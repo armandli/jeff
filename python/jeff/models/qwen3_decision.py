@@ -1,17 +1,17 @@
-"""Qwen3-8B decision model with QLoRA and a learned MLP readout head.
+"""Qwen3-8B decision model with QLoRA and a lightweight linear readout head.
 
 Architecture
 ------------
 - Base: Qwen3-8B (or Qwen3-8B-Instruct), loaded in 4-bit NF4 via bitsandbytes
 - LoRA adapters on q_proj / k_proj / v_proj / o_proj / gate_proj / up_proj / down_proj
-- DecisionHead: small MLP on top of the last hidden state at the answer position
+- DecisionHead: single Linear(hidden_size, 1) on the last hidden state at the answer position
   (replaces the raw next-token logit readout used by stock AnyJev)
 - Permutation debiasing (AnyJev style): K cyclic rotations of option order,
   scores averaged before softmax to cancel positional bias
 
 Training flow
 -------------
-1. SFT phase  : cross-entropy on correct option index via MLP head scores
+1. SFT phase  : cross-entropy on correct option index via linear head scores
 2. RLCD phase : DPO on (chosen, rejected) option pairs
 
 Inference flow
@@ -20,7 +20,6 @@ Inference flow
   out = model.decide(DecisionInput(context="...", options=["A", "B", "C"]))
 """
 
-import itertools
 from dataclasses import dataclass, field
 
 import torch
@@ -33,31 +32,24 @@ from jeff.models.base import DecisionInput, DecisionModel, DecisionOutput
 DEFAULT_MODEL = "Qwen/Qwen3-8B-Instruct"
 
 # ---------------------------------------------------------------------------
-# MLP readout head
+# Linear readout head
 # ---------------------------------------------------------------------------
 
 class DecisionHead(nn.Module):
-    """Maps a single hidden-state vector to a scalar decision score.
+    """Maps a hidden-state vector to a scalar decision score via a single linear layer.
 
-    One forward pass per option (or per permuted option position); the scores
-    are then compared across options before softmax.
+    One forward pass per option; scores are compared across options before softmax.
+    Zero-initialised so it starts as a no-op and the backbone drives early training.
     """
 
     def __init__(self, hidden_size: int):
         super().__init__()
-        mid = hidden_size // 2
-        self.net = nn.Sequential(
-            nn.Linear(hidden_size, mid, bias=False),
-            nn.GELU(),
-            nn.LayerNorm(mid),
-            nn.Linear(mid, 1, bias=False),
-        )
-        # Zero-init output layer so the MLP starts as a no-op relative to logits
-        nn.init.zeros_(self.net[-1].weight)
+        self.proj = nn.Linear(hidden_size, 1, bias=False)
+        nn.init.zeros_(self.proj.weight)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         # hidden: [batch, hidden_size] → [batch]
-        return self.net(hidden).squeeze(-1)
+        return self.proj(hidden).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
