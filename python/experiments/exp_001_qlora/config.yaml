@@ -1,0 +1,39 @@
+# Experiment 001 — QLoRA fine-tune Qwen3-8B with MLP decision head
+# Approach: AnyJev-style permutation debiasing + learned MLP readout
+# Base model: Qwen/Qwen3-8B-Instruct (4-bit NF4 via bitsandbytes)
+
+model:
+  name: "Qwen/Qwen3-8B-Instruct"
+  load_in_4bit: true
+  lora_r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  lora_target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+training:
+  num_epochs: 3
+  batch_size: 4
+  gradient_accumulation_steps: 8     # effective batch = 32
+  learning_rate: 2.0e-4              # LoRA adapters
+  head_learning_rate: 1.0e-3         # MLP decision head
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  bf16: true
+
+data:
+  train: "~/data/sft/mmlu.jsonl"
+  eval: null                         # add an eval file when available
+
+output:
+  dir: "checkpoints/exp_001_qlora"
+
+wandb:
+  project: "jeff"
+  run_name: "exp_001_qlora"

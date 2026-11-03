@@ -6,23 +6,39 @@ build-backend = "hatchling.build"
 name = "jeff"
 version = "0.1.0"
 description = "System 1 decision model — open reproduction of JEV"
-requires-python = ">=3.11"
+# 3.10 matches anyjev's minimum; Qwen3 tooling works on 3.10+
+requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.3",
-    "transformers>=4.45",
-    "datasets>=2.21",
+    # Core ML stack — torch itself is installed separately by setup_env.sh
+    # because the wheel URL depends on the local CUDA version.
+    "transformers>=4.53",       # Qwen3 support landed in 4.51; 4.53 for stability
     "accelerate>=0.34",
-    "peft>=0.13",
-    "trl>=0.11",          # DPO / RLCD trainers
+    "datasets>=2.21",
+    "sentencepiece>=0.2",
+    "tiktoken>=0.7",            # Qwen3 tokenizer fallback
     "einops>=0.8",
     "numpy>=1.26",
     "pyyaml>=6.0",
     "tqdm>=4.66",
     "wandb>=0.18",
-    "sentencepiece>=0.2",
+
+    # LoRA / QLoRA
+    "peft>=0.14",               # 0.14+ has QLoRA fixes for Qwen3 attention layers
+    "bitsandbytes>=0.44",       # 4-bit / 8-bit quantisation for QLoRA
+
+    # Training helpers
+    "trl>=0.12",                # SFTTrainer, DPOTrainer, updated API for Qwen3
+
+    # AnyJev: permutation-debiased decision readout
+    "anyjev[hf]>=0.3",
 ]
 
 [project.optional-dependencies]
+# Flash-Attention is strongly recommended for Qwen3-8B throughput but requires
+# a CUDA-version-matched wheel; install via setup_env.sh --flash-attn.
+flash = [
+    "flash-attn>=2.6",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.6",
