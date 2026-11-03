@@ -1,0 +1,21 @@
+_base: "../../../configs/base.yaml"
+
+# Experiment 000 — SFT baseline on MMLU training split
+# Goal: verify the training pipeline works end-to-end before RLCD.
+
+model:
+  name: "Qwen/Qwen2.5-3B-Instruct"   # smaller for iteration speed
+
+training:
+  num_train_epochs: 1
+  per_device_train_batch_size: 8
+
+data:
+  train: "data/processed/mmlu_train.jsonl"
+  eval: "data/processed/mmlu_val.jsonl"
+
+output:
+  dir: "checkpoints/exp_000_baseline"
+
+wandb:
+  run_name: "exp_000_baseline"

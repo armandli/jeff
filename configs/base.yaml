@@ -1,0 +1,33 @@
+model:
+  name: "Qwen/Qwen2.5-7B-Instruct"
+  torch_dtype: "bfloat16"
+  device_map: "auto"
+
+training:
+  stage: "sft"          # sft | rlcd
+  num_train_epochs: 3
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-5
+  warmup_ratio: 0.05
+  bf16: true
+  logging_steps: 10
+  save_steps: 200
+  eval_steps: 200
+
+lora:
+  r: 64
+  alpha: 128
+  target_modules: ["q_proj", "v_proj"]
+  dropout: 0.0
+
+data:
+  train: "data/processed/train.jsonl"
+  eval: "data/processed/eval.jsonl"
+
+output:
+  dir: "checkpoints/base"
+
+wandb:
+  project: "jeff"
+  run_name: "base"

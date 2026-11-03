@@ -218,3 +218,36 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# C++ build artifacts
+build/
+cmake-build-*/
+*.o
+*.a
+*.out
+compile_commands.json
+
+# Model weights and checkpoints (large binaries)
+checkpoints/*/
+!checkpoints/.gitkeep
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.gguf
+
+# Raw and processed data (download via scripts/)
+data/raw/*/
+!data/raw/.gitkeep
+data/processed/*/
+!data/processed/.gitkeep
+
+# HuggingFace cache
+.cache/huggingface/
+
+# Weights & Biases
+wandb/
+
+# LibTorch (download separately — see README)
+third_party/libtorch/
+
