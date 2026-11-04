@@ -2,7 +2,7 @@
 
 Architecture
 ------------
-- Base: Qwen3-8B (or Qwen3-8B-Instruct), loaded in 4-bit NF4 via bitsandbytes
+- Base: Qwen3-8B (hybrid thinking/instruct model), loaded in 4-bit NF4 via bitsandbytes
 - LoRA adapters on q_proj / k_proj / v_proj / o_proj / gate_proj / up_proj / down_proj
 - DecisionHead: single Linear(hidden_size, 1) on the last hidden state at the answer position
   (replaces the raw next-token logit readout used by stock AnyJev)
@@ -29,7 +29,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from jeff.models.base import DecisionInput, DecisionModel, DecisionOutput
 
-DEFAULT_MODEL = "Qwen/Qwen3-8B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen3-8B"
 
 # ---------------------------------------------------------------------------
 # Linear readout head
@@ -72,7 +72,9 @@ def _format_prompt(context: str, options: list[str], perm: list[int]) -> tuple[s
     prompt = (
         f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
         f"<|im_start|>user\n{context}\n\nOptions:\n{opts_text}<|im_end|>\n"
-        f"<|im_start|>assistant\n"
+        # Empty think block = Qwen3 non-thinking mode (what the official chat
+        # template emits with enable_thinking=False).
+        f"<|im_start|>assistant\n<think>\n\n</think>\n\n"
     )
     return prompt, "Answer:"
 

@@ -12,8 +12,10 @@ safe to re-run after a partial download.
 """
 
 import argparse
+import hashlib
 import json
 import os
+import random
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -125,7 +127,7 @@ def fetch_winogrande() -> None:
     if _skip(out, "winogrande"): return
 
     def gen():
-        for split in ("train_xl", "validation"):
+        for split in ("train", "validation"):
             ds = load_dataset("allenai/winogrande", "winogrande_xl", split=split,
                               trust_remote_code=True)
             for row in ds:
@@ -146,7 +148,7 @@ def fetch_commonsenseqa() -> None:
 
     def gen():
         for split in ("train", "validation"):
-            ds = load_dataset("commonsense_qa", split=split)
+            ds = load_dataset("tau/commonsense_qa", split=split)
             for row in ds:
                 labels = row["choices"]["label"]
                 texts = row["choices"]["text"]
@@ -168,16 +170,20 @@ def fetch_truthfulqa() -> None:
     if _skip(out, "truthfulqa"): return
 
     def gen():
-        ds = load_dataset("truthful_qa", "multiple_choice", split="validation")
+        ds = load_dataset("truthfulqa/truthful_qa", "multiple_choice", split="validation")
         for row in ds:
             choices = row["mc1_targets"]["choices"]
             labels = row["mc1_targets"]["labels"]
             if 1 not in labels:
                 continue
+            # mc1 always lists the correct answer first; shuffle deterministically.
+            seed = int(hashlib.sha256(row["question"].encode()).hexdigest()[:8], 16)
+            order = list(range(len(choices)))
+            random.Random(seed).shuffle(order)
             yield {
                 "context": row["question"],
-                "options": choices,
-                "correct_index": labels.index(1),
+                "options": [choices[i] for i in order],
+                "correct_index": order.index(labels.index(1)),
                 "source": "truthfulqa/validation",
             }
     _write_jsonl(out, gen(), "truthfulqa")
@@ -190,7 +196,7 @@ def fetch_openbookqa() -> None:
 
     def gen():
         for split in ("train", "validation", "test"):
-            ds = load_dataset("openbookqa", "main", split=split)
+            ds = load_dataset("allenai/openbookqa", "main", split=split)
             for row in ds:
                 labels = row["choices"]["label"]
                 texts = row["choices"]["text"]
@@ -213,7 +219,7 @@ def fetch_piqa() -> None:
 
     def gen():
         for split in ("train", "validation"):
-            ds = load_dataset("ybisk/piqa", split=split, trust_remote_code=True)
+            ds = load_dataset("ybisk/piqa", split=split, revision="refs/convert/parquet")
             for row in ds:
                 yield {
                     "context": row["goal"],
@@ -231,7 +237,7 @@ def fetch_siqa() -> None:
 
     def gen():
         for split in ("train", "validation"):
-            ds = load_dataset("social_i_qa", split=split, trust_remote_code=True)
+            ds = load_dataset("allenai/social_i_qa", split=split, revision="refs/convert/parquet")
             for row in ds:
                 yield {
                     "context": row["context"] + " " + row["question"],
@@ -265,13 +271,13 @@ def fetch_gpqa() -> None:
     out = SFT_DIR / "gpqa.jsonl"
     if _skip(out, "gpqa"): return
 
+
     def gen():
+        # GPQA is gated: accept the terms on the HF page and run `hf auth login`
+        # first. Errors propagate so we never write an empty file that a re-run
+        # would then skip.
         for config in ("gpqa_main", "gpqa_diamond", "gpqa_extended"):
-            try:
-                ds = load_dataset("Idavidrein/gpqa", config, split="train",
-                                  trust_remote_code=True)
-            except Exception:
-                continue
+            ds = load_dataset("Idavidrein/gpqa", config, split="train")
             for row in ds:
                 options = [
                     row["Correct Answer"],
@@ -279,10 +285,14 @@ def fetch_gpqa() -> None:
                     row["Incorrect Answer 2"],
                     row["Incorrect Answer 3"],
                 ]
+                # Deterministic shuffle so the correct answer is not always index 0.
+                seed = int(hashlib.sha256(row["Question"].encode()).hexdigest()[:8], 16)
+                order = list(range(4))
+                random.Random(seed).shuffle(order)
                 yield {
                     "context": row["Question"],
-                    "options": options,
-                    "correct_index": 0,  # correct is always first before any shuffle
+                    "options": [options[i] for i in order],
+                    "correct_index": order.index(0),
                     "source": f"gpqa/{config}",
                 }
     _write_jsonl(out, gen(), "gpqa")

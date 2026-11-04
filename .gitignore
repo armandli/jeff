@@ -228,7 +228,7 @@ cmake-build-*/
 compile_commands.json
 
 # Model weights and checkpoints (large binaries)
-checkpoints/*/
+checkpoints/*
 !checkpoints/.gitkeep
 *.pt
 *.pth
@@ -237,9 +237,9 @@ checkpoints/*/
 *.gguf
 
 # Raw and processed data (download via scripts/)
-data/raw/*/
+data/raw/*
 !data/raw/.gitkeep
-data/processed/*/
+data/processed/*
 !data/processed/.gitkeep
 
 # HuggingFace cache

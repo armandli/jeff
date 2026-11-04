@@ -34,5 +34,10 @@ def load_dataset_from_jsonl(path: str | Path) -> DecisionDataset:
             if not line:
                 continue
             d = json.loads(line)
-            examples.append(DecisionExample(**d))
+            # Ignore extra metadata (e.g. "source") written by fetch_training_data.py
+            examples.append(DecisionExample(
+                context=d["context"],
+                options=d["options"],
+                correct_index=int(d["correct_index"]),
+            ))
     return DecisionDataset(examples)

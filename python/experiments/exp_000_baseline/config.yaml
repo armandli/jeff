@@ -1,7 +1,9 @@
 _base: "../../../configs/base.yaml"
 
-# Experiment 000 — SFT baseline on MMLU training split
-# Goal: verify the training pipeline works end-to-end before RLCD.
+# Experiment 000 — SFT baseline on MMLU auxiliary_train
+# Goal: verify the training pipeline works end-to-end before RLCD, and measure
+# how far plain LoRA SFT moves MMLU-val accuracy over the zero-shot model.
+# Data: scripts/prepare_mmlu.py splits ~/data/sft/mmlu.jsonl by source split.
 
 model:
   name: "Qwen/Qwen2.5-3B-Instruct"   # smaller for iteration speed
@@ -9,6 +11,9 @@ model:
 training:
   num_train_epochs: 1
   per_device_train_batch_size: 8
+  gradient_accumulation_steps: 8      # effective batch 64 -> ~1.5k steps/epoch
+  learning_rate: 1.0e-4               # base.yaml's 2e-5 is a full-FT rate; LoRA needs more
+  max_length: 2048
 
 data:
   train: "data/processed/mmlu_train.jsonl"

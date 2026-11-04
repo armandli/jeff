@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -10,11 +12,16 @@ class QwenDecisionModel(DecisionModel):
     def __init__(self, model_name_or_path: str, device: str = "cuda"):
         self.device = device
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            torch_dtype=torch.bfloat16,
-            device_map=device,
-        )
+        if (Path(model_name_or_path) / "adapter_config.json").exists():
+            # LoRA checkpoint produced by JeffTrainer
+            from peft import AutoPeftModelForCausalLM
+            self.model = AutoPeftModelForCausalLM.from_pretrained(
+                model_name_or_path, dtype=torch.bfloat16, device_map=device,
+            )
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path, dtype=torch.bfloat16, device_map=device,
+            )
         self.model.eval()
 
     def score_options(self, inp: DecisionInput) -> list[float]:
@@ -27,10 +34,11 @@ class QwenDecisionModel(DecisionModel):
             logits = self.model(**enc).logits[0, -1]  # last position
             log_probs = torch.log_softmax(logits, dim=-1)
 
-        for option in inp.options:
-            option_ids = self.tokenizer.encode(option, add_special_tokens=False)
-            # Score by first token of each option (fast System 1 heuristic)
-            scores.append(log_probs[option_ids[0]].item())
+        # The prompt lists options as "0. ...", "1. ..." and the SFT target is the
+        # index, so score the index token (digits are single tokens in Qwen).
+        for i in range(len(inp.options)):
+            idx_ids = self.tokenizer.encode(str(i), add_special_tokens=False)
+            scores.append(log_probs[idx_ids[0]].item())
 
         return scores
 
@@ -41,7 +49,7 @@ class QwenDecisionModel(DecisionModel):
 
     def _format_prompt(self, inp: DecisionInput) -> str:
         opts = "\n".join(f"{i}. {o}" for i, o in enumerate(inp.options))
-        return f"{inp.context}\n\nOptions:\n{opts}\n\nAnswer:"
+        return f"{inp.context}\n\nOptions:\n{opts}\n\nAnswer: "
 
     def export_torchscript(self, path: str) -> None:
         """Export for LibTorch C++ inference."""

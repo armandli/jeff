@@ -1,9 +1,9 @@
 # Experiment 001 — QLoRA fine-tune Qwen3-8B with MLP decision head
 # Approach: AnyJev-style permutation debiasing + learned MLP readout
-# Base model: Qwen/Qwen3-8B-Instruct (4-bit NF4 via bitsandbytes)
+# Base model: Qwen/Qwen3-8B (4-bit NF4 via bitsandbytes)
 
 model:
-  name: "Qwen/Qwen3-8B-Instruct"
+  name: "Qwen/Qwen3-8B"
   load_in_4bit: true
   lora_r: 64
   lora_alpha: 128

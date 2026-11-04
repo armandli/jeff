@@ -21,7 +21,7 @@ from jeff.models.qwen3_decision import Qwen3Config, Qwen3DecisionModel
 @dataclass
 class QLoRATrainingConfig:
     # Model
-    model_name: str = "Qwen/Qwen3-8B-Instruct"
+    model_name: str = "Qwen/Qwen3-8B"
     load_in_4bit: bool = True
     lora_r: int = 64
     lora_alpha: int = 128
