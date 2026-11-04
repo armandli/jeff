@@ -153,7 +153,7 @@ uv pip install hatchling editables
 echo "Installing jeff project dependencies..."
 cd "${PYTHON_DIR}"
 TORCH_BEFORE="$(python -W ignore -c 'import torch; print(torch.__version__)')"
-uv pip install -e ".[dev]" --no-build-isolation
+uv pip install -e ".[dev,doom]" --no-build-isolation
 TORCH_AFTER="$(python -W ignore -c 'import torch; print(torch.__version__)')"
 if [[ "${TORCH_BEFORE}" != "${TORCH_AFTER}" ]]; then
     echo "ERROR: installing project deps replaced torch ${TORCH_BEFORE} with ${TORCH_AFTER}."

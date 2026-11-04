@@ -251,3 +251,6 @@ wandb/
 # LibTorch (download separately — see README)
 third_party/libtorch/
 
+
+# ViZDoom writes its engine config into the working directory
+_vizdoom.ini

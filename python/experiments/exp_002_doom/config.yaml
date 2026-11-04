@@ -1,0 +1,36 @@
+# Experiment 002 — jeff plays Doom (ViZDoom defend_the_center), text-only.
+#
+# The model never sees pixels: each decision gets a text description of health,
+# ammo and every live Demon's distance/bearing, and picks ATTACK / TURN_LEFT /
+# TURN_RIGHT. Kills are the score (+1 each; dying costs -1 reward).
+#
+# Plan
+#   step 1 (this setup): baselines — random, scripted aim-bot teacher, zero-shot Qwen3-8B
+#   step 2: SFT on teacher-labelled states recorded from play (imitation)
+#   step 3: RLCD/DPO on (better, worse) action pairs from game outcomes
+#
+# ViZDoom runs synchronously, so model latency slows wall-clock time but never
+# the game itself.
+
+env:
+  scenario: "defend_the_center"
+  tics_per_action: 2          # ~3.5 deg per turn decision; 4 tics overshoots far targets
+  include_physics: true       # add the factual "hit cone / turn rate" note to the prompt
+  max_monsters: 6
+
+model:
+  name: "Qwen/Qwen3-8B"
+  load_in_4bit: true
+  n_permutations: 0           # 0 = all 3 cyclic rotations, batched in one forward pass
+  adapter: null               # LoRA checkpoint for fine-tuned runs
+
+eval:
+  episodes: 20
+  seed: 7                     # fixed seeds: episode variance is larger than brain gaps
+
+teacher:
+  aim_margin: 1.0             # 7.5 kills/episode on 20 seeded episodes
+
+output:
+  results_dir: "python/experiments/exp_002_doom/results"
+  data_dir: "~/data/doom"     # recorded trajectories (JSONL)
