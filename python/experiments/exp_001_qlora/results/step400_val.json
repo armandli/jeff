@@ -1,0 +1,15 @@
+{
+  "tag": "step400_val",
+  "n": 1531,
+  "accuracy": 0.7472240365774004,
+  "accuracy_letter_only": 0.7459177008491182,
+  "nll": 0.7024614659463774,
+  "pred_dist": {
+    "0": 401,
+    "1": 353,
+    "2": 398,
+    "3": 379
+  },
+  "seconds": 386.1,
+  "checkpoint": "checkpoints/exp_001_qlora/best"
+}

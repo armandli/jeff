@@ -1,6 +1,10 @@
-# Experiment 001 — QLoRA fine-tune Qwen3-8B with MLP decision head
-# Approach: AnyJev-style permutation debiasing + learned MLP readout
+# Experiment 001 — QLoRA fine-tune Qwen3-8B with a linear decision head
+# Approach: AnyJev-style permutation debiasing + learned linear readout
 # Base model: Qwen/Qwen3-8B (4-bit NF4 via bitsandbytes)
+#
+# Score per option = log p(letter | prompt) + Linear(h_option), where h_option is
+# the hidden state at the last token of that option's text. The head is zero-init,
+# so step 0 == the zero-shot letter scorer (the eval at step 0 is the baseline).
 
 model:
   name: "Qwen/Qwen3-8B"
@@ -16,23 +20,33 @@ model:
     - gate_proj
     - up_proj
     - down_proj
+  max_seq_len: 1024           # longer prompts are dropped from training
 
 training:
-  num_epochs: 3
+  num_epochs: 1
+  max_steps: null             # optimizer-step cap; the 2026-11-04 run was stopped at ~650 (best: step 400)
   batch_size: 4
   gradient_accumulation_steps: 8     # effective batch = 32
-  learning_rate: 2.0e-4              # LoRA adapters
-  head_learning_rate: 1.0e-3         # MLP decision head
+  learning_rate: 5.0e-5              # LoRA adapters; 2e-4 was unstable (val 70% -> 27% by step 250)
+  head_learning_rate: 1.0e-3         # linear decision head
   warmup_ratio: 0.05
   max_grad_norm: 1.0
   bf16: true
+  seed: 0
+
+eval:
+  every: 100                  # optimizer steps, on a fixed val subset; best kept in <dir>/best
+  subset: 300
 
 data:
-  train: "~/data/sft/mmlu.jsonl"
-  eval: null                         # add an eval file when available
+  # MMLU auxiliary_train only. ~/data/sft/mmlu.jsonl also contains the val and
+  # test splits, so it must not be used for training.
+  train: "data/processed/mmlu_train.jsonl"
+  eval: "data/processed/mmlu_val.jsonl"
 
 output:
   dir: "checkpoints/exp_001_qlora"
+  results_dir: "python/experiments/exp_001_qlora/results"
 
 wandb:
   project: "jeff"

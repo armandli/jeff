@@ -1,0 +1,107 @@
+[
+  {
+    "tag": "zeroshot_subset",
+    "n": 300,
+    "accuracy": 0.7,
+    "accuracy_letter_only": 0.7,
+    "nll": 2.8646545270753094,
+    "pred_dist": {
+      "0": 74,
+      "1": 66,
+      "2": 83,
+      "3": 77
+    },
+    "seconds": 80.7,
+    "step": 0
+  },
+  {
+    "tag": "step100_subset",
+    "n": 300,
+    "accuracy": 0.74,
+    "accuracy_letter_only": 0.7266666666666667,
+    "nll": 0.7142681175344235,
+    "pred_dist": {
+      "0": 77,
+      "1": 63,
+      "2": 86,
+      "3": 74
+    },
+    "seconds": 82.4,
+    "step": 100
+  },
+  {
+    "tag": "step200_subset",
+    "n": 300,
+    "accuracy": 0.7466666666666667,
+    "accuracy_letter_only": 0.7566666666666667,
+    "nll": 0.6398741091221261,
+    "pred_dist": {
+      "0": 72,
+      "1": 71,
+      "2": 81,
+      "3": 76
+    },
+    "seconds": 83.0,
+    "step": 200
+  },
+  {
+    "tag": "step300_subset",
+    "n": 300,
+    "accuracy": 0.7566666666666667,
+    "accuracy_letter_only": 0.7533333333333333,
+    "nll": 0.6720378246794765,
+    "pred_dist": {
+      "0": 76,
+      "1": 67,
+      "2": 85,
+      "3": 72
+    },
+    "seconds": 82.7,
+    "step": 300
+  },
+  {
+    "tag": "step400_subset",
+    "n": 300,
+    "accuracy": 0.7733333333333333,
+    "accuracy_letter_only": 0.7666666666666667,
+    "nll": 0.6873695513493536,
+    "pred_dist": {
+      "0": 81,
+      "1": 64,
+      "2": 82,
+      "3": 73
+    },
+    "seconds": 82.8,
+    "step": 400
+  },
+  {
+    "tag": "step500_subset",
+    "n": 300,
+    "accuracy": 0.76,
+    "accuracy_letter_only": 0.7533333333333333,
+    "nll": 0.6474760638796336,
+    "pred_dist": {
+      "0": 77,
+      "1": 66,
+      "2": 81,
+      "3": 76
+    },
+    "seconds": 82.6,
+    "step": 500
+  },
+  {
+    "tag": "step600_subset",
+    "n": 300,
+    "accuracy": 0.7566666666666667,
+    "accuracy_letter_only": 0.7633333333333333,
+    "nll": 0.6747017234168016,
+    "pred_dist": {
+      "0": 77,
+      "1": 63,
+      "2": 86,
+      "3": 74
+    },
+    "seconds": 82.7,
+    "step": 600
+  }
+]
