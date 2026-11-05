@@ -1,0 +1,65 @@
+# Experiment 003 — Fast encoder decision model
+#
+# Hypothesis
+# ----------
+# An encoder-only model (ModernBERT-large, 395M) with a linear decision head
+# can match or exceed the accuracy of exp_001 (Qwen3-8B QLoRA, ~71.6% on MMLU val)
+# at 10-30× lower latency by eliminating autoregressive token generation.
+#
+# Architecture
+# ------------
+# Base model  : answerdotai/ModernBERT-large (395M, bidirectional, flash-attn)
+# Score       : [CLS] context [SEP] option_i [SEP] → Linear(1024, 1) scalar
+# Debiasing   : all cyclic option permutations, scores averaged
+# Training    : LoRA on {Wqkv, o_proj, Wi, Wo} + full linear head in fp32
+#
+# Von (Nokia, archived) and LiquidAI d1-omni-600M use the same encoder approach
+# and achieve 8-50ms/decision on GPU vs ~200ms for Qwen3-8B QLoRA (exp_001).
+#
+# Speed evaluation is included in the final eval: sequential ms/decision,
+# batched throughput, and a comparison ratio vs exp_001 baseline.
+#
+# Faster alternative: swap model.name → answerdotai/ModernBERT-base (149M)
+# for ~2× additional speedup at a ~3-5pp accuracy cost.
+
+model:
+  name: "answerdotai/ModernBERT-large"
+  full_finetune: false
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules:
+    - Wqkv
+    - o_proj
+    - Wi
+    - Wo
+  max_seq_len: 512
+  n_permutations: 0           # 0 = all N cyclic rotations
+
+training:
+  num_epochs: 3
+  max_steps: null
+  batch_size: 8
+  gradient_accumulation_steps: 4    # effective batch = 32
+  learning_rate: 2.0e-5             # encoder backbone
+  head_learning_rate: 1.0e-4        # linear decision head
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  bf16: true
+  seed: 0
+
+eval:
+  every: 500
+  subset: 300
+
+data:
+  train: "data/processed/mmlu_train.jsonl"
+  eval:  "data/processed/mmlu_val.jsonl"
+
+output:
+  dir: "checkpoints/exp_003_fast_encoder"
+  results_dir: "python/experiments/exp_003_fast_encoder/results"
+
+wandb:
+  project: "jeff"
+  run_name: "exp_003_fast_encoder"
