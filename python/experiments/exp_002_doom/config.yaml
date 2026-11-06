@@ -30,7 +30,91 @@ eval:
 
 teacher:
   aim_margin: 1.0             # 7.5 kills/episode on 20 seeded episodes
+  fire_period: 10             # teacher v2 (play.py --v2): also fire after 10 shot-free decisions
 
 output:
   results_dir: "python/experiments/exp_002_doom/results"
   data_dir: "~/data/doom"     # recorded trajectories (JSONL)
+
+# Step 2 — SFT (imitation) on teacher-labelled states; same QLoRA + head trainer as exp_001.
+# Data: prepare_sft.py (clean teacher seeds 1000-1199 + eps=0.3 noisy teacher seeds 2000-2149,
+# deduped, 24k sampled); val = clean teacher seeds 5000-5019 (accuracy == teacher agreement).
+sft:
+  lora_r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  max_seq_len: 512
+  num_epochs: 1
+  max_steps: null
+  batch_size: 8
+  gradient_accumulation_steps: 4     # effective batch = 32 -> 750 steps for 24k states
+  learning_rate: 5.0e-5              # exp_001: 2e-4 collapsed, 5e-5 stable
+  head_learning_rate: 1.0e-3
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  bf16: true
+  seed: 0
+  eval_every: 50
+  eval_subset: 300
+  train: "data/processed/doom_sft_train.jsonl"
+  eval: "data/processed/doom_sft_val.jsonl"
+  output_dir: "checkpoints/exp_002_doom_sft"
+  wandb_run: "exp_002_doom_sft"
+
+# Step 3 — RLCD as option-level DPO on game-outcome preferences.
+# label_q.py: teacher+eps0.1 play (seeds 3000-3399); every 2nd state, each action is
+# followed by 16 eps-0.1-teacher rollouts to episode end (common random numbers);
+# build_prefs.py keeps pairs with paired kill gap >= 0.5 and > 2.5 se.
+dpo:
+  init_adapter: "checkpoints/exp_002_doom_sft/best"     # SFT step 200 (7.75 kills/ep)
+  beta: 1.0                   # option scores are a 3-way log-softmax; margins are O(1-5) nats
+  nll_weight: 0.2             # RPO-style anchor on the chosen option
+  num_epochs: 2
+  max_steps: null
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-5
+  head_learning_rate: 5.0e-4
+  warmup_ratio: 0.05
+  eval_every: 25
+  state_eval_subset: 300      # teacher-state accuracy, to watch drift from the SFT policy
+  train: "data/processed/doom_prefs_train.jsonl"
+  eval: "data/processed/doom_prefs_eval.jsonl"
+  output_dir: "checkpoints/exp_002_doom_dpo"
+  wandb_run: "exp_002_doom_dpo"
+
+# Step 3b — SFT on MC-policy-improved labels (prepare_improved.py): the significantly
+# better action from label_q.py rollouts where one exists (6.4% of states), else the
+# teacher's. DPO on the pairs alone (dpo:) shifted 31% of in-game decisions away from
+# the teacher, while the MC lookahead policy it was distilled from deviates on 3.7%.
+# Overrides of the sft: section.
+sft_improved:
+  max_steps: 300
+  train: "data/processed/doom_improved_train.jsonl"
+  eval: "data/processed/doom_improved_val.jsonl"
+  output_dir: "checkpoints/exp_002_doom_improved"
+  wandb_run: "exp_002_doom_improved"
+
+# Step 4 — observation v2 + teacher v2 (play.py --v2). Noise ablation (seed 11, 200 ep):
+# random extra shots raise the aim-bot from 7.09 to 9.06 kills/ep, random turns lower it;
+# the deterministic "fire after 10 shot-free decisions" rule gets 9.26. The v1 text has no
+# shot timing, so no text policy could express it; v2 adds "Decisions since your last shot".
+# Same recipe as step 2 (clean seeds 1000-1199 + eps0.3 seeds 2000-2149, val 5000-5019).
+sft_v2:
+  max_steps: 300
+  train: "data/processed/doom_v2_sft_train.jsonl"
+  eval: "data/processed/doom_v2_sft_val.jsonl"
+  output_dir: "checkpoints/exp_002_doom_v2_sft"
+  wandb_run: "exp_002_doom_v2_sft"
+
+# Step 4b — SFT on MC-improved labels under obs v2 (label_q.py --v2, replay-based:
+# teacher v2 + eps0.1 behaviour, seeds 3000-3199, every 3rd state, K16 eps0.1 teacher-v2
+# continuations; prepare_improved.py --prefix doom_v2_improved). The replay MC oracle beats
+# teacher v2 by +4.25 kills/ep (13.68 vs 9.43, 44 paired eps), overriding 3.9% of decisions.
+sft_v2_improved:
+  max_steps: 400
+  train: "data/processed/doom_v2_improved_train.jsonl"
+  eval: "data/processed/doom_v2_improved_val.jsonl"
+  output_dir: "checkpoints/exp_002_doom_v2_improved"
+  wandb_run: "exp_002_doom_v2_improved"

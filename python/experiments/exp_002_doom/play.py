@@ -27,7 +27,7 @@ from pathlib import Path
 
 import yaml
 
-from jeff.envs.doom import ACTION_NAMES, DoomEnv, DoomState, heuristic_action
+from jeff.envs.doom import ACTION_NAMES, DoomEnv, DoomState, heuristic_action, periodic_fire_action
 from jeff.models.base import DecisionInput
 
 EXP_DIR = Path(__file__).resolve().parent
@@ -43,11 +43,11 @@ class RandomBrain:
 
 
 class HeuristicBrain:
-    def __init__(self, aim_margin: float):
-        self.aim_margin = aim_margin
+    def __init__(self, teacher):
+        self.teacher = teacher
 
     def __call__(self, state: DoomState, context: str):
-        return heuristic_action(state, self.aim_margin), None
+        return self.teacher(state), None
 
 
 class Qwen3Brain:
@@ -56,6 +56,17 @@ class Qwen3Brain:
         from jeff.models.qwen3_choice import Qwen3ChoiceConfig, Qwen3ChoiceModel
 
         m = cfg["model"]
+        adapter = adapter or m.get("adapter")
+        if adapter and (Path(adapter) / "decision_head.pt").exists():
+            # SFT checkpoint from train_sft.py: score with letter log-prob + linear head,
+            # exactly as in training.
+            from jeff.models.qwen3_decision import Qwen3Config, Qwen3DecisionModel
+            n_perm = m.get("n_permutations", 0) if n_permutations is None else n_permutations
+            self.model = Qwen3DecisionModel.from_pretrained(
+                adapter, base_model=model_name or m["name"],
+                cfg=Qwen3Config(model_name=model_name or m["name"], device=device,
+                                load_in_4bit=m.get("load_in_4bit", True), n_permutations=n_perm))
+            return
         self.model = Qwen3ChoiceModel(Qwen3ChoiceConfig(
             model_name=model_name or m["name"],
             adapter=adapter or m.get("adapter"),
@@ -81,6 +92,11 @@ def main():
     ap.add_argument("--model", default=None, help="override model.name (e.g. Qwen/Qwen3-0.6B)")
     ap.add_argument("--adapter", default=None, help="LoRA checkpoint dir")
     ap.add_argument("--n-permutations", type=int, default=None)
+    ap.add_argument("--epsilon", type=float, default=0.0,
+                    help="take a uniform random action with this probability (off-policy "
+                         "states for recording; labels stay the teacher's)")
+    ap.add_argument("--v2", action="store_true",
+                    help="observation v2 (decisions since last shot) + periodic-fire teacher")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -89,15 +105,21 @@ def main():
     episodes = args.episodes or ev["episodes"]
     seed = ev["seed"] if args.seed is None else args.seed
     aim_margin = cfg["teacher"]["aim_margin"]
+    shot_timer = args.v2 or env_cfg.get("shot_timer", False)
+    fire_period = cfg["teacher"].get("fire_period") if args.v2 else None
+    if fire_period:
+        teacher_fn = lambda s: periodic_fire_action(s, aim_margin, fire_period)  # noqa: E731
+    else:
+        teacher_fn = lambda s: heuristic_action(s, aim_margin)  # noqa: E731
 
     if args.brain == "random":
         brain = RandomBrain(seed)
     elif args.brain == "heuristic":
-        brain = HeuristicBrain(aim_margin)
+        brain = HeuristicBrain(teacher_fn)
     else:
         brain = Qwen3Brain(cfg, args.device, args.model, args.adapter, args.n_permutations)
 
-    env = DoomEnv(env_cfg["scenario"], env_cfg["tics_per_action"], seed=seed)
+    env = DoomEnv(env_cfg["scenario"], env_cfg["tics_per_action"], seed=seed, shot_timer=shot_timer)
     env.game.set_seed(seed)   # measure_turn_rate() consumed an episode; restart the seed stream
     rec = None
     if args.record:
@@ -105,16 +127,19 @@ def main():
         args.record.parent.mkdir(parents=True, exist_ok=True)
         rec = open(args.record, "w")
 
+    eps_rng = random.Random(seed + 12345)
     kills, rewards, lengths, shots, agree, latency = [], [], [], 0, [], []
     for ep in range(episodes):
         state = env.reset()
         step = 0
         while not env.done and (args.max_steps is None or step < args.max_steps):
             context = state.describe(env_cfg["max_monsters"], env_cfg["include_physics"])
-            teacher = heuristic_action(state, aim_margin)
+            teacher = teacher_fn(state)
             t0 = time.perf_counter()
             action, scores = brain(state, context)
             latency.append(time.perf_counter() - t0)
+            if args.epsilon and eps_rng.random() < args.epsilon:
+                action = eps_rng.choice(ACTION_NAMES)
             agree.append(action == teacher)
             reward = env.step(action)
             nxt = env.observe()
@@ -147,7 +172,7 @@ def main():
         "model": args.model or (cfg["model"]["name"] if args.brain == "qwen3" else None),
         "adapter": args.adapter,
         "episodes": episodes, "seed": seed, "tics_per_action": env_cfg["tics_per_action"],
-        "max_steps": args.max_steps,
+        "max_steps": args.max_steps, "epsilon": args.epsilon, "v2": args.v2,
         "kills_mean": st.mean(kills), "kills_sd": st.pstdev(kills),
         "reward_mean": st.mean(rewards),
         "decisions_mean": st.mean(lengths),

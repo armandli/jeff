@@ -1,0 +1,734 @@
+{
+  "teacher": {
+    "kills_mean": 9.431818181818182,
+    "kills_sd": 1.6841200463679875,
+    "kills_per_bullet": 0.40057915057915056,
+    "override_rate": 0.0
+  },
+  "mc": {
+    "kills_mean": 13.681818181818182,
+    "kills_sd": 1.3275528969554757,
+    "kills_per_bullet": 0.5262237762237763,
+    "override_rate": 0.01571227227645247
+  },
+  "paired_diff_mean": 4.25,
+  "paired_diff_se": 0.37653842291636946,
+  "config": {
+    "episodes": 44,
+    "seed": 7000,
+    "k": 16,
+    "cont_eps": 0.1,
+    "min_gap": 0.5,
+    "z": 2.5,
+    "se_floor": 0.1,
+    "v2": true,
+    "workers": 20,
+    "out": "python/experiments/exp_002_doom/results/mc_policy_v2.json"
+  },
+  "episodes": [
+    {
+      "seed": 7000,
+      "mode": "teacher",
+      "kills": 9,
+      "decisions": 249,
+      "overrides": 0,
+      "shots": 23
+    },
+    {
+      "seed": 7000,
+      "mode": "mc",
+      "kills": 12,
+      "decisions": 411,
+      "overrides": 9,
+      "shots": 26
+    },
+    {
+      "seed": 7001,
+      "mode": "teacher",
+      "kills": 12,
+      "decisions": 405,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7001,
+      "mode": "mc",
+      "kills": 14,
+      "decisions": 355,
+      "overrides": 10,
+      "shots": 26
+    },
+    {
+      "seed": 7002,
+      "mode": "teacher",
+      "kills": 11,
+      "decisions": 409,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7002,
+      "mode": "mc",
+      "kills": 15,
+      "decisions": 428,
+      "overrides": 8,
+      "shots": 26
+    },
+    {
+      "seed": 7003,
+      "mode": "teacher",
+      "kills": 12,
+      "decisions": 429,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7003,
+      "mode": "mc",
+      "kills": 13,
+      "decisions": 400,
+      "overrides": 6,
+      "shots": 26
+    },
+    {
+      "seed": 7004,
+      "mode": "teacher",
+      "kills": 12,
+      "decisions": 375,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7004,
+      "mode": "mc",
+      "kills": 12,
+      "decisions": 354,
+      "overrides": 9,
+      "shots": 26
+    },
+    {
+      "seed": 7005,
+      "mode": "teacher",
+      "kills": 7,
+      "decisions": 213,
+      "overrides": 0,
+      "shots": 19
+    },
+    {
+      "seed": 7005,
+      "mode": "mc",
+      "kills": 12,
+      "decisions": 368,
+      "overrides": 4,
+      "shots": 26
+    },
+    {
+      "seed": 7006,
+      "mode": "teacher",
+      "kills": 7,
+      "decisions": 231,
+      "overrides": 0,
+      "shots": 20
+    },
+    {
+      "seed": 7006,
+      "mode": "mc",
+      "kills": 16,
+      "decisions": 490,
+      "overrides": 14,
+      "shots": 26
+    },
+    {
+      "seed": 7007,
+      "mode": "teacher",
+      "kills": 11,
+      "decisions": 273,
+      "overrides": 0,
+      "shots": 25
+    },
+    {
+      "seed": 7007,
+      "mode": "mc",
+      "kills": 14,
+      "decisions": 424,
+      "overrides": 5,
+      "shots": 26
+    },
+    {
+      "seed": 7008,
+      "mode": "teacher",
+      "kills": 9,
+      "decisions": 247,
+      "overrides": 0,
+      "shots": 22
+    },
+    {
+      "seed": 7008,
+      "mode": "mc",
+      "kills": 15,
+      "decisions": 427,
+      "overrides": 9,
+      "shots": 26
+    },
+    {
+      "seed": 7009,
+      "mode": "teacher",
+      "kills": 9,
+      "decisions": 249,
+      "overrides": 0,
+      "shots": 22
+    },
+    {
+      "seed": 7009,
+      "mode": "mc",
+      "kills": 14,
+      "decisions": 448,
+      "overrides": 5,
+      "shots": 26
+    },
+    {
+      "seed": 7010,
+      "mode": "teacher",
+      "kills": 10,
+      "decisions": 329,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7010,
+      "mode": "mc",
+      "kills": 13,
+      "decisions": 400,
+      "overrides": 5,
+      "shots": 26
+    },
+    {
+      "seed": 7011,
+      "mode": "teacher",
+      "kills": 11,
+      "decisions": 373,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7011,
+      "mode": "mc",
+      "kills": 14,
+      "decisions": 406,
+      "overrides": 5,
+      "shots": 26
+    },
+    {
+      "seed": 7012,
+      "mode": "teacher",
+      "kills": 8,
+      "decisions": 257,
+      "overrides": 0,
+      "shots": 23
+    },
+    {
+      "seed": 7012,
+      "mode": "mc",
+      "kills": 12,
+      "decisions": 449,
+      "overrides": 5,
+      "shots": 26
+    },
+    {
+      "seed": 7013,
+      "mode": "teacher",
+      "kills": 9,
+      "decisions": 241,
+      "overrides": 0,
+      "shots": 21
+    },
+    {
+      "seed": 7013,
+      "mode": "mc",
+      "kills": 17,
+      "decisions": 452,
+      "overrides": 13,
+      "shots": 26
+    },
+    {
+      "seed": 7014,
+      "mode": "teacher",
+      "kills": 10,
+      "decisions": 277,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7014,
+      "mode": "mc",
+      "kills": 13,
+      "decisions": 416,
+      "overrides": 7,
+      "shots": 26
+    },
+    {
+      "seed": 7015,
+      "mode": "teacher",
+      "kills": 9,
+      "decisions": 251,
+      "overrides": 0,
+      "shots": 22
+    },
+    {
+      "seed": 7015,
+      "mode": "mc",
+      "kills": 13,
+      "decisions": 418,
+      "overrides": 5,
+      "shots": 26
+    },
+    {
+      "seed": 7016,
+      "mode": "teacher",
+      "kills": 10,
+      "decisions": 261,
+      "overrides": 0,
+      "shots": 24
+    },
+    {
+      "seed": 7016,
+      "mode": "mc",
+      "kills": 13,
+      "decisions": 432,
+      "overrides": 3,
+      "shots": 26
+    },
+    {
+      "seed": 7017,
+      "mode": "teacher",
+      "kills": 10,
+      "decisions": 283,
+      "overrides": 0,
+      "shots": 25
+    },
+    {
+      "seed": 7017,
+      "mode": "mc",
+      "kills": 13,
+      "decisions": 482,
+      "overrides": 4,
+      "shots": 26
+    },
+    {
+      "seed": 7018,
+      "mode": "teacher",
+      "kills": 6,
+      "decisions": 207,
+      "overrides": 0,
+      "shots": 19
+    },
+    {
+      "seed": 7018,
+      "mode": "mc",
+      "kills": 17,
+      "decisions": 480,
+      "overrides": 10,
+      "shots": 26
+    },
+    {
+      "seed": 7019,
+      "mode": "teacher",
+      "kills": 11,
+      "decisions": 372,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7019,
+      "mode": "mc",
+      "kills": 14,
+      "decisions": 483,
+      "overrides": 8,
+      "shots": 26
+    },
+    {
+      "seed": 7020,
+      "mode": "teacher",
+      "kills": 11,
+      "decisions": 353,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7020,
+      "mode": "mc",
+      "kills": 14,
+      "decisions": 468,
+      "overrides": 6,
+      "shots": 26
+    },
+    {
+      "seed": 7021,
+      "mode": "teacher",
+      "kills": 8,
+      "decisions": 235,
+      "overrides": 0,
+      "shots": 22
+    },
+    {
+      "seed": 7021,
+      "mode": "mc",
+      "kills": 15,
+      "decisions": 475,
+      "overrides": 6,
+      "shots": 26
+    },
+    {
+      "seed": 7022,
+      "mode": "teacher",
+      "kills": 7,
+      "decisions": 221,
+      "overrides": 0,
+      "shots": 19
+    },
+    {
+      "seed": 7022,
+      "mode": "mc",
+      "kills": 14,
+      "decisions": 499,
+      "overrides": 7,
+      "shots": 26
+    },
+    {
+      "seed": 7023,
+      "mode": "teacher",
+      "kills": 8,
+      "decisions": 231,
+      "overrides": 0,
+      "shots": 20
+    },
+    {
+      "seed": 7023,
+      "mode": "mc",
+      "kills": 13,
+      "decisions": 428,
+      "overrides": 6,
+      "shots": 26
+    },
+    {
+      "seed": 7024,
+      "mode": "teacher",
+      "kills": 7,
+      "decisions": 237,
+      "overrides": 0,
+      "shots": 21
+    },
+    {
+      "seed": 7024,
+      "mode": "mc",
+      "kills": 12,
+      "decisions": 362,
+      "overrides": 6,
+      "shots": 26
+    },
+    {
+      "seed": 7025,
+      "mode": "teacher",
+      "kills": 7,
+      "decisions": 209,
+      "overrides": 0,
+      "shots": 18
+    },
+    {
+      "seed": 7025,
+      "mode": "mc",
+      "kills": 16,
+      "decisions": 397,
+      "overrides": 9,
+      "shots": 26
+    },
+    {
+      "seed": 7026,
+      "mode": "teacher",
+      "kills": 11,
+      "decisions": 318,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7026,
+      "mode": "mc",
+      "kills": 13,
+      "decisions": 434,
+      "overrides": 5,
+      "shots": 26
+    },
+    {
+      "seed": 7027,
+      "mode": "teacher",
+      "kills": 9,
+      "decisions": 255,
+      "overrides": 0,
+      "shots": 24
+    },
+    {
+      "seed": 7027,
+      "mode": "mc",
+      "kills": 13,
+      "decisions": 451,
+      "overrides": 7,
+      "shots": 26
+    },
+    {
+      "seed": 7028,
+      "mode": "teacher",
+      "kills": 8,
+      "decisions": 213,
+      "overrides": 0,
+      "shots": 19
+    },
+    {
+      "seed": 7028,
+      "mode": "mc",
+      "kills": 15,
+      "decisions": 504,
+      "overrides": 7,
+      "shots": 26
+    },
+    {
+      "seed": 7029,
+      "mode": "teacher",
+      "kills": 11,
+      "decisions": 295,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7029,
+      "mode": "mc",
+      "kills": 12,
+      "decisions": 454,
+      "overrides": 5,
+      "shots": 26
+    },
+    {
+      "seed": 7030,
+      "mode": "teacher",
+      "kills": 7,
+      "decisions": 245,
+      "overrides": 0,
+      "shots": 22
+    },
+    {
+      "seed": 7030,
+      "mode": "mc",
+      "kills": 14,
+      "decisions": 414,
+      "overrides": 6,
+      "shots": 26
+    },
+    {
+      "seed": 7031,
+      "mode": "teacher",
+      "kills": 11,
+      "decisions": 461,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7031,
+      "mode": "mc",
+      "kills": 13,
+      "decisions": 474,
+      "overrides": 5,
+      "shots": 26
+    },
+    {
+      "seed": 7032,
+      "mode": "teacher",
+      "kills": 8,
+      "decisions": 243,
+      "overrides": 0,
+      "shots": 21
+    },
+    {
+      "seed": 7032,
+      "mode": "mc",
+      "kills": 15,
+      "decisions": 443,
+      "overrides": 9,
+      "shots": 26
+    },
+    {
+      "seed": 7033,
+      "mode": "teacher",
+      "kills": 10,
+      "decisions": 305,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7033,
+      "mode": "mc",
+      "kills": 12,
+      "decisions": 437,
+      "overrides": 7,
+      "shots": 26
+    },
+    {
+      "seed": 7034,
+      "mode": "teacher",
+      "kills": 11,
+      "decisions": 281,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7034,
+      "mode": "mc",
+      "kills": 15,
+      "decisions": 527,
+      "overrides": 6,
+      "shots": 26
+    },
+    {
+      "seed": 7035,
+      "mode": "teacher",
+      "kills": 11,
+      "decisions": 435,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7035,
+      "mode": "mc",
+      "kills": 12,
+      "decisions": 463,
+      "overrides": 5,
+      "shots": 26
+    },
+    {
+      "seed": 7036,
+      "mode": "teacher",
+      "kills": 10,
+      "decisions": 370,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7036,
+      "mode": "mc",
+      "kills": 13,
+      "decisions": 437,
+      "overrides": 7,
+      "shots": 26
+    },
+    {
+      "seed": 7037,
+      "mode": "teacher",
+      "kills": 10,
+      "decisions": 374,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7037,
+      "mode": "mc",
+      "kills": 14,
+      "decisions": 496,
+      "overrides": 8,
+      "shots": 26
+    },
+    {
+      "seed": 7038,
+      "mode": "teacher",
+      "kills": 11,
+      "decisions": 409,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7038,
+      "mode": "mc",
+      "kills": 13,
+      "decisions": 410,
+      "overrides": 4,
+      "shots": 26
+    },
+    {
+      "seed": 7039,
+      "mode": "teacher",
+      "kills": 7,
+      "decisions": 223,
+      "overrides": 0,
+      "shots": 20
+    },
+    {
+      "seed": 7039,
+      "mode": "mc",
+      "kills": 15,
+      "decisions": 396,
+      "overrides": 7,
+      "shots": 26
+    },
+    {
+      "seed": 7040,
+      "mode": "teacher",
+      "kills": 11,
+      "decisions": 405,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7040,
+      "mode": "mc",
+      "kills": 14,
+      "decisions": 471,
+      "overrides": 7,
+      "shots": 26
+    },
+    {
+      "seed": 7041,
+      "mode": "teacher",
+      "kills": 7,
+      "decisions": 211,
+      "overrides": 0,
+      "shots": 19
+    },
+    {
+      "seed": 7041,
+      "mode": "mc",
+      "kills": 13,
+      "decisions": 466,
+      "overrides": 10,
+      "shots": 26
+    },
+    {
+      "seed": 7042,
+      "mode": "teacher",
+      "kills": 11,
+      "decisions": 431,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7042,
+      "mode": "mc",
+      "kills": 12,
+      "decisions": 349,
+      "overrides": 6,
+      "shots": 26
+    },
+    {
+      "seed": 7043,
+      "mode": "teacher",
+      "kills": 10,
+      "decisions": 370,
+      "overrides": 0,
+      "shots": 26
+    },
+    {
+      "seed": 7043,
+      "mode": "mc",
+      "kills": 14,
+      "decisions": 379,
+      "overrides": 6,
+      "shots": 26
+    }
+  ]
+}

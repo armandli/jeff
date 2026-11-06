@@ -54,10 +54,13 @@ class DoomState:
     ammo: int
     monsters: list[Monster] = field(default_factory=list)   # nearest first
     turn_deg: float = 0.0     # degrees one turn decision rotates (from a standstill)
+    since_shot: int | None = None   # decisions since the last ATTACK (None = not observed)
 
     def describe(self, max_monsters: int = 6, include_physics: bool = True) -> str:
         """Render the state as the text context the model decides on."""
         lines = [f"Health: {self.health}", f"Ammo: {self.ammo}"]
+        if self.since_shot is not None:
+            lines.append(f"Decisions since your last shot: {self.since_shot}")
         if self.monsters:
             lines.append("Monsters (nearest first):")
             for m in self.monsters[:max_monsters]:
@@ -90,7 +93,7 @@ class DoomEnv:
     """Headless defend_the_center with text observations and named actions."""
 
     def __init__(self, scenario: str = "defend_the_center", tics_per_action: int = 2,
-                 seed: int | None = None, visible: bool = False):
+                 seed: int | None = None, visible: bool = False, shot_timer: bool = False):
         import vizdoom as vzd
 
         self.vzd = vzd
@@ -111,6 +114,8 @@ class DoomEnv:
         g.init()
         self.game = g
         self.tics = tics_per_action
+        self.shot_timer = shot_timer   # expose decisions-since-last-shot in the observation
+        self._since_shot = 0
         self.buttons = [str(b).split(".")[-1] for b in g.get_available_buttons()]
         missing = set(ACTION_NAMES) - set(self.buttons)
         if missing:
@@ -123,6 +128,7 @@ class DoomEnv:
     # -- episode control ---------------------------------------------------
     def reset(self) -> DoomState:
         self.game.new_episode()
+        self._since_shot = 0
         return self.observe()
 
     @property
@@ -131,8 +137,9 @@ class DoomEnv:
 
     def observe(self) -> DoomState:
         s = self.game.get_state()
+        since = self._since_shot if self.shot_timer else None
         if s is None:   # episode finished
-            return DoomState(health=0, ammo=0, turn_deg=self.turn_deg)
+            return DoomState(health=0, ammo=0, turn_deg=self.turn_deg, since_shot=since)
         hp, ammo, px, py, ang, _kills = s.game_variables
         monsters = []
         for o in s.objects:
@@ -143,10 +150,11 @@ class DoomEnv:
             monsters.append(Monster(o.name, math.hypot(dx, dy), bearing))
         monsters.sort(key=lambda m: m.distance)
         return DoomState(health=int(hp), ammo=int(ammo), monsters=monsters,
-                         turn_deg=self.turn_deg)
+                         turn_deg=self.turn_deg, since_shot=since)
 
     def step(self, action: str) -> float:
         vec = [int(b == action) for b in self.buttons]
+        self._since_shot = 0 if action == "ATTACK" else self._since_shot + 1
         return float(self.game.make_action(vec, self.tics))
 
     @property
@@ -186,3 +194,31 @@ def heuristic_action(state: DoomState, aim_margin: float = 1.0) -> str:
     if abs(m.bearing) <= m.hit_half_angle * aim_margin and state.ammo > 0:
         return "ATTACK"
     return "TURN_LEFT" if m.bearing > 0 else "TURN_RIGHT"
+
+
+def periodic_fire_action(state: DoomState, aim_margin: float = 1.0, fire_period: int = 10) -> str:
+    """Teacher v2: the aim-bot, plus a shot whenever none was fired for fire_period decisions.
+
+    Needs state.since_shot (DoomEnv(shot_timer=True)). Measured on 200 episodes, seed 11:
+    period 10 -> 9.26 kills/ep vs 7.09 for heuristic_action (period 5: 8.65, 20: 8.76,
+    40: 7.84). Random extra shots help too (10% -> 9.06) and random turns hurt, so
+    spare ammo is worth spending: the plain aim-bot dies with most of its 26 bullets.
+    """
+    if state.since_shot is not None and state.since_shot >= fire_period and state.ammo > 0:
+        return "ATTACK"
+    return heuristic_action(state, aim_margin)
+
+
+def replay(env: DoomEnv, seed: int, actions: list[str]) -> DoomState:
+    """Restore a game state by re-seeding and replaying an action prefix.
+
+    Use this, not ViZDoom save()/load(), to branch from a state: in 1.3.2 on
+    defend_the_center, save() alone lowers the aim-bot from 7.2 to 5.2 kills/ep, and
+    save()+load() every decision drops it to 0.25, whereas seeded replay is exactly
+    deterministic (identical health/ammo/kill traces). The shot timer is recomputed.
+    """
+    env.game.set_seed(seed)
+    env.reset()
+    for a in actions:
+        env.step(a)
+    return env.observe()
