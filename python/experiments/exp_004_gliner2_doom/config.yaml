@@ -1,0 +1,46 @@
+# Experiment 004 — GLiNER2 fast action classifier for ViZDoom (defend_the_center)
+#
+# Hypothesis
+# ----------
+# A small schema-classification encoder (fastino GLiNER2.5-base, 194M, DeBERTa-v3-base)
+# fine-tuned with LoRA on the exp_002 v2-teacher states can match Qwen3-8B v2 SFT
+# (9.00 kills/ep seed 7x20; teacher v2 9.20) at ~20x lower latency (~13 ms vs ~300 ms).
+#
+# Same game, observation (obs v2 with shot timer), labels and eval seeds as exp_002,
+# so results are directly comparable. Evaluation runs through exp_002's play.py:
+#   python/.venv/bin/python python/experiments/exp_002_doom/play.py --v2 --brain gliner2 \
+#       --adapter checkpoints/exp_004_gliner2_doom/best --tag gliner2_v2_best \
+#       --results-dir python/experiments/exp_004_gliner2_doom/results
+#
+# Pretrained zero-shot (no adapter) agrees with the teacher on only ~21% of val
+# states (nearly always ATTACK), so the classification head must be learned.
+
+model:
+  name: "fastino/gliner2.5-base-v1"   # alt: gliner2.5-small-v1 (74M, CPU/edge)
+
+data:
+  src_train: "data/processed/doom_v2_sft_train.jsonl"   # from exp_002 prepare_sft.py --prefix doom_v2_sft
+  src_val:   "data/processed/doom_v2_sft_val.jsonl"
+  train: "data/processed/doom_v2_gliner2_train.jsonl"
+  val:   "data/processed/doom_v2_gliner2_val.jsonl"
+
+training:
+  num_epochs: 3
+  batch_size: 16
+  eval_batch_size: 32
+  gradient_accumulation_steps: 1
+  encoder_lr: 1.0e-5          # unused with LoRA (all LoRA params use task_lr)
+  task_lr: 5.0e-4
+  warmup_ratio: 0.05
+  eval_steps: 500
+  bf16: true
+  seed: 0
+  lora:
+    use: true
+    r: 16
+    alpha: 32
+    dropout: 0.05
+
+output:
+  dir: "checkpoints/exp_004_gliner2_doom"
+  results_dir: "python/experiments/exp_004_gliner2_doom/results"

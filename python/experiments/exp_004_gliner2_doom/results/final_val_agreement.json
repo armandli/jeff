@@ -1,0 +1,12 @@
+{
+  "tag": "final_val",
+  "model": "fastino/gliner2.5-base-v1",
+  "n": 3722,
+  "agreement": 0.9736700698549167,
+  "pred_dist": {
+    "ATTACK": 628,
+    "TURN_LEFT": 1635,
+    "TURN_RIGHT": 1459
+  },
+  "ms_per_decision": 19.753514096990862
+}

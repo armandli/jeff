@@ -31,6 +31,9 @@ dependencies = [
 
     # AnyJev: permutation-debiased decision readout
     "anyjev[hf]>=0.3",
+
+    # exp_004: GLiNER2 schema-classification encoder (fast Doom action policy)
+    "gliner2[train]>=2.1",
 ]
 
 [project.optional-dependencies]

@@ -4,6 +4,7 @@ Brains:
   random     uniform over the three buttons (floor)
   heuristic  scripted aim-bot teacher (bar to beat)
   qwen3      Qwen3-8B zero-shot (or --adapter LoRA) via option-letter scoring
+  gliner2    GLiNER2 action classifier (exp_004; --adapter = PEFT LoRA dir)
 
 Every run writes a results JSON; --record also writes one JSONL line per
 decision in jeff's DecisionExample format (context / options / correct_index,
@@ -80,9 +81,20 @@ class Qwen3Brain:
         return ACTION_NAMES[out.chosen_index], out.scores
 
 
+class GLiNER2Brain:
+    def __init__(self, device: str, model_name: str | None, adapter: str | None):
+        from jeff.models.gliner2_decision import DEFAULT_MODEL, GLiNER2Config, GLiNER2DecisionModel
+        self.model = GLiNER2DecisionModel(GLiNER2Config(
+            model_name=model_name or DEFAULT_MODEL, adapter=adapter, device=device))
+
+    def __call__(self, state: DoomState, context: str):
+        out = self.model.decide(DecisionInput(context=context, options=state.option_texts()))
+        return ACTION_NAMES[out.chosen_index], out.scores
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--brain", choices=["random", "heuristic", "qwen3"], required=True)
+    ap.add_argument("--brain", choices=["random", "heuristic", "qwen3", "gliner2"], required=True)
     ap.add_argument("--episodes", type=int, default=None)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--max-steps", type=int, default=None, help="cap decisions per episode (smoke tests)")
@@ -97,6 +109,8 @@ def main():
                          "states for recording; labels stay the teacher's)")
     ap.add_argument("--v2", action="store_true",
                     help="observation v2 (decisions since last shot) + periodic-fire teacher")
+    ap.add_argument("--results-dir", default=None,
+                    help="override output.results_dir (repo-relative), e.g. for exp_004")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -116,6 +130,8 @@ def main():
         brain = RandomBrain(seed)
     elif args.brain == "heuristic":
         brain = HeuristicBrain(teacher_fn)
+    elif args.brain == "gliner2":
+        brain = GLiNER2Brain(args.device, args.model, args.adapter)
     else:
         brain = Qwen3Brain(cfg, args.device, args.model, args.adapter, args.n_permutations)
 
@@ -169,7 +185,8 @@ def main():
 
     result = {
         "brain": args.brain,
-        "model": args.model or (cfg["model"]["name"] if args.brain == "qwen3" else None),
+        "model": args.model or (cfg["model"]["name"] if args.brain == "qwen3"
+                                else "fastino/gliner2.5-base-v1" if args.brain == "gliner2" else None),
         "adapter": args.adapter,
         "episodes": episodes, "seed": seed, "tics_per_action": env_cfg["tics_per_action"],
         "max_steps": args.max_steps, "epsilon": args.epsilon, "v2": args.v2,
@@ -181,7 +198,7 @@ def main():
         "ms_per_decision": 1000 * st.mean(latency) if latency else 0.0,
         "kills": kills,
     }
-    out = REPO_ROOT / cfg["output"]["results_dir"] / f"{args.tag or args.brain}.json"
+    out = REPO_ROOT / (args.results_dir or cfg["output"]["results_dir"]) / f"{args.tag or args.brain}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v)
