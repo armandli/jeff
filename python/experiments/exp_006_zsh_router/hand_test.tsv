@@ -1,0 +1,196 @@
+# Hand-labelled test set for exp_006 (zsh router): label (1=valid, 0=invalid) <TAB> category <TAB> typed line.
+# Focus: zsh-specific syntax, zsh builtins, and constructs not in exp_005's hand_test.
+# Written before any model ran, and removed from generated data. Never tune on this file.
+#
+# --- zsh builtins and options ---
+1	valid	setopt extendedglob
+1	valid	setopt nocaseglob
+1	valid	unsetopt nomatch
+1	valid	setopt autocd
+1	valid	setopt histignorealldups sharehistory
+1	valid	unsetopt beep
+1	valid	autoload -U compinit
+1	valid	compinit
+1	valid	autoload -Uz colors && colors
+1	valid	autoload -Uz vcs_info
+1	valid	zmodload zsh/complist
+1	valid	zmodload zsh/mathfunc
+1	valid	zstyle ':completion:*' menu select
+1	valid	zstyle ':completion:*:*:*:*:*' menu yes
+1	valid	bindkey -v
+1	valid	bindkey -e
+1	valid	bindkey '^R' history-incremental-search-backward
+1	valid	bindkey '^[[A' history-search-backward
+1	valid	zle -N my-widget my-fn
+1	valid	typeset -A assoc
+1	valid	typeset -a arr
+1	valid	typeset -i x=5
+1	valid	integer x=42
+1	valid	float y=3.14
+1	valid	local -a items
+1	valid	local -A mapping
+# --- zsh arrays ---
+1	valid	a=(foo bar baz)
+1	valid	echo $a[1]
+1	valid	echo $a[-1]
+1	valid	echo ${#a}
+1	valid	echo ${a[@]}
+1	valid	echo ${(j:,:)a}
+1	valid	echo ${(u)a}
+1	valid	a+=(qux)
+1	valid	print -l ${a}
+1	valid	for x in ${a[@]}; do echo $x; done
+# --- zsh parameter expansion ---
+1	valid	echo ${var:-default}
+1	valid	echo ${var:=default}
+1	valid	echo ${var:?error}
+1	valid	echo ${(U)var}
+1	valid	echo ${(L)var}
+1	valid	echo ${(q)var}
+1	valid	echo ${(e)var}
+1	valid	echo ${var##*/}
+1	valid	echo ${var%%.*}
+1	valid	echo ${var:0:5}
+1	valid	echo ${var/old/new}
+1	valid	echo ${var//old/new}
+1	valid	echo ${(f)"$(cat notes.txt)"}
+# --- zsh extended globbing ---
+1	valid	ls **/*.py
+1	valid	ls **/*(.)
+1	valid	rm -- *(m+30)
+1	valid	ls *(Om[1,5])
+1	valid	ls *(.)
+1	valid	ls *(@)
+1	valid	ls **/*.{js,ts}
+1	valid	print -l src/**/*.c
+1	valid	wc -l **/*.go
+# --- zsh process substitution (=(cmd)) ---
+1	valid	diff =(head -5 a.txt) =(head -5 b.txt)
+1	valid	cat =(echo hello)
+1	valid	sort =(grep error app.log)
+# --- zsh anonymous functions ---
+1	valid	() { echo $1 } hello
+1	valid	() { local x=$1; echo $((x*2)) } 7
+# --- zsh-specific sourcing and config ---
+1	valid	source ~/.zshrc
+1	valid	source ~/.zprofile
+1	valid	. ~/.zshenv
+1	valid	exec zsh
+1	valid	zsh --version
+1	valid	zsh -n script.sh
+1	valid	zsh -c 'echo hello'
+1	valid	zsh -x debug.sh
+# --- zsh prompt ---
+1	valid	print -P '%F{blue}%~%f'
+1	valid	print -P '%B%n%b@%m'
+1	valid	PROMPT='%n@%m %~ %# '
+1	valid	RPROMPT='%T'
+# --- zsh modifiers on globbing ---
+1	valid	noglob ls *.txt
+1	valid	nocorrect make
+1	valid	repeat 3 { echo hi }
+# --- zsh arithmetic ---
+1	valid	echo $((2 ** 10))
+1	valid	(( x = 5 + 3 ))
+1	valid	(( x++ ))
+1	valid	(( y = x > 0 ? x : -x ))
+# --- commands valid in both shells (zsh-flavoured context) ---
+1	valid	vim ~/.zshrc
+1	valid	nano ~/.zshenv
+1	valid	cat ~/.zhistory
+1	valid	grep -c error /var/log/syslog
+1	valid	awk '{sum+=$1} END{print sum}' numbers.txt
+1	valid	xargs rm -f < to_delete.txt
+1	valid	tee /tmp/out.log < input.txt
+1	valid	ssh-keygen -t ed25519 -C "work"
+1	valid	gpg --list-keys
+1	valid	openssl rand -hex 32
+1	valid	jq -r '.name' package.json
+1	valid	curl -s https://ipinfo.io | jq '.ip'
+1	valid	python3 -c 'import sys; print(sys.version)'
+1	valid	node -e 'console.log(process.version)'
+1	valid	go version
+1	valid	rustc --version
+1	valid	nvcc --version
+# --- English natural language (should go to AGENT) ---
+0	nl_plain	show me my zsh history
+0	nl_plain	how do I set up oh-my-zsh
+0	nl_plain	what is the difference between setopt and unsetopt
+0	nl_plain	why is my zsh startup slow
+0	nl_plain	please configure my shell prompt
+0	nl_plain	add autosuggestions to my zsh
+0	nl_plain	what does the globbing pattern ** mean
+0	nl_plain	how do I write a zsh function
+0	nl_plain	explain what compinit does
+0	nl_plain	enable syntax highlighting in zsh
+0	nl_plain	my aliases are not loading in zsh
+0	nl_plain	debug why my zshrc is broken
+0	nl_plain	which zsh theme should I use
+0	nl_plain	convert my bash script to zsh
+0	nl_plain	list all my zsh plugins
+# --- cmdlike (looks like a command but is prose) ---
+0	nl_cmdlike	set up my shell environment
+0	nl_cmdlike	repeat the last command
+0	nl_cmdlike	print all environment variables to a file
+0	nl_cmdlike	source my entire dotfiles directory
+0	nl_cmdlike	autoload all my custom functions
+0	nl_cmdlike	type the password for me
+0	nl_cmdlike	complete the installation
+0	nl_cmdlike	bindkey my editor shortcut to open vim
+0	nl_cmdlike	float the window above others
+0	nl_cmdlike	integer overflow in my script
+0	nl_cmdlike	local the best coffee shop
+0	nl_cmdlike	echo all the errors in the log
+# --- broken zsh syntax ---
+0	syntax	echo "unterminated
+0	syntax	setopt {
+0	syntax	a=(1 2 3
+0	syntax	for f in *(.; do echo $f; done
+0	syntax	echo $((1 +
+0	syntax	() { echo $1
+0	syntax	typeset -A {
+0	syntax	repeat { echo hi }
+0	syntax	echo ${(U
+0	syntax	ls **(*
+0	syntax	print -P '%F{
+0	syntax	if [[ -f notes.txt ]]; then echo yes
+# --- typo'd commands ---
+0	typo_cmd	soruce ~/.zshrc
+0	typo_cmd	seetopt extendedglob
+0	typo_cmd	unsetoptt nomatch
+0	typo_cmd	autolaod -U compinit
+0	typo_cmd	tyepset -A assoc
+0	typo_cmd	bnidkey -v
+0	typo_cmd	zle -N wdige fn
+0	typo_cmd	zmdoload zsh/complist
+0	typo_cmd	precmd_fucntions
+0	typo_cmd	compiinit
+# --- bad subcommands ---
+0	bad_subcmd	git statsu
+0	bad_subcmd	git comit -m "wip"
+0	bad_subcmd	docker buld -t app .
+0	bad_subcmd	kubectl gte nodes
+0	bad_subcmd	npm insatll
+0	bad_subcmd	cargo biuld --release
+0	bad_subcmd	pip isntall torch
+# --- bad flags ---
+0	bad_flag	ls --extendedd
+0	bad_flag	grep --recursivee .
+0	bad_flag	sort --reversee names.txt
+0	bad_flag	cut --delimiteer , data.csv
+0	bad_flag	du --human-readible .
+# --- missing required arguments ---
+0	missing_args	cp notes.txt
+0	missing_args	mv draft.md
+0	missing_args	chmod 755
+0	missing_args	grep -r
+0	missing_args	ln -s
+0	missing_args	tar -xzf
+# --- other languages typed at the prompt ---
+0	other_code	print("hello from python")
+0	other_code	import os
+0	other_code	const x = require('fs')
+0	other_code	SELECT * FROM users;
+0	other_code	fn main() { println!("hi"); }
+0	other_code	Get-ChildItem -Recurse
+0	other_code	{"key": "value"}
