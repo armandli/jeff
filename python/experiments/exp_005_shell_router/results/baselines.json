@@ -1,0 +1,479 @@
+{
+  "val": {
+    "always_run": {
+      "n": 5000,
+      "threshold": 0.5,
+      "accuracy": 0.5,
+      "english_run_rate": 1.0,
+      "other_invalid_run_rate": 1.0,
+      "command_to_agent_rate": 0.0,
+      "heldout_tool_accuracy": 0.6120632827949901,
+      "per_category": {
+        "bad_flag": {
+          "accuracy": 0.0,
+          "n": 150
+        },
+        "bad_subcmd": {
+          "accuracy": 0.0,
+          "n": 150
+        },
+        "missing_args": {
+          "accuracy": 0.0,
+          "n": 16
+        },
+        "nl_cmdlike": {
+          "accuracy": 0.0,
+          "n": 500
+        },
+        "nl_plain": {
+          "accuracy": 0.0,
+          "n": 887
+        },
+        "other_code": {
+          "accuracy": 0.0,
+          "n": 122
+        },
+        "syntax": {
+          "accuracy": 0.0,
+          "n": 375
+        },
+        "typo_cmd": {
+          "accuracy": 0.0,
+          "n": 300
+        },
+        "valid": {
+          "accuracy": 1.0,
+          "n": 2300
+        },
+        "valid_english_args": {
+          "accuracy": 1.0,
+          "n": 171
+        },
+        "valid_interactive": {
+          "accuracy": 1.0,
+          "n": 29
+        }
+      }
+    },
+    "bash_n": {
+      "n": 5000,
+      "threshold": 0.5,
+      "accuracy": 0.6132,
+      "english_run_rate": 0.9026676279740447,
+      "other_invalid_run_rate": 0.6127583108715184,
+      "command_to_agent_rate": 0.0,
+      "heldout_tool_accuracy": 0.7122610415293342,
+      "per_category": {
+        "bad_flag": {
+          "accuracy": 0.0,
+          "n": 150
+        },
+        "bad_subcmd": {
+          "accuracy": 0.0,
+          "n": 150
+        },
+        "missing_args": {
+          "accuracy": 0.0,
+          "n": 16
+        },
+        "nl_cmdlike": {
+          "accuracy": 0.0,
+          "n": 500
+        },
+        "nl_plain": {
+          "accuracy": 0.15219842164599776,
+          "n": 887
+        },
+        "other_code": {
+          "accuracy": 0.4344262295081967,
+          "n": 122
+        },
+        "syntax": {
+          "accuracy": 1.0,
+          "n": 375
+        },
+        "typo_cmd": {
+          "accuracy": 0.01,
+          "n": 300
+        },
+        "valid": {
+          "accuracy": 1.0,
+          "n": 2300
+        },
+        "valid_english_args": {
+          "accuracy": 1.0,
+          "n": 171
+        },
+        "valid_interactive": {
+          "accuracy": 1.0,
+          "n": 29
+        }
+      }
+    },
+    "bash_n_known_command": {
+      "n": 5000,
+      "threshold": 0.5,
+      "accuracy": 0.8774,
+      "english_run_rate": 0.18817591925018023,
+      "other_invalid_run_rate": 0.3036837376460018,
+      "command_to_agent_rate": 0.0056,
+      "heldout_tool_accuracy": 0.9264996704021095,
+      "per_category": {
+        "bad_flag": {
+          "accuracy": 0.0,
+          "n": 150
+        },
+        "bad_subcmd": {
+          "accuracy": 0.0,
+          "n": 150
+        },
+        "missing_args": {
+          "accuracy": 0.0,
+          "n": 16
+        },
+        "nl_cmdlike": {
+          "accuracy": 0.478,
+          "n": 500
+        },
+        "nl_plain": {
+          "accuracy": 1.0,
+          "n": 887
+        },
+        "other_code": {
+          "accuracy": 0.819672131147541,
+          "n": 122
+        },
+        "syntax": {
+          "accuracy": 1.0,
+          "n": 375
+        },
+        "typo_cmd": {
+          "accuracy": 1.0,
+          "n": 300
+        },
+        "valid": {
+          "accuracy": 0.9939130434782608,
+          "n": 2300
+        },
+        "valid_english_args": {
+          "accuracy": 1.0,
+          "n": 171
+        },
+        "valid_interactive": {
+          "accuracy": 1.0,
+          "n": 29
+        }
+      }
+    }
+  },
+  "test": {
+    "always_run": {
+      "n": 5000,
+      "threshold": 0.5,
+      "accuracy": 0.5,
+      "english_run_rate": 1.0,
+      "other_invalid_run_rate": 1.0,
+      "command_to_agent_rate": 0.0,
+      "heldout_tool_accuracy": 0.6115271898404429,
+      "per_category": {
+        "bad_flag": {
+          "accuracy": 0.0,
+          "n": 150
+        },
+        "bad_subcmd": {
+          "accuracy": 0.0,
+          "n": 150
+        },
+        "missing_args": {
+          "accuracy": 0.0,
+          "n": 48
+        },
+        "nl_cmdlike": {
+          "accuracy": 0.0,
+          "n": 500
+        },
+        "nl_plain": {
+          "accuracy": 0.0,
+          "n": 865
+        },
+        "other_code": {
+          "accuracy": 0.0,
+          "n": 112
+        },
+        "syntax": {
+          "accuracy": 0.0,
+          "n": 375
+        },
+        "typo_cmd": {
+          "accuracy": 0.0,
+          "n": 300
+        },
+        "valid": {
+          "accuracy": 1.0,
+          "n": 2318
+        },
+        "valid_english_args": {
+          "accuracy": 1.0,
+          "n": 153
+        },
+        "valid_interactive": {
+          "accuracy": 1.0,
+          "n": 29
+        }
+      }
+    },
+    "bash_n": {
+      "n": 5000,
+      "threshold": 0.5,
+      "accuracy": 0.6032,
+      "english_run_rate": 0.9274725274725275,
+      "other_invalid_run_rate": 0.6325991189427312,
+      "command_to_agent_rate": 0.0,
+      "heldout_tool_accuracy": 0.7095408661673722,
+      "per_category": {
+        "bad_flag": {
+          "accuracy": 0.0,
+          "n": 150
+        },
+        "bad_subcmd": {
+          "accuracy": 0.0,
+          "n": 150
+        },
+        "missing_args": {
+          "accuracy": 0.0,
+          "n": 48
+        },
+        "nl_cmdlike": {
+          "accuracy": 0.0,
+          "n": 500
+        },
+        "nl_plain": {
+          "accuracy": 0.11445086705202312,
+          "n": 865
+        },
+        "other_code": {
+          "accuracy": 0.36607142857142855,
+          "n": 112
+        },
+        "syntax": {
+          "accuracy": 1.0,
+          "n": 375
+        },
+        "typo_cmd": {
+          "accuracy": 0.0033333333333333335,
+          "n": 300
+        },
+        "valid": {
+          "accuracy": 1.0,
+          "n": 2318
+        },
+        "valid_english_args": {
+          "accuracy": 1.0,
+          "n": 153
+        },
+        "valid_interactive": {
+          "accuracy": 1.0,
+          "n": 29
+        }
+      }
+    },
+    "bash_n_known_command": {
+      "n": 5000,
+      "threshold": 0.5,
+      "accuracy": 0.8722,
+      "english_run_rate": 0.19047619047619047,
+      "other_invalid_run_rate": 0.3180616740088106,
+      "command_to_agent_rate": 0.0072,
+      "heldout_tool_accuracy": 0.9238033213936828,
+      "per_category": {
+        "bad_flag": {
+          "accuracy": 0.0,
+          "n": 150
+        },
+        "bad_subcmd": {
+          "accuracy": 0.0,
+          "n": 150
+        },
+        "missing_args": {
+          "accuracy": 0.0,
+          "n": 48
+        },
+        "nl_cmdlike": {
+          "accuracy": 0.48,
+          "n": 500
+        },
+        "nl_plain": {
+          "accuracy": 1.0,
+          "n": 865
+        },
+        "other_code": {
+          "accuracy": 0.8839285714285714,
+          "n": 112
+        },
+        "syntax": {
+          "accuracy": 1.0,
+          "n": 375
+        },
+        "typo_cmd": {
+          "accuracy": 1.0,
+          "n": 300
+        },
+        "valid": {
+          "accuracy": 0.9926660914581535,
+          "n": 2318
+        },
+        "valid_english_args": {
+          "accuracy": 1.0,
+          "n": 153
+        },
+        "valid_interactive": {
+          "accuracy": 0.9655172413793104,
+          "n": 29
+        }
+      }
+    }
+  },
+  "hand": {
+    "always_run": {
+      "n": 266,
+      "threshold": 0.5,
+      "accuracy": 0.45112781954887216,
+      "english_run_rate": 1.0,
+      "other_invalid_run_rate": 1.0,
+      "command_to_agent_rate": 0.0,
+      "heldout_tool_accuracy": null,
+      "per_category": {
+        "bad_flag": {
+          "accuracy": 0.0,
+          "n": 10
+        },
+        "bad_subcmd": {
+          "accuracy": 0.0,
+          "n": 12
+        },
+        "missing_args": {
+          "accuracy": 0.0,
+          "n": 10
+        },
+        "nl_cmdlike": {
+          "accuracy": 0.0,
+          "n": 36
+        },
+        "nl_plain": {
+          "accuracy": 0.0,
+          "n": 36
+        },
+        "other_code": {
+          "accuracy": 0.0,
+          "n": 16
+        },
+        "syntax": {
+          "accuracy": 0.0,
+          "n": 12
+        },
+        "typo_cmd": {
+          "accuracy": 0.0,
+          "n": 14
+        },
+        "valid": {
+          "accuracy": 1.0,
+          "n": 120
+        }
+      }
+    },
+    "bash_n": {
+      "n": 266,
+      "threshold": 0.5,
+      "accuracy": 0.5263157894736842,
+      "english_run_rate": 0.9861111111111112,
+      "other_invalid_run_rate": 0.7432432432432432,
+      "command_to_agent_rate": 0.0,
+      "heldout_tool_accuracy": null,
+      "per_category": {
+        "bad_flag": {
+          "accuracy": 0.0,
+          "n": 10
+        },
+        "bad_subcmd": {
+          "accuracy": 0.0,
+          "n": 12
+        },
+        "missing_args": {
+          "accuracy": 0.0,
+          "n": 10
+        },
+        "nl_cmdlike": {
+          "accuracy": 0.0,
+          "n": 36
+        },
+        "nl_plain": {
+          "accuracy": 0.027777777777777776,
+          "n": 36
+        },
+        "other_code": {
+          "accuracy": 0.4375,
+          "n": 16
+        },
+        "syntax": {
+          "accuracy": 1.0,
+          "n": 12
+        },
+        "typo_cmd": {
+          "accuracy": 0.0,
+          "n": 14
+        },
+        "valid": {
+          "accuracy": 1.0,
+          "n": 120
+        }
+      }
+    },
+    "bash_n_known_command": {
+      "n": 266,
+      "threshold": 0.5,
+      "accuracy": 0.7030075187969925,
+      "english_run_rate": 0.6111111111111112,
+      "other_invalid_run_rate": 0.4594594594594595,
+      "command_to_agent_rate": 0.008333333333333333,
+      "heldout_tool_accuracy": null,
+      "per_category": {
+        "bad_flag": {
+          "accuracy": 0.0,
+          "n": 10
+        },
+        "bad_subcmd": {
+          "accuracy": 0.0,
+          "n": 12
+        },
+        "missing_args": {
+          "accuracy": 0.0,
+          "n": 10
+        },
+        "nl_cmdlike": {
+          "accuracy": 0.05555555555555555,
+          "n": 36
+        },
+        "nl_plain": {
+          "accuracy": 0.7222222222222222,
+          "n": 36
+        },
+        "other_code": {
+          "accuracy": 0.875,
+          "n": 16
+        },
+        "syntax": {
+          "accuracy": 1.0,
+          "n": 12
+        },
+        "typo_cmd": {
+          "accuracy": 1.0,
+          "n": 14
+        },
+        "valid": {
+          "accuracy": 0.9916666666666667,
+          "n": 120
+        }
+      }
+    }
+  }
+}

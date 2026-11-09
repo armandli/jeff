@@ -1,0 +1,68 @@
+# Experiment 005 — smart-shell router: run valid bash, send everything else to an agent
+#
+# Decision: RUN vs AGENT for one typed line, using exp_001's scorer (QLoRA Qwen3-8B +
+# linear head). See python/jeff/data/shell_router.py for the definition of "valid".
+#
+# The errors are asymmetric: English marked RUN gets executed by bash, while a command
+# marked AGENT only takes a slower route. evaluate.py therefore picks its RUN threshold
+# on val to cap english_run_rate, then applies it unchanged to the test sets.
+#
+#   python/.venv/bin/python python/experiments/exp_005_shell_router/prepare_data.py
+#   python/.venv/bin/python python/experiments/exp_005_shell_router/evaluate.py --baselines-only
+#   python/.venv/bin/python python/experiments/exp_005_shell_router/train.py
+#   python/.venv/bin/python python/experiments/exp_005_shell_router/evaluate.py \
+#       --adapter checkpoints/exp_005_shell_router/best --tag best
+
+model:
+  name: "Qwen/Qwen3-8B"
+  load_in_4bit: true
+  lora_r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  max_seq_len: 384
+
+training:
+  num_epochs: 1
+  max_steps: null
+  batch_size: 8
+  gradient_accumulation_steps: 4     # effective batch = 32 -> 1250 steps for 40k examples
+  learning_rate: 5.0e-5              # exp_001: 2e-4 collapsed, 5e-5 stable
+  head_learning_rate: 1.0e-3
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  bf16: true
+  seed: 0
+
+eval:
+  every: 100
+  subset: 500
+  max_english_run_rate: 0.005        # threshold selection target, measured on val
+
+data:
+  raw_dir: "data/raw/exp_005"
+  out_dir: "data/processed"
+  prefix: "shell_router"
+  hand_test: "python/experiments/exp_005_shell_router/hand_test.tsv"
+  n_train: 40000
+  n_val: 5000
+  n_test: 5000
+  max_per_tool: 800                  # positives per tool; NL2Bash alone is 60% `find`
+  common_tools: 40                   # split by command for these, by whole tool for the rest
+  negative_mix:                      # share of the invalid half; short pools are reported
+    nl_plain: 0.30
+    nl_cmdlike: 0.20
+    syntax: 0.15
+    typo_cmd: 0.12
+    other_code: 0.08
+    bad_subcmd: 0.06
+    bad_flag: 0.06
+    missing_args: 0.03
+
+output:
+  dir: "checkpoints/exp_005_shell_router"
+  results_dir: "python/experiments/exp_005_shell_router/results"
+
+wandb:
+  project: "jeff"
+  run_name: "exp_005_shell_router"

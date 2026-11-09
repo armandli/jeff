@@ -1,0 +1,268 @@
+# Hand-labelled test set: label (1 valid, 0 invalid) <TAB> category <TAB> typed line.
+# Written before any model ran, and removed from generated data. Never tune on this file.
+1	valid	ls
+1	valid	ls -lh
+1	valid	ls -la ~/Downloads
+1	valid	cd ..
+1	valid	cd /etc/nginx/sites-available
+1	valid	pwd
+1	valid	clear
+1	valid	exit
+1	valid	whoami
+1	valid	top
+1	valid	htop
+1	valid	make
+1	valid	make install
+1	valid	date
+1	valid	df -h /
+1	valid	du -sh * | sort -h
+1	valid	free -m
+1	valid	ps aux | grep python
+1	valid	kill -9 4312
+1	valid	pkill -f gunicorn
+1	valid	cat /etc/hosts
+1	valid	less /var/log/syslog
+1	valid	tail -f /var/log/nginx/error.log
+1	valid	head -n 20 train.log
+1	valid	wc -l *.py
+1	valid	grep -rn TODO src/
+1	valid	grep -v '^#' config.ini
+1	valid	find . -name '*.pyc' -delete
+1	valid	find /var/log -mtime +7 -type f
+1	valid	sed -i 's/foo/bar/g' input.txt
+1	valid	awk '{print $2}' access.log | sort | uniq -c | sort -rn | head
+1	valid	cut -d, -f1,3 sales.csv
+1	valid	sort -u names.txt
+1	valid	tr '[:upper:]' '[:lower:]' < in.txt > out.txt
+1	valid	xargs -n1 echo < list.txt
+1	valid	cp -r assets/ public/
+1	valid	mv draft.md final.md
+1	valid	rm -rf node_modules
+1	valid	mkdir -p a/b/c
+1	valid	touch .env
+1	valid	chmod +x deploy.sh
+1	valid	chown -R www-data:www-data /var/www
+1	valid	ln -s /opt/app/current app
+1	valid	tar -czf site.tar.gz site/
+1	valid	tar xvf linux-6.6.tar.xz
+1	valid	unzip photos.zip -d photos
+1	valid	gzip -9 dump.sql
+1	valid	curl -fsSL https://example.org/install.sh -o install.sh
+1	valid	wget -c https://example.org/big.iso
+1	valid	ssh -p 2222 deploy@staging.internal
+1	valid	scp report.pdf bob@fileserver:/srv/share/
+1	valid	rsync -avz --delete build/ web01:/var/www/
+1	valid	ping -c 4 1.1.1.1
+1	valid	dig +short example.org
+1	valid	ss -tlnp
+1	valid	ip route show
+1	valid	git status
+1	valid	git log --graph --oneline -20
+1	valid	git checkout -b feature/login
+1	valid	git push origin main
+1	valid	git rebase -i HEAD~3
+1	valid	git stash pop
+1	valid	git diff --staged
+1	valid	docker ps -a
+1	valid	docker compose up -d
+1	valid	docker run --rm -it ubuntu:24.04 bash
+1	valid	docker build -t myapp:latest .
+1	valid	kubectl get pods -n prod
+1	valid	kubectl logs -f deploy/api
+1	valid	systemctl status sshd
+1	valid	sudo systemctl restart postgresql
+1	valid	journalctl -u nginx --since today
+1	valid	sudo apt install ripgrep
+1	valid	sudo apt-get update && sudo apt-get upgrade -y
+1	valid	pip install -r requirements.txt
+1	valid	python3 -m venv .venv
+1	valid	python3 train.py --epochs 5
+1	valid	source .venv/bin/activate
+1	valid	npm install
+1	valid	npm run build
+1	valid	cargo test --release
+1	valid	go build ./...
+1	valid	gcc -O2 main.c -o main
+1	valid	cmake --build build -j
+1	valid	nvidia-smi
+1	valid	vim ~/.bashrc
+1	valid	tmux attach -t work
+1	valid	./configure --prefix=/usr/local
+1	valid	./run_tests.sh
+1	valid	../scripts/setup.sh prod
+1	valid	/usr/local/bin/backup --full
+1	valid	FOO=bar ./app
+1	valid	export PATH="$HOME/bin:$PATH"
+1	valid	alias gs='git status'
+1	valid	echo $HOME
+1	valid	echo hello world
+1	valid	echo "time flies like an arrow"
+1	valid	git commit -m "remove the old login page"
+1	valid	grep -i "show me the logs" chat.txt
+1	valid	notify-send "stand up and stretch"
+1	valid	for f in *.png; do convert "$f" "${f%.png}.jpg"; done
+1	valid	while true; do date; sleep 5; done
+1	valid	if [ -f .env ]; then source .env; fi
+1	valid	[ -d build ] && rm -r build
+1	valid	(cd frontend && npm test)
+1	valid	sleep 10 && echo done
+1	valid	cat <<< "hello"
+1	valid	diff <(sort a.txt) <(sort b.txt)
+1	valid	jq '.items[].name' data.json
+1	valid	ffmpeg -i in.mp4 -vn out.mp3
+1	valid	man tar
+1	valid	which python3
+1	valid	type ls
+1	valid	history | tail -20
+1	valid	crontab -l
+1	valid	sudo !!
+1	valid	yes | apt install vim
+1	valid	time make -j8
+1	valid	watch -n 2 nvidia-smi
+1	valid	nohup ./server > server.log 2>&1 &
+0	nl_plain	show me all the files in this folder
+0	nl_plain	what is the weather today
+0	nl_plain	how do I undo my last git commit
+0	nl_plain	why is my laptop so slow
+0	nl_plain	please delete the temporary files
+0	nl_plain	hello
+0	nl_plain	hi there
+0	nl_plain	thanks
+0	nl_plain	can you help me fix this bug
+0	nl_plain	explain what this script does
+0	nl_plain	list the five biggest files in my home directory
+0	nl_plain	summarize the changes on this branch
+0	nl_plain	write a python function that reverses a string
+0	nl_plain	what does the -r flag do in grep?
+0	nl_plain	how much disk space do I have left
+0	nl_plain	which process is using port 8080?
+0	nl_plain	create a new react project called dashboard
+0	nl_plain	refactor the parser to use a state machine
+0	nl_plain	add unit tests for the login module
+0	nl_plain	Commit everything and open a pull request.
+0	nl_plain	could you check whether nginx is running
+0	nl_plain	compress all the pictures in this folder
+0	nl_plain	rename every jpeg here to lowercase
+0	nl_plain	translate this readme to french
+0	nl_plain	remind me what we did yesterday
+0	nl_plain	is it safe to delete node_modules
+0	nl_plain	give me a summary of the error log
+0	nl_plain	set up a virtual environment for this project
+0	nl_plain	I want to download a youtube video
+0	nl_plain	列出当前目录下的所有文件
+0	nl_plain	montre-moi les fichiers modifiés
+0	nl_plain	wie viel Speicher ist noch frei
+0	nl_plain	nothing, never mind
+0	nl_plain	ok do it
+0	nl_plain	yes please go ahead
+0	nl_plain	Don't touch the config file
+0	nl_cmdlike	find the largest file on this machine
+0	nl_cmdlike	find all python files that import torch
+0	nl_cmdlike	make dinner
+0	nl_cmdlike	make this script faster
+0	nl_cmdlike	make a new branch for the login work
+0	nl_cmdlike	kill the server
+0	nl_cmdlike	kill whatever is hogging the gpu
+0	nl_cmdlike	time flies like an arrow
+0	nl_cmdlike	sort the imports in this file
+0	nl_cmdlike	cat pictures are the best
+0	nl_cmdlike	head to the docs and find the install steps
+0	nl_cmdlike	tail the logs and tell me what broke
+0	nl_cmdlike	touch up the readme
+0	nl_cmdlike	cut the release tomorrow
+0	nl_cmdlike	test the login flow end to end
+0	nl_cmdlike	who wrote this function
+0	nl_cmdlike	which file defines the router
+0	nl_cmdlike	watch the build and tell me when it finishes
+0	nl_cmdlike	install the dependencies and run the tests
+0	nl_cmdlike	remove all the debug prints
+0	nl_cmdlike	git commit my changes with a good message
+0	nl_cmdlike	docker is broken again
+0	nl_cmdlike	python is not finding my module
+0	nl_cmdlike	grep for the word error in all the logs
+0	nl_cmdlike	ls but only the big ones
+0	nl_cmdlike	cd into the project folder and start it
+0	nl_cmdlike	echo is not printing anything
+0	nl_cmdlike	sudo make me a sandwich
+0	nl_cmdlike	man this is hard
+0	nl_cmdlike	date of the last commit
+0	nl_cmdlike	help me write a commit message
+0	nl_cmdlike	less noise in the logs please
+0	nl_cmdlike	more detail on that last answer
+0	nl_cmdlike	diff the two config files and explain them
+0	nl_cmdlike	test this on staging first
+0	nl_cmdlike	stop the database and back it up
+0	other_code	print("hello world")
+0	other_code	import numpy as np
+0	other_code	x = 5
+0	other_code	def add(a, b): return a + b
+0	other_code	for i in range(3): print(i)
+0	other_code	SELECT name FROM customers WHERE id = 7;
+0	other_code	DROP TABLE sessions;
+0	other_code	console.log(process.env.HOME);
+0	other_code	const app = express();
+0	other_code	int x = 10;
+0	other_code	System.out.println("hi");
+0	other_code	<a href="/home">Home</a>
+0	other_code	{"name": "jeff", "version": 1}
+0	other_code	Get-ChildItem C:\Temp
+0	other_code	Set-ExecutionPolicy RemoteSigned
+0	other_code	del /s /q C:\build
+0	syntax	echo "unterminated
+0	syntax	cat foo |
+0	syntax	if true; then echo hi
+0	syntax	for i in 1 2 3; do echo $i
+0	syntax	ls && 
+0	syntax	(cd src && make
+0	syntax	echo "it's broken
+0	syntax	grep foo | | wc -l
+0	syntax	while true do echo hi; done
+0	syntax	cat < 
+0	syntax	echo hi )
+0	syntax	| sort
+0	typo_cmd	gti status
+0	typo_cmd	lsa -la
+0	typo_cmd	cta /etc/hosts
+0	typo_cmd	grpe error app.log
+0	typo_cmd	pyhton3 main.py
+0	typo_cmd	dokcer ps
+0	typo_cmd	kubeclt get pods
+0	typo_cmd	mkidr build
+0	typo_cmd	suod apt update
+0	typo_cmd	claer
+0	typo_cmd	sytemctl status nginx
+0	typo_cmd	tial -f app.log
+0	typo_cmd	nmp install
+0	typo_cmd	ehco hello
+0	bad_subcmd	git psuh origin main
+0	bad_subcmd	git stauts
+0	bad_subcmd	git comit -m "fix"
+0	bad_subcmd	git chekout main
+0	bad_subcmd	docker pss
+0	bad_subcmd	docker biuld -t app .
+0	bad_subcmd	kubectl gte pods
+0	bad_subcmd	systemctl statsu nginx
+0	bad_subcmd	apt instal vim
+0	bad_subcmd	npm isntall
+0	bad_subcmd	pip instal requests
+0	bad_subcmd	cargo biuld
+0	bad_flag	ls --notaflag
+0	bad_flag	grep --recursivee foo .
+0	bad_flag	rm --recrusive build
+0	bad_flag	cp --recusive a b
+0	bad_flag	mkdir --parent-dirs a/b
+0	bad_flag	sort --revrse names.txt
+0	bad_flag	du --human-readible .
+0	bad_flag	tail --folow app.log
+0	bad_flag	wc --line-count notes.txt
+0	bad_flag	df --humanize
+0	missing_args	tar -xzf
+0	missing_args	cp notes.txt
+0	missing_args	mv draft.md
+0	missing_args	chmod 755
+0	missing_args	chown alice
+0	missing_args	grep -r
+0	missing_args	mkdir
+0	missing_args	rm -r
+0	missing_args	ln -s
+0	missing_args	scp report.pdf
