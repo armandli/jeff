@@ -72,6 +72,8 @@ class ModernBERTConfig:
     full_finetune: bool = False        # True → fine-tune all weights (no LoRA)
     max_seq_len: int = 512
     n_permutations: int = 0            # ignored: option order cannot affect scores (see module doc)
+    pooling: str = "cls"               # "cls" = first token; "mean" = masked mean over tokens.
+                                       # Saved with the checkpoint (pooling.txt) and read back.
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +138,10 @@ class ModernBERTDecisionModel(DecisionModel):
         from peft import PeftModel
 
         obj = cls(cfg)
+        import os
+        pool_file = f"{checkpoint}/pooling.txt"
+        if os.path.exists(pool_file):
+            obj.cfg.pooling = open(pool_file).read().strip()
         obj._load_base(base_model or (cfg.model_name if cfg else DEFAULT_MODEL))
         obj.backbone = PeftModel.from_pretrained(obj.backbone, checkpoint)
         obj.head.load_state_dict(
@@ -193,7 +199,12 @@ class ModernBERTDecisionModel(DecisionModel):
         n_options: int,                # N options per example
     ) -> torch.Tensor:                 # [B, N] log-scores
         out = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-        cls_h = out.last_hidden_state[:, 0, :]      # [B*N, H]
+        h = out.last_hidden_state
+        if self.cfg.pooling == "mean":
+            m = attention_mask.unsqueeze(-1).to(h.dtype)
+            cls_h = (h * m).sum(1) / m.sum(1).clamp(min=1)   # [B*N, H]
+        else:
+            cls_h = h[:, 0, :]                               # [B*N, H]
         scores = self.head(cls_h).view(-1, n_options)   # [B, N]
         return scores
 
@@ -269,3 +280,5 @@ class ModernBERTDecisionModel(DecisionModel):
         self.backbone.save_pretrained(output_dir)
         self.tokenizer.save_pretrained(output_dir)
         torch.save(self.head.state_dict(), f"{output_dir}/decision_head.pt")
+        with open(f"{output_dir}/pooling.txt", "w") as f:
+            f.write(self.cfg.pooling + "\n")

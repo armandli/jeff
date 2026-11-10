@@ -86,6 +86,35 @@ def first_word(text: str, skip_prefixes: bool = True) -> str:
     return ""
 
 
+def command_word(text: str) -> str:
+    """The command word for a known-command check, or "" when the line has none: (( ))
+    arithmetic and [[ ]] tests are not commands, which first_word would return as x++ or -f."""
+    if text.lstrip().startswith(("((", "[[")):
+        return ""
+    return first_word(text)
+
+
+def pick_threshold_accuracy(rows: list[dict], p_run: list[float], cap: float,
+                            n_candidates: int = 400) -> float:
+    """P(RUN) threshold with the best accuracy among those keeping english_run_rate <= cap.
+
+    pick_threshold returns the lowest threshold meeting the cap, which maximises RUN
+    decisions and so executes other invalid input (typos, other languages) whenever the
+    model is confident on English; this one trades that off against command_to_agent."""
+    lowest, _ = pick_threshold(rows, p_run, cap)
+    cands = sorted(set(p for p in p_run if p >= lowest))
+    if len(cands) > n_candidates:
+        cands = [cands[int(i * (len(cands) - 1) / (n_candidates - 1))] for i in range(n_candidates)]
+    cands = [lowest] + cands + [1.0 + 1e-9]
+    valid = [r["correct_index"] == RUN for r in rows]
+    best_t, best_acc = lowest, -1.0
+    for t in cands:
+        acc = sum((p >= t) == v for p, v in zip(p_run, valid))
+        if acc > best_acc:
+            best_t, best_acc = t, acc
+    return best_t
+
+
 def pick_threshold(rows: list[dict], p_run: list[float], cap: float) -> tuple[float, bool]:
     """Lowest P(RUN) threshold that keeps english_run_rate <= cap on these rows.
 
@@ -97,3 +126,26 @@ def pick_threshold(rows: list[dict], p_run: list[float], cap: float) -> tuple[fl
         return 0.0, True
     threshold = english[-allowed - 1] + 1e-9
     return threshold, threshold <= 1.0
+
+
+# "line" context mode (exp_006 short-context variant): the encoder sees only the typed line
+# and one-word options, no instruction prompt, so a decision encodes ~10x fewer tokens.
+LINE_OPTIONS = ["RUN", "AGENT"]
+CONTEXT_MODES = ("prompt", "line")
+
+
+def apply_context_mode(row: dict, mode: str) -> dict:
+    """Return the row as the model sees it in this context mode (rows are not modified)."""
+    if mode == "prompt":
+        return row
+    if mode == "line":
+        return {**row, "context": row["text"], "options": list(LINE_OPTIONS)}
+    raise ValueError(f"unknown context mode {mode!r}; choices: {CONTEXT_MODES}")
+
+
+def read_context_mode(checkpoint_dir) -> str:
+    """Context mode a checkpoint was trained with: <run dir>/context_mode.txt, default prompt."""
+    from pathlib import Path
+    f = Path(checkpoint_dir).parent / "context_mode.txt"
+    return f.read_text().strip() if f.exists() else "prompt"
+

@@ -32,8 +32,12 @@ sys.path.insert(0, str(REPO_ROOT / "python"))
 from jeff.data.zsh_router import (  # noqa: E402
     ENGLISH_CATEGORIES,
     RUN,
+    apply_context_mode,
+    command_word,
     first_word,
     pick_threshold,
+    pick_threshold_accuracy,
+    read_context_mode,
     zsh_parses,
 )
 
@@ -73,9 +77,21 @@ def compute_metrics(rows: list[dict], p_run: list[float], threshold: float) -> d
     }
 
 
-def rule_baselines(cfg: dict) -> dict:
+def load_vocab(cfg: dict) -> set[str]:
     d = cfg["data"]
-    vocab = set(json.load(open(REPO_ROOT / d["out_dir"] / f"{d['prefix']}_vocab.json")))
+    return set(json.load(open(REPO_ROOT / d["out_dir"] / f"{d['prefix']}_vocab.json")))
+
+
+def known_or_no_command(text: str, vocab: set[str]) -> bool:
+    """Deployment proxy for `whence`: the command word is a known command or a path, or
+    the line has no command word at all (pure assignment, (( )) arithmetic, anonymous
+    function), in which case the model decides alone."""
+    word = command_word(text)
+    return word == "" or word in vocab or word.startswith(("/", "./", "../", "~/", "."))
+
+
+def rule_baselines(cfg: dict) -> dict:
+    vocab = load_vocab(cfg)
     results = {}
     for split in SPLITS:
         rows = load_rows(cfg, split)
@@ -154,23 +170,32 @@ def latency_benchmark(model, rows: list[dict], n: int = 200) -> dict:
 def evaluate_one(model_key: str, adapter: str | None, cfg: dict, args) -> dict:
     model = load_model(model_key, adapter, cfg)
     data = {s: load_rows(cfg, s)[:args.limit] for s in SPLITS}
+    mode = read_context_mode(REPO_ROOT / adapter)
+    model_rows = {s: [apply_context_mode(r, mode) for r in data[s]] for s in SPLITS}
     scores = {}
     for split in SPLITS:
         t0 = time.time()
-        scores[split] = score_batched(model, data[split], args.batch_size)
+        scores[split] = score_batched(model, model_rows[split], args.batch_size)
         print(f"[{model_key}] scored {split}: {len(data[split])} rows in {time.time()-t0:.0f}s",
               flush=True)
 
     with ThreadPoolExecutor(8) as ex:
         parses = {s: list(ex.map(zsh_parses, (r["text"] for r in data[s]))) for s in SPLITS}
     cascade = {s: [p if ok else 0.0 for p, ok in zip(scores[s], parses[s])] for s in SPLITS}
+    # known-command cascade: additionally send lines whose command word is unknown to AGENT
+    vocab = load_vocab(cfg)
+    cascade_known = {s: [p if known_or_no_command(r["text"], vocab) else 0.0
+                         for p, r in zip(cascade[s], data[s])] for s in SPLITS}
 
     cap = cfg["eval"]["max_english_run_rate"]
     threshold, cap_met = pick_threshold(data["val"], cascade["val"], cap)
-    lat = latency_benchmark(model, data["val"])
+    threshold_known, _ = pick_threshold(data["val"], cascade_known["val"], cap)
+    threshold_known_acc = pick_threshold_accuracy(data["val"], cascade_known["val"], cap)
+    lat = latency_benchmark(model, model_rows["val"])
     res = {
         "model_key": model_key,
         "adapter": adapter,
+        "context_mode": mode,
         "threshold": threshold,
         "threshold_cap": cap,
         "threshold_cap_met_on_val": cap_met,
@@ -181,17 +206,36 @@ def evaluate_one(model_key: str, adapter: str | None, cfg: dict, args) -> dict:
         res["splits"][split] = {
             "model_at_0.5": compute_metrics(data[split], scores[split], 0.5),
             "cascade_at_threshold": compute_metrics(data[split], cascade[split], threshold),
+            "cascade_known_at_threshold": compute_metrics(data[split], cascade_known[split],
+                                                          threshold_known),
+            # same threshold as the plain cascade: the known-command check can only turn RUN
+            # into AGENT, so english_run can never rise above the plain cascade's
+            "cascade_known_at_base_threshold": compute_metrics(data[split], cascade_known[split],
+                                                               threshold),
+            # known-command cascade, threshold = best val accuracy under the english cap
+            "cascade_known_at_acc_threshold": compute_metrics(data[split], cascade_known[split],
+                                                              threshold_known_acc),
         }
         m = res["splits"][split]["cascade_at_threshold"]
         print(f"[{model_key}] {split:5} cascade acc {m['accuracy']:.3f}  "
               f"english_run {m['english_run_rate']:.3f}  "
               f"other_invalid_run {m['other_invalid_run_rate']:.3f}  "
               f"p50_ms {lat['p50_ms']}", flush=True)
+        k = res["splits"][split]["cascade_known_at_threshold"]
+        print(f"[{model_key}] {split:5} +known acc {k['accuracy']:.3f}  "
+              f"english_run {k['english_run_rate']:.3f}  "
+              f"other_invalid_run {k['other_invalid_run_rate']:.3f}  "
+              f"cmd_to_agent {k['command_to_agent_rate']:.3f}", flush=True)
     res["hand_errors"] = [
         {"text": r["text"], "category": r["category"], "p_run": round(p, 4)}
         for r, p in zip(data["hand"], cascade["hand"])
         if (p >= threshold) != (r["correct_index"] == RUN)
     ]
+    res["threshold_known"] = threshold_known
+    res["threshold_known_acc"] = threshold_known_acc
+    # per-row scores so cascades can be re-analysed offline without the GPU
+    res["row_scores"] = {s: [round(p, 5) for p in scores[s]] for s in SPLITS}
+    res["row_parses"] = {s: parses[s] for s in SPLITS}
     return res
 
 

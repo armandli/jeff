@@ -28,11 +28,13 @@ REPO_ROOT = EXP_DIR.parents[2]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
 from jeff.data.loader import load_dataset_from_jsonl  # noqa: E402
-from jeff.data.zsh_router import ENGLISH_CATEGORIES, RUN, pick_threshold, zsh_parses  # noqa: E402
+from jeff.data.zsh_router import (  # noqa: E402
+    CONTEXT_MODES, ENGLISH_CATEGORIES, RUN, apply_context_mode, pick_threshold, zsh_parses,
+)
 from jeff.training.encoder_trainer import EncoderTrainer, EncoderTrainingConfig  # noqa: E402
 
 
-def make_rank_fn(val_path: Path, cap: float):
+def make_rank_fn(val_path: Path, cap: float, context_mode: str = "prompt"):
     """Rank checkpoints the way the router is deployed: `zsh -n` failures go to AGENT,
     the RUN threshold is the lowest one keeping english_run_rate <= cap on the eval
     subset, and the score is accuracy at that threshold. Plain argmax accuracy rewards
@@ -40,7 +42,7 @@ def make_rank_fn(val_path: Path, cap: float):
     meta = {}
     for line in open(val_path):
         r = json.loads(line)
-        meta[r["context"]] = r
+        meta[apply_context_mode(r, context_mode)["context"]] = r
     parse_cache: dict[str, bool] = {}
 
     def rank_fn(examples, probs) -> dict:
@@ -75,6 +77,17 @@ def main():
     )
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--output-dir", default=None, help="override base output dir")
+    ap.add_argument("--run-tag", default=None,
+                    help="suffix for the per-model output dir and wandb run (hyperparameter sweeps)")
+    ap.add_argument("--learning-rate", type=float, default=None, help="override training.learning_rate")
+    ap.add_argument("--head-learning-rate", type=float, default=None)
+    ap.add_argument("--num-epochs", type=int, default=None)
+    ap.add_argument("--lora-r", type=int, default=None, help="override lora_r (alpha = 2r)")
+    ap.add_argument("--seed", type=int, default=None, help="override training.seed")
+    ap.add_argument("--head-init-std", type=float, default=0.0,
+                    help="random normal init std for the decision head (0 = zero init)")
+    ap.add_argument("--context-mode", choices=CONTEXT_MODES, default="prompt",
+                    help="line = typed line only with RUN/AGENT options (no instruction prompt)")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(EXP_DIR / "config.yaml"))
@@ -86,11 +99,36 @@ def main():
     t, ev, d = cfg["training"], cfg["eval"], cfg["data"]
     processed = REPO_ROOT / d["out_dir"]
 
-    train_ds = load_dataset_from_jsonl(processed / f"{d['prefix']}_train.jsonl")
-    eval_ds = load_dataset_from_jsonl(processed / f"{d['prefix']}_val.jsonl")
 
     out_base = Path(args.output_dir) if args.output_dir else REPO_ROOT / cfg["output"]["dir"]
-    out = out_base / model_key
+    run_name = model_key + (f"_{args.run_tag}" if args.run_tag else "")
+    out = out_base / run_name
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "context_mode.txt").write_text(args.context_mode + "\n")
+    data_paths = {}
+    for split in ("train", "val"):
+        src = processed / f"{d['prefix']}_{split}.jsonl"
+        if args.context_mode == "prompt":
+            data_paths[split] = src
+            continue
+        dst = out / f"data_{args.context_mode}_{split}.jsonl"
+        with open(dst, "w") as f:
+            for line in open(src):
+                f.write(json.dumps(apply_context_mode(json.loads(line), args.context_mode),
+                                   ensure_ascii=False) + "\n")
+        data_paths[split] = dst
+    train_ds = load_dataset_from_jsonl(data_paths["train"])
+    eval_ds = load_dataset_from_jsonl(data_paths["val"])
+    if args.learning_rate is not None:
+        t["learning_rate"] = args.learning_rate
+    if args.head_learning_rate is not None:
+        t["head_learning_rate"] = args.head_learning_rate
+    if args.seed is not None:
+        t["seed"] = args.seed
+    if args.num_epochs is not None:
+        t["num_epochs"] = args.num_epochs
+    if args.lora_r is not None:
+        m["lora_r"], m["lora_alpha"] = args.lora_r, 2 * args.lora_r
 
     tcfg = EncoderTrainingConfig(
         model_name=m["name"],
@@ -111,13 +149,16 @@ def main():
         max_grad_norm=t["max_grad_norm"],
         bf16=t["bf16"],
         seed=t["seed"],
+        head_init_std=args.head_init_std,
+        pooling=m.get("pooling", "cls"),
         eval_every=ev["every"],
         eval_subset=ev["subset"],
         speed_eval_every=ev.get("speed_every", 0),
         wandb_project=cfg["wandb"]["project"],
-        wandb_run=f"{cfg['wandb']['run_name']}_{model_key}",
+        wandb_run=f"{cfg['wandb']['run_name']}_{run_name}",
     )
-    rank_fn = make_rank_fn(processed / f"{d['prefix']}_val.jsonl", ev["max_english_run_rate"])
+    rank_fn = make_rank_fn(processed / f"{d['prefix']}_val.jsonl", ev["max_english_run_rate"],
+                           args.context_mode)
     EncoderTrainer(tcfg, rank_fn=rank_fn).train_sft(train_ds, eval_ds)
     print(f"Done. Checkpoint at {out}/final")
 

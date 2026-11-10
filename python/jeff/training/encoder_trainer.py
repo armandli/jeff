@@ -48,6 +48,11 @@ class EncoderTrainingConfig:
     max_grad_norm: float = 1.0
     bf16: bool = True
     seed: int = 0
+    # std of a random normal init for the decision head; 0 keeps the zero init (untrained
+    # model scores every option equally). With a zero head no gradient reaches the backbone
+    # until the head itself has grown, and RoBERTa can then sit at loss ln2 for a whole run.
+    head_init_std: float = 0.0
+    pooling: str = "cls"               # see ModernBERTConfig.pooling
 
     # Eval / logging
     eval_every: int = 500
@@ -83,8 +88,11 @@ class EncoderTrainer:
             lora_target_modules=c.lora_target_modules,
             max_seq_len=c.max_seq_len,
             n_permutations=c.n_permutations,
+            pooling=c.pooling,
         ))
         model.load_base_for_training()
+        if c.head_init_std > 0:
+            torch.nn.init.normal_(model.head.proj.weight, std=c.head_init_std)
         return model
 
     # ------------------------------------------------------------------

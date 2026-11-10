@@ -52,6 +52,25 @@ models:
     max_seq_len: 384
     description: "125M cased RoBERTa (byte-level BPE keeps case and every symbol); alternative architecture for speed comparison. Replaced ELECTRA-base, whose uncased tokenizer cannot tell -R from -r"
 
+  roberta_base_mean:
+    name: "FacebookAI/roberta-base"
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_target_modules: [query, key, value, dense]
+    max_seq_len: 384
+    pooling: mean
+    description: "roberta_base_full with masked mean pooling instead of the <s> state, whose RUN/AGENT difference is tiny; roberta_base_full sat at loss ln2 in about half its runs"
+
+  roberta_base_full:
+    name: "FacebookAI/roberta-base"
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_target_modules: [query, key, value, dense]
+    max_seq_len: 384
+    description: "roberta_base with LoRA on every linear layer (attention output and FFN too). Train with a high lr (3e-4 / head 1e-3): with q/k/v-only LoRA at 2e-5 the run never left loss ln2, because RoBERTa's <s> state barely changes between the RUN and AGENT option encodings"
+
 # ---------------------------------------------------------------------------
 # Shared training hyperparameters
 # ---------------------------------------------------------------------------
