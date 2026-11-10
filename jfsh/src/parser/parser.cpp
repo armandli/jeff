@@ -158,19 +158,65 @@ bool Parser::par_simple() {
     return true;
 }
 
-// Stub compound command parsers
+// ---------------------------------------------------------------------------
+// TODO(parser/if): consume TK_IF; par_list(); expect TK_THEN; par_list();
+//   repeat [TK_ELIF par_list() TK_THEN par_list()]*;
+//   optional [TK_ELSE par_list()]; expect TK_FI.
+//   Emit WC_IF with offsets to each branch.
 bool Parser::par_if()      { lex_.consume(); return true; }
+
+// TODO(parser/while): consume TK_WHILE or TK_UNTIL; par_list() (cond);
+//   expect TK_DO; par_list() (body); expect TK_DONE.
+//   Emit WC_WHILE with until-flag and body offset.
 bool Parser::par_while()   { lex_.consume(); return true; }
+
+// TODO(parser/for): Two forms:
+//   `for name in words; do body; done`  → WC_FOR
+//   `for ((init; cond; incr)); do body; done` → WC_FOR_COND
 bool Parser::par_for()     { lex_.consume(); return true; }
+
+// TODO(parser/case): consume TK_CASE word TK_IN;
+//   parse pattern-list: pat [| pat]* ) par_list() (;;|;&|;|) until TK_ESAC.
+//   Emit WC_CASE with offset table.
 bool Parser::par_case()    { lex_.consume(); return true; }
+
+// TODO(parser/select): Like for — consume TK_SELECT name TK_IN words TK_DO body TK_DONE.
 bool Parser::par_select()  { lex_.consume(); return true; }
+
+// TODO(parser/repeat): consume TK_REPEAT word TK_NEWLINE|TK_LBRACE body TK_RBRACE.
 bool Parser::par_repeat()  { lex_.consume(); return true; }
+
+// TODO(parser/subsh): consume TK_LPAREN; par_list(); consume TK_RPAREN.
+//   Emit WC_SUBSH with body offset.
 bool Parser::par_subsh()   { lex_.consume(); return true; }
+
+// TODO(parser/funcdef): Two forms:
+//   `function name [()] { body }`
+//   `name () { body }`
+//   Register function name in function table with its CompiledProgram.
+//   Emit WC_FUNCDEF.
 bool Parser::par_funcdef() { lex_.consume(); return true; }
+
+// TODO(parser/cond): consume TK_DLPAREN (for [[);
+//   parse binary/unary test operators (-f, -d, =, ==, =~, <, >, -eq, etc.)
+//   and logical operators (&& || !).
+//   Emit WC_COND with operand string refs.
 bool Parser::par_cond()    { lex_.consume(); return true; }
+
+// TODO(parser/arith): consume TK_DLPAREN;
+//   collect arithmetic expression tokens until TK_DRPAREN.
+//   Emit WC_ARITH with expression string ref.
 bool Parser::par_arith()   { lex_.consume(); return true; }
-// par_always is not in the grammar stubs — always/try handled via par_cmd dispatch
+
+// TODO(parser/redir): Parse fd[redir_type]target:
+//   fd is optional integer prefix; redir_type from RedirType enum;
+//   target word or here-doc delimiter.
+//   register_heredoc() when REDIR_HEREDOC / REDIR_HEREDOCD encountered.
+//   Emit WC_REDIR with RedirType and string indices.
 bool Parser::par_redir()   { lex_.consume(); return true; }
+
+// TODO(parser/assign): Detect name=value or name+=(array) word.
+//   Emit WC_ASSIGN with name and value indices.
 bool Parser::par_assign()  { lex_.consume(); return true; }
 
 } // namespace jfsh

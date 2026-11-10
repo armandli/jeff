@@ -112,8 +112,15 @@ Result<ChatResponse> AnthropicBackend::chat(const ChatRequest& req) {
 }
 
 Result<ChatResponse> AnthropicBackend::chat_stream(const ChatRequest& req, StreamCallback cb) {
+    // TODO(anthropic/stream): Implement SSE streaming for the Anthropic API.
+    //   Anthropic SSE events:
+    //     event: content_block_delta  → data: {"type":"content_block_delta","delta":{"text":"..."}}
+    //     event: message_stop         → streaming complete
+    //   Use a CURLOPT_WRITEFUNCTION callback (like curl_stream_write in openai.cpp)
+    //   but parse the anthropic-specific event structure.
+    //   Wire CURLOPT_HTTPHEADER with Accept: text/event-stream.
     ChatRequest sreq = req; sreq.stream = true;
-    auto resp = chat(sreq);  // streaming TBD — fall back to non-streaming
+    auto resp = chat(sreq);  // fallback to non-streaming until TODO above is done
     if (resp && cb) cb(resp->content);
     return resp;
 }

@@ -62,7 +62,19 @@ Result<std::string> HistoryManager::expand(std::string_view line) {
         if (entries_.empty()) return std::unexpected(ShellError{ErrorKind::ExecError, "no previous command"});
         return entries_.back().text;
     }
-    return std::string(line);  // full expansion TBD
+    // TODO(hist/expand): Implement full zsh bang-history expansion:
+    //   !N      → entry number N
+    //   !-N     → Nth entry from end
+    //   !str    → most recent entry starting with str
+    //   !?str   → most recent entry containing str
+    //   !#      → current command line so far
+    //   Word designators: !N:0 (command), !N:1 (first arg), !N:^ !N:$ !N:* !N:2-4
+    //   Modifiers: :h (head/dirname), :t (tail/basename), :r (remove ext),
+    //              :e (extension), :q (quote), :x (quote each word),
+    //              :s/old/new/ (substitute), :gs/old/new/ (global substitute),
+    //              :& (repeat last s), :u (uppercase), :l (lowercase), :p (print, no exec)
+    //   HIST_SUBST_PATTERN option: use pattern matching instead of literal for :s.
+    return std::string(line);
 }
 
 const HistEntry* HistoryManager::lookup(int num) const noexcept {

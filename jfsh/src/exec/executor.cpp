@@ -25,8 +25,16 @@ int Executor::exec(const CompiledProgram& prog) {
     return exec_list(es, EF_NONE);
 }
 
-int Executor::exec_string(std::string_view /*src*/) {
-    // TODO: parse src and exec
+int Executor::exec_string(std::string_view src) {
+    // TODO(exec): Wire up parse_string once StringInputSource is exposed from lexer/input.cpp.
+    //   Steps:
+    //   1. Create StringInputSource(src)
+    //   2. Create Lexer(source)
+    //   3. Create Parser(lexer)
+    //   4. auto prog = parser.parse()  — returns Result<ProgRef>
+    //   5. if (!prog) report error and return 1
+    //   6. return exec(*prog)
+    (void)src;
     return 0;
 }
 
@@ -105,22 +113,78 @@ int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
     }
 }
 
-// Stub compound commands
-int Executor::exec_if     (ExecState&)         { return 0; }
-int Executor::exec_while  (ExecState&)         { return 0; }
-int Executor::exec_for    (ExecState&)         { return 0; }
-int Executor::exec_case   (ExecState&)         { return 0; }
-int Executor::exec_select (ExecState&)         { return 0; }
-int Executor::exec_repeat (ExecState&)         { return 0; }
-int Executor::exec_subsh  (ExecState&, ExecFlags) { return 0; }
-int Executor::exec_funcdef(ExecState&)         { return 0; }
-int Executor::exec_cond   (ExecState&)         { return 0; }
-int Executor::exec_arith  (ExecState&)         { return 0; }
-int Executor::exec_always (ExecState&)         { return 0; }
+// ---------------------------------------------------------------------------
+// TODO(exec/if): Read WC_IF bytecode layout:
+//   WC_IF cond_len then_len [elif_cond_len elif_then_len]* [else_len] WC_END
+//   Execute cond_list; if exit==0 execute then_list, else try elif chain / else.
+int Executor::exec_if(ExecState&) { return 0; }
 
-void Executor::setup_redirects  (ExecState&)                    {}
-void Executor::expand_args      (ExecState&, std::vector<std::string>&) {}
-void Executor::apply_assigns    (const std::vector<std::string>&, bool) {}
+// TODO(exec/while): WC_WHILE has a cond_prog and a body_prog offset.
+//   Loop: exec cond; if exit!=0 (or ==0 for `until`) break; exec body;
+//   Respect ctx_.break_level / ctx_.cont_level.
+int Executor::exec_while(ExecState&) { return 0; }
+
+// TODO(exec/for): Two variants:
+//   WC_FOR word_list body — foreach word in list; exec body
+//   WC_FOR_COND init cond incr body — C-style arithmetic for
+int Executor::exec_for(ExecState&) { return 0; }
+
+// TODO(exec/case): Pattern list is a series of (pattern, body) pairs terminated
+//   by WC_END. Glob-match each pattern against the subject word.
+int Executor::exec_case(ExecState&) { return 0; }
+
+// TODO(exec/select): Like for but prints a numbered menu, reads $REPLY,
+//   re-runs body until break.
+int Executor::exec_select(ExecState&) { return 0; }
+
+// TODO(exec/repeat): exec body N times (N is the word before the body).
+int Executor::exec_repeat(ExecState&) { return 0; }
+
+// TODO(exec/subsh): fork() a subshell, run the body in child, waitpid in parent.
+//   With EF_NOFORK, exec directly (last command optimisation).
+int Executor::exec_subsh(ExecState&, ExecFlags) { return 0; }
+
+// TODO(exec/funcdef): Register a named function in a function table.
+//   The body is a CompiledProgram offset stored in the bytecode.
+//   The function table lives on ParamTable or a separate HashTable<ProgRef>.
+int Executor::exec_funcdef(ExecState&) { return 0; }
+
+// TODO(exec/cond): Evaluate a [[ ]] expression tree.
+//   Opcodes inside the cond block: WC_COND_STR, WC_COND_REGEX, WC_COND_AND/OR/NOT
+//   Delegate to builtins/cond.cpp evaluator.
+int Executor::exec_cond(ExecState&) { return 0; }
+
+// TODO(exec/arith): Evaluate (( expr )).
+//   Fetch the expression string from the strs table, parse and compute
+//   with the arithmetic evaluator in builtins/math.cpp.
+//   Returns 0 if result != 0, 1 if result == 0 (like zsh).
+int Executor::exec_arith(ExecState&) { return 0; }
+
+// TODO(exec/always): { body } always { cleanup }
+//   Run body; whether it exits normally or via break/continue/return/exit,
+//   always run the cleanup block before propagating the control flow.
+int Executor::exec_always(ExecState&) { return 0; }
+
+// TODO(exec/redirects): Parse redirection records from ExecState, open file
+//   descriptors (open/pipe/dup2/close), save originals for restoration after
+//   the command.  Types: REDIR_READ, REDIR_WRITE, REDIR_APPEND, REDIR_HEREDOC,
+//   REDIR_HERESTR, REDIR_MERGE, REDIR_PROC_IN/OUT (process substitution), etc.
+void Executor::setup_redirects(ExecState&) {}
+
+// TODO(exec/expand): Word expansion pipeline (mirrors zsh's prefork/postfork):
+//   1. Tilde expansion  (~, ~user)
+//   2. Parameter expansion  ($var, ${var:-default}, ${#var}, ${var##pat}, etc.)
+//   3. Command substitution  $(cmd), `cmd`
+//   4. Arithmetic substitution  $((expr))
+//   5. Word splitting  (IFS)
+//   6. Glob expansion  (*, ?, [...], **/...)
+//   7. Quote removal
+void Executor::expand_args(ExecState&, std::vector<std::string>&) {}
+
+// TODO(exec/assign): Apply name=value assignments from the WC_ASSIGN block.
+//   With export_flag=true (from `export`), mark each param PM_EXPORTED.
+//   Must handle array assignments: arr=(a b c) and hash assignments: hash=(k v).
+void Executor::apply_assigns(const std::vector<std::string>&, bool) {}
 
 bool Executor::is_builtin(std::string_view name) const noexcept {
     return s_builtins.find(name) != nullptr;

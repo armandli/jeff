@@ -101,8 +101,15 @@ Result<ChatResponse> OllamaBackend::chat(const ChatRequest& req) {
 }
 
 Result<ChatResponse> OllamaBackend::chat_stream(const ChatRequest& req, StreamCallback cb) {
-    // Streaming NDJSON — fall back to non-streaming for now
-    auto resp = chat(req);
+    // TODO(ollama/stream): Implement NDJSON streaming for Ollama.
+    //   Ollama streams one JSON object per line, each with:
+    //     {"message":{"role":"assistant","content":"chunk"},"done":false}
+    //   The final line has "done":true and may include timing metadata.
+    //   Use a CURLOPT_WRITEFUNCTION callback that buffers partial lines,
+    //   calls parse_ndjson_chunk() on each complete '\n'-delimited line,
+    //   extracts .message.content, and invokes the StreamCallback.
+    //   Wire build_body(req, /*stream=*/true) to include "stream":true.
+    auto resp = chat(req);  // fallback to non-streaming until TODO above is done
     if (resp && cb) cb(resp->content);
     return resp;
 }

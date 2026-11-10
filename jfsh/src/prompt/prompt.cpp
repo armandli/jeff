@@ -128,7 +128,13 @@ PromptRenderer::expand_percent(std::string_view src, int pos) const {
 }
 
 std::string PromptRenderer::do_subst(std::string_view s) const {
-    // Parameter/command substitution in prompts (PROMPT_SUBST) — TBD
+    // TODO(prompt/subst): When PROMPT_SUBST option is set, run a full parameter
+    //   and command substitution pass over the prompt string before percent
+    //   expansion.  This allows prompts like:
+    //     PS1='$(git_branch)%n@%m %~%# '
+    //   Implementation: create a StringInputSource, Lexer, and call the
+    //   substitution expander from lexer/subst.cpp on the prompt string.
+    //   The result replaces s before expand_percent is called.
     return std::string(s);
 }
 

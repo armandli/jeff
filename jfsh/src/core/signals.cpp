@@ -140,9 +140,18 @@ void SignalManager::unblock() {
 void SignalManager::dispatch_pending() {
     if (pending_.test(SIGCHLD)) {
         pending_.clear(SIGCHLD);
-        // Reap children — called from main loop
+        // TODO(signals/sigchld): Call waitpid(-1, &status, WNOHANG|WUNTRACED)
+        //   in a loop until it returns 0 or -1; for each pid found call
+        //   g_jobs.update(pid, status) to update job/process state, then
+        //   g_jobs.notify_changes() if the NOTIFY option is set.
     }
-    // Other signals would be dispatched here
+    // TODO(signals/dispatch): For each set bit in pending_ (other than SIGCHLD):
+    //   1. Look up traps_[sig].action
+    //   2. If TrapAction::Command: push the command string onto an eval queue
+    //      (do NOT call exec directly here — we may be in a signal handler context).
+    //   3. After the pending set is cleared, drain the eval queue from the
+    //      main REPL loop using exec_string().
+    //   4. For SIGINT: set ctx_.break_level and clear pending input if interactive.
 }
 
 Result<void> SignalManager::kill_job(Pid pgid, int sig) noexcept {
