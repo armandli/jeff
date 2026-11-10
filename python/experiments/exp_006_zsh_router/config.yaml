@@ -9,10 +9,10 @@
 # Commands (run from repo root):
 #   python/.venv/bin/python python/experiments/exp_006_zsh_router/prepare_data.py
 #   python/.venv/bin/python python/experiments/exp_006_zsh_router/evaluate.py --baselines-only
-#   # train all three models (can run in parallel on separate GPUs):
+#   # train the three models one at a time (parallel runs on one GPU distort latency):
 #   python/.venv/bin/python python/experiments/exp_006_zsh_router/train.py --model-key modernbert_base
 #   python/.venv/bin/python python/experiments/exp_006_zsh_router/train.py --model-key modernbert_large
-#   python/.venv/bin/python python/experiments/exp_006_zsh_router/train.py --model-key electra_base
+#   python/.venv/bin/python python/experiments/exp_006_zsh_router/train.py --model-key roberta_base
 #   # monitor all running checkpoints live:
 #   python/.venv/bin/python python/experiments/exp_006_zsh_router/monitor.py
 #   # evaluate a finished checkpoint:
@@ -43,14 +43,14 @@ models:
     max_seq_len: 384
     description: "395M bidirectional encoder; most accurate ModernBERT variant"
 
-  electra_base:
-    name: "google/electra-base-discriminator"
+  roberta_base:
+    name: "FacebookAI/roberta-base"
     lora_r: 16
     lora_alpha: 32
     lora_dropout: 0.05
     lora_target_modules: [query, key, value]
     max_seq_len: 384
-    description: "110M ELECTRA discriminator; alternative architecture for speed comparison"
+    description: "125M cased RoBERTa (byte-level BPE keeps case and every symbol); alternative architecture for speed comparison. Replaced ELECTRA-base, whose uncased tokenizer cannot tell -R from -r"
 
 # ---------------------------------------------------------------------------
 # Shared training hyperparameters
@@ -59,7 +59,7 @@ training:
   num_epochs: 3
   max_steps: null
   batch_size: 16
-  gradient_accumulation_steps: 2        # effective batch = 32 → ~1250 steps for 40k examples
+  gradient_accumulation_steps: 2        # effective batch = 32; after the exp_005 ban ~28k train rows → ~885 steps/epoch, ~2650 total
   learning_rate: 2.0e-5                 # encoder backbone
   head_learning_rate: 1.0e-4            # linear decision head
   warmup_ratio: 0.05
@@ -72,7 +72,7 @@ training:
 # ---------------------------------------------------------------------------
 eval:
   every: 200                            # accuracy eval every N optimizer steps
-  subset: 300
+  subset: 1000                          # checkpoints ranked on this; ~10 s per eval for base models
   speed_every: 1000                     # full speed benchmark every N steps
   speed_target_ms: 15.0                 # p50 latency goal (ms/decision)
   max_english_run_rate: 0.005           # threshold selection target on val

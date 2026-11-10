@@ -7,10 +7,14 @@ Decision: is a line typed at an interactive zsh prompt a valid zsh command
 system, ignoring whether specific files or installed tools exist. So `kubectl get
 pods` is valid anywhere, while `find the largest file`, `git psuh` and `tar -xzf`
 are not.
+
+Unlike exp_005 there is no safety override: a dangerous but valid command such as
+`rm -rf /` is labelled RUN. The router decides only whether the line is valid zsh.
 """
 
 import os
 import re
+import shutil
 import subprocess
 
 OPTIONS = [
@@ -52,6 +56,9 @@ def usable_line(text: str) -> bool:
 
 def zsh_parses(text: str) -> bool:
     """Whether zsh can parse the text. `zsh -n` reads stdin and never executes it."""
+    if not shutil.which("zsh", path=_ZSH_ENV["PATH"]):
+        raise RuntimeError("zsh is not installed (or not on PATH); exp_006 needs it: "
+                           "sudo apt install zsh")
     try:
         r = subprocess.run(
             ["zsh", "-n"],
@@ -77,3 +84,16 @@ def first_word(text: str, skip_prefixes: bool = True) -> str:
             return ""
         return tok.rstrip(");}&|")
     return ""
+
+
+def pick_threshold(rows: list[dict], p_run: list[float], cap: float) -> tuple[float, bool]:
+    """Lowest P(RUN) threshold that keeps english_run_rate <= cap on these rows.
+
+    Returns (threshold, cap_met). With no English rows any threshold meets the cap.
+    """
+    english = sorted(p for r, p in zip(rows, p_run) if r["category"] in ENGLISH_CATEGORIES)
+    allowed = int(cap * len(english))
+    if allowed >= len(english):
+        return 0.0, True
+    threshold = english[-allowed - 1] + 1e-9
+    return threshold, threshold <= 1.0

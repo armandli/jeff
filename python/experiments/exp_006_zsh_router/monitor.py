@@ -8,7 +8,7 @@ Run this alongside one or more train.py processes:
     python/.venv/bin/python python/experiments/exp_006_zsh_router/monitor.py
     python/.venv/bin/python python/experiments/exp_006_zsh_router/monitor.py --poll 30
     python/.venv/bin/python python/experiments/exp_006_zsh_router/monitor.py \
-        --model-keys modernbert_base electra_base
+        --model-keys modernbert_base roberta_base
 
 The monitor reads eval_history.json (written by EncoderTrainer after each eval step)
 and decision_head.pt mtime to detect new checkpoints. For each newly arrived checkpoint
@@ -59,13 +59,23 @@ def quick_latency(model_key: str, adapter_dir: Path, cfg: dict, rows: list[dict]
             if hasattr(torch, "cuda") and torch.cuda.is_available():
                 torch.cuda.synchronize()
             times.append((time.perf_counter() - t0) * 1000)
-        times = sorted(times[5:])
+        times.sort()
         return {
-            "p50_ms": round(sorted(times)[len(times) // 2], 2),
+            "p50_ms": round(times[len(times) // 2], 2),
             "p95_ms": round(times[int(0.95 * len(times))], 2),
         }
-    except Exception as e:
+    except Exception as e:  # e.g. `latest` being replaced by the trainer mid-read
         return {"error": str(e)}
+    finally:
+        # Free the copy so repeated polls don't pile up next to the training run.
+        model = None  # noqa: F841
+        import gc
+        gc.collect()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def read_latest_eval(ckpt_dir: Path) -> dict | None:
@@ -140,18 +150,21 @@ def main():
             status = "error: " + lat["error"] if (lat and "error" in lat) else "ok"
             print(f"{model_key:22} {step_str:>6} {acc_str:>7} {p50_str:>8} {p95_str:>8}  {status}")
 
-        # Also print final results if training is done
+        # Also print final results if training is done. EncoderTrainer writes the full-val
+        # eval plus its speed benchmark to <results_dir>/final_val.json (= <out>/<model_key>).
         for model_key in model_keys:
-            final_json = out_base / model_key / "final" / "eval.json"
+            final_json = out_base / model_key / "final_val.json"
             if final_json.exists():
                 try:
                     d = json.loads(final_json.read_text())
                     spd = d.get("speed", {})
-                    print(f"  [{model_key}] FINAL: acc={d.get('accuracy','?'):.3f}  "
-                          f"p50={spd.get('sequential_ms_p50','?')}ms  "
-                          f"dec/s={spd.get('sequential_decisions_per_sec','?')}")
-                except Exception:
-                    pass
+                    rank = d.get("rank_score")
+                    print(f"  [{model_key}] FINAL: acc={d['accuracy']:.3f}  "
+                          + (f"cascade_acc={rank:.3f}  " if rank is not None else "")
+                          + f"p50={spd.get('sequential_ms_p50', '?')}ms  "
+                          f"dec/s={spd.get('sequential_decisions_per_sec', '?')}")
+                except (OSError, ValueError, KeyError) as e:
+                    print(f"  [{model_key}] FINAL: unreadable final_val.json ({e})")
 
         print(f"\n[{time.strftime('%H:%M:%S')}] next poll in {args.poll}s …", flush=True)
         time.sleep(args.poll)

@@ -13,7 +13,7 @@
 //
 // Default model:     <repo_root>/checkpoints/exp_006_zsh_router/<model-key>/best
 // Default model-key: modernbert_base
-// Available keys:    modernbert_base | modernbert_large | electra_base
+// Available keys:    modernbert_base | modernbert_large | roberta_base
 
 #include "router_common.hpp"
 
@@ -26,7 +26,7 @@ static void usage(const char* prog) {
         << "Options:\n"
         << "  -m, --model PATH     checkpoint dir  (default: checkpoints/exp_006_zsh_router/<key>/best)\n"
         << "  --model-key KEY      model variant; must match the checkpoint  (default: modernbert_base)\n"
-        << "                       choices: modernbert_base | modernbert_large | electra_base\n"
+        << "                       choices: modernbert_base | modernbert_large | roberta_base\n"
         << "  --threshold P        RUN when P(RUN) >= P  (default: 0.5)\n"
         << "  --raw                model only: skip the zsh -n check\n"
         << "  -v, --verbose        print the context, options and command sent to the model\n"

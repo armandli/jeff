@@ -11,6 +11,7 @@ import json
 import math
 import random
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -33,7 +34,7 @@ class EncoderTrainingConfig:
         "Wqkv", "o_proj", "Wi", "Wo",
     ])
     max_seq_len: int = 512
-    n_permutations: int = 0            # 0 = all cyclic rotations
+    n_permutations: int = 0            # ignored by ModernBERTDecisionModel (order-independent)
 
     # Training
     output_dir: str = "checkpoints/exp_003_fast_encoder"
@@ -59,10 +60,17 @@ class EncoderTrainingConfig:
     results_dir: str | None = None
 
 
+# rank_fn(examples, probs) -> dict of extra eval metrics, where probs[i] is the list of
+# option probabilities for examples[i]. If it returns "rank_score", checkpoints are
+# ranked on that (higher is better) instead of plain argmax accuracy.
+RankFn = Callable[[list, list[list[float]]], dict]
+
+
 class EncoderTrainer:
 
-    def __init__(self, cfg: EncoderTrainingConfig):
+    def __init__(self, cfg: EncoderTrainingConfig, rank_fn: RankFn | None = None):
         self.cfg = cfg
+        self.rank_fn = rank_fn
 
     def build_model(self) -> ModernBERTDecisionModel:
         c = self.cfg
@@ -87,7 +95,7 @@ class EncoderTrainer:
         for ex in dataset:
             perm = list(range(len(ex.options)))
             rng.shuffle(perm)
-            enc = model.encode_example(ex.context, ex.options, perm)
+            enc = model.encode_example(ex.context, ex.options, perm, truncate=False)
             if max(len(x) for x in enc["input_ids"]) > self.cfg.max_seq_len:
                 dropped += 1
                 continue
@@ -99,7 +107,7 @@ class EncoderTrainer:
 
     def evaluate(self, model: ModernBERTDecisionModel, examples, tag: str) -> dict:
         model.backbone.eval()
-        preds, labels = [], []
+        preds, labels, probs = [], [], []
         nll = 0.0
         t0 = time.time()
         for ex in examples:
@@ -107,6 +115,7 @@ class EncoderTrainer:
             s = model.score_options(inp)
             preds.append(max(range(len(s)), key=s.__getitem__))
             labels.append(ex.correct_index)
+            probs.append([math.exp(x) for x in s])
             nll -= s[ex.correct_index]
         model.backbone.train()
         n = len(labels)
@@ -118,6 +127,8 @@ class EncoderTrainer:
             "seconds": round(time.time() - t0, 1),
             "ms_per_decision": round((time.time() - t0) * 1000 / n, 2),
         }
+        if self.rank_fn:
+            res.update(self.rank_fn(list(examples), probs))
         print("EVAL " + json.dumps(res), flush=True)
         return res
 
@@ -235,13 +246,16 @@ class EncoderTrainer:
         wandb.init(project=c.wandb_project, name=c.wandb_run, config=asdict(c),
                    mode="offline", dir=str(out))
 
+        def rank(h):
+            return h.get("rank_score", h["accuracy"])
+
         def log_eval(res):
             history.append(res)
-            prev = [h["accuracy"] for h in history[:-1] if h["tag"].startswith("step")]
-            if res["tag"].startswith("step") and (not prev or res["accuracy"] > max(prev)):
+            prev = [rank(h) for h in history[:-1] if h["tag"].startswith("step")]
+            if res["tag"].startswith("step") and (not prev or rank(res) > max(prev)):
                 model.save_pretrained(str(out / "best"))
                 (out / "best" / "eval.json").write_text(json.dumps(res, indent=2) + "\n")
-                print(f"new best {res['accuracy']:.4f} @ step {res.get('step', '?')} → {out/'best'}",
+                print(f"new best {rank(res):.4f} @ step {res.get('step', '?')} → {out/'best'}",
                       flush=True)
             (results_dir / "eval_history.json").write_text(json.dumps(history, indent=2) + "\n")
             wandb.log({f"eval/{k}": v for k, v in res.items() if isinstance(v, float)},

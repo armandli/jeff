@@ -33,6 +33,7 @@ from jeff.data.zsh_router import (  # noqa: E402
     ENGLISH_CATEGORIES,
     RUN,
     first_word,
+    pick_threshold,
     zsh_parses,
 )
 
@@ -72,15 +73,6 @@ def compute_metrics(rows: list[dict], p_run: list[float], threshold: float) -> d
     }
 
 
-def pick_threshold(rows: list[dict], p_run: list[float], cap: float) -> tuple[float, bool]:
-    english = sorted(p for r, p in zip(rows, p_run) if r["category"] in ENGLISH_CATEGORIES)
-    allowed = int(cap * len(english))
-    if allowed >= len(english):
-        return 0.0, True
-    threshold = english[-allowed - 1] + 1e-9
-    return threshold, threshold <= 1.0
-
-
 def rule_baselines(cfg: dict) -> dict:
     d = cfg["data"]
     vocab = set(json.load(open(REPO_ROOT / d["out_dir"] / f"{d['prefix']}_vocab.json")))
@@ -103,50 +95,38 @@ def rule_baselines(cfg: dict) -> dict:
     return results
 
 
-def load_model(model_key: str, adapter: str | None, cfg: dict):
+def load_model(model_key: str, adapter: str, cfg: dict):
+    """Load a trained checkpoint. There is no zero-shot mode: the decision head is
+    zero-initialised, so an untrained model gives P(RUN) = 0.5 for every row."""
     from jeff.models.modernbert_decision import ModernBERTConfig, ModernBERTDecisionModel
     m = cfg["models"][model_key]
     mcfg = ModernBERTConfig(model_name=m["name"], lora_target_modules=m["lora_target_modules"],
                              max_seq_len=m["max_seq_len"])
-    if adapter:
-        return ModernBERTDecisionModel.from_pretrained(str(REPO_ROOT / adapter), cfg=mcfg)
-    model = ModernBERTDecisionModel(mcfg)
-    model._load_base(m["name"])
-    model.backbone.eval()
-    return model
+    return ModernBERTDecisionModel.from_pretrained(str(REPO_ROOT / adapter), cfg=mcfg)
 
 
 def score_batched(model, rows: list[dict], batch_size: int) -> list[float]:
-    """P(RUN) per row via batched cyclic-permutation scoring."""
+    """P(RUN) per row, batched. Options are encoded independently, so one order suffices."""
     import torch
 
-    from jeff.models.modernbert_decision import _cyclic_permutations
-
-    n_opts = len(rows[0]["options"])
-    perms = _cyclic_permutations(n_opts)
-    items = []
-    for i, r in enumerate(rows):
-        for perm in perms:
-            it = model.encode_example(r["context"], r["options"], perm)
-            items.append({**it, "row": i, "perm": perm})
-    items.sort(key=lambda it: len(it["input_ids"][0]))
+    items = [{**model.encode_example(r["context"], r["options"], list(range(len(r["options"])))),
+              "row": i} for i, r in enumerate(rows)]
+    items.sort(key=lambda it: len(it["input_ids"][0]))     # similar lengths pad less
 
     device = model.head.proj.weight.device
-    acc = torch.zeros(len(rows), n_opts)
+    p_run = [0.0] * len(rows)
     with torch.no_grad():
         for start in range(0, len(items), batch_size):
             chunk = items[start:start + batch_size]
             batch = model.collate(chunk)
             scores = model.forward_for_training(
-                **{k: v.to(device) for k, v in batch.items()
-                   if k not in ("labels", "n_options", "counts")},
+                batch["input_ids"].to(device), batch["attention_mask"].to(device),
                 n_options=batch["n_options"],
             )
-            for it, row in zip(chunk, scores.float().cpu()):
-                for pos, orig in enumerate(it["perm"]):
-                    acc[it["row"], orig] += row[pos]
-    probs = torch.softmax(acc / len(perms), dim=-1)
-    return probs[:, RUN].tolist()
+            probs = torch.softmax(scores.float(), dim=-1).cpu()
+            for it, row in zip(chunk, probs):
+                p_run[it["row"]] = row[RUN].item()
+    return p_run
 
 
 def latency_benchmark(model, rows: list[dict], n: int = 200) -> dict:
@@ -181,7 +161,8 @@ def evaluate_one(model_key: str, adapter: str | None, cfg: dict, args) -> dict:
         print(f"[{model_key}] scored {split}: {len(data[split])} rows in {time.time()-t0:.0f}s",
               flush=True)
 
-    parses = {s: [zsh_parses(r["text"]) for r in data[s]] for s in SPLITS}
+    with ThreadPoolExecutor(8) as ex:
+        parses = {s: list(ex.map(zsh_parses, (r["text"] for r in data[s]))) for s in SPLITS}
     cascade = {s: [p if ok else 0.0 for p, ok in zip(scores[s], parses[s])] for s in SPLITS}
 
     cap = cfg["eval"]["max_english_run_rate"]
@@ -214,9 +195,8 @@ def evaluate_one(model_key: str, adapter: str | None, cfg: dict, args) -> dict:
     return res
 
 
-def compare_all(cfg: dict, args) -> None:
-    """Train all three models' best checkpoints and print an accuracy-vs-latency table."""
-    results_dir = REPO_ROOT / cfg["output"]["results_dir"]
+def compare_all(cfg: dict, args, results_dir: Path) -> None:
+    """Evaluate every model's best checkpoint and print an accuracy-vs-latency table."""
     all_res = {}
     for model_key in cfg["models"]:
         adapter_path = REPO_ROOT / cfg["output"]["dir"] / model_key / "best"
@@ -248,9 +228,11 @@ def compare_all(cfg: dict, args) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--adapter", default=None, help="repo-relative checkpoint path")
-    ap.add_argument("--model-key", default=None, help="model key (required unless --compare-all or --baselines-only)")
-    ap.add_argument("--tag", default="zeroshot")
+    ap.add_argument("--adapter", default=None,
+                    help="checkpoint path, repo-relative or absolute (required unless "
+                         "--compare-all or --baselines-only)")
+    ap.add_argument("--model-key", default=None, help="model key (default: first in config)")
+    ap.add_argument("--tag", default=None, help="results file name (default: <model-key>)")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--baselines-only", action="store_true")
     ap.add_argument("--compare-all", action="store_true", help="benchmark all trained model checkpoints")
@@ -274,12 +256,16 @@ def main():
         return
 
     if args.compare_all:
-        compare_all(cfg, args)
+        compare_all(cfg, args, results_dir)
         return
 
+    if not args.adapter:
+        ap.error("--adapter is required (an untrained head scores every row 0.5)")
     model_key = args.model_key or next(iter(cfg["models"]))
+    if model_key not in cfg["models"]:
+        ap.error(f"unknown --model-key {model_key!r}; choices: {', '.join(cfg['models'])}")
     res = evaluate_one(model_key, args.adapter, cfg, args)
-    (results_dir / f"{args.tag}.json").write_text(
+    (results_dir / f"{args.tag or model_key}.json").write_text(
         json.dumps(res, indent=2, ensure_ascii=False) + "\n")
     print(json.dumps({k: res[k] for k in ("threshold", "threshold_cap_met_on_val", "latency_ms")}))
 

@@ -77,6 +77,19 @@ PLACEHOLDERS = [("url", "https://example.com/data"), ("host", "example.com"), ("
                 ("user", "alice"), ("branch", "main"), ("pattern", "error"), ("name", "app"),
                 ("package", "vim"), ("image", "nginx"), ("number", "5"), ("string", "hello")]
 
+# Real names for template slots that zsh checks at run time: an unknown option, parameter
+# flag or widget is an error, so filling these from CODE_NAMES (`setopt users`) would
+# label invalid lines RUN.
+ZSH_OPTIONS = """autocd autopushd correct extendedglob globdots histignorealldups histignorespace
+incappendhistory interactivecomments nocaseglob nomatch nullglob numericglobsort promptsubst
+pushdignoredups sharehistory""".split()
+PARAM_FLAGS = ["U", "L", "C", "q", "Q", "k", "v", "o", "O", "u", "f", "j:,:", "s:/:", "@"]
+ZLE_BINDINGS = [("'^R'", "history-incremental-search-backward"), ("'^A'", "beginning-of-line"),
+                ("'^E'", "end-of-line"), ("'^K'", "kill-line"), ("'^L'", "clear-screen"),
+                ("'^W'", "backward-kill-word"), ("'^[f'", "forward-word"),
+                ("'^[b'", "backward-word"), ("'^U'", "backward-kill-line")]
+REAL_CMDS = "cat sort head tail wc less uniq".split()
+
 # Zsh-specific interactive commands not in exp_005
 INTERACTIVE = """setopt|unsetopt|autoload -U compinit|compinit|autoload -U colors|colors
 bindkey -v|bindkey -e|bindkey '^R' history-incremental-search-backward
@@ -97,13 +110,14 @@ noglob ls *.txt|nocorrect make|nohup zsh script.sh
 repeat 3 { echo hi }|while read line; do echo $line; done <<< "hello"
 zsh -c 'echo hello'|zsh -n script.sh|zsh -x script.sh""".replace(
     "\n", "|").split("|")
+INTERACTIVE = [t.strip() for t in INTERACTIVE]
 INTERACTIVE_T = ["ls **/*.{f}", "rm -- *(m+{v})", "ls {d}/**/*.py", "print -P '%F{{green}}{n}%f'",
                  "source {d}/init.zsh", "zsh {f}", "autoload -Uz {n}", "typeset -A {n}",
-                 "a=({f} {d}); echo $a[1]", "echo ${{({n})var}}", "diff =({n} {f}) =({n} {f})",
-                 "() {{ echo $1 }} {n}", "integer {n}={v}", "setopt {n}", "unsetopt {n}",
+                 "a=({f} {d}); echo $a[1]", "echo ${{({p}){n}}}", "diff =({c} {f}) =({c} {f})",
+                 "() {{ echo $1 }} {n}", "integer {n}={v}", "setopt {o}", "unsetopt {o}",
                  "zstyle ':completion:*:{n}:*' menu yes", "repeat {v} {{ echo {n} }}",
-                 "noglob cp {f} {d}", "nocorrect {n} {f}", "print -l {f} {d}",
-                 "bindkey '{n}' {n}", "echo ${{(U){n}}}", "echo ${{(j:,:){n}}}",
+                 "noglob cp {f} {d}", "nocorrect {c} {f}", "print -l {f} {d}",
+                 "bindkey {k} {w}", "echo ${{(U){n}}}", "echo ${{(j:,:){n}}}",
                  "echo ${{(f)\"$(ls {d})\"}}"]
 ENGLISH_ARGS = ['echo the build has finished', 'echo "please delete all my files"',
                 'git commit -m "fix the bug in the parser"', 'git commit -am "update the readme"',
@@ -155,7 +169,8 @@ MISSING_ARGS_T = ["cp {f}", "cp -r {d}", "mv {f}", "mv {d}", "chmod 755", "chmod
                   "sudo apt install", "curl -o {f}", "wget -O {f}", "unzip", "head -n 5 --",
                   "cut -d,", "xargs -I"]
 
-# Zsh-specific invalid syntax (zsh parses differently from bash in some edge cases)
+# Zsh-specific invalid syntax. main() keeps only the lines `zsh -n` rejects: some that
+# look broken (`setopt {`, `ls **/(*`) parse fine and only fail at run time.
 ZSH_SYNTAX_ERRORS = [
     "setopt {",        # unclosed brace
     "print -P '%F{",   # unclosed format
@@ -358,15 +373,15 @@ def split_of(group: str, prefix: str = "e6:") -> str:
 
 
 def load_e5_texts(out_dir: Path, e5_prefix: str) -> set[str]:
-    """Return every text string in the exp_005 processed files."""
+    """Return every text in the exp_005 processed files: all splits including the critical
+    gate sets, both the current files and the v1 snapshot (exp_005 v1 trained on a
+    different train file than v2)."""
     texts: set[str] = set()
-    for split in ("train", "val", "test", "hand"):
-        p = out_dir / f"{e5_prefix}_{split}.jsonl"
-        if not p.exists():
-            continue
+    paths = sorted(out_dir.glob(f"{e5_prefix}_*.jsonl")) + sorted(out_dir.glob(f"*/{e5_prefix}_*.jsonl"))
+    for p in paths:
         for line in p.open():
-            obj = json.loads(line)
-            texts.add(obj["text"])
+            texts.add(json.loads(line)["text"])
+    print(f"exp_005 ban sources: {[str(p.relative_to(out_dir)) for p in paths]}", flush=True)
     return texts
 
 
@@ -441,23 +456,40 @@ def main():
 
     # ---- hand-written zsh-specific lists ----------------------------------------
     def fill(template):
+        key, widget = rng.choice(ZLE_BINDINGS)
         names = {"f": rng.choice(FILES), "d": rng.choice(DIRS), "h": rng.choice(HOSTS),
                  "n": rng.choice(CODE_NAMES), "N": rng.choice(CODE_NAMES).title(),
-                 "v": rng.randrange(1, 100)}
+                 "v": rng.randrange(1, 100), "o": rng.choice(ZSH_OPTIONS),
+                 "p": rng.choice(PARAM_FLAGS), "k": key, "w": widget, "c": rng.choice(REAL_CMDS)}
         return template.format(**names)
 
-    for text in {*INTERACTIVE, *(fill(t) for t in INTERACTIVE_T for _ in range(30))}:
+    def parsed_only(texts, what):
+        """Hand-written positives must at least parse; report any that don't."""
+        texts = sorted(texts)
+        with ThreadPoolExecutor(8) as ex:
+            ok = list(ex.map(zsh_parses, texts))
+        bad = [t for t, good in zip(texts, ok) if not good]
+        if bad:
+            print(f"dropped {len(bad)} {what} lines that fail zsh -n: {bad[:10]}", flush=True)
+        return [t for t, good in zip(texts, ok) if good]
+
+    interactive = {*INTERACTIVE, *(fill(t) for t in INTERACTIVE_T for _ in range(30))}
+    for text in parsed_only(interactive, "valid_interactive"):
         examples[split_of(f"t:{text}", group_prefix)].append(make_example(
             text, True, category="valid_interactive", source="template", tool_seen=True))
-    for text in {fill(t) for t in ENGLISH_ARGS for _ in range(12)}:
+    for text in parsed_only({fill(t) for t in ENGLISH_ARGS for _ in range(12)}, "valid_english_args"):
         examples[split_of(f"t:{text}", group_prefix)].append(make_example(
             text, True, category="valid_english_args", source="template", tool_seen=True))
     for text in {fill(t) for t in OTHER_CODE for _ in range(40)}:
         add_negative(text, "other_code", "template", f"t:{text}", True)
     for text in {fill(t) for t in MISSING_ARGS_T for _ in range(6)}:
         add_negative(text, "missing_args", "template", f"t:{text}", True)
+    parses_anyway = [t for t in ZSH_SYNTAX_ERRORS if zsh_parses(t)]
+    if parses_anyway:
+        print(f"ZSH_SYNTAX_ERRORS lines that parse, skipped: {parses_anyway}", flush=True)
     for text in ZSH_SYNTAX_ERRORS:
-        add_negative(text, "syntax", "template", f"t:{text}", True)
+        if text not in parses_anyway:
+            add_negative(text, "syntax", "template", f"t:{text}", True)
     for verb in CMDLIKE_VERBS:
         for obj in rng.sample(CMDLIKE_OBJECTS, 8):
             text = f"{verb} {obj.strip()}"
@@ -519,6 +551,17 @@ def main():
                 seen.add(r["text"])
                 chosen.append(r)
                 missing -= 1
+        # The exp_005 ban removes many positives from the shared sources; if fewer than
+        # n_half survive, drop negatives at random so the split stays 50/50.
+        pos = [r for r in chosen if r["correct_index"] == 0]
+        neg = [r for r in chosen if r["correct_index"] == 1]
+        if len(pos) < len(neg):
+            print(f"WARNING {split}: only {len(pos)} positives for {n_half} wanted; "
+                  f"downsampling negatives {len(neg)} -> {len(pos)}", flush=True)
+            rng.shuffle(neg)
+            for r in neg[len(pos):]:
+                seen.discard(r["text"])
+            chosen = pos + neg[:len(pos)]
         taken |= seen
         rng.shuffle(chosen)
         with open(out_dir / f"{cfg['prefix']}_{split}.jsonl", "w") as f:

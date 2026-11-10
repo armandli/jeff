@@ -8,7 +8,9 @@ Architecture
 - Scoring: for each option, encode "[CLS] context [SEP] option [SEP]" and read
   the [CLS] hidden state → Linear(hidden_size, 1) → scalar score.
   All N options for one example are encoded in a single batched forward pass.
-- Permutation debiasing: same cyclic-rotation approach as exp_001.
+- No permutation debiasing: each option is encoded on its own with the context, so
+  an option's score cannot depend on where it sits in the list. Averaging over
+  cyclic rotations (as the Qwen decoder models do) would only repeat the same work.
 
 Speed rationale (vs Qwen3-8B decoder)
 --------------------------------------
@@ -69,18 +71,12 @@ class ModernBERTConfig:
     ])
     full_finetune: bool = False        # True → fine-tune all weights (no LoRA)
     max_seq_len: int = 512
-    n_permutations: int = 0            # 0 = all cyclic rotations
+    n_permutations: int = 0            # ignored: option order cannot affect scores (see module doc)
 
 
 # ---------------------------------------------------------------------------
 # Encoding helpers
 # ---------------------------------------------------------------------------
-
-def _cyclic_permutations(n: int, max_k: int = 0) -> list[list[int]]:
-    base = list(range(n))
-    perms = [base[i:] + base[:i] for i in range(n)]
-    return perms if max_k == 0 else perms[:max_k]
-
 
 def encode_options(
     tokenizer,
@@ -88,19 +84,22 @@ def encode_options(
     options: list[str],
     perm: list[int],
     max_seq_len: int,
+    truncate: bool = True,
 ) -> dict:
     """Tokenise all options for one permutation as a batch of pair sequences.
 
     Returns {"input_ids": list[list[int]], "attention_mask": list[list[int]]}
-    with one row per option in permuted order.
+    with one row per option in permuted order. Truncation cuts the end of the
+    context, which is where a router's typed line sits, so training encodes with
+    truncate=False and drops over-long rows instead.
     """
     contexts = [context] * len(perm)
     opted = [options[i] for i in perm]
     enc = tokenizer(
         contexts,
         opted,
-        truncation=True,
-        max_length=max_seq_len,
+        truncation=truncate,
+        max_length=max_seq_len if truncate else None,
         padding=False,          # will pad in collate
         add_special_tokens=True,
     )
@@ -226,9 +225,10 @@ class ModernBERTDecisionModel(DecisionModel):
     # Encode one training example
     # ------------------------------------------------------------------
 
-    def encode_example(self, context: str, options: list[str], perm: list[int]) -> dict:
+    def encode_example(self, context: str, options: list[str], perm: list[int],
+                       truncate: bool = True) -> dict:
         enc = encode_options(
-            self.tokenizer, context, options, perm, self.cfg.max_seq_len
+            self.tokenizer, context, options, perm, self.cfg.max_seq_len, truncate
         )
         return enc   # {"input_ids": [[...], ...], "attention_mask": [[...], ...]}
 
@@ -238,20 +238,15 @@ class ModernBERTDecisionModel(DecisionModel):
 
     @torch.no_grad()
     def score_options(self, inp: DecisionInput) -> list[float]:
+        """Log-probabilities over the options, one forward pass for all of them."""
         n = len(inp.options)
-        perms = _cyclic_permutations(n, self.cfg.n_permutations)
-        acc = torch.zeros(n)
-        for perm in perms:
-            enc = self.encode_example(inp.context, inp.options, perm)
-            batch = self.collate([enc])
-            dev = self.head.proj.weight.device
-            ids = batch["input_ids"].to(dev)
-            am  = batch["attention_mask"].to(dev)
-            scores = self.forward_for_training(ids, am, n_options=n).squeeze(0).cpu()
-            for pos, orig in enumerate(perm):
-                acc[orig] += scores[pos].item()
-        avg = acc / len(perms)
-        return torch.log_softmax(avg, dim=-1).tolist()
+        enc = self.encode_example(inp.context, inp.options, list(range(n)))
+        batch = self.collate([enc])
+        dev = self.head.proj.weight.device
+        scores = self.forward_for_training(
+            batch["input_ids"].to(dev), batch["attention_mask"].to(dev), n_options=n
+        ).squeeze(0).float().cpu()
+        return torch.log_softmax(scores, dim=-1).tolist()
 
     def decide(self, inp: DecisionInput) -> DecisionOutput:
         scores = self.score_options(inp)
