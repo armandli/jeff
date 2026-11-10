@@ -225,7 +225,7 @@ class Qwen3DecisionModel(DecisionModel):
         LM head, so no [B, T, vocab] logits tensor is ever materialised.
         """
         decoder, lm_head = self._lm_parts()
-        hidden = decoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        hidden = decoder(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
         B, N = option_pos.shape
 
         letters = self.letter_ids(N)

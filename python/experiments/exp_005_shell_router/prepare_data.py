@@ -31,7 +31,15 @@ EXP_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EXP_DIR.parents[2]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
-from jeff.data.shell_router import bash_parses, first_word, make_example, usable_line  # noqa: E402
+import critical  # noqa: E402
+
+from jeff.data.shell_router import (  # noqa: E402
+    bash_parses,
+    first_word,
+    is_critical_command,
+    make_example,
+    usable_line,
+)
 
 METACHARS = re.compile(r"[|;&<>$`()\\{}*?!#]")
 BASH_WORDS = """alias bg bind break builtin caller case cd command compgen complete continue declare
@@ -342,6 +350,16 @@ def main():
         ok = list(ex.map(bash_parses, candidates))
     clean = {c: v for (c, v), good in zip(candidates.items(), ok) if good and first_word(c)}
     print(f"unique commands {len(candidates)}, parse OK {len(clean)}")
+
+    # ---- must-pass safety rows: corpus commands the rule flags can no longer be RUN --------
+    corpus_critical = {c: v for c, v in clean.items() if is_critical_command(c)}
+    clean = {c: v for c, v in clean.items() if c not in corpus_critical}
+    print(f"corpus commands relabelled critical_cmd: {len(corpus_critical)}")
+    critical_rows = critical.generate(rng, cfg["critical_fills"])
+    for cmd, (_, source) in corpus_critical.items():
+        critical_rows[split_of(f"crit:{cmd}")].append((cmd, "critical_cmd", f"corpus_{source}"))
+    crit_hand = [line.rstrip("\n").split("\t") for line in open(REPO_ROOT / cfg["critical_hand"])
+                 if line.strip() and not line.startswith("#")]
     vocab |= {first_word(c) for c in clean if re.fullmatch(r"[a-z][a-z0-9_+.-]+", first_word(c))}
 
     tool_counts = collections.Counter(first_word(c) for c in clean)
@@ -381,7 +399,8 @@ def main():
         for _ in range(3):      # the tools with known flags are a small share of the corpus
             add_negative(mutate_flag(cmd, flags, rng), "bad_flag", source, group, seen)
         add_negative(mutate_missing_args(cmd), "missing_args", source, group, seen)
-        if rng.random() < 0.06 and (hard := with_english_args(prompt, rng)) and bash_parses(hard):
+        if (rng.random() < 0.06 and (hard := with_english_args(prompt, rng)) and bash_parses(hard)
+                and not is_critical_command(hard)):
             examples[split_of(group)].append(make_example(
                 hard, True, category="valid_english_args", source=source, tool_seen=seen))
         if per_tool[tool] < cfg["max_per_tool"]:
@@ -430,8 +449,20 @@ def main():
     conflicts = {t for t, seen in labels.items() if len(seen) > 1}
     print(f"strings with both labels (dropped): {len(conflicts)}; "
           f"hand-test strings removed from generated data: {len(hand_texts & set(labels))}")
-    banned, out_dir = conflicts | hand_texts, REPO_ROOT / cfg["out_dir"]
+    crit_hand_texts = {h[2] for h in crit_hand}
+    crit_heldout = {r[0] for split in ("val", "test") for r in critical_rows[split]}
+    banned, out_dir = conflicts | hand_texts | crit_hand_texts | crit_heldout, REPO_ROOT / cfg["out_dir"]
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    def critical_example(text, category, family):
+        return make_example(text, category == "critical_run", category=category, source=family, tool_seen=True)
+
+    for split in ("val", "test"):
+        rows_out = {r[0]: r for r in critical_rows[split]}
+        with open(out_dir / f"{cfg['prefix']}_critical_{split}.jsonl", "w") as f:
+            for text in sorted(rows_out.keys() - hand_texts - crit_hand_texts):
+                f.write(json.dumps(critical_example(*rows_out[text]), ensure_ascii=False) + "\n")
+        print(f"critical_{split}: {dict(collections.Counter(r[1] for r in rows_out.values()))}")
 
     print("negative pools:", {c: sum(len(negatives[s][c]) for s in negatives) for c in cfg["negative_mix"]})
     taken: set[str] = set(banned)
@@ -465,6 +496,14 @@ def main():
                 seen.add(r["text"])
                 chosen.append(r)
                 missing -= 1
+        if split == "train":
+            # Oversampled because the gate is all-or-nothing; each copy gets its own option order.
+            unique = {r[0]: r for r in critical_rows["train"] if r[0] not in taken}
+            chosen = [r for r in chosen if r["text"] not in unique]
+            for row in unique.values():
+                chosen += [critical_example(*row) for _ in range(cfg["critical_oversample"])]
+            print(f"critical_train unique: {dict(collections.Counter(r[1] for r in unique.values()))} "
+                  f"x{cfg['critical_oversample']}")
         taken |= seen
         rng.shuffle(chosen)
         with open(out_dir / f"{cfg['prefix']}_{split}.jsonl", "w") as f:
@@ -481,6 +520,12 @@ def main():
             f.write(json.dumps(make_example(text, label == "1", category=category, source="hand",
                                             tool_seen=True), ensure_ascii=False) + "\n")
     print(f"hand test: {len(hand)}  {dict(collections.Counter(h[0] for h in hand))}")
+    with open(out_dir / f"{cfg['prefix']}_critical_hand.jsonl", "w") as f:
+        for label, category, text in crit_hand:
+            f.write(json.dumps(make_example(text, label == "1", category=category, source="hand",
+                                            tool_seen=True), ensure_ascii=False) + "\n")
+    print(f"critical hand: {dict(collections.Counter(h[1] for h in crit_hand))}")
+    (out_dir / f"{cfg['prefix']}_corpus_critical.txt").write_text("\n".join(sorted(corpus_critical)) + "\n")
     (out_dir / f"{cfg['prefix']}_vocab.json").write_text(json.dumps(sorted(vocab)))
 
 

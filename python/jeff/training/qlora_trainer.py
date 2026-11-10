@@ -124,7 +124,9 @@ class QLoRATrainer:
 
     # ------------------------------------------------------------------
 
-    def train_sft(self, train_dataset, eval_dataset=None) -> None:
+    def train_sft(self, train_dataset, eval_dataset=None, gate_dataset=None) -> None:
+        """gate_dataset: must-pass rows scored at every eval. Its accuracy outranks the
+        eval subset's when choosing the best checkpoint."""
         import wandb
         from torch.optim import AdamW
         from transformers import get_cosine_schedule_with_warmup
@@ -175,10 +177,22 @@ class QLoRATrainer:
         wandb.init(project=c.wandb_project, name=c.wandb_run, config=asdict(c),
                    mode="offline", dir=str(out))
 
+        gate_list = list(gate_dataset) if gate_dataset is not None else []
+
+        def run_eval(tag, examples):
+            res = {**self.evaluate(model, examples, tag), "step": step}
+            if gate_list:
+                gate = self.evaluate(model, gate_list, f"{tag}_gate")
+                res["gate_accuracy"], res["gate_nll"] = gate["accuracy"], gate["nll"]
+            return res
+
+        def rank(h):
+            return (h.get("gate_accuracy", 0.0), h["accuracy"])
+
         def log_eval(res):
             history.append(res)
-            prev = [h["accuracy"] for h in history[:-1] if h["tag"].startswith("step")]
-            if res["tag"].startswith("step") and (not prev or res["accuracy"] > max(prev)):
+            prev = [rank(h) for h in history[:-1] if h["tag"].startswith("step")]
+            if res["tag"].startswith("step") and (not prev or rank(res) > max(prev)):
                 model.save_pretrained(str(out / "best"))
                 (out / "best" / "eval.json").write_text(json.dumps(res, indent=2) + "\n")
                 print(f"new best {res['accuracy']:.4f} at step {res['step']} → {out / 'best'}", flush=True)
@@ -186,7 +200,7 @@ class QLoRATrainer:
             wandb.log({f"eval/{k}": v for k, v in res.items() if isinstance(v, float)}, step=step)
 
         if step == 0 and eval_sub:
-            log_eval({**self.evaluate(model, eval_sub, "zeroshot_subset"), "step": 0})
+            log_eval(run_eval("zeroshot_subset", eval_sub))
 
         print(f"total optimizer steps: {total_steps} ({steps_per_epoch}/epoch)", flush=True)
         model.backbone.train()
@@ -231,7 +245,7 @@ class QLoRATrainer:
                 if step % c.save_every == 0 or step >= total_steps:
                     self._save_state(model, optimizer, scheduler, step, history, latest)
                 if eval_sub and step % c.eval_every == 0 and step < total_steps:
-                    log_eval({**self.evaluate(model, eval_sub, f"step{step}_subset"), "step": step})
+                    log_eval(run_eval(f"step{step}_subset", eval_sub))
                 if step >= total_steps:
                     done = True
                     break
@@ -239,7 +253,7 @@ class QLoRATrainer:
         model.save_pretrained(str(out / "final"))
         print(f"Saved final → {out / 'final'}", flush=True)
         if eval_sub:
-            log_eval({**self.evaluate(model, eval_sub, "final_subset"), "step": step})
+            log_eval(run_eval("final_subset", eval_sub))
         if eval_list:
             res = {**self.evaluate(model, eval_list, "final_full_val"), "step": step}
             log_eval(res)

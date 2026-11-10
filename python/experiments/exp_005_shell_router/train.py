@@ -24,6 +24,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--output-dir", default=None)
+    ap.add_argument("--learning-rate", type=float, default=None, help="override training.learning_rate")
+    ap.add_argument("--run-name", default=None, help="override wandb.run_name")
+    ap.add_argument("--eval-limit", type=int, default=None, help="rows per eval set, for smoke tests")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(EXP_DIR / "config.yaml"))
@@ -31,6 +34,10 @@ def main():
     processed = REPO_ROOT / d["out_dir"]
     train_ds = load_dataset_from_jsonl(processed / f"{d['prefix']}_train.jsonl")
     eval_ds = load_dataset_from_jsonl(processed / f"{d['prefix']}_val.jsonl")
+    gate_ds = load_dataset_from_jsonl(processed / f"{d['prefix']}_critical_val.jsonl")
+    if args.eval_limit:
+        eval_ds = list(eval_ds)[:args.eval_limit]
+        gate_ds = list(gate_ds)[:args.eval_limit]
 
     out = Path(args.output_dir) if args.output_dir else REPO_ROOT / cfg["output"]["dir"]
     tcfg = QLoRATrainingConfig(
@@ -40,12 +47,12 @@ def main():
         output_dir=str(out), results_dir=str(out),
         num_epochs=t["num_epochs"], max_steps=args.max_steps or t.get("max_steps"),
         batch_size=t["batch_size"], gradient_accumulation_steps=t["gradient_accumulation_steps"],
-        learning_rate=t["learning_rate"], head_learning_rate=t["head_learning_rate"],
+        learning_rate=args.learning_rate or t["learning_rate"], head_learning_rate=t["head_learning_rate"],
         warmup_ratio=t["warmup_ratio"], max_grad_norm=t["max_grad_norm"], bf16=t["bf16"],
         seed=t["seed"], eval_every=ev["every"], eval_subset=ev["subset"],
-        save_every=50, wandb_project=cfg["wandb"]["project"], wandb_run=cfg["wandb"]["run_name"],
+        save_every=50, wandb_project=cfg["wandb"]["project"], wandb_run=args.run_name or cfg["wandb"]["run_name"],
     )
-    QLoRATrainer(tcfg).train_sft(train_ds, eval_ds)
+    QLoRATrainer(tcfg).train_sft(train_ds, eval_ds, gate_ds)
     print(f"Done. Checkpoint at {out}/final")
 
 

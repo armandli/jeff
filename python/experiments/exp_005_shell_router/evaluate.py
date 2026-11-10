@@ -2,7 +2,13 @@
 
 Deployed system = cascade: if `bash -n` fails go straight to AGENT, otherwise RUN when
 the model's P(RUN) >= threshold. The threshold is chosen on val as the lowest value
-with english_run_rate <= eval.max_english_run_rate, then used unchanged on both tests.
+with english_run_rate <= eval.max_english_run_rate that also keeps every must-pass AGENT
+row of critical_val below it, then used unchanged on all test sets.
+
+The must-pass gate (critical_val, critical_test, critical_hand) is reported for the model
+alone and for the model behind the rule guard is_critical_command, each with a threshold
+picked on val. A gate passes only at 100%; every failure is listed. critical_hand is a
+final check: never pick a threshold, checkpoint or template from it.
 
     python/.venv/bin/python python/experiments/exp_005_shell_router/evaluate.py --baselines-only
     python/.venv/bin/python python/experiments/exp_005_shell_router/evaluate.py --tag zeroshot
@@ -13,6 +19,7 @@ with english_run_rate <= eval.max_english_run_rate, then used unchanged on both 
 import argparse
 import collections
 import json
+import random
 import statistics
 import sys
 import time
@@ -26,13 +33,16 @@ REPO_ROOT = EXP_DIR.parents[2]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
 from jeff.data.shell_router import (  # noqa: E402
+    CRITICAL_AGENT_CATEGORIES,
     ENGLISH_CATEGORIES,
     RUN,
     bash_parses,
     first_word,
+    is_critical_command,
 )
 
 SPLITS = ("val", "test", "hand")
+GATES = ("critical_val", "critical_test", "critical_hand")
 
 
 def load_rows(cfg: dict, split: str) -> list[dict]:
@@ -68,6 +78,30 @@ def compute_metrics(rows: list[dict], p_run: list[float], threshold: float) -> d
     }
 
 
+def gate_metrics(rows: list[dict], p_run: list[float], threshold: float) -> dict:
+    """All-or-nothing check. Scores near the threshold are listed as well as failures."""
+    failures = [{"text": r["text"], "category": r["category"], "source": r["source"], "p_run": round(p, 6)}
+                for r, p in zip(rows, p_run) if (p >= threshold) != (r["correct_index"] == RUN)]
+    per_category = collections.Counter(r["category"] for r in rows)
+    failed = collections.Counter(f["category"] for f in failures)
+    return {
+        "n": len(rows), "threshold": threshold, "failures_n": len(failures), "passed": not failures,
+        "per_category": {c: {"n": n, "failed": failed[c]} for c, n in sorted(per_category.items())},
+        "failures": sorted(failures, key=lambda f: f["category"]),
+    }
+
+
+def pick_gated_threshold(val_rows, val_p, gate_rows, gate_p, cap: float) -> dict:
+    """Lowest threshold meeting the english cap on val with no critical AGENT row at or above it."""
+    english_thr, cap_met = pick_threshold(val_rows, val_p, cap)
+    must_agent = [p for r, p in zip(gate_rows, gate_p) if r["category"] in CRITICAL_AGENT_CATEGORIES]
+    must_run = [p for r, p in zip(gate_rows, gate_p) if r["category"] not in CRITICAL_AGENT_CATEGORIES]
+    threshold = max(english_thr, max(must_agent) + 1e-9)
+    return {"threshold": threshold, "english_threshold": english_thr, "cap_met_on_val": cap_met,
+            "gate_max_p_must_agent": max(must_agent), "gate_min_p_must_run": min(must_run),
+            "gate_separable_on_val": max(must_agent) < min(must_run)}
+
+
 def pick_threshold(rows: list[dict], p_run: list[float], cap: float) -> tuple[float, bool]:
     """Lowest threshold meeting the english_run_rate cap on these rows."""
     english = sorted(p for r, p in zip(rows, p_run) if r["category"] in ENGLISH_CATEGORIES)
@@ -82,7 +116,7 @@ def rule_baselines(cfg: dict) -> dict:
     d = cfg["data"]
     vocab = set(json.load(open(REPO_ROOT / d["out_dir"] / f"{d['prefix']}_vocab.json")))
     results = {}
-    for split in SPLITS:
+    for split in (*SPLITS, *GATES):
         rows = load_rows(cfg, split)
         with ThreadPoolExecutor(8) as ex:
             parses = list(ex.map(bash_parses, (r["text"] for r in rows)))
@@ -91,12 +125,15 @@ def rule_baselines(cfg: dict) -> dict:
             word = first_word(text)
             return word in vocab or word.startswith(("/", "./", "../", "~/", "."))
 
-        results[split] = {
-            "always_run": compute_metrics(rows, [1.0] * len(rows), 0.5),
-            "bash_n": compute_metrics(rows, [float(p) for p in parses], 0.5),
-            "bash_n_known_command": compute_metrics(
-                rows, [float(p and known(r["text"])) for p, r in zip(parses, rows)], 0.5),
+        rules = {
+            "always_run": [1.0] * len(rows),
+            "bash_n": [float(p) for p in parses],
+            "bash_n_known_command": [float(p and known(r["text"])) for p, r in zip(parses, rows)],
+            "bash_n_known_command_guard": [float(p and known(r["text"]) and not is_critical_command(r["text"]))
+                                           for p, r in zip(parses, rows)],
         }
+        score = gate_metrics if split in GATES else compute_metrics
+        results[split] = {name: score(rows, p_run, 0.5) for name, p_run in rules.items()}
     return results
 
 
@@ -173,33 +210,63 @@ def main():
         (results_dir / "baselines.json").write_text(json.dumps(res, indent=2) + "\n")
         for split, by_rule in res.items():
             for name, m in by_rule.items():
-                print(f"{split:5} {name:22} acc {m['accuracy']:.3f}  english_run {m['english_run_rate']:.3f}  "
+                if split in GATES:
+                    print(f"{split:13} {name:26} failures {m['failures_n']}/{m['n']}  {m['per_category']}")
+                    continue
+                print(f"{split:5} {name:26} acc {m['accuracy']:.3f}  english_run {m['english_run_rate']:.3f}  "
                       f"other_invalid_run {m['other_invalid_run_rate']:.3f}  "
                       f"cmd_to_agent {m['command_to_agent_rate']:.3f}")
         return
 
     model = load_model(args.adapter)
-    data = {s: load_rows(cfg, s)[:args.limit] for s in SPLITS}
+    data = {s: load_rows(cfg, s) for s in (*SPLITS, *GATES)}
+    if args.limit:      # the gate files are sorted, so a prefix would miss whole classes
+        data = {s: random.Random(0).sample(rows, min(args.limit, len(rows))) for s, rows in data.items()}
     scores = {}
-    for split in SPLITS:
+    for split in (*SPLITS, *GATES):
         t0 = time.time()
         scores[split] = score_batched(model, data[split], args.batch_size)
         print(f"scored {split}: {len(data[split])} rows in {time.time() - t0:.0f}s", flush=True)
-    parses = {s: [bash_parses(r["text"]) for r in data[s]] for s in SPLITS}
-    cascade = {s: [p if ok else 0.0 for p, ok in zip(scores[s], parses[s])] for s in SPLITS}
+    parses = {s: [bash_parses(r["text"]) for r in data[s]] for s in scores}
+    cascade = {s: [p if ok else 0.0 for p, ok in zip(scores[s], parses[s])] for s in scores}
+    guarded = {s: [0.0 if is_critical_command(r["text"]) else p for r, p in zip(data[s], cascade[s])]
+               for s in scores}
 
     cap = cfg["eval"]["max_english_run_rate"]
-    threshold, cap_met = pick_threshold(data["val"], cascade["val"], cap)
+    pick = pick_gated_threshold(data["val"], cascade["val"], data["critical_val"], cascade["critical_val"], cap)
+    pick_g = pick_gated_threshold(data["val"], guarded["val"], data["critical_val"], guarded["critical_val"], cap)
+    threshold, threshold_g = pick["threshold"], pick_g["threshold"]
     res = {"tag": args.tag, "adapter": args.adapter, "threshold": threshold,
-           "threshold_cap": cap, "threshold_cap_met_on_val": cap_met,
-           "latency_ms": latency_ms(model, data["val"]), "splits": {}}
+           "threshold_cap": cap, "threshold_pick": pick, "guarded_threshold_pick": pick_g,
+           "latency_ms": latency_ms(model, data["val"]), "splits": {}, "gates": {}}
     for split in SPLITS:
         res["splits"][split] = {
             "model_at_0.5": compute_metrics(data[split], scores[split], 0.5),
             "cascade_at_threshold": compute_metrics(data[split], cascade[split], threshold),
+            "guarded_at_threshold": compute_metrics(data[split], guarded[split], threshold_g),
+            "cascade_at_0.5": compute_metrics(data[split], cascade[split], 0.5),
+            "guarded_at_0.5": compute_metrics(data[split], guarded[split], 0.5),
         }
         m = res["splits"][split]["cascade_at_threshold"]
         print(f"{split:5} cascade acc {m['accuracy']:.3f}  english_run {m['english_run_rate']:.3f}  "
+              f"other_invalid_run {m['other_invalid_run_rate']:.3f}  "
+              f"cmd_to_agent {m['command_to_agent_rate']:.3f}", flush=True)
+
+    for gate in GATES:
+        res["gates"][gate] = {
+            "model_at_0.5": gate_metrics(data[gate], scores[gate], 0.5),
+            "cascade_at_threshold": gate_metrics(data[gate], cascade[gate], threshold),
+            "guarded_at_threshold": gate_metrics(data[gate], guarded[gate], threshold_g),
+            "cascade_at_0.5": gate_metrics(data[gate], cascade[gate], 0.5),
+            "guarded_at_0.5": gate_metrics(data[gate], guarded[gate], 0.5),
+        }
+        for name in ("cascade_at_threshold", "guarded_at_threshold", "guarded_at_0.5"):
+            m = res["gates"][gate][name]
+            print(f"{gate:13} {name:21} {'PASS' if m['passed'] else 'FAIL'} "
+                  f"failures {m['failures_n']}/{m['n']}  {m['per_category']}", flush=True)
+    for name in ("guarded_at_threshold", "guarded_at_0.5"):
+        m = res["splits"]["test"][name]
+        print(f"test  {name:21} acc {m['accuracy']:.3f}  english_run {m['english_run_rate']:.3f}  "
               f"other_invalid_run {m['other_invalid_run_rate']:.3f}  "
               f"cmd_to_agent {m['command_to_agent_rate']:.3f}", flush=True)
 
@@ -210,7 +277,7 @@ def main():
         if (p >= threshold) != (r["correct_index"] == RUN)
     ]
     (results_dir / f"{args.tag}.json").write_text(json.dumps(res, indent=2, ensure_ascii=False) + "\n")
-    print(json.dumps({k: res[k] for k in ("threshold", "threshold_cap_met_on_val", "latency_ms")}))
+    print(json.dumps({k: res[k] for k in ("threshold_pick", "guarded_threshold_pick", "latency_ms")}))
 
 
 if __name__ == "__main__":

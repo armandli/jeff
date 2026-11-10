@@ -7,6 +7,9 @@
 # marked AGENT only takes a slower route. evaluate.py therefore picks its RUN threshold
 # on val to cap english_run_rate, then applies it unchanged to the test sets.
 #
+# Must-pass gate: critical_cmd and critical_nl must never RUN, critical_run must never be
+# sent to the AGENT, all at 100%. See critical.py. Checkpoints are ranked on the gate first.
+#
 #   python/.venv/bin/python python/experiments/exp_005_shell_router/prepare_data.py
 #   python/.venv/bin/python python/experiments/exp_005_shell_router/evaluate.py --baselines-only
 #   python/.venv/bin/python python/experiments/exp_005_shell_router/train.py
@@ -44,6 +47,9 @@ data:
   out_dir: "data/processed"
   prefix: "shell_router"
   hand_test: "python/experiments/exp_005_shell_router/hand_test.tsv"
+  critical_hand: "python/experiments/exp_005_shell_router/critical_hand.tsv"
+  critical_fills: {critical_cmd: 6, critical_run: 6}   # fills per template, before de-duplication
+  critical_oversample: 5
   n_train: 40000
   n_val: 5000
   n_test: 5000
