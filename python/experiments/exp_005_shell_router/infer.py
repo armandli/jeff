@@ -30,8 +30,8 @@ def main() -> None:
     model = Qwen3DecisionModel.from_pretrained(args.model)
 
     inp = DecisionInput(context=make_context(args.text), options=list(OPTIONS))
-    # score_options_both returns log-probs with cyclic-permutation debiasing
-    log_probs = model.score_options_both(inp)
+    # score_options returns log-probs with cyclic-permutation debiasing
+    log_probs = model.score_options(inp)
 
     # Convert from log-space to probabilities
     probs = [math.exp(lp) for lp in log_probs]
