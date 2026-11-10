@@ -51,6 +51,7 @@ class EncoderTrainingConfig:
     # Eval / logging
     eval_every: int = 500
     eval_subset: int = 300
+    speed_eval_every: int = 0            # run speed_benchmark every N steps; 0 = disabled
     log_every: int = 10
     save_every: int = 100
     wandb_project: str = "jeff"
@@ -305,6 +306,11 @@ class EncoderTrainer:
                     self._save_state(model, optimizer, scheduler, step, history, latest)
                 if eval_sub and step % c.eval_every == 0 and step < total_steps:
                     log_eval({**self.evaluate(model, eval_sub, f"step{step}_subset"), "step": step})
+                if c.speed_eval_every and step % c.speed_eval_every == 0 and eval_list:
+                    speed = self.speed_benchmark(model, eval_list)
+                    print("SPEED " + json.dumps({**speed, "step": step}), flush=True)
+                    wandb.log({f"speed/{k}": v for k, v in speed.items()
+                               if isinstance(v, (int, float))}, step=step)
                 if step >= total_steps:
                     done = True
                     break

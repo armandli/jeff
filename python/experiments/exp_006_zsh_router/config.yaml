@@ -1,0 +1,114 @@
+# Experiment 006 — smart-shell router for zsh, with multi-model speed comparison
+#
+# Like exp_005 but:
+#   - zsh syntax validation instead of bash (`zsh -n`)
+#   - dataset is non-overlapping with exp_005 (exp_005 texts are banned)
+#   - three encoder model candidates trained and compared for accuracy vs latency
+#   - speed benchmark runs periodically during training, not only at the end
+#
+# Commands (run from repo root):
+#   python/.venv/bin/python python/experiments/exp_006_zsh_router/prepare_data.py
+#   python/.venv/bin/python python/experiments/exp_006_zsh_router/evaluate.py --baselines-only
+#   # train all three models (can run in parallel on separate GPUs):
+#   python/.venv/bin/python python/experiments/exp_006_zsh_router/train.py --model-key modernbert_base
+#   python/.venv/bin/python python/experiments/exp_006_zsh_router/train.py --model-key modernbert_large
+#   python/.venv/bin/python python/experiments/exp_006_zsh_router/train.py --model-key electra_base
+#   # monitor all running checkpoints live:
+#   python/.venv/bin/python python/experiments/exp_006_zsh_router/monitor.py
+#   # evaluate a finished checkpoint:
+#   python/.venv/bin/python python/experiments/exp_006_zsh_router/evaluate.py \
+#       --adapter checkpoints/exp_006_zsh_router/modernbert_base/best --model-key modernbert_base --tag best_base
+#   # compare all three trained models side-by-side:
+#   python/.venv/bin/python python/experiments/exp_006_zsh_router/evaluate.py --compare-all
+
+# ---------------------------------------------------------------------------
+# Model candidates — select with `train.py --model-key <key>`
+# ---------------------------------------------------------------------------
+models:
+  modernbert_base:
+    name: "answerdotai/ModernBERT-base"
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_target_modules: [Wqkv, o_proj, Wi, Wo]
+    max_seq_len: 384
+    description: "149M bidirectional encoder; fastest ModernBERT variant"
+
+  modernbert_large:
+    name: "answerdotai/ModernBERT-large"
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_target_modules: [Wqkv, o_proj, Wi, Wo]
+    max_seq_len: 384
+    description: "395M bidirectional encoder; most accurate ModernBERT variant"
+
+  electra_base:
+    name: "google/electra-base-discriminator"
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_target_modules: [query, key, value]
+    max_seq_len: 384
+    description: "110M ELECTRA discriminator; alternative architecture for speed comparison"
+
+# ---------------------------------------------------------------------------
+# Shared training hyperparameters
+# ---------------------------------------------------------------------------
+training:
+  num_epochs: 3
+  max_steps: null
+  batch_size: 16
+  gradient_accumulation_steps: 2        # effective batch = 32 → ~1250 steps for 40k examples
+  learning_rate: 2.0e-5                 # encoder backbone
+  head_learning_rate: 1.0e-4            # linear decision head
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  bf16: true
+  seed: 0
+
+# ---------------------------------------------------------------------------
+# Eval / speed
+# ---------------------------------------------------------------------------
+eval:
+  every: 200                            # accuracy eval every N optimizer steps
+  subset: 300
+  speed_every: 1000                     # full speed benchmark every N steps
+  speed_target_ms: 15.0                 # p50 latency goal (ms/decision)
+  max_english_run_rate: 0.005           # threshold selection target on val
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+data:
+  raw_dir: "data/raw/exp_005"           # reuse same downloads as exp_005
+  out_dir: "data/processed"
+  prefix: "zsh_router"                  # → zsh_router_{train,val,test,hand}.jsonl
+  e5_prefix: "shell_router"             # exp_005 prefix — all its texts are banned
+  hand_test: "python/experiments/exp_006_zsh_router/hand_test.tsv"
+  n_train: 40000
+  n_val: 5000
+  n_test: 5000
+  max_per_tool: 800                     # positives per tool
+  common_tools: 40
+  group_prefix: "e6:"                   # prepended to group hash key → different splits from exp_005
+  negative_mix:
+    nl_plain: 0.30
+    nl_cmdlike: 0.20
+    syntax: 0.15
+    typo_cmd: 0.12
+    other_code: 0.08
+    bad_subcmd: 0.06
+    bad_flag: 0.06
+    missing_args: 0.03
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+output:
+  dir: "checkpoints/exp_006_zsh_router"
+  results_dir: "python/experiments/exp_006_zsh_router/results"
+
+wandb:
+  project: "jeff"
+  run_name: "exp_006_zsh_router"
