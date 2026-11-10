@@ -61,7 +61,7 @@ def zsh_parses(text: str) -> bool:
             timeout=5,
             env=_ZSH_ENV,
         )
-    except (subprocess.TimeoutExpired, UnicodeError, ValueError, FileNotFoundError):
+    except (subprocess.TimeoutExpired, UnicodeError, ValueError):
         return False
     return r.returncode == 0
 
