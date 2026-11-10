@@ -1,4 +1,5 @@
 #include <jfsh/builtins/builtins.hh>
+
 // [[ ]] conditional expression evaluator.
 //
 // TODO(cond/unary): Implement unary file/string tests:
@@ -20,4 +21,5 @@
 // [[ is a compound command parsed by par_cond() and executed by exec_cond().
 // The evaluator here receives the WC_COND bytecode stream and returns 0/1.
 
-namespace jfsh { } // namespace jfsh
+namespace jfsh {
+}  // namespace jfsh

@@ -1,4 +1,5 @@
 #include <jfsh/parser/parser.hh>
+
 // Decompiler: convert a CompiledProgram back to source text.
 // Used by `functions` / `typeset -f` to print function bodies.
 //
@@ -23,4 +24,5 @@
 //   Indentation should increase inside compound commands.
 //   String literals come from the strs[] table via WC_STRING indices.
 
-namespace jfsh { } // namespace jfsh
+namespace jfsh {
+}  // namespace jfsh

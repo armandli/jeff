@@ -1,4 +1,5 @@
 #include <jfsh/lexer/lexer.hh>
+
 // Parameter, command, and arithmetic substitution expansion.
 //
 // TODO(subst/param): Implement $var and ${...} expansion.
@@ -38,4 +39,5 @@
 //
 // TODO(subst/glob): Integrate glob_expand after word splitting.
 
-namespace jfsh { } // namespace jfsh
+namespace jfsh {
+}  // namespace jfsh

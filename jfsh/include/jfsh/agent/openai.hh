@@ -1,4 +1,5 @@
-#pragma once
+#ifndef JFSH_AGENT_OPENAI_HH
+#define JFSH_AGENT_OPENAI_HH
 // jfsh/agent/openai.hh — OpenAI chat completion backend.
 //
 // Implements AgentBackend using the OpenAI REST API (POST /v1/chat/completions).
@@ -9,30 +10,27 @@
 
 namespace jfsh {
 
-class OpenAIBackend : public AgentBackend {
-public:
-    explicit OpenAIBackend(ProviderConfig cfg);
+struct OpenAIBackend : AgentBackend {
+  explicit OpenAIBackend(ProviderConfig cfg);
 
-    Result<ChatResponse> chat(const ChatRequest& req) override;
-    Result<ChatResponse> chat_stream(const ChatRequest& req,
-                                     StreamCallback cb) override;
+  Result<ChatResponse> chat(const ChatRequest& req) override;
+  Result<ChatResponse> chat_stream(
+    const ChatRequest& req, StreamCallback cb) override;
+
+protected:
+  std::string         build_body(const ChatRequest& req) const;
+  Result<ChatResponse> parse_response(std::string_view json) const;
+  std::optional<std::string> parse_sse_chunk(std::string_view line) const;
+
+  Result<std::string> http_post(
+    std::string_view url,
+    std::string_view body,
+    std::string_view extra_headers = {}) const;
 
 private:
-    ProviderConfig cfg_;
-
-    // Build the JSON request body.
-    std::string build_body(const ChatRequest& req) const;
-
-    // Parse a non-streaming response JSON.
-    Result<ChatResponse> parse_response(std::string_view json) const;
-
-    // Parse one SSE data line from a streaming response.
-    std::optional<std::string> parse_sse_chunk(std::string_view line) const;
-
-    // HTTP POST with the Authorization: Bearer header.
-    Result<std::string> http_post(std::string_view url,
-                                  std::string_view body,
-                                  std::string_view extra_headers = {}) const;
+  ProviderConfig mCfg;
 };
 
-} // namespace jfsh
+}  // namespace jfsh
+
+#endif  // JFSH_AGENT_OPENAI_HH

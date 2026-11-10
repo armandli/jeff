@@ -1,4 +1,5 @@
 #include <jfsh/glob/glob.hh>
+
 // Extended-glob pattern compiler (requires EXTENDED_GLOB option).
 //
 // TODO(glob/extglob): Implement zsh extended glob operators:
@@ -23,4 +24,5 @@
 //
 // TODO(glob/mark): Implement the MARK_DIRS option — append / to matched dirs.
 
-namespace jfsh { } // namespace jfsh
+namespace jfsh {
+}  // namespace jfsh

@@ -1,4 +1,5 @@
 #include <jfsh/exec/executor.hh>
+
 // REPL loop helpers (interactive prompt-read-execute cycle).
 //
 // TODO(loop/rc): Implement RC file loading sequence (mirrors zsh init.c):
@@ -22,4 +23,5 @@
 // TODO(loop/precmd): Call the precmd hook function (if defined) before each
 //   primary prompt is displayed. Also call preexec before each command.
 
-namespace jfsh { } // namespace jfsh
+namespace jfsh {
+}  // namespace jfsh

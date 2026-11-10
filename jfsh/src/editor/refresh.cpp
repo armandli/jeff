@@ -1,4 +1,5 @@
 #include <jfsh/editor/editor.hh>
+
 // Terminal display refresh — full ZLE-style screen management.
 //
 // TODO(refresh/multiline): Handle prompts and buffers that wrap across terminal
@@ -26,4 +27,5 @@
 //   / highlighters (zsh-syntax-highlighting compatible interface):
 //   color commands, strings, errors, keywords differently.
 
-namespace jfsh { } // namespace jfsh
+namespace jfsh {
+}  // namespace jfsh

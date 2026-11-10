@@ -1,80 +1,65 @@
-#pragma once
+#ifndef JFSH_BUILTINS_BUILTINS_HH
+#define JFSH_BUILTINS_BUILTINS_HH
 // jfsh/builtins/builtins.hh — shell builtin commands.
 //
 // Mirrors zsh's builtin.c / bltins1.c / bltins2.c.
-// Each builtin is a function: (argc, argv, ExecContext&) → exit_code.
+// Each builtin is a function: (argv, ExecContext&) → exit_code.
 
-#include <jfsh/core/types.hh>
-#include <jfsh/core/param.hh>
-#include <jfsh/core/options.hh>
 #include <cstdint>
+
 #include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include <jfsh/core/options.hh>
+#include <jfsh/core/param.hh>
+#include <jfsh/core/types.hh>
+
 namespace jfsh {
 
 struct ExecContext;  // forward — defined in executor.hh
 
-// ---------------------------------------------------------------------------
-// BuiltinFlags — properties of a builtin (mirrors zsh BINF_* constants)
-// ---------------------------------------------------------------------------
 enum BuiltinFlags : std::uint32_t {
-    BINF_NONE      = 0,
-    BINF_SPECIAL   = 1 << 0,  // POSIX special builtin (errors exit script)
-    BINF_ASSIGN    = 1 << 1,  // accepts name=value args (like typeset)
-    BINF_TYPESET   = 1 << 2,  // is a typeset variant
-    BINF_PRINT     = 1 << 3,  // print / echo family
-    BINF_ECHOOPT   = 1 << 4,  // echo with -e / -E options
-    BINF_NOGLOB    = 1 << 5,  // don't glob-expand arguments
-    BINF_PSPECIAL  = 1 << 6,  // pseudo-special (like `export`)
+  BINF_NONE     = 0,
+  BINF_SPECIAL  = 1 << 0,  // POSIX special builtin (errors exit script)
+  BINF_ASSIGN   = 1 << 1,  // accepts name=value args (like typeset)
+  BINF_TYPESET  = 1 << 2,  // is a typeset variant
+  BINF_PRINT    = 1 << 3,  // print / echo family
+  BINF_ECHOOPT  = 1 << 4,  // echo with -e / -E options
+  BINF_NOGLOB   = 1 << 5,  // don't glob-expand arguments
+  BINF_PSPECIAL = 1 << 6,  // pseudo-special (like `export`)
 };
 
-// Builtin function signature.
 using BuiltinFn = std::function<int(std::vector<std::string>&, ExecContext&)>;
 
-// ---------------------------------------------------------------------------
-// BuiltinDef — one registered builtin
-// ---------------------------------------------------------------------------
 struct BuiltinDef {
-    const char*   name;
-    BuiltinFn     fn;
-    std::uint32_t flags;
-    int           min_args = 0;
-    int           max_args = -1;  // -1 = unlimited
+  const char*   name;
+  BuiltinFn     fn;
+  std::uint32_t flags;
+  int           min_args = 0;
+  int           max_args = -1;  // -1 = unlimited
 };
 
-// ---------------------------------------------------------------------------
-// BuiltinTable — registry of all shell builtins
-// ---------------------------------------------------------------------------
-class BuiltinTable {
-public:
-    // Populate with all standard builtins (called once at startup).
-    void register_all();
+struct BuiltinTable {
+  void register_all();
 
-    // Look up by name; returns nullptr if not found.
-    const BuiltinDef* find(std::string_view name) const noexcept;
+  std::optional<std::reference_wrapper<const BuiltinDef>>
+  find(std::string_view name) const noexcept;
 
-    // Register a custom builtin (for modules / testing).
-    void add(BuiltinDef def);
+  void add(BuiltinDef def);
 
-    // Enumerate all builtins (for `builtin -l` / completions).
-    void for_each(std::function<void(const BuiltinDef&)>) const;
+  void for_each(std::function<void(const BuiltinDef&)>) const;
 
 private:
-    HashTable<BuiltinDef> table_;
+  HashTable<BuiltinDef> mTable;
 };
-
-// ---------------------------------------------------------------------------
-// Individual builtin implementations (declared here, defined in builtins.cpp)
-// ---------------------------------------------------------------------------
 
 // POSIX special builtins
 int builtin_break     (std::vector<std::string>&, ExecContext&);
-int builtin_colon     (std::vector<std::string>&, ExecContext&);  // :
+int builtin_colon     (std::vector<std::string>&, ExecContext&);
 int builtin_continue  (std::vector<std::string>&, ExecContext&);
-int builtin_dot       (std::vector<std::string>&, ExecContext&);  // .
+int builtin_dot       (std::vector<std::string>&, ExecContext&);
 int builtin_eval      (std::vector<std::string>&, ExecContext&);
 int builtin_exec      (std::vector<std::string>&, ExecContext&);
 int builtin_exit      (std::vector<std::string>&, ExecContext&);
@@ -128,7 +113,7 @@ int builtin_rehash    (std::vector<std::string>&, ExecContext&);
 int builtin_pwd       (std::vector<std::string>&, ExecContext&);
 int builtin_true      (std::vector<std::string>&, ExecContext&);
 int builtin_false     (std::vector<std::string>&, ExecContext&);
-int builtin_test      (std::vector<std::string>&, ExecContext&);  // [ and test
+int builtin_test      (std::vector<std::string>&, ExecContext&);
 int builtin_ulimit    (std::vector<std::string>&, ExecContext&);
 int builtin_umask     (std::vector<std::string>&, ExecContext&);
 int builtin_zmodload  (std::vector<std::string>&, ExecContext&);
@@ -145,8 +130,8 @@ int builtin_vared     (std::vector<std::string>&, ExecContext&);
 int builtin_zle       (std::vector<std::string>&, ExecContext&);
 int builtin_zpty      (std::vector<std::string>&, ExecContext&);
 int builtin_sched     (std::vector<std::string>&, ExecContext&);
-
-// Arithmetic / conditional helpers
 int builtin_let       (std::vector<std::string>&, ExecContext&);
 
-} // namespace jfsh
+}  // namespace jfsh
+
+#endif  // JFSH_BUILTINS_BUILTINS_HH

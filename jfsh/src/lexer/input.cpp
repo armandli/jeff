@@ -1,59 +1,56 @@
-#include <jfsh/lexer/lexer.hh>
 #include <cstdio>
 #include <string>
 
+#include <jfsh/lexer/lexer.hh>
+
 namespace jfsh {
 
-// ---------------------------------------------------------------------------
-// StringInputSource — lex from an in-memory string
-// ---------------------------------------------------------------------------
-class StringInputSource : public InputSource {
-public:
-    explicit StringInputSource(std::string src, int start_line = 1)
-        : src_(std::move(src)), pos_(0), line_(start_line) {}
+struct StringInputSource : InputSource {
+  explicit StringInputSource(std::string src, int start_line = 1)
+    : mSrc{std::move(src)}, mPos{0}, mLine{start_line} {}
 
-    int next_char() override {
-        if (pos_ >= src_.size()) return -1;
-        int c = static_cast<unsigned char>(src_[pos_++]);
-        if (c == '\n') ++line_;
-        return c;
+  int next_char() override {
+    if (mPos >= mSrc.size()) return -1;
+    int c = static_cast<unsigned char>(mSrc[mPos++]);
+    if (c == '\n') ++mLine;
+    return c;
+  }
+
+  void unget(int c) override {
+    if (mPos > 0) {
+      --mPos;
+      if (c == '\n' and mLine > 1) --mLine;
     }
-    void unget(int c) override {
-        if (pos_ > 0) {
-            --pos_;
-            if (c == '\n' && line_ > 1) --line_;
-        }
-    }
-    int line() const noexcept override { return line_; }
+  }
+
+  int line() const noexcept override { return mLine; }
 
 private:
-    std::string src_;
-    std::size_t pos_;
-    int         line_;
+  std::string mSrc;
+  std::size_t mPos;
+  int         mLine;
 };
 
-// ---------------------------------------------------------------------------
-// FileInputSource — lex from a FILE*
-// ---------------------------------------------------------------------------
-class FileInputSource : public InputSource {
-public:
-    explicit FileInputSource(std::FILE* f, int start_line = 1)
-        : f_(f), line_(start_line) {}
+struct FileInputSource : InputSource {
+  explicit FileInputSource(std::FILE* f, int start_line = 1)
+    : mFile{f}, mLine{start_line} {}
 
-    int next_char() override {
-        int c = std::fgetc(f_);
-        if (c == '\n') ++line_;
-        return c;
-    }
-    void unget(int c) override {
-        std::ungetc(c, f_);
-        if (c == '\n' && line_ > 1) --line_;
-    }
-    int line() const noexcept override { return line_; }
+  int next_char() override {
+    int c = std::fgetc(mFile);
+    if (c == '\n') ++mLine;
+    return c;
+  }
+
+  void unget(int c) override {
+    std::ungetc(c, mFile);
+    if (c == '\n' and mLine > 1) --mLine;
+  }
+
+  int line() const noexcept override { return mLine; }
 
 private:
-    std::FILE* f_;
-    int        line_;
+  std::FILE* mFile;
+  int        mLine;
 };
 
-} // namespace jfsh
+}  // namespace jfsh

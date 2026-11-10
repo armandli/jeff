@@ -1,4 +1,5 @@
 #include <jfsh/builtins/builtins.hh>
+
 // (( )) arithmetic expression evaluator.
 //
 // TODO(math/parser): Implement a Pratt/precedence-climbing parser for
@@ -32,4 +33,5 @@
 // TODO(math/float): When FORCE_FLOAT option is set, use double arithmetic
 //   and expose math functions (sin, cos, sqrt, etc.) via zsh mathfunc module.
 
-namespace jfsh { } // namespace jfsh
+namespace jfsh {
+}  // namespace jfsh

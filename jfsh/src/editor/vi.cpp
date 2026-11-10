@@ -1,4 +1,5 @@
 #include <jfsh/editor/editor.hh>
+
 // Vi-mode command dispatch (normal-mode motions, operators, text objects).
 //
 // TODO(vi/modes): Track vi mode state: INSERT vs NORMAL vs VISUAL vs REPLACE.
@@ -34,4 +35,5 @@
 //
 // TODO(vi/count): Implement numeric prefix counts (3w, 2dd, 10j, etc.).
 
-namespace jfsh { } // namespace jfsh
+namespace jfsh {
+}  // namespace jfsh
