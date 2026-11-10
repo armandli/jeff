@@ -5,6 +5,7 @@
 
 #include <jfsh/agent/agent.hh>
 #include <jfsh/agent/provider.hh>
+#include <jfsh/router/jeff.hh>
 #include <jfsh/router/jev.hh>
 #include <jfsh/core/jobs.hh>
 #include <jfsh/core/options.hh>
@@ -21,19 +22,19 @@
 
 static void print_usage(const char* prog) {
   std::fprintf(stderr,
-      "Usage: %s [-c command] [-s] [-i] [--norouter] [--model DIR] [script [args...]]\n"
+      "Usage: %s [-c command] [-s] [-i] [--norouter] [script [args...]]\n"
       "Options:\n"
-      "  -c CMD        execute CMD and exit\n"
-      "  -s            read commands from stdin\n"
-      "  -i            force interactive mode\n"
-      "  --norouter    disable AI routing (all commands run as shell)\n"
-      "  --model DIR   router model checkpoint directory\n"
+      "  -c CMD              execute CMD and exit\n"
+      "  -s                  read commands from stdin\n"
+      "  -i                  force interactive mode\n"
+      "  --norouter          disable AI routing (all commands run as shell)\n"
+      "  --router R          System 1 router: jeff|jev|heuristic\n"
+      "  --jeff-url URL      jeff-service base URL (default: http://127.0.0.1:8765)\n"
+      "  --typesafe-key K    TypeSafe API key for JEV router\n"
+      "  --jev-model M       JEV model name (default: jev-latest)\n"
       "  --provider P        LLM provider: openai|anthropic|ollama|openrouter\n"
       "  --api-key K         LLM API key\n"
-      "  --llm-model M       LLM model name\n"
-      "  --router R          System 1 router: jeff|jev|heuristic\n"
-      "  --typesafe-key K    TypeSafe API key for JEV router\n"
-      "  --jev-model M       JEV model name (default: jev-latest)\n",
+      "  --llm-model M       LLM model name\n",
       prog);
 }
 
@@ -42,11 +43,11 @@ int main(int argc, char* argv[]) {
   bool        norouter       = false;
   std::string eval_cmd;
   std::string script_path;
-  std::string model_dir;
   std::string provider_name;
   std::string api_key;
   std::string llm_model;
   std::string router_kind;    // "jeff" | "jev" | "heuristic" | ""
+  std::string jeff_url;       // overrides JeffConfig::base_url
   std::string typesafe_key;
   std::string jev_model;
 
@@ -61,8 +62,6 @@ int main(int argc, char* argv[]) {
       interactive = false;
     } else if (arg == "--norouter") {
       norouter = true;
-    } else if (arg == "--model" and i + 1 < argc) {
-      model_dir = argv[++i];
     } else if (arg == "--provider" and i + 1 < argc) {
       provider_name = argv[++i];
     } else if (arg == "--api-key" and i + 1 < argc) {
@@ -71,6 +70,8 @@ int main(int argc, char* argv[]) {
       llm_model = argv[++i];
     } else if (arg == "--router" and i + 1 < argc) {
       router_kind = argv[++i];
+    } else if (arg == "--jeff-url" and i + 1 < argc) {
+      jeff_url = argv[++i];
     } else if (arg == "--typesafe-key" and i + 1 < argc) {
       typesafe_key = argv[++i];
     } else if (arg == "--jev-model" and i + 1 < argc) {
@@ -108,14 +109,14 @@ int main(int argc, char* argv[]) {
   router.set_bypass(norouter);
 
   // Determine which System 1 backend to use.
-  //   --router jeff   → local jeff TorchRouter (requires --model DIR)
-  //   --router jev    → TypeSafe JEV cloud router
-  //   --router heuristic → zsh -n heuristic (default when no model loaded)
-  //   Auto-detect: --typesafe-key → jev; --model → jeff; else heuristic
+  //   --router jeff       → local jeff-service HTTP client (default port 8765)
+  //   --router jev        → TypeSafe JEV cloud API
+  //   --router heuristic  → zsh -n heuristic (no service required)
+  //   Auto-detect: --typesafe-key → jev; --jeff-url → jeff; else heuristic
   bool use_jev  = (router_kind == "jev") or
                   (router_kind.empty() and not typesafe_key.empty());
   bool use_jeff = (router_kind == "jeff") or
-                  (router_kind.empty() and not model_dir.empty() and not use_jev);
+                  (router_kind.empty() and not jeff_url.empty() and not use_jev);
 
   if (use_jev) {
     jfsh::JevConfig jev_cfg = jfsh::JevConfig::from_env();
@@ -123,7 +124,9 @@ int main(int argc, char* argv[]) {
     if (not jev_model.empty())    jev_cfg.model   = jev_model;
     router.load_jev(std::move(jev_cfg));
   } else if (use_jeff) {
-    router.load_model(model_dir);
+    jfsh::JeffConfig jeff_cfg;
+    if (not jeff_url.empty()) jeff_cfg.base_url = jeff_url;
+    router.load_jeff(std::move(jeff_cfg));
   }
 
   jfsh::ProviderConfig provider_cfg = jfsh::ProviderConfig::from_env();

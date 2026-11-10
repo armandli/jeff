@@ -6,17 +6,17 @@
 //   RUN   → execute normally as a shell command
 //   AGENT → forward to the configured LLM agent
 //
-// When JFSH_USE_TORCH is not set, the router falls back to a heuristic
-// (unparseable lines → AGENT, everything else → RUN).
+// Three backends, selected at startup:
+//   HeuristicRouter — zsh -n syntax check (default, no service required)
+//   JeffRouter      — local jeff HTTP service (127.0.0.1:8765)
+//   JevRouter       — TypeSafe JEV cloud API (api.typesafe.ai)
 
 #include <cstdint>
 
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 
-#include <jfsh/core/options.hh>
 #include <jfsh/core/types.hh>
 
 namespace jfsh {
@@ -37,13 +37,19 @@ struct RouterDecision {
 
 struct RouterModel {
   virtual ~RouterModel() = default;
-  virtual RouterDecision  classify(std::string_view line) = 0;
+  virtual RouterDecision   classify(std::string_view line) = 0;
   virtual std::string_view name() const noexcept = 0;
 };
 
 struct HeuristicRouter : RouterModel {
-  RouterDecision  classify(std::string_view line) override;
+  RouterDecision   classify(std::string_view line) override;
   std::string_view name() const noexcept override { return "heuristic"; }
+};
+
+// Configuration for the local jeff HTTP service (jeff-service binary).
+struct JeffConfig {
+  std::string   base_url   = "http://127.0.0.1:8765";
+  std::uint32_t timeout_ms = 1000;  // local — fast timeout
 };
 
 // Configuration for the JEV cloud router (api.typesafe.ai).
@@ -56,23 +62,6 @@ struct JevConfig {
   static JevConfig from_env();  // reads TYPESAFE_API_KEY
 };
 
-#ifdef JFSH_USE_TORCH
-struct TorchRouter : RouterModel {
-  static std::unique_ptr<TorchRouter> load(std::string model_dir);
-
-  RouterDecision  classify(std::string_view line) override;
-  std::string_view name() const noexcept override { return mName; }
-
-protected:
-  struct Impl;
-  explicit TorchRouter(std::unique_ptr<Impl> impl, std::string name);
-
-private:
-  std::unique_ptr<Impl> mImpl;
-  std::string           mName;
-};
-#endif
-
 struct Router {
   Router();
 
@@ -81,7 +70,7 @@ struct Router {
   void set_bypass(bool on)  noexcept { mBypass = on; }
   bool is_bypass()    const noexcept { return mBypass; }
 
-  void load_model(std::string checkpoint_dir);
+  void load_jeff(JeffConfig cfg);
   void load_jev(JevConfig cfg);
 
   void set_threshold(float t) noexcept { mThreshold = t; }

@@ -52,5 +52,16 @@ else()
   message(STATUS "jfsh: TorchScript router disabled (subprocess mode only)")
 endif()
 
+# ---- cpp-httplib (single-header HTTP server for jeff-service) ---------------
+FetchContent_Declare(cpp_httplib
+  GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+  GIT_TAG        v0.18.5
+  GIT_SHALLOW    TRUE
+)
+# Header-only mode — avoids a separate compilation unit in consumer targets.
+set(HTTPLIB_HEADER_ONLY ON  CACHE BOOL "" FORCE)
+set(HTTPLIB_COMPILE     OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(cpp_httplib)
+
 # ---- threads (async agent calls) --------------------------------------------
 find_package(Threads REQUIRED)
