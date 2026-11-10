@@ -153,9 +153,11 @@ target_link_libraries(jfsh_modules PUBLIC jfsh_core ${CMAKE_DL_LIBS} jfsh_compil
 # ---------------------------------------------------------------------------
 add_library(jfsh_router STATIC
   src/router/router.cpp
+  src/router/jev.cpp
 )
 target_include_directories(jfsh_router PUBLIC include)
-target_link_libraries(jfsh_router PUBLIC jfsh_core jfsh_dep_torch jfsh_compiler_options)
+target_link_libraries(jfsh_router PUBLIC
+  jfsh_core jfsh_dep_curl jfsh_dep_torch jfsh_compiler_options)
 
 # ---------------------------------------------------------------------------
 # jfsh_agent — LLM provider abstraction + per-provider HTTP clients.

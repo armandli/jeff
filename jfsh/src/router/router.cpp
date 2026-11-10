@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include <jfsh/router/jev.hh>
 #include <jfsh/router/router.hh>
 
 namespace jfsh {
@@ -32,6 +33,10 @@ RouterDecision Router::classify(std::string_view line) {
   if (decision.confidence < mThreshold)
     return {RouterVerdict::Run, decision.confidence, decision.model_name};
   return decision;
+}
+
+void Router::load_jev(JevConfig cfg) {
+  mModel = std::make_unique<JevRouter>(std::move(cfg));
 }
 
 void Router::load_model(std::string checkpoint_dir) {

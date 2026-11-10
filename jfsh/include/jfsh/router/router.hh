@@ -46,6 +46,16 @@ struct HeuristicRouter : RouterModel {
   std::string_view name() const noexcept override { return "heuristic"; }
 };
 
+// Configuration for the JEV cloud router (api.typesafe.ai).
+struct JevConfig {
+  std::string   api_key;
+  std::string   model      = "jev-latest";
+  std::string   base_url   = "https://api.typesafe.ai";
+  std::uint32_t timeout_ms = 10000;
+
+  static JevConfig from_env();  // reads TYPESAFE_API_KEY
+};
+
 #ifdef JFSH_USE_TORCH
 struct TorchRouter : RouterModel {
   static std::unique_ptr<TorchRouter> load(std::string model_dir);
@@ -72,6 +82,7 @@ struct Router {
   bool is_bypass()    const noexcept { return mBypass; }
 
   void load_model(std::string checkpoint_dir);
+  void load_jev(JevConfig cfg);
 
   void set_threshold(float t) noexcept { mThreshold = t; }
 

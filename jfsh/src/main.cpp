@@ -5,6 +5,7 @@
 
 #include <jfsh/agent/agent.hh>
 #include <jfsh/agent/provider.hh>
+#include <jfsh/router/jev.hh>
 #include <jfsh/core/jobs.hh>
 #include <jfsh/core/options.hh>
 #include <jfsh/core/param.hh>
@@ -27,21 +28,27 @@ static void print_usage(const char* prog) {
       "  -i            force interactive mode\n"
       "  --norouter    disable AI routing (all commands run as shell)\n"
       "  --model DIR   router model checkpoint directory\n"
-      "  --provider P  LLM provider: openai|anthropic|ollama|openrouter\n"
-      "  --api-key K   LLM API key\n"
-      "  --llm-model M LLM model name\n",
+      "  --provider P        LLM provider: openai|anthropic|ollama|openrouter\n"
+      "  --api-key K         LLM API key\n"
+      "  --llm-model M       LLM model name\n"
+      "  --router R          System 1 router: jeff|jev|heuristic\n"
+      "  --typesafe-key K    TypeSafe API key for JEV router\n"
+      "  --jev-model M       JEV model name (default: jev-latest)\n",
       prog);
 }
 
 int main(int argc, char* argv[]) {
-  bool        interactive  = isatty(STDIN_FILENO) and isatty(STDOUT_FILENO);
-  bool        norouter     = false;
+  bool        interactive    = isatty(STDIN_FILENO) and isatty(STDOUT_FILENO);
+  bool        norouter       = false;
   std::string eval_cmd;
   std::string script_path;
   std::string model_dir;
   std::string provider_name;
   std::string api_key;
   std::string llm_model;
+  std::string router_kind;    // "jeff" | "jev" | "heuristic" | ""
+  std::string typesafe_key;
+  std::string jev_model;
 
   for (int i = 1; i < argc; ++i) {
     std::string_view arg(argv[i]);
@@ -62,6 +69,12 @@ int main(int argc, char* argv[]) {
       api_key = argv[++i];
     } else if (arg == "--llm-model" and i + 1 < argc) {
       llm_model = argv[++i];
+    } else if (arg == "--router" and i + 1 < argc) {
+      router_kind = argv[++i];
+    } else if (arg == "--typesafe-key" and i + 1 < argc) {
+      typesafe_key = argv[++i];
+    } else if (arg == "--jev-model" and i + 1 < argc) {
+      jev_model = argv[++i];
     } else if (arg == "--help" or arg == "-h") {
       print_usage(argv[0]);
       return 0;
@@ -93,7 +106,25 @@ int main(int argc, char* argv[]) {
 
   jfsh::Router router;
   router.set_bypass(norouter);
-  if (not model_dir.empty()) router.load_model(model_dir);
+
+  // Determine which System 1 backend to use.
+  //   --router jeff   → local jeff TorchRouter (requires --model DIR)
+  //   --router jev    → TypeSafe JEV cloud router
+  //   --router heuristic → zsh -n heuristic (default when no model loaded)
+  //   Auto-detect: --typesafe-key → jev; --model → jeff; else heuristic
+  bool use_jev  = (router_kind == "jev") or
+                  (router_kind.empty() and not typesafe_key.empty());
+  bool use_jeff = (router_kind == "jeff") or
+                  (router_kind.empty() and not model_dir.empty() and not use_jev);
+
+  if (use_jev) {
+    jfsh::JevConfig jev_cfg = jfsh::JevConfig::from_env();
+    if (not typesafe_key.empty()) jev_cfg.api_key = typesafe_key;
+    if (not jev_model.empty())    jev_cfg.model   = jev_model;
+    router.load_jev(std::move(jev_cfg));
+  } else if (use_jeff) {
+    router.load_model(model_dir);
+  }
 
   jfsh::ProviderConfig provider_cfg = jfsh::ProviderConfig::from_env();
   if (not provider_name.empty()) {
