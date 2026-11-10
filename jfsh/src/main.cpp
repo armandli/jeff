@@ -29,7 +29,7 @@ static void print_usage(const char* prog) {
       "  -i                  force interactive mode\n"
       "  --norouter          disable AI routing (all commands run as shell)\n"
       "  --router R          System 1 router: jeff|jev|heuristic\n"
-      "  --jeff-url URL      jeff-service base URL (default: http://127.0.0.1:8765)\n"
+      "  --jeff-url URL      jeff-server base URL (default: http://127.0.0.1:8765)\n"
       "  --typesafe-key K    TypeSafe API key for JEV router\n"
       "  --jev-model M       JEV model name (default: jev-latest)\n"
       "  --provider P        LLM provider: openai|anthropic|ollama|openrouter\n"
@@ -109,7 +109,7 @@ int main(int argc, char* argv[]) {
   router.set_bypass(norouter);
 
   // Determine which System 1 backend to use.
-  //   --router jeff       → local jeff-service HTTP client (default port 8765)
+  //   --router jeff       → local jeff-server HTTP client (default port 8765)
   //   --router jev        → TypeSafe JEV cloud API
   //   --router heuristic  → zsh -n heuristic (no service required)
   //   Auto-detect: --typesafe-key → jev; --jeff-url → jeff; else heuristic

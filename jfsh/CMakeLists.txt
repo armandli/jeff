@@ -160,6 +160,7 @@ target_include_directories(jfsh_router PUBLIC include)
 target_link_libraries(jfsh_router PUBLIC
   jfsh_core jfsh_dep_curl jfsh_compiler_options)
 
+
 # ---------------------------------------------------------------------------
 # jfsh_agent — LLM provider abstraction + per-provider HTTP clients.
 #              Providers: OpenAI, Anthropic, Ollama, OpenRouter.
@@ -193,31 +194,6 @@ target_link_libraries(jfsh PRIVATE
 install(TARGETS jfsh DESTINATION bin)
 
 # ---------------------------------------------------------------------------
-# jeff-service — System 1 HTTP inference service (wraps jeff TorchScript model)
-#
-# Build:  cmake -DJFSH_BUILD_SERVICE=ON -DJFSH_USE_TORCH=ON ..
-# Run:    jeff-service --model <checkpoint_dir> [--host 127.0.0.1] [--port 8765]
-# ---------------------------------------------------------------------------
-option(JFSH_BUILD_SERVICE "Build jeff-service HTTP inference server" OFF)
-if(JFSH_BUILD_SERVICE)
-  if(NOT JFSH_USE_TORCH)
-    message(FATAL_ERROR
-      "jeff-service requires libtorch: re-run cmake with -DJFSH_USE_TORCH=ON")
-  endif()
-  add_executable(jeff-service service/main.cpp)
-  target_include_directories(jeff-service PRIVATE include)
-  target_link_libraries(jeff-service PRIVATE
-    jfsh_core
-    jfsh_dep_torch
-    httplib::httplib
-    nlohmann_json::nlohmann_json
-    jfsh_compiler_options
-  )
-  install(TARGETS jeff-service DESTINATION bin)
-  message(STATUS "jfsh: jeff-service enabled")
-endif()
-
-# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 option(JFSH_BUILD_TESTS "Build jfsh unit tests" ON)
@@ -233,5 +209,5 @@ message(STATUS "")
 message(STATUS "  jfsh ${PROJECT_VERSION}")
 message(STATUS "  C++ standard  : ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Build type    : ${CMAKE_BUILD_TYPE}")
-message(STATUS "  jeff-service  : ${JFSH_BUILD_SERVICE}")
+message(STATUS "  jeff router   : connects to jeff-server (127.0.0.1:8765)")
 message(STATUS "")

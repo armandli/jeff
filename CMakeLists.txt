@@ -16,8 +16,29 @@ endif()
 
 find_package(Torch REQUIRED HINTS "${TORCH_DIR}")
 
+include(FetchContent)
+
+# ---- nlohmann/json ----------------------------------------------------------
+FetchContent_Declare(nlohmann_json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG        v3.11.3
+  GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
+# ---- cpp-httplib (single-header HTTP server for jeff-server) ----------------
+FetchContent_Declare(cpp_httplib
+  GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+  GIT_TAG        v0.18.5
+  GIT_SHALLOW    TRUE
+)
+set(HTTPLIB_HEADER_ONLY ON  CACHE BOOL "" FORCE)
+set(HTTPLIB_COMPILE     OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(cpp_httplib)
+
 include(cmake/CompilerOptions.cmake)
 
 add_subdirectory(src/inference)
 add_subdirectory(src/mcp)
 add_subdirectory(src/cli)
+add_subdirectory(server)

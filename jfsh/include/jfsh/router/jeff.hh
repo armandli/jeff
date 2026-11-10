@@ -1,12 +1,12 @@
 #ifndef JFSH_ROUTER_JEFF_HH
 #define JFSH_ROUTER_JEFF_HH
-// jfsh/router/jeff.hh — System 1 router backed by the local jeff-service.
+// jfsh/router/jeff.hh — System 1 router backed by the local jeff-server.
 //
-// Sends every candidate line to POST /classify on the running jeff-service
+// Sends every candidate line to POST /classify on the running jeff-server
 // binary (127.0.0.1:8765 by default). Falls back to HeuristicRouter on any
 // connection error so the shell remains usable when the service is not running.
 //
-// Start the service:  jeff-service --model <checkpoint_dir>
+// Start the service:  jeff-server --model <checkpoint_dir>
 
 #include <string>
 #include <string_view>

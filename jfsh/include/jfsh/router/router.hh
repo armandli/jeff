@@ -46,7 +46,7 @@ struct HeuristicRouter : RouterModel {
   std::string_view name() const noexcept override { return "heuristic"; }
 };
 
-// Configuration for the local jeff HTTP service (jeff-service binary).
+// Configuration for the local jeff HTTP service (jeff-server binary).
 struct JeffConfig {
   std::string   base_url   = "http://127.0.0.1:8765";
   std::uint32_t timeout_ms = 1000;  // local — fast timeout
