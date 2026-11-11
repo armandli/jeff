@@ -3,6 +3,7 @@
 #   make                 build Release into build/release
 #   make debug           build Debug (with AddressSanitizer) into build/debug
 #   make routers         build only bash_router and zsh_router
+#   make test            build and run the C++ unit tests (tests/, GoogleTest)
 #   make bash_router ARGS="ls -la"   build, then run a binary with ARGS
 #   make help            list every target and variable
 #
@@ -43,10 +44,11 @@ endif
 
 BINARIES := jeff jeff-serve bash_router zsh_router
 CACHE    := $(BUILD_DIR)/CMakeCache.txt
-CMAKE_SOURCES := CMakeLists.txt $(wildcard cmake/*.cmake) $(wildcard src/*/CMakeLists.txt)
+CMAKE_SOURCES := CMakeLists.txt $(wildcard cmake/*.cmake) $(wildcard src/*/CMakeLists.txt) \
+                 $(wildcard tests/CMakeLists.txt)
 
 .DEFAULT_GOAL := all
-.PHONY: all build release debug configure reconfigure routers $(BINARIES) \
+.PHONY: all build release debug configure reconfigure routers test $(BINARIES) \
         compile-commands clean distclean rebuild info help
 
 all: build
@@ -80,6 +82,10 @@ debug:
 
 routers: $(CACHE)
 	$(CMAKE) --build $(BUILD_DIR) -j $(JOBS) --target bash_router zsh_router
+
+# Builds everything (the test binaries need the libraries anyway), then runs ctest.
+test: build
+	ctest --test-dir $(BUILD_DIR) --output-on-failure -j $(JOBS)
 
 # `make <binary>` builds that one target; with ARGS set it also runs it.
 $(BINARIES): $(CACHE)
@@ -116,6 +122,7 @@ help:
 	@echo "  configure         run the CMake configure step only"
 	@echo "  reconfigure       drop CMakeCache.txt and configure again"
 	@echo "  routers           build bash_router and zsh_router only"
+	@echo "  test              build, then run the C++ unit tests with ctest"
 	@echo "  <binary>          build one of: $(BINARIES)"
 	@echo "                    with ARGS=\"...\" it also runs it, e.g."
 	@echo "                    make bash_router ARGS=\"ls -la\""
