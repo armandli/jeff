@@ -1008,6 +1008,53 @@ struct ToolResult {
 };
 ```
 
+### H4 — Namespace-scope variables: `UPPER_SNAKE_CASE` constants, `UpperCamelCase` mutables
+
+```cpp
+// BEFORE
+namespace jfsh {
+namespace {
+constexpr double kLambda = 0.95;
+const SigEntry kSigNames[] = {{"INT", SIGINT}, {"TERM", SIGTERM}};
+const char* default_prompt = "%~ %# ";
+std::unordered_map<std::string, int> name_map;
+}  // namespace
+
+int lookup(std::string_view name) {
+  constexpr std::string_view kPrefix = "SIG";  // function-local: not renamed
+  // ... uses kLambda, kSigNames, default_prompt, name_map
+}
+}  // namespace jfsh
+
+// AFTER
+namespace jfsh {
+namespace {
+constexpr double LAMBDA = 0.95;
+const SigEntry SIG_NAMES[] = {{"INT", SIGINT}, {"TERM", SIGTERM}};
+const char* DefaultPrompt = "%~ %# ";  // pointer is mutable, so not a constant
+std::unordered_map<std::string, int> NameMap;
+}  // namespace
+
+int lookup(std::string_view name) {
+  constexpr std::string_view kPrefix = "SIG";
+  // ... uses LAMBDA, SIG_NAMES, DefaultPrompt, NameMap
+}
+}  // namespace jfsh
+```
+
+**Across translation units — rename the `extern` declaration and every use:**
+```cpp
+// options.h, BEFORE                      // options.h, AFTER
+extern const OptionInfo kOptionInfo[];    extern const OptionInfo OPTION_INFO[];
+// options.cpp and every file that uses it are updated to OPTION_INFO as well.
+```
+
+**Exception — skip a rename that collides with a macro:**
+```cpp
+// Keep as-is: renaming to EOF would be replaced by the <cstdio> macro.
+constexpr int kEof = -1;
+```
+
 **Exception — static members keep their convention:**
 ```cpp
 struct Registry {

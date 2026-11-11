@@ -227,6 +227,34 @@ Unlike H2, abbreviations after the `m` are capitalized like ordinary words rathe
 
 When applying this rule, update every reference to the renamed member — in particular constructor member-initializer lists, in-class default initializers, and any place the old name appears inside the type's own methods. Because the members are private or protected, all references are within the type itself or its derived types, so the rename is contained; if a member turns out to be reachable from outside (a friend declaration, a macro), skip it and note it.
 
+**H4 — Namespace-scope variables: `UPPER_SNAKE_CASE` constants, `UpperCamelCase` mutables.** A variable declared at namespace scope (the global namespace, a named or anonymous namespace, or file-`static`) is named by whether the variable itself is constant:
+- **Constant** (`constexpr`, or the object itself is `const`): all capital letters, words separated by `_`. No `k` prefix, no lowercase.
+- **Non-constant** global object: `UpperCamelCase`, like a type name (H2), with no separator characters.
+
+```cpp
+constexpr double LAMBDA = 0.95;                    // yes
+const std::size_t MAX_RETRY_COUNT = 3;             // yes
+constexpr std::string_view DATA_PREFIX = "data:";  // yes
+static const SigEntry SIG_NAMES[] = {/* ... */};   // yes
+std::unordered_map<std::string, int> NameMap;      // yes
+std::atomic<bool> InterruptRequested{false};       // yes
+
+constexpr double kLambda = 0.95;                   // no: k prefix
+const std::size_t max_retry_count = 3;             // no: lowercase
+std::unordered_map<std::string, int> name_map;     // no: snake case for a mutable
+std::unordered_map<std::string, int> NAME_MAP;     // no: caps are for constants only
+```
+
+Constness is about the variable, not what it points to: `const char* Greeting = "hi";` is a mutable pointer, so it is `UpperCamelCase`; `const char* const GREETING` and `constexpr const char* GREETING` are constants.
+
+**Exceptions — do NOT rename:**
+- Function-local variables, including `static` locals and local `constexpr` constants (`constexpr std::string_view kPrefix` inside a function body stays as-is). This rule covers namespace scope only.
+- Static data members, which follow H3's exception.
+- `extern "C"` variables, names required by a library or ABI (`environ`, `optarg`), and variables in code you do not own.
+- A rename whose new name collides with a macro (`EOF`, `PATH_MAX`, `SIGINT`), a type, or another identifier in scope. Skip it and note the collision.
+
+When applying this rule, update every use, including `extern` declarations in headers and uses in other translation units. Grep the whole project for the old name, not just the current file.
+
 ### Group I: Comments
 
 **I1 — Delete comments the code already says.** Assume a reader who fully understands C++ syntax and the standard library. If that reader would learn nothing from the comment, remove it. Deletion is the default disposition: a comment survives only by falling under I2 or the exceptions below.
