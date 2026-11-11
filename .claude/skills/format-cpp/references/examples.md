@@ -487,6 +487,82 @@ enum OldStyle { A, B, C };
 enum OldStyle : int { A, B, C };
 ```
 
+### E7 — `inline` only where linkage requires it
+
+**Redundant — removed:**
+```cpp
+// BEFORE (in a header)
+struct Counter {
+  inline int value() const { return mValue; }       // defined in the body: already inline
+  static constexpr inline int kMax = 100;           // static constexpr member: already inline (C++17)
+
+private:
+  int mValue = 0;
+};
+
+inline constexpr int clamp_count(int n) {           // constexpr function: already inline
+  return n > Counter::kMax ? Counter::kMax : n;
+}
+
+template<typename T>
+inline T twice(T v) { return v + v; }               // template: already exempt
+
+// AFTER
+struct Counter {
+  int value() const { return mValue; }
+  static constexpr int kMax = 100;
+
+private:
+  int mValue = 0;
+};
+
+constexpr int clamp_count(int n) {
+  return n > Counter::kMax ? Counter::kMax : n;
+}
+
+template<typename T>
+T twice(T v) { return v + v; }
+```
+
+**In a `.cpp` file — removed, and file-local helpers moved to an anonymous namespace:**
+```cpp
+// BEFORE (parser.cpp; is_digit is not declared in any header)
+inline bool is_digit(char c) { return c >= '0' and c <= '9'; }
+
+// AFTER
+namespace {
+
+bool is_digit(char c) { return c >= '0' and c <= '9'; }
+
+}  // namespace
+```
+
+**Required — kept:**
+```cpp
+// router_common.h, included by several .cpp files
+inline std::string shell_quote(std::string_view s) {       // non-template function defined in a header
+  return "'" + std::string(s) + "'";
+}
+
+inline int gRequestCount = 0;                              // header-defined variable (C++17)
+
+struct Path {
+  std::string str() const;
+
+private:
+  std::string mText;
+};
+inline std::string Path::str() const { return mText; }     // out-of-class member definition in a header
+
+template<typename T> std::string describe(const T&);
+template<> inline std::string describe(const int& v) {     // explicit specialization in a header
+  return "int " + std::to_string(v);
+}
+```
+
+Dropping any of these makes the second `.cpp` file that includes the header fail to link with
+"multiple definition of ...". Adding `inline` to make code faster is never a reason to keep it.
+
 ---
 
 ## Group F: Formatting

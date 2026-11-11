@@ -1,6 +1,6 @@
 ---
 name: format-cpp
-description: Formats C++ code according to 32 specific style rules covering whitespace, braces, preprocessor directives, namespaces, types, formatting, semantic transformations, naming conventions, and comments. Use when user asks to "format my C++ code", "apply C++ style rules", "clean up this C++ file", or "run format-cpp on X". Run refactor-cpp before this skill. Do NOT use for explaining C++ code, debugging, or writing new C++ code from scratch.
+description: Formats C++ code according to 33 specific style rules covering whitespace, braces, preprocessor directives, namespaces, types, formatting, semantic transformations, naming conventions, and comments. Use when user asks to "format my C++ code", "apply C++ style rules", "clean up this C++ file", or "run format-cpp on X". Run refactor-cpp before this skill. Do NOT use for explaining C++ code, debugging, or writing new C++ code from scratch.
 argument-hint: "[file or directory path]"
 ---
 
@@ -116,9 +116,14 @@ template<typename T>   // yes
 template<class T>      // no
 ```
 
-**E5 — Inline small methods.** Methods with 3 or fewer statements should be defined inline in the struct/class body. Move longer methods out-of-line.
+**E5 — Inline small methods.** Methods with 3 or fewer statements should be defined inline in the struct/class body. Move longer methods out-of-line. A method defined in the body is implicitly inline: do not write the `inline` keyword (E7).
 
 **E6 — Enum underlying type.** Every `enum class`, `enum struct`, and plain `enum` declaration must include an explicit underlying fundamental type. If none is specified, add `: int` as the default. Only use a type other than `int` when the enum values demonstrably require it (e.g., a flags enum needing more than 32 bits uses `: uint64_t`, an enum that must fit in a byte uses `: uint8_t`). If the declaration already has an explicit underlying type, leave it unchanged.
+
+**E7 — `inline` only where linkage requires it.** `inline` means "this definition may appear in several translation units", not "make this faster": compilers inline whatever their heuristics choose, with or without the keyword. Never add it as a performance hint.
+- **Remove** it where it is redundant: member functions defined inside the class body, `constexpr`/`consteval` functions, function templates, and `static constexpr` data members (C++17) are already inline.
+- **Remove** it from functions defined in a `.cpp` file. If such a function is used only in that file and is not declared in any header, also move it into an anonymous namespace (or make it `static`).
+- **Keep** it on non-template functions and variables defined in a header, on member functions defined outside the class body but still in a header, and on explicit specializations of function templates defined in a header. Removing it there causes "multiple definition" link errors as soon as two `.cpp` files include the header.
 
 ### Group F: Formatting
 
@@ -281,6 +286,7 @@ void MemoryTool::rewrite(std::string_view notes);
 - **Template-heavy code**: Be extra cautious with G1 and G3 in heavily templated code; prefer skipping over breaking
 - **C++17 required**: Rules D3, G1, and G3 require C++17 or later. If the standard cannot be detected, ask the user before applying these rules
 - **Never break compilation**: If applying a rule would introduce a compile error, skip it
+- **`inline` in a `.cpp` file (E7)**: Only move a function into an anonymous namespace when no header declares it and no other file refers to it; if you cannot check every file, just drop the keyword
 - **Callers out of reach (G4)**: If a function with an in-out parameter is called from code you cannot see or update (a public library API, other repositories), skip it and note it in the report rather than breaking those callers
 - **Comment uncertainty**: If you cannot tell whether a comment carries information the code doesn't, keep it. A comment kept in error costs a line; one deleted in error destroys the only record of a decision
 
