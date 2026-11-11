@@ -78,11 +78,11 @@ int main(int argc, char* argv[]) {
     if (a.verbose)
         std::cerr << "=== command ===\n" << cmd << "\n\n";
 
-    std::string json = router::run_infer(cmd);
-    if (json.empty()) return 1;
+    auto json = router::run_infer(cmd);
+    if (!json) return 1;
 
-    int critical = router::json_bool(json, "critical");
-    router::print_result(a.text, json, "bash -n:    ",
+    int critical = router::json_bool(*json, "critical");
+    router::print_result(a.text, *json, "bash -n:    ",
         {{"Critical:   ", critical == 1 ? "YES (guard forces AGENT)" : critical == 0 ? "no" : "skipped"}});
     return 0;
 }

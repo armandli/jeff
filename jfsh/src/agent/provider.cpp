@@ -1,5 +1,7 @@
 #include <cstdlib>
 
+#include <json.hpp>
+
 #include <jfsh/agent/provider.hh>
 
 namespace jfsh {
@@ -68,6 +70,15 @@ ProviderConfig ProviderConfig::default_ollama(std::string model) {
 }
 ProviderConfig ProviderConfig::default_openrouter(std::string model) {
   ProviderConfig c; c.kind = ProviderKind::OpenRouter; c.model = std::move(model); return c;
+}
+
+std::optional<std::string> api_error_message(const jeff::json::Value& response) {
+  const jeff::json::Value* err = response.find("error");
+  if (not err or err->is_null()) return std::nullopt;
+  if (const std::string* s = err->as_string()) return *s;
+  if (const jeff::json::Value* msg = err->find("message"))
+    if (const std::string* s = msg->as_string()) return *s;
+  return err->dump();
 }
 
 }  // namespace jfsh

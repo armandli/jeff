@@ -1,6 +1,6 @@
-#include <sstream>
-
 #include <curl/curl.h>
+
+#include <json.hpp>
 
 #include <jfsh/agent/anthropic.hh>
 
@@ -15,41 +15,24 @@ static std::size_t curl_write_anthropic(char* ptr, std::size_t, std::size_t nmem
 AnthropicBackend::AnthropicBackend(ProviderConfig cfg) : mCfg(std::move(cfg)) {}
 
 std::string AnthropicBackend::build_body(const ChatRequest& req) const {
-  std::string system_text;
-  std::string body = "{\"model\":\"" + req.config.model + "\",";
-  body += "\"max_tokens\":" + std::to_string(req.config.params.max_tokens) + ",";
-  std::vector<const Message*> chat_msgs;
-  for (const auto& m : req.messages) {
+  std::string_view system_text;
+  for (const auto& m : req.messages)
     if (m.role == Role::System) system_text = m.content;
-    else chat_msgs.push_back(&m);
+
+  jeff::json::Writer w;
+  w.begin_object()
+      .field("model",      req.config.model)
+      .field("max_tokens", req.config.params.max_tokens);
+  if (not system_text.empty()) w.field("system", system_text);
+  if (req.stream)              w.field("stream", true);
+  w.key("messages").begin_array();
+  for (const auto& m : req.messages) {
+    if (m.role == Role::System) continue;
+    const char* role = m.role == Role::Assistant ? "assistant" : "user";
+    w.begin_object().field("role", role).field("content", m.content).end_object();
   }
-  if (not system_text.empty()) {
-    body += "\"system\":\"";
-    for (char c : system_text) {
-      if (c == '"') body += "\\\"";
-      else if (c == '\\') body += "\\\\";
-      else if (c == '\n') body += "\\n";
-      else body += c;
-    }
-    body += "\",";
-  }
-  if (req.stream) body += "\"stream\":true,";
-  body += "\"messages\":[";
-  for (std::size_t i = 0; i < chat_msgs.size(); ++i) {
-    if (i) body += ",";
-    const char* role =
-        chat_msgs[i]->role == Role::Assistant ? "assistant" : "user";
-    body += "{\"role\":\"" + std::string(role) + "\",\"content\":\"";
-    for (char c : chat_msgs[i]->content) {
-      if (c == '"') body += "\\\"";
-      else if (c == '\\') body += "\\\\";
-      else if (c == '\n') body += "\\n";
-      else body += c;
-    }
-    body += "\"}";
-  }
-  body += "]}";
-  return body;
+  w.end_array().end_object();
+  return w.str();
 }
 
 Result<std::string> AnthropicBackend::http_post(std::string_view url,
@@ -67,7 +50,9 @@ Result<std::string> AnthropicBackend::http_post(std::string_view url,
   hdrs = curl_slist_append(hdrs, av.c_str());
 
   curl_easy_setopt(curl, CURLOPT_URL,           std::string(url).c_str());
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    std::string(body).c_str());
+  // POSTFIELDS is not copied by curl; body outlives curl_easy_perform below.
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    body.data());
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER,    hdrs);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_anthropic);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &resp);
@@ -84,27 +69,41 @@ Result<std::string> AnthropicBackend::http_post(std::string_view url,
 }
 
 Result<ChatResponse> AnthropicBackend::parse_response(std::string_view json) const {
+  // {"content":[{"type":"text","text":"..."},...],"stop_reason":"end_turn",
+  //  "usage":{"input_tokens":N,"output_tokens":M}}
+  auto parsed = jeff::json::parse(json);
+  if (not parsed)
+    return std::unexpected(ShellError{
+        ErrorKind::AgentError, "invalid response: " + parsed.error});
+  if (auto err = api_error_message(parsed.value))
+    return std::unexpected(ShellError{ErrorKind::AgentError, *err});
+
+  const jeff::json::Value* blocks = parsed.value.find("content");
+  if (not blocks or not blocks->is_array())
+    return std::unexpected(ShellError{ErrorKind::AgentError, "no content in response"});
+
   ChatResponse r;
-  // Anthropic response: {"content":[{"type":"text","text":"..."}]}
-  auto pos = json.find("\"text\":\"");
-  if (pos == std::string_view::npos)
-    return std::unexpected(ShellError{ErrorKind::AgentError, "no text in response"});
-  pos += 8;
-  for (; pos < json.size() and json[pos] != '"'; ++pos) {
-    if (json[pos] == '\\' and pos + 1 < json.size()) {
-      char esc = json[++pos];
-      if (esc == 'n') r.content += '\n';
-      else r.content += esc;
-    } else {
-      r.content += json[pos];
-    }
+  for (const auto& block : *blocks->as_array())
+    if (block.get_string("type") == "text") r.content += block.get_string("text");
+  r.finish_reason = parsed.value.get_string("stop_reason");
+  if (const jeff::json::Value* usage = parsed.value.find("usage")) {
+    r.prompt_tokens   = static_cast<int>(usage->get_int("input_tokens"));
+    r.response_tokens = static_cast<int>(usage->get_int("output_tokens"));
   }
   return r;
 }
 
 std::optional<std::string>
-AnthropicBackend::parse_sse_chunk(std::string_view /*line*/) const {
-  return std::nullopt;
+AnthropicBackend::parse_sse_chunk(std::string_view line) const {
+  // data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+  auto data = jeff::json::sse_data(line);
+  if (not data) return std::nullopt;
+  auto parsed = jeff::json::parse(*data);
+  if (not parsed or parsed.value.get_string("type") != "content_block_delta")
+    return std::nullopt;
+  const jeff::json::Value* delta = parsed.value.find("delta");
+  if (not delta or delta->get_string("type") != "text_delta") return std::nullopt;
+  return delta->get_string("text");
 }
 
 Result<ChatResponse> AnthropicBackend::chat(const ChatRequest& req) {
@@ -125,7 +124,8 @@ Result<ChatResponse> AnthropicBackend::chat_stream(const ChatRequest& req,
   //     event: content_block_delta  → data: {"type":"content_block_delta","delta":{"text":"..."}}
   //     event: message_stop         → streaming complete
   //   Use a CURLOPT_WRITEFUNCTION callback (like curl_stream_write in openai.cpp)
-  //   but parse the anthropic-specific event structure.
+  //   that feeds a jeff::json::LineSplitter and passes each line to
+  //   parse_sse_chunk(), which already decodes content_block_delta events.
   //   Wire CURLOPT_HTTPHEADER with Accept: text/event-stream.
   ChatRequest sreq = req; sreq.stream = true;
   auto resp = chat(sreq);  // fallback to non-streaming until TODO above is done

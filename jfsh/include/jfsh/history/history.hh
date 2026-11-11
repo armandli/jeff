@@ -11,6 +11,7 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <jfsh/core/types.hh>
@@ -67,7 +68,7 @@ struct HistoryManager {
   void set_options(HistOptions opts) { mOpts = std::move(opts); }
 
 protected:
-  bool should_suppress(const std::string& text) const noexcept;
+  bool should_suppress(std::string_view text) const noexcept;
   void trim_to_limit();
 
 private:

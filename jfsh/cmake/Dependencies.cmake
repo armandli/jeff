@@ -25,13 +25,12 @@ find_package(OpenSSL REQUIRED)
 add_library(jfsh_dep_ssl INTERFACE IMPORTED)
 target_link_libraries(jfsh_dep_ssl INTERFACE OpenSSL::SSL OpenSSL::Crypto)
 
-# ---- nlohmann/json (JSON parsing for LLM API requests/responses) ------------
-FetchContent_Declare(nlohmann_json
-  GIT_REPOSITORY https://github.com/nlohmann/json.git
-  GIT_TAG        v3.11.3
-  GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(nlohmann_json)
+# ---- jeff_json (simdjson + utilities, shared with the top-level jeff build) ---
+# Lives in the parent repo at src/json; it fetches and pins simdjson itself.
+if(NOT TARGET jeff_json)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../src/json
+                   ${CMAKE_CURRENT_BINARY_DIR}/jeff_json)
+endif()
 
 # (LibTorch is not used by the shell — inference runs in jeff-server.)
 

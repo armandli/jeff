@@ -18,8 +18,7 @@
 #include <string_view>
 
 #include <httplib.h>
-#include <nlohmann/json.hpp>
-
+#include "json.hpp"
 #include "model.hpp"
 
 static std::atomic<httplib::Server*> g_server{nullptr};
@@ -66,15 +65,27 @@ int main(int argc, char* argv[]) {
   std::signal(SIGTERM, on_signal);
 
   svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-    nlohmann::json j = {{"status", "ok"}, {"model", "jeff"}};
-    res.set_content(j.dump(), "application/json");
+    jeff::json::Writer w;
+    w.begin_object().field("status", "ok").field("model", "jeff").end_object();
+    res.set_content(w.str(), "application/json");
   });
 
   svr.Post("/classify",
       [&model](const httplib::Request& req, httplib::Response& res) {
+    auto fail = [&res](std::string_view message) {
+      jeff::json::Writer w;
+      w.begin_object().field("error", message).end_object();
+      res.status = 400;
+      res.set_content(w.str(), "application/json");
+    };
+
     try {
-      auto body = nlohmann::json::parse(req.body);
-      auto line = body.at("line").get<std::string>();
+      auto body = jeff::json::parse(req.body);
+      if (not body) return fail(body.error);
+      const jeff::json::Value* line_v = body.value.find("line");
+      if (not line_v or not line_v->is_string())
+        return fail("missing string field \"line\"");
+      const std::string& line = *line_v->as_string();
 
       jeff::DecisionInput input;
       input.context = line;
@@ -90,17 +101,15 @@ int main(int argc, char* argv[]) {
               ? out.scores[static_cast<std::size_t>(out.chosen_index)]
               : 0.9f;
 
-      nlohmann::json r = {
-          {"verdict",    verdict},
-          {"confidence", confidence},
-          {"model",      "jeff"},
-      };
-      res.set_content(r.dump(), "application/json");
+      jeff::json::Writer w;
+      w.begin_object()
+          .field("verdict",    verdict)
+          .field("confidence", confidence)
+          .field("model",      "jeff")
+          .end_object();
+      res.set_content(w.str(), "application/json");
     } catch (const std::exception& e) {
-      res.status = 400;
-      res.set_content(
-          nlohmann::json{{"error", e.what()}}.dump(),
-          "application/json");
+      fail(e.what());
     }
   });
 

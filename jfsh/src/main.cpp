@@ -20,6 +20,8 @@
 #include <jfsh/prompt/prompt.hh>
 #include <jfsh/router/router.hh>
 
+extern char** environ;
+
 static void print_usage(const char* prog) {
   std::fprintf(stderr,
       "Usage: %s [-c command] [-s] [-i] [--norouter] [script [args...]]\n"

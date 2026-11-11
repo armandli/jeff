@@ -17,7 +17,13 @@ static const SigEntry kSigNames[] = {
   {SIGTTIN,  "TTIN"},  {SIGTTOU, "TTOU"},   {SIGURG,  "URG"},
   {SIGXCPU,  "XCPU"},  {SIGXFSZ, "XFSZ"},   {SIGVTALRM, "VTALRM"},
   {SIGPROF,  "PROF"},  {SIGWINCH, "WINCH"}, {SIGIO,   "IO"},
-  {SIGPWR,   "PWR"},   {SIGSYS,  "SYS"},
+#ifdef SIGPWR
+  {SIGPWR,   "PWR"},
+#endif
+#ifdef SIGINFO
+  {SIGINFO,  "INFO"},
+#endif
+  {SIGSYS,   "SYS"},
   // Pseudo
   {SIGEXIT,  "EXIT"},  {SIGZERR, "ZERR"},   {SIGDEBUG, "DEBUG"},
   {0, nullptr},

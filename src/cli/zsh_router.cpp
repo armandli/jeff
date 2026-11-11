@@ -84,11 +84,11 @@ int main(int argc, char* argv[]) {
     if (a.verbose)
         std::cerr << "=== command ===\n" << cmd << "\n\n";
 
-    std::string json = router::run_infer(cmd);
-    if (json.empty()) return 1;
+    auto json = router::run_infer(cmd);
+    if (!json) return 1;
 
-    std::string model_name = router::json_str(json, "model_name");
-    router::print_result(a.text, json, "zsh -n:     ",
+    std::string model_name = router::json_str(*json, "model_name");
+    router::print_result(a.text, *json, "zsh -n:     ",
         {{"Model:      ", a.model_key + (model_name.empty() ? "" : "  (" + model_name + ")")}});
     return 0;
 }
