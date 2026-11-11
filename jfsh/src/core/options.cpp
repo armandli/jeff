@@ -7,7 +7,7 @@
 
 namespace jfsh {
 
-const OptionInfo kOptionInfo[OPT_COUNT] = {
+const OptionInfo OPTION_INFO[OPT_COUNT] = {
   // A
   {"aliases",             OPT_ALIASES,             true,  false, true,  false},
   {"allexport",           OPT_ALLEXPORT,           false, false, false, false},
@@ -205,7 +205,7 @@ const OptionInfo kOptionInfo[OPT_COUNT] = {
 };
 
 OptionState::OptionState() {
-  for (const auto& info : kOptionInfo)
+  for (const auto& info : OPTION_INFO)
     mOpts[info.index] = info.default_val;
 }
 
@@ -228,7 +228,7 @@ const OptionInfo* OptionState::find(std::string_view name) noexcept {
   }
   (void)negated;
 
-  for (const auto& info : kOptionInfo) {
+  for (const auto& info : OPTION_INFO) {
     if (normalize_option_name(info.name) == norm)
       return &info;
   }
@@ -236,14 +236,14 @@ const OptionInfo* OptionState::find(std::string_view name) noexcept {
 }
 
 void OptionState::apply_emulation(Emulation mode) {
-  for (const auto& info : kOptionInfo) {
+  for (const auto& info : OPTION_INFO) {
     bool val = info.default_val;
     switch (mode) {
-      case Emulation::ZSH: val = info.default_val;   break;
-      case Emulation::SH:  val = info.emulation_sh;  break;
-      case Emulation::KSH: val = info.emulation_ksh; break;
-      case Emulation::CSH: val = info.emulation_csh; break;
-      default:             val = info.default_val;   break;
+      case Emulation::ZSH: val = info.default_val;
+      break; case Emulation::SH:  val = info.emulation_sh;
+      break; case Emulation::KSH: val = info.emulation_ksh;
+      break; case Emulation::CSH: val = info.emulation_csh;
+      break; default:             val = info.default_val;
     }
     mOpts[info.index] = val;
   }

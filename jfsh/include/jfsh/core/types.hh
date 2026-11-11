@@ -54,9 +54,9 @@ struct ShellError {
 template<typename T>
 using Result = std::expected<T, ShellError>;
 
-// Meta-encoding: byte b >= 0x80 or b == 0x00 is stored as {Meta, b^0x20}.
-inline constexpr char kMeta   = '\x83';
-inline constexpr char kMarker = '\xa0';
+// Meta-encoding: byte b >= 0x80 or b == 0x00 is stored as {META, b^0x20}.
+inline constexpr char META   = '\x83';
+inline constexpr char MARKER = '\xa0';
 
 struct Metastring {
   std::string raw;    // bytes possibly containing Meta sequences

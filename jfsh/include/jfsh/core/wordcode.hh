@@ -20,14 +20,14 @@ namespace jfsh {
 
 using WordCode = std::uint32_t;
 
-inline constexpr int      kWCBits = 5;
-inline constexpr int      kWCData = 32 - kWCBits;
-inline constexpr WordCode kWCMask = (1u << kWCBits) - 1u;
+inline constexpr int      WC_BITS = 5;
+inline constexpr int      WC_DATA = 32 - WC_BITS;
+inline constexpr WordCode WC_MASK = (1u << WC_BITS) - 1u;
 
-constexpr WordCode wc_code(WordCode w) noexcept { return w & kWCMask; }
-constexpr WordCode wc_data(WordCode w) noexcept { return w >> kWCBits; }
+constexpr WordCode wc_code(WordCode w) noexcept { return w & WC_MASK; }
+constexpr WordCode wc_data(WordCode w) noexcept { return w >> WC_BITS; }
 constexpr WordCode make_wc(WordCode op, WordCode d) noexcept {
-  return (d << kWCBits) | (op & kWCMask);
+  return (d << WC_BITS) | (op & WC_MASK);
 }
 
 enum WCOpcode : WordCode {
@@ -84,35 +84,35 @@ enum WCOpcode : WordCode {
 
 inline constexpr WordCode WC_LIST_ASYNC = 1u;  // & (background)
 inline constexpr WordCode WC_LIST_END   = 2u;  // last in list
-inline constexpr int      kWCListFlagBits = 2;
+inline constexpr int      WC_LIST_FLAG_BITS = 2;
 
 inline constexpr WordCode WC_SUBLIST_END  = 0u;
 inline constexpr WordCode WC_SUBLIST_AND  = 1u;    // &&
 inline constexpr WordCode WC_SUBLIST_OR   = 2u;    // ||
 inline constexpr WordCode WC_SUBLIST_NOT  = 4u;    // !
 inline constexpr WordCode WC_SUBLIST_TYPE = 3u;    // mask for END/AND/OR
-inline constexpr int      kWCSublistFlagBits = 3;
+inline constexpr int      WC_SUBLIST_FLAG_BITS = 3;
 
 inline constexpr WordCode WC_ASSIGN_APPEND = 1u;   // name+=value
 
 constexpr WordCode make_wc_list(WordCode flags, WordCode skip) noexcept {
-  return make_wc(WC_LIST, (skip << kWCListFlagBits) | flags);
+  return make_wc(WC_LIST, (skip << WC_LIST_FLAG_BITS) | flags);
 }
 constexpr WordCode wc_list_flags(WordCode w) noexcept {
-  return wc_data(w) & ((1u << kWCListFlagBits) - 1u);
+  return wc_data(w) & ((1u << WC_LIST_FLAG_BITS) - 1u);
 }
 constexpr WordCode wc_list_skip(WordCode w) noexcept {
-  return wc_data(w) >> kWCListFlagBits;
+  return wc_data(w) >> WC_LIST_FLAG_BITS;
 }
 
 constexpr WordCode make_wc_sublist(WordCode flags, WordCode skip) noexcept {
-  return make_wc(WC_SUBLIST, (skip << kWCSublistFlagBits) | flags);
+  return make_wc(WC_SUBLIST, (skip << WC_SUBLIST_FLAG_BITS) | flags);
 }
 constexpr WordCode wc_sublist_flags(WordCode w) noexcept {
-  return wc_data(w) & ((1u << kWCSublistFlagBits) - 1u);
+  return wc_data(w) & ((1u << WC_SUBLIST_FLAG_BITS) - 1u);
 }
 constexpr WordCode wc_sublist_skip(WordCode w) noexcept {
-  return wc_data(w) >> kWCSublistFlagBits;
+  return wc_data(w) >> WC_SUBLIST_FLAG_BITS;
 }
 
 enum RedirType : WordCode {

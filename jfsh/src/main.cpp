@@ -105,7 +105,7 @@ int main(int argc, char* argv[]) {
     (void)p;
   }
 
-  jfsh::g_signals.init(interactive);
+  jfsh::Signals.init(interactive);
 
   jfsh::Router router;
   router.set_bypass(norouter);
@@ -147,7 +147,7 @@ int main(int argc, char* argv[]) {
 
   auto agent = jfsh::Agent::create(provider_cfg);
 
-  jfsh::ExecContext ctx{params, opts, jfsh::g_jobs, jfsh::g_signals, 0, -1};
+  jfsh::ExecContext ctx{params, opts, jfsh::Jobs, jfsh::Signals, 0, -1};
   jfsh::Executor executor(ctx);
 
   if (not eval_cmd.empty()) {
@@ -222,7 +222,7 @@ int main(int argc, char* argv[]) {
 
       history.add(line);
 
-      jfsh::g_jobs.notify_changes();
+      jfsh::Jobs.notify_changes();
 
       if (ctx.exiting) break;
     }
@@ -240,7 +240,7 @@ int main(int argc, char* argv[]) {
   }
 
   if (not hist_opts.histfile.empty()) history.save(hist_opts.histfile);
-  jfsh::g_signals.traps().run_exit_trap();
+  jfsh::Signals.traps().run_exit_trap();
 
   return ctx.exiting ? ctx.exit_val : ctx.last_exit;
 }

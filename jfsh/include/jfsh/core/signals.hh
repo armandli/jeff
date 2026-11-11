@@ -20,13 +20,13 @@
 
 namespace jfsh {
 
-inline constexpr int kMaxSig = 64;
+inline constexpr int MAX_SIG = 64;
 
 // Pseudo-signals (zsh-style, stored after real ones in the trap table)
-inline constexpr int SIGEXIT  = kMaxSig + 1;  // runs on exit
-inline constexpr int SIGZERR  = kMaxSig + 2;  // runs on non-zero exit
-inline constexpr int SIGDEBUG = kMaxSig + 3;  // runs before each command
-inline constexpr int kTrapTableSize = kMaxSig + 4;
+inline constexpr int SIGEXIT  = MAX_SIG + 1;
+inline constexpr int SIGZERR  = MAX_SIG + 2;
+inline constexpr int SIGDEBUG = MAX_SIG + 3;
+inline constexpr int TRAP_TABLE_SIZE = MAX_SIG + 4;
 
 enum class TrapAction : std::uint8_t {
   Default,  // SIG_DFL
@@ -60,8 +60,8 @@ struct SignalTable {
   static const char*        sig_to_name(int sig_no)            noexcept;
 
 private:
-  std::array<Trap, kTrapTableSize>              mTraps{};
-  std::vector<std::array<Trap, kTrapTableSize>> mSavedTraps;
+  std::array<Trap, TRAP_TABLE_SIZE>              mTraps{};
+  std::vector<std::array<Trap, TRAP_TABLE_SIZE>> mSavedTraps;
 };
 
 // Bit-set: one bit per signal (we have <= 68 signals, fits in two 64-bit words).
@@ -97,7 +97,7 @@ private:
   int            mBlockDepth = 0;
 };
 
-extern SignalManager g_signals;
+extern SignalManager Signals;
 
 }  // namespace jfsh
 

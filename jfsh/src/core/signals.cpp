@@ -7,7 +7,7 @@ namespace jfsh {
 
 struct SigEntry { int num; const char* name; };
 
-static const SigEntry kSigNames[] = {
+static const SigEntry SIG_NAMES[] = {
   {SIGHUP,   "HUP"},   {SIGINT,  "INT"},    {SIGQUIT, "QUIT"},
   {SIGILL,   "ILL"},   {SIGTRAP, "TRAP"},   {SIGABRT, "ABRT"},
   {SIGFPE,   "FPE"},   {SIGKILL, "KILL"},   {SIGSEGV, "SEGV"},
@@ -37,7 +37,7 @@ std::optional<int> SignalTable::name_to_sig(std::string_view name) noexcept {
       and (n[2]=='G' or n[2]=='g'))
     n = n.substr(3);
 
-  for (const auto* e = kSigNames; e->name; ++e) {
+  for (const auto* e = SIG_NAMES; e->name; ++e) {
     if (n == e->name) return e->num;
     std::string upper;
     for (char c : n)
@@ -48,7 +48,7 @@ std::optional<int> SignalTable::name_to_sig(std::string_view name) noexcept {
 }
 
 const char* SignalTable::sig_to_name(int sig_no) noexcept {
-  for (const auto* e = kSigNames; e->name; ++e)
+  for (const auto* e = SIG_NAMES; e->name; ++e)
     if (e->num == sig_no) return e->name;
   return "UNKNOWN";
 }
@@ -56,20 +56,21 @@ const char* SignalTable::sig_to_name(int sig_no) noexcept {
 SignalTable::SignalTable() = default;
 
 void SignalTable::set_trap(int sig_idx, TrapAction action, std::string cmd) {
-  if (sig_idx < 0 or sig_idx >= kTrapTableSize) return;
+  if (sig_idx < 0 or sig_idx >= TRAP_TABLE_SIZE) return;
   auto& t = mTraps[static_cast<std::size_t>(sig_idx)];
   t.action  = action;
   t.command = std::move(cmd);
-  if (sig_idx < kMaxSig) {
+  if (sig_idx < MAX_SIG) {
     switch (action) {
       case TrapAction::Default:
-        std::signal(sig_idx, SIG_DFL); break;
-      case TrapAction::Ignore:
-        std::signal(sig_idx, SIG_IGN); break;
-      case TrapAction::Command:
-        break;  // real handler set by SignalManager::init
-      default:
-        break;
+        std::signal(sig_idx, SIG_DFL);
+      break; case TrapAction::Ignore:
+        std::signal(sig_idx, SIG_IGN);
+      break; case TrapAction::Command:
+        // Real handler is set by SignalManager::init; Command only records the
+        // trap string here.
+      break; default:
+        ;
     }
   }
 }
@@ -80,7 +81,7 @@ void SignalTable::clear_trap(int sig_idx) {
 
 const Trap& SignalTable::get_trap(int sig_idx) const noexcept {
   static const Trap kDefault{};
-  if (sig_idx < 0 or sig_idx >= kTrapTableSize) return kDefault;
+  if (sig_idx < 0 or sig_idx >= TRAP_TABLE_SIZE) return kDefault;
   return mTraps[static_cast<std::size_t>(sig_idx)];
 }
 
@@ -116,7 +117,7 @@ bool PendingSignals::test(int sig) const noexcept {
 }
 
 void SignalManager::init(bool /*interactive*/) {
-  std::signal(SIGCHLD, [](int) { g_signals.note_sigchld(); });
+  std::signal(SIGCHLD, [](int) { Signals.note_sigchld(); });
 }
 
 void SignalManager::block()   { ++mBlockDepth; }
@@ -133,8 +134,8 @@ void SignalManager::dispatch_pending() {
     mPending.clear(SIGCHLD);
     // TODO(signals/sigchld): Call waitpid(-1, &status, WNOHANG|WUNTRACED)
     //   in a loop until it returns 0 or -1; for each pid found call
-    //   g_jobs.update(pid, status) to update job/process state, then
-    //   g_jobs.notify_changes() if the NOTIFY option is set.
+    //   Jobs.update(pid, status) to update job/process state, then
+    //   Jobs.notify_changes() if the NOTIFY option is set.
   }
   // TODO(signals/dispatch): For each set bit in mPending_ (other than SIGCHLD):
   //   1. Look up mTraps[sig].action

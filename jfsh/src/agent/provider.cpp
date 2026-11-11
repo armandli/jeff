@@ -1,5 +1,7 @@
 #include <cstdlib>
 
+#include <string_view>
+
 #include <json.hpp>
 
 #include <jfsh/agent/provider.hh>
@@ -46,7 +48,7 @@ ProviderConfig ProviderConfig::from_env() {
 ProviderConfig ProviderConfig::from_map(const HashTable<std::string>& kv) {
   ProviderConfig cfg;
   if (auto it = kv.find("provider"); it != kv.end()) {
-    const std::string& p = it->second;
+    std::string_view p = it->second;
     if (p == "openai")          cfg.kind = ProviderKind::OpenAI;
     else if (p == "anthropic")  cfg.kind = ProviderKind::Anthropic;
     else if (p == "openrouter") cfg.kind = ProviderKind::OpenRouter;

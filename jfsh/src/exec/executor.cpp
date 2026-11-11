@@ -12,12 +12,12 @@
 
 namespace jfsh {
 
-static BuiltinTable s_builtins;
+static BuiltinTable Builtins;
 
 Executor::Executor(ExecContext& ctx) : mCtx(ctx) {
   static bool initialized = false;
   if (not initialized) {
-    s_builtins.register_all();
+    Builtins.register_all();
     initialized = true;
   }
 }
@@ -72,7 +72,7 @@ int Executor::exec_simple(std::vector<std::string> args,
 
   // TODO(M4): shell functions are looked up here, before builtins.  Aliases
   //   never reach this point: they are expanded by the lexer (M7).
-  if (auto def = s_builtins.find(args[0])) {
+  if (auto def = Builtins.find(args[0])) {
     // zsh keeps assignments in front of a special builtin only under
     // POSIX_BUILTINS; otherwise they last while the builtin runs.
     if ((def->get().flags & BINF_SPECIAL) and mCtx.opts.get(OPT_POSIXBUILTINS)) {
@@ -351,13 +351,13 @@ void Executor::trace(const std::vector<std::string>& args,
 }
 
 bool Executor::is_builtin(std::string_view name) const noexcept {
-  return s_builtins.find(name).has_value();
+  return Builtins.find(name).has_value();
 }
 
 int Executor::call_builtin(std::string_view name,
                            std::vector<std::string>& args,
                            ExecContext& ctx) {
-  if (auto def = s_builtins.find(name)) return def->get().fn(args, ctx);
+  if (auto def = Builtins.find(name)) return def->get().fn(args, ctx);
   return 127;
 }
 

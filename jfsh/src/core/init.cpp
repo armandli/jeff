@@ -6,7 +6,7 @@
 
 namespace jfsh {
 
-JobTable      g_jobs;
-SignalManager g_signals;
+JobTable      Jobs;
+SignalManager Signals;
 
 }  // namespace jfsh

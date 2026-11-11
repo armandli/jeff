@@ -42,7 +42,7 @@ struct Shell {
   ParamTable  params;
   OptionState opts;
   JobTable    jobs;
-  ExecContext ctx{params, opts, jobs, g_signals};
+  ExecContext ctx{params, opts, jobs, Signals};
   Executor    exec{ctx};
 
   Shell() {

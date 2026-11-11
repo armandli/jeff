@@ -42,11 +42,11 @@ Editor::~Editor() {
   if (mRawModeActive) exit_raw_mode();
 }
 
-static struct termios s_orig_termios;
+static struct termios OrigTermios;
 
 void Editor::enter_raw_mode() {
-  tcgetattr(STDIN_FILENO, &s_orig_termios);
-  struct termios raw = s_orig_termios;
+  tcgetattr(STDIN_FILENO, &OrigTermios);
+  struct termios raw = OrigTermios;
   raw.c_lflag &= static_cast<tcflag_t>(~(ECHO | ICANON | ISIG | IEXTEN));
   raw.c_iflag &= static_cast<tcflag_t>(~(IXON | ICRNL | BRKINT | INPCK | ISTRIP));
   raw.c_cflag |= CS8;
@@ -58,7 +58,7 @@ void Editor::enter_raw_mode() {
 }
 
 void Editor::exit_raw_mode() {
-  tcsetattr(STDIN_FILENO, TCSAFLUSH, &s_orig_termios);
+  tcsetattr(STDIN_FILENO, TCSAFLUSH, &OrigTermios);
   mRawModeActive = false;
 }
 

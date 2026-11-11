@@ -64,31 +64,26 @@ std::string disassemble(const CompiledProgram& prog) {
         out += ' ' + flag_names({{f & WC_LIST_ASYNC, "async"},
                                  {f & WC_LIST_END,   "end"}});
         out += " skip=" + std::to_string(wc_list_skip(w));
-        break;
       }
-      case WC_SUBLIST: {
+      break; case WC_SUBLIST: {
         WordCode f    = wc_sublist_flags(w);
         WordCode type = f & WC_SUBLIST_TYPE;
         out += ' ' + flag_names({{type == WC_SUBLIST_AND, "and"},
                                  {type == WC_SUBLIST_OR,  "or"},
                                  {f & WC_SUBLIST_NOT,     "not"}});
         out += " skip=" + std::to_string(wc_sublist_skip(w));
-        break;
       }
-      case WC_ASSIGN:
+      break; case WC_ASSIGN:
         out += ' ' + flag_names({{wc_data(w) & WC_ASSIGN_APPEND, "append"}});
-        break;
-      case WC_STRING: {
+      break; case WC_STRING: {
         WordCode idx = wc_data(w);
         out += idx < prog.strs.size() ? " \"" + prog.strs[idx] + '"'
                                       : " <bad index " + std::to_string(idx) + '>';
-        break;
       }
-      case WC_END:
-        break;
-      default:
+      break; case WC_END:
+        ;
+      break; default:
         out += ' ' + std::to_string(wc_data(w));
-        break;
     }
     out += '\n';
   }

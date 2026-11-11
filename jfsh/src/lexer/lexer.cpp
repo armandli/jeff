@@ -5,7 +5,7 @@
 
 namespace jfsh {
 
-static const struct { const char* word; TokType type; } kKeywords[] = {
+static const struct { const char* word; TokType type; } KEYWORDS[] = {
   {"if",       TokType::TK_IF},
   {"then",     TokType::TK_THEN},
   {"elif",     TokType::TK_ELIF},
@@ -32,7 +32,7 @@ Lexer::Lexer(InputSource& src) : mSrc{src} {}
 Lexer::~Lexer() = default;
 
 bool Lexer::is_keyword(std::string_view s) const noexcept {
-  for (auto* k = kKeywords; k->word; ++k)
+  for (auto* k = KEYWORDS; k->word; ++k)
     if (s == k->word) return true;
   return false;
 }
@@ -183,7 +183,7 @@ LexToken Lexer::read_word(int first_char) {
     c = mSrc.next_char();
   }
   if (not text.empty() and is_keyword(text)) {
-    for (auto* k = kKeywords; k->word; ++k)
+    for (auto* k = KEYWORDS; k->word; ++k)
       if (text == k->word) return {k->type, text, ln};
   }
   return {TokType::TK_WORD, text, ln};

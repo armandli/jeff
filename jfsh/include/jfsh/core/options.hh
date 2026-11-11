@@ -249,7 +249,7 @@ private:
   std::array<bool, OPT_COUNT> mOpts{};
 };
 
-extern const OptionInfo kOptionInfo[OPT_COUNT];
+extern const OptionInfo OPTION_INFO[OPT_COUNT];
 
 }  // namespace jfsh
 

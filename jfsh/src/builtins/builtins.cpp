@@ -215,7 +215,7 @@ int builtin_fg(std::vector<std::string>& args, ExecContext& ctx) {
   (void)args; (void)ctx; return 0;
 }
 int builtin_jobs(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/jobs): Print live jobs from g_jobs.for_each().
+  // TODO(builtin/jobs): Print live jobs from Jobs.for_each().
   //   -l: include pid; -p: only pid; -r: running only; -s: stopped only.
   //   LONG_LIST_JOBS option: always use long format.
   (void)args; (void)ctx; return 0;

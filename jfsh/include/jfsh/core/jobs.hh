@@ -109,7 +109,7 @@ private:
   int find_free_slot() noexcept;
 };
 
-extern JobTable g_jobs;
+extern JobTable Jobs;
 
 }  // namespace jfsh
 
