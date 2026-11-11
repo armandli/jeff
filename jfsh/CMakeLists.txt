@@ -158,7 +158,7 @@ add_library(jfsh_router STATIC
 )
 target_include_directories(jfsh_router PUBLIC include)
 target_link_libraries(jfsh_router PUBLIC
-  jfsh_core jfsh_dep_curl jfsh_compiler_options)
+  jfsh_core jfsh_dep_curl jeff_json jfsh_compiler_options)
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +175,7 @@ add_library(jfsh_agent STATIC
 )
 target_include_directories(jfsh_agent PUBLIC include)
 target_link_libraries(jfsh_agent PUBLIC
-  jfsh_core jfsh_dep_curl jfsh_dep_ssl nlohmann_json::nlohmann_json
+  jfsh_core jfsh_dep_curl jfsh_dep_ssl jeff_json
   jfsh_compiler_options)
 
 # ---------------------------------------------------------------------------

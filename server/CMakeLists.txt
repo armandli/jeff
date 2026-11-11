@@ -7,7 +7,7 @@ target_include_directories(jeff-server PRIVATE
 target_link_libraries(jeff-server PRIVATE
   jeff_inference
   httplib::httplib
-  nlohmann_json::nlohmann_json
+  jeff_json
   jeff_compiler_options
 )
 

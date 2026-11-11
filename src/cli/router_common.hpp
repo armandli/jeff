@@ -13,11 +13,15 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
+
+#include "json.hpp"
 
 namespace router {
 
@@ -66,35 +70,19 @@ inline std::string last_line(const std::string& s) {
     return line.empty() ? last : line;
 }
 
-// Minimal readers for the flat one-line JSON that infer.py prints with json.dumps
-// (default ", " and ": " separators). String values must not contain escaped quotes;
-// infer.py only emits fixed keywords and model names there.
-inline std::string json_str(const std::string& json, const std::string& key) {
-    std::string needle = "\"" + key + "\": \"";
-    auto pos = json.find(needle);
-    if (pos == std::string::npos) return {};
-    pos += needle.size();
-    auto end = json.find('"', pos);
-    return (end == std::string::npos) ? std::string{} : json.substr(pos, end - pos);
+// Field readers for the one-line JSON object that infer.py prints with json.dumps.
+inline std::string json_str(const jeff::json::Value& json, std::string_view key) {
+    return json.get_string(key);
 }
 
-inline double json_num(const std::string& json, const std::string& key, double dflt = 0.0) {
-    std::string needle = "\"" + key + "\": ";
-    auto pos = json.find(needle);
-    if (pos == std::string::npos) return dflt;
-    pos += needle.size();
-    try { return std::stod(json.substr(pos)); } catch (...) { return dflt; }
+inline double json_num(const jeff::json::Value& json, std::string_view key, double dflt = 0.0) {
+    return json.get_double(key, dflt);
 }
 
 // Returns 1 for true, 0 for false, -1 for null or missing.
-inline int json_bool(const std::string& json, const std::string& key) {
-    std::string needle = "\"" + key + "\": ";
-    auto pos = json.find(needle);
-    if (pos == std::string::npos) return -1;
-    pos += needle.size();
-    if (json.compare(pos, 4, "true") == 0) return 1;
-    if (json.compare(pos, 5, "false") == 0) return 0;
-    return -1;
+inline int json_bool(const jeff::json::Value& json, std::string_view key) {
+    auto b = json.get_bool(key);
+    return b ? static_cast<int>(*b) : -1;
 }
 
 inline std::string repo_root() {
@@ -188,35 +176,37 @@ inline std::string build_command(const std::string& python, const fs::path& infe
     return cmd;
 }
 
-// Runs infer.py and returns its JSON line, or an empty string after printing an error.
-inline std::string run_infer(const std::string& cmd) {
+// Runs infer.py and returns its parsed JSON line, or nullopt after printing an error.
+inline std::optional<jeff::json::Value> run_infer(const std::string& cmd) {
     ProcResult r;
     try {
         r = popen_read(cmd);
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
-        return {};
+        return std::nullopt;
     }
     std::string line = last_line(r.out);
-    if (line.empty() || line.front() != '{') {
+    auto parsed = jeff::json::parse(line);
+    if (!parsed || !parsed.value.is_object()) {
         std::cerr << "Inference failed (exit " << r.exit_code << ")"
                   << (r.out.empty() ? std::string{} : ":\n" + r.out) << "\n";
-        return {};
+        return std::nullopt;
     }
-    if (std::string err = json_str(line, "error"); !err.empty() || r.exit_code != 0) {
+    const jeff::json::Value& json = parsed.value;
+    if (std::string err = json_str(json, "error"); !err.empty() || r.exit_code != 0) {
         std::cerr << "Inference failed (exit " << r.exit_code << "): "
                   << (err.empty() ? line : err) << "\n";
-        return {};
+        return std::nullopt;
     }
-    if (std::string d = json_str(line, "decision"); d != "RUN" && d != "AGENT") {
+    if (std::string d = json_str(json, "decision"); d != "RUN" && d != "AGENT") {
         std::cerr << "Inference returned no decision: " << line << "\n";
-        return {};
+        return std::nullopt;
     }
-    return line;
+    return std::move(parsed.value);
 }
 
 // Prints the verdict. `extra` lines are appended as label/value pairs.
-inline void print_result(const std::string& text, const std::string& json,
+inline void print_result(const std::string& text, const jeff::json::Value& json,
                          const std::string& shell_check_label,
                          const std::vector<std::pair<std::string, std::string>>& extra) {
     std::string decision = json_str(json, "decision");

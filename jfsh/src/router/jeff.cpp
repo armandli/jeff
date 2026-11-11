@@ -2,6 +2,8 @@
 
 #include <curl/curl.h>
 
+#include <json.hpp>
+
 #include <jfsh/router/jeff.hh>
 
 namespace jfsh {
@@ -15,15 +17,9 @@ static std::size_t curl_write_jeff(char* ptr, std::size_t, std::size_t nmemb,
 JeffRouter::JeffRouter(JeffConfig cfg) : mCfg(std::move(cfg)) {}
 
 std::string JeffRouter::build_body(std::string_view line) const {
-  std::string body = "{\"line\":\"";
-  for (char c : line) {
-    if      (c == '"')  body += "\\\"";
-    else if (c == '\\') body += "\\\\";
-    else if (c == '\n') body += "\\n";
-    else                body += c;
-  }
-  body += "\"}";
-  return body;
+  jeff::json::Writer w;
+  w.begin_object().field("line", line).end_object();
+  return w.str();
 }
 
 Result<std::string> JeffRouter::http_post(std::string_view url,
@@ -37,7 +33,9 @@ Result<std::string> JeffRouter::http_post(std::string_view url,
   hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
 
   curl_easy_setopt(curl, CURLOPT_URL,           std::string(url).c_str());
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    std::string(body).c_str());
+  // POSTFIELDS is not copied by curl; body outlives curl_easy_perform below.
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    body.data());
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER,    hdrs);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_jeff);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &resp);
@@ -56,34 +54,21 @@ Result<std::string> JeffRouter::http_post(std::string_view url,
 
 Result<RouterDecision> JeffRouter::parse_response(
     std::string_view json) const {
-  RouterDecision d;
-  d.model_name = "jeff";
-
-  // Extract verdict from: {"verdict":"run"|"agent","confidence":<float>}
-  auto vpos = json.find("\"verdict\":\"");
-  if (vpos == std::string_view::npos)
+  // {"verdict":"run"|"agent","confidence":<float>,"model":"jeff"}
+  auto parsed = jeff::json::parse(json);
+  if (not parsed)
+    return std::unexpected(ShellError{ErrorKind::RouterError,
+        "jeff: invalid response: " + parsed.error});
+  const jeff::json::Value* verdict = parsed.value.find("verdict");
+  if (not verdict or not verdict->is_string())
     return std::unexpected(
         ShellError{ErrorKind::RouterError, "jeff: no verdict in response"});
-  vpos += 11;
-  std::string verdict;
-  for (; vpos < json.size() and json[vpos] != '"'; ++vpos)
-    verdict += json[vpos];
 
-  auto cpos = json.find("\"confidence\":");
-  float confidence = 0.9f;
-  if (cpos != std::string_view::npos) {
-    cpos += 13;
-    std::string cs;
-    for (; cpos < json.size() and
-           (json[cpos] == '.' or
-            static_cast<bool>(std::isdigit(json[cpos]))); ++cpos)
-      cs += json[cpos];
-    if (not cs.empty()) confidence = std::stof(cs);
-  }
-
-  d.verdict    = (verdict == "agent") ? RouterVerdict::Agent
-                                      : RouterVerdict::Run;
-  d.confidence = confidence;
+  RouterDecision d;
+  d.model_name = "jeff";
+  d.verdict    = (*verdict->as_string() == "agent") ? RouterVerdict::Agent
+                                                    : RouterVerdict::Run;
+  d.confidence = static_cast<float>(parsed.value.get_double("confidence", 0.9));
   return d;
 }
 

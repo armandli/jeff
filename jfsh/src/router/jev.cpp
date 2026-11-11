@@ -1,8 +1,9 @@
-#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 
 #include <curl/curl.h>
+
+#include <json.hpp>
 
 #include <jfsh/router/jev.hh>
 
@@ -24,21 +25,22 @@ JevConfig JevConfig::from_env() {
 JevRouter::JevRouter(JevConfig cfg) : mCfg(std::move(cfg)) {}
 
 std::string JevRouter::build_body(std::string_view line) const {
-  std::string body = "{\"model\":\"" + mCfg.model + "\",\"state\":\"";
-  for (char c : line) {
-    if      (c == '"')  body += "\\\"";
-    else if (c == '\\') body += "\\\\";
-    else if (c == '\n') body += "\\n";
-    else                body += c;
-  }
-  body +=
-    "\",\"questions\":{\"routing\":{"
-    "\"type\":\"choice\","
-    "\"criteria\":{"
-    "\"run\":\"Execute as a shell command or script.\","
-    "\"agent\":\"Answer as a natural-language question or task "
-    "with an AI assistant.\"}}}}";
-  return body;
+  jeff::json::Writer w;
+  w.begin_object()
+      .field("model", mCfg.model)
+      .field("state", line)
+      .key("questions").begin_object()
+        .key("routing").begin_object()
+          .field("type", "choice")
+          .key("criteria").begin_object()
+            .field("run",   "Execute as a shell command or script.")
+            .field("agent", "Answer as a natural-language question or task "
+                            "with an AI assistant.")
+          .end_object()
+        .end_object()
+      .end_object()
+    .end_object();
+  return w.str();
 }
 
 Result<std::string> JevRouter::http_post(std::string_view url,
@@ -54,7 +56,9 @@ Result<std::string> JevRouter::http_post(std::string_view url,
   hdrs = curl_slist_append(hdrs, auth.c_str());
 
   curl_easy_setopt(curl, CURLOPT_URL,           std::string(url).c_str());
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    std::string(body).c_str());
+  // POSTFIELDS is not copied by curl; body outlives curl_easy_perform below.
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    body.data());
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER,    hdrs);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_jev);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &resp);
@@ -73,34 +77,26 @@ Result<std::string> JevRouter::http_post(std::string_view url,
 
 Result<RouterDecision> JevRouter::parse_response(
     std::string_view json) const {
-  RouterDecision d;
-  d.model_name = "jev";
-
-  // Extract the choice value from "answers":{"routing":{"choice":"<val>"}}
-  auto choice_pos = json.find("\"choice\":\"");
-  if (choice_pos == std::string_view::npos)
+  // {"answers":{"routing":{"choice":"run"|"agent","confidence":<float>}}}
+  auto parsed = jeff::json::parse(json);
+  if (not parsed)
+    return std::unexpected(ShellError{ErrorKind::RouterError,
+        "jev: invalid response: " + parsed.error});
+  const jeff::json::Value* routing = parsed.value.at({"answers", "routing"});
+  const jeff::json::Value* choice  = routing ? routing->find("choice") : nullptr;
+  if (not choice or not choice->is_string())
     return std::unexpected(
         ShellError{ErrorKind::RouterError, "jev: no choice in response"});
-  choice_pos += 10;
-  std::string choice;
-  for (; choice_pos < json.size() and json[choice_pos] != '"'; ++choice_pos)
-    choice += json[choice_pos];
 
-  auto conf_pos = json.find("\"confidence\":");
-  float confidence = 0.9f;
-  if (conf_pos != std::string_view::npos) {
-    conf_pos += 13;
-    std::string cs;
-    for (; conf_pos < json.size() and
-           (json[conf_pos] == '.' or
-            static_cast<bool>(std::isdigit(json[conf_pos]))); ++conf_pos)
-      cs += json[conf_pos];
-    if (not cs.empty()) confidence = std::stof(cs);
-  }
+  // Confidence may sit beside the choice or at the top level.
+  double confidence = parsed.value.get_double("confidence", 0.9);
+  confidence        = routing->get_double("confidence", confidence);
 
-  d.verdict    = (choice == "agent") ? RouterVerdict::Agent
-                                     : RouterVerdict::Run;
-  d.confidence = confidence;
+  RouterDecision d;
+  d.model_name = "jev";
+  d.verdict    = (*choice->as_string() == "agent") ? RouterVerdict::Agent
+                                                   : RouterVerdict::Run;
+  d.confidence = static_cast<float>(confidence);
   return d;
 }
 

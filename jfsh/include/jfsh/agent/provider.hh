@@ -10,6 +10,8 @@
 
 #include <jfsh/core/types.hh>
 
+namespace jeff::json { class Value; }
+
 namespace jfsh {
 
 enum class ProviderKind : std::uint8_t {
@@ -63,6 +65,10 @@ struct ChatResponse {
   int         response_tokens = 0;
   std::string finish_reason;
 };
+
+// The provider's error message from a response body, if it is an error response.
+// Handles {"error":{"message":"..."}} (OpenAI, Anthropic) and {"error":"..."} (Ollama).
+std::optional<std::string> api_error_message(const jeff::json::Value& response);
 
 }  // namespace jfsh
 
