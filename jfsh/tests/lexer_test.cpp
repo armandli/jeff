@@ -3,38 +3,14 @@
 
 #include <gtest/gtest.h>
 
+#include <jfsh/lexer/input.hh>
 #include <jfsh/lexer/lexer.hh>
 
 namespace jfsh {
 namespace {
 
-// lexer/input.cpp keeps its StringInputSource internal, so tests bring their own.
-struct TestInput : InputSource {
-  explicit TestInput(std::string s) : mSrc{std::move(s)} {}
-
-  int next_char() override {
-    if (mPos >= mSrc.size()) return -1;
-    int c = static_cast<unsigned char>(mSrc[mPos++]);
-    if (c == '\n') ++mLine;
-    return c;
-  }
-
-  void unget(int c) override {
-    if (c == -1 or mPos == 0) return;
-    --mPos;
-    if (c == '\n') --mLine;
-  }
-
-  int line() const noexcept override { return mLine; }
-
-private:
-  std::string mSrc;
-  std::size_t mPos  = 0;
-  int         mLine = 1;
-};
-
 std::vector<LexToken> lex_all(std::string src, LexFlags flags = LEX_NORMAL) {
-  TestInput in{std::move(src)};
+  StringInputSource in{std::move(src)};
   Lexer lex{in};
   if (flags != LEX_NORMAL) lex.push_state(flags);
   std::vector<LexToken> out;
@@ -124,13 +100,22 @@ TEST(Lexer, CommentsSkippedOnlyWhenEnabled) {
 }
 
 TEST(Lexer, PeekDoesNotConsume) {
-  TestInput in{"a b"};
+  StringInputSource in{"a b"};
   Lexer lex{in};
   EXPECT_EQ(lex.peek().text, "a");
   EXPECT_EQ(lex.peek().text, "a");
   EXPECT_EQ(lex.next_token().text, "a");
   lex.consume();
   EXPECT_EQ(lex.next_token().type, TokType::TK_EOF);
+}
+
+// The lexer ungets the character it peeked even at EOF; that must not rewind
+// the input, or the trailing operator would be produced forever (bug B3).
+TEST(Lexer, TrailingOperatorAtEofTerminates) {
+  for (const char* src : {"echo a;", "echo a&", "echo a|"}) {
+    auto toks = lex_all(src);
+    EXPECT_EQ(toks.size(), 3u) << src;
+  }
 }
 
 // Known gap: '(' and '{' end a word, so $(...) and ${...} are split into several

@@ -1,3 +1,8 @@
+#include <initializer_list>
+#include <iterator>
+#include <string>
+#include <utility>
+
 #include <jfsh/parser/parser.hh>
 
 // Decompiler: convert a CompiledProgram back to source text.
@@ -25,4 +30,69 @@
 //   String literals come from the strs[] table via WC_STRING indices.
 
 namespace jfsh {
+
+static const char* opcode_name(WordCode op) noexcept {
+  static const char* const kNames[] = {
+    "END", "LIST", "SUBLIST", "PIPE", "REDIR", "SIMPLE", "TYPESET", "ASSIGN",
+    "IF", "WHILE", "FOR", "CASE", "SELECT", "REPEAT", "SUBSH", "FUNCDEF",
+    "FOR_COND", "ALWAYS", "TRY", "COND", "ARITH", "AUTOFN", "STRING",
+  };
+  static_assert(std::size(kNames) == WC_MAX);
+  return op < WC_MAX ? kNames[op] : "?";
+}
+
+// Joins the names of the set flags with `|`, or returns "-" when none are set.
+static std::string flag_names(
+    std::initializer_list<std::pair<bool, const char*>> flags) {
+  std::string out;
+  for (auto [set, name] : flags) {
+    if (not set) continue;
+    if (not out.empty()) out += '|';
+    out += name;
+  }
+  return out.empty() ? "-" : out;
+}
+
+std::string disassemble(const CompiledProgram& prog) {
+  std::string out;
+  for (WordCode w : prog.prog) {
+    WordCode op = wc_code(w);
+    out += opcode_name(op);
+    switch (op) {
+      case WC_LIST: {
+        WordCode f = wc_list_flags(w);
+        out += ' ' + flag_names({{f & WC_LIST_ASYNC, "async"},
+                                 {f & WC_LIST_END,   "end"}});
+        out += " skip=" + std::to_string(wc_list_skip(w));
+        break;
+      }
+      case WC_SUBLIST: {
+        WordCode f    = wc_sublist_flags(w);
+        WordCode type = f & WC_SUBLIST_TYPE;
+        out += ' ' + flag_names({{type == WC_SUBLIST_AND, "and"},
+                                 {type == WC_SUBLIST_OR,  "or"},
+                                 {f & WC_SUBLIST_NOT,     "not"}});
+        out += " skip=" + std::to_string(wc_sublist_skip(w));
+        break;
+      }
+      case WC_ASSIGN:
+        out += ' ' + flag_names({{wc_data(w) & WC_ASSIGN_APPEND, "append"}});
+        break;
+      case WC_STRING: {
+        WordCode idx = wc_data(w);
+        out += idx < prog.strs.size() ? " \"" + prog.strs[idx] + '"'
+                                      : " <bad index " + std::to_string(idx) + '>';
+        break;
+      }
+      case WC_END:
+        break;
+      default:
+        out += ' ' + std::to_string(wc_data(w));
+        break;
+    }
+    out += '\n';
+  }
+  return out;
+}
+
 }  // namespace jfsh

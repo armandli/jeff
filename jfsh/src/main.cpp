@@ -217,9 +217,6 @@ int main(int argc, char* argv[]) {
         }
       } else {
         ctx.last_exit = executor.exec_string(line);
-        if (opts.xtrace()) {
-          std::fprintf(stderr, "+ %s\n", line.c_str());
-        }
         if (opts.errexit() and ctx.last_exit != 0) break;
       }
 

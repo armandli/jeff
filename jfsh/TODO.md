@@ -1,12 +1,14 @@
 # jfsh — remaining work
 
-Status as of 2026-11-10 (after `gtest-unit-tests`, commit `e58a779`); bug list re-verified
-against the code on 2026-11-11.
+Status as of 2026-11-11: M1 (simple commands) is done, along with the part of M0 it
+needed.
 
-jfsh builds on macOS and Linux and has gtest coverage for the pieces that work. **It cannot run a
-single shell command yet**: `jfsh -c 'echo hi'` prints nothing and exits 0. The System 1
-router and the LLM agent layer work end to end; the shell language underneath them is
-scaffolding.
+jfsh builds on macOS and Linux and has gtest coverage for the pieces that work. It runs
+**simple commands** joined by `;`, newlines, `&&`, `||` and `!`: builtins and `$PATH`
+executables, with `NAME=value` assignments, quote removal, and zsh's exit statuses. Anything
+else (pipelines, `&`, redirections, compound commands, `$var` and other expansions) is either
+reported as "not supported yet" or, for expansions, left as literal text. The System 1
+router and the LLM agent layer work end to end.
 
 This file has two parts:
 
@@ -49,46 +51,50 @@ Milestones M0–M4 are the minimum for jfsh to be usable as a shell. The router/
 
 ### M0. Bytecode contract and `exec_string`
 
-The parser and executor disagree about the WordCode layout, so wiring `exec_string` alone
-would still execute nothing (see bug [B1](#critical)).
+**Done** (with M1): the prefix layout for lists, sublists, pipelines, simple commands and
+assignments is written down in `include/jfsh/core/wordcode.hh`, with skip lengths on
+`WC_LIST` and `WC_SUBLIST` so un-taken branches are jumped over; the parser and executor
+follow it (bug B1). `StringInputSource`/`FileInputSource` are public in
+`include/jfsh/lexer/input.hh`. `Parser::parse_string` and `Executor::exec_string` work,
+parse errors print `jfsh:LINE: parse error near `X'` with status 1, and leftover tokens
+are an error (B9). `disassemble()` (`src/parser/text.cpp`) backs `tests/parser_test.cpp`.
 
-**Requirements**
-- Write down the WordCode layout for every opcode in `include/jfsh/core/wordcode.hh`
-  (prefix vs postfix, operand counts, how branch offsets are encoded) and make the parser
-  and executor both follow it. Prefix with explicit lengths (as zsh does) is recommended,
-  because it lets the executor skip un-taken branches without decoding them.
-- `WC_SIMPLE` must carry its words: the executor reads `arg_count` `WC_STRING` operands
-  and passes them to `exec_simple`.
-- Lists: each list element is introduced by `WC_LIST` with `ASYNC`/`END` flags; sublists by
-  `WC_SUBLIST` with `AND`/`OR`/`NOT`; pipelines by `WC_PIPE` with a segment count.
-- Move `StringInputSource` / `FileInputSource` from `lexer/input.cpp` into
-  `lexer/lexer.hh` (or a new `lexer/input.hh`) so the executor, `eval`, `source`,
-  prompt substitution and tests can use them.
-- Implement `Parser::parse_string` and `Executor::exec_string`
-  (`StringInputSource` → `Lexer` → `Parser` → `exec`), with parse errors reported as
-  `jfsh: parse error near 'X'` and exit status 1.
-- `Parser::parse` must fail on leftover tokens instead of silently stopping (bug B9).
-- Add a WordCode disassembler (also needed for `functions`/`which`, [text/decompile]) and
-  use it in parser unit tests.
-
-**Done when** `jfsh -c 'true; false; echo $?'`-style programs run once M1–M3 land, and
-parser tests assert exact bytecode for each construct.
+**Remaining**
+- Each construct that lands later (redirections in M2, compound commands in M4, `[[ ]]` and
+  `(( ))` in M5) adds its layout to the comment in `wordcode.hh`, its own
+  `disassemble()` formatting, and parser tests asserting the exact bytecode.
+- The source-text decompiler for `functions`/`which` [text/decompile] is still to do.
 
 ### M1. Simple commands
 
-**Requirements**
-- Collect the command's words, expand them (M3), then dispatch in zsh order: alias
-  (when `ALIASES` is set and the word is unquoted), function, builtin, external.
-- Leading `NAME=value` words are assignments [parser/assign], [exec/assign]:
-  - with no command, they set shell parameters;
-  - before an external command they only go into that child's environment;
-  - before a special builtin they persist, as in POSIX.
-- External commands: search `PATH` (honouring a command hash table, [builtin/hash]),
-  `execve` with an environment built from `ParamTable::make_envp()` rather than the
-  process `environ`, so `export` actually reaches children (bug B12). Exit 127 for
-  not found, 126 for not executable, `128+sig` for signalled.
-- `$?` is updated after every command.
-- `xtrace` (`set -x`) prints `PS4` plus the expanded command **before** running it.
+**Done.** Implemented in `src/exec/executor.cpp` (`exec_simple`, `run_external`,
+`find_command`), with tests in `tests/exec_test.cpp`:
+- Words go through quote removal (the only M3 step so far), then dispatch to a builtin
+  or an external command.
+- Leading `NAME=value` / `NAME+=value` words (unquoted identifier before the `=`) are
+  assignments:
+  - with no command they set shell parameters through `ParamTable::set_scalar`, which
+    updates the existing parameter wherever it lives, keeps its attributes, refuses
+    readonly parameters, and creates new ones as globals;
+  - before an external command they go only into that child's environment;
+  - before a builtin they last only while it runs. Following zsh rather than POSIX, they
+    persist after a **special** builtin only when `POSIX_BUILTINS` is set.
+- External commands: the `$PATH` search reads the shell's own `PATH` parameter, and an
+  empty component means `.`. Results are cached while `HASH_CMDS` is set, and the cache
+  is dropped whenever `PATH` changes. The command runs with `execve` and an environment
+  from `ParamTable::make_envp()`. A file with no `#!` line runs under `/bin/sh`. Exit
+  statuses: 127 for not found, 126 for not executable, `128+sig` for signalled.
+- `$?` (`ExecContext::last_exit`) is updated after every pipeline, and `exit` stops the
+  program.
+- `xtrace` prints `PS4` (default `+ `) plus the expanded command, quoted where needed,
+  **before** running it.
+
+**Left to other milestones**
+- Function lookup ahead of builtins (M4); aliases are expanded by the lexer (M7).
+- `PS4` is printed raw; prompt escapes such as zsh's default `+%N:%i> ` need M9.
+- Assigning to an integer parameter stores text; zsh evaluates it arithmetically (M5).
+- Array assignments `a=(x y)` need lexer fix B8 [parser/assign], [exec/assign].
+- There is still no way to turn on `xtrace` from the shell until `set -x`/`setopt` exist (M7).
 
 ### M2. Pipelines, redirections, lists, background
 
@@ -96,9 +102,13 @@ parser tests assert exact bytecode for each construct.
 - Pipelines `a | b | c` and `|&` (stderr too): create pipes, fork each stage, put all
   stages in one process group, wait for all of them. The exit status is the last
   stage's, or the rightmost failure when `PIPEFAIL` is set. `! pipeline` negates it.
-- `&&`, `||` short-circuit; `;` and newline sequence; `&` runs the sublist as a background
-  job, sets `$!` and prints `[N] pid` in interactive shells.
+- `&` runs the sublist as a background job, sets `$!` and prints `[N] pid` in interactive
+  shells. (`;`, newlines, `&&` and `||` already work; `&` and multi-command pipelines are
+  currently rejected at run time with "not supported yet", and `WC_PIPE` does not yet
+  record which segments are `|&`.)
 - Redirections [parser/redir], [exec/redirects]:
+  - `par_redir` must consume the target word too (today any redirection is a
+    "not supported yet" parse error);
   - `<`, `>`, `>>`, `>|`, `<>`, `<<`, `<<-`, `<<<`, `>&N`, `<&N`, `>&-`, `&>`, `&>>`;
   - optional fd prefix (`2>`, `3<`), which the lexer currently drops (bug B10);
   - here-documents: bodies are read after the current line, expanded unless the
@@ -394,10 +404,11 @@ Every stub currently returns 0, which is actively harmful: `[ -f /nonexistent ]`
 
 ### Testing
 
-- Parser tests that assert bytecode or decompiled text for every construct.
+- Parser tests that assert bytecode for every construct: `tests/parser_test.cpp` covers
+  what M1 parses; extend it as constructs land.
 - Executor tests that run scripts through `exec_string` and capture stdout/stderr/exit
-  status, via a test helper that runs jfsh in-process with redirected fds or as a
-  subprocess.
+  status: `tests/exec_test.cpp` has the in-process helper (`Shell::run`, fds 1 and 2
+  redirected to temp files); extend it per milestone.
 - A zsh compatibility corpus: `tests/compat/*.zsh` scripts run under both `zsh` and
   `jfsh`, with their outputs compared. Generate expected outputs from zsh in CI.
 - Interactive tests: drive the editor through a pty (`forkpty`) and assert on screen
@@ -405,7 +416,8 @@ Every stub currently returns 0, which is actively harmful: `[ -f /nonexistent ]`
 - Enable the two `DISABLED_` tests (`GlobPatternMatch.DISABLED_BracketExpressions`,
   `Lexer.DISABLED_SubstitutionsStayOneWord`) as their features land.
 - Run the suite under ASan/UBSan in CI. jfsh's Debug build has no sanitizer flags yet,
-  although the top-level build does.
+  although the top-level build does. (The suite passed under ASan + UBSan + LeakSanitizer
+  when M1 landed, using a scratch build with `-fsanitize=address,undefined`.)
 
 ---
 
@@ -421,9 +433,6 @@ Severity:
 
 | ID | Location | Bug | Evidence |
 |---|---|---|---|
-| B1 | `src/parser/parser.cpp:156`, `:85`, `:111` vs `src/exec/executor.cpp:95` | Parser and executor disagree on the bytecode layout. The parser emits **postfix** code: `WC_STRING…` then `WC_SIMPLE`, a list body then `WC_LIST`, a pipeline then `WC_SUBLIST_NOT`. The executor decodes **prefix** code and calls `exec_simple({}, {}, …)` with no words. Even with `exec_string` wired up, nothing would run. | code reading |
-| B2 | `src/exec/executor.cpp:29` | `exec_string` is a no-op that returns 0, so `-c`, scripts, stdin and interactive input all do nothing and report success. | **confirmed**: `jfsh -c false; echo $?` → 0 |
-| B3 | `src/lexer/input.cpp:19` | `StringInputSource::unget(-1)` at EOF rewinds the position. Input ending in `;`, `&` or `|` then produces that token forever. This is latent until M0 wires the class up, and then every `cmd;` hangs. | **confirmed**: lexing `echo a;` yields `[;]` endlessly |
 | B4 | `src/core/jobs.cpp:18` | On an empty table, `find_free_slot()` returns `mTable.size()` (0), so the first job gets id 0. Id 0 means "free slot", so that job is invisible to `get()`, `for_each()`, notifications and `reap()`. | **confirmed**: first `alloc` → id 0, `get(0)` = missing |
 | B5 | `src/history/history.cpp:122` | `save()` in append mode, the default, writes **all** entries, including those just loaded from the file, so `HISTFILE` doubles every session (1 → 3 → 7 → 15 …). | **confirmed**: 3 sessions × 1 command = 7 lines |
 | B6 | `src/history/history.cpp:91` | `lookup(0)` computes `idx = size()` and reads one past the end. | **confirmed**: ASan heap-buffer-overflow |
@@ -432,14 +441,11 @@ Severity:
 
 | ID | Location | Bug | Evidence |
 |---|---|---|---|
-| B7 | `src/lexer/lexer.cpp:185` | Reserved words are recognized in every position, so `echo done`, `git log --until …` and `ls in` produce keyword tokens. They must only be keywords in command position. | code reading |
+| B7 | `src/lexer/lexer.cpp:185` | Reserved words are still lexed as keyword tokens in every position. `par_simple` now turns them back into words after the command word, so `echo done` works, but every later construct that takes words (`for x in …` lists, `case` patterns, `[[ ]]` operands) must do the same, or the lexer should only produce keywords in command position. | code reading |
 | B8 | `src/lexer/lexer.cpp:167` | `(`, `)`, `{` and `}` always end a word, so `$(cmd)`, `${var}`, `$((1+2))`, `a{b,c}` and `f(x)`-style globs are split into several tokens. | **confirmed** by `Lexer.DISABLED_SubstitutionsStayOneWord` |
-| B9 | `src/parser/parser.cpp:10` | `parse()` never checks that it reached `TK_EOF`. On an unexpected token (e.g. `)` or a stray `fi`) it stops and returns success with the rest of the input dropped. Also, when `par_list()` fails with an empty error message, the partial program is returned as success. | code reading |
 | B10 | `src/lexer/lexer.cpp:192` | Fd-number prefixes are not part of the redirection: `2>&1` lexes as word `2`, redir `>&`, word `1`, so `2` becomes a command argument. | code reading |
-| B11 | `src/parser/parser.cpp:127` | `TK_LBRACE` dispatches to `par_funcdef`, so a brace group `{ a; b; }` would be parsed as a function definition. | code reading |
-| B12 | `src/exec/executor.cpp:209`, `src/core/params.cpp:111` | External commands use `execvp` with the process `environ`, not `ParamTable::make_envp()`, so `export`/assignments can never reach children. `make_envp()` also emits a variable once per scope it appears in, and the outer value comes first. | **confirmed**: `X` appears twice in `envp` |
-| B13 | `src/core/params.cpp:83` | `assign()` always writes into the innermost scope, so assigning a global from inside a function creates a shadowing local and the global never changes. `readonly` is not enforced. When `flags` is 0 the parameter becomes `PM_SCALAR` even if the value is an integer or array. | **confirmed**: global `X` unchanged after an inner-scope assign |
-| B14 | `src/exec/executor.cpp:214` | `do_exec` ignores `waitpid`'s return value: on `EINTR`/`ECHILD` the status stays 0 and the command "succeeds". Stopped children (Ctrl-Z) are not handled, because there is no `WUNTRACED` and the shell blocks. | code reading |
+| B13 | `src/core/params.cpp:83` | Shell assignments now go through `set_scalar`, which updates the right scope and enforces readonly. The lower-level `assign()` still writes into the innermost scope, ignores `PM_READONLY`, and with `flags` 0 makes the parameter `PM_SCALAR` even for an integer or array value; `typeset`/`local`/`export` (M7) must not use it for plain updates. | code reading |
+| B14 | `src/exec/executor.cpp` (`run_external`) | `waitpid` now retries on `EINTR`, but there is no `WUNTRACED`: a stopped child (Ctrl-Z) leaves the shell blocked in `waitpid`. Part of M6. | code reading |
 | B15 | `src/core/options.cpp:225` | `OptionState::find` strips a leading `no` **before** matching, so the real options `nomatch` and `notify` can never be found. The negation it detects is thrown away, so `noextendedglob` resolves to `extendedglob` and the caller can't tell. | **confirmed**: `find("nomatch")` = not found; `find("noextendedglob")` = `extendedglob` |
 | B16 | `src/core/signals.cpp:69` | `trap 'cmd' SIG` (`TrapAction::Command`) installs no handler at all, so command traps never fire. `set_trap` also calls `std::signal` on `SIGKILL`/`SIGSTOP` and ignores the failure. | code reading |
 | B17 | `src/core/signals.cpp:149` | `kill_job(pgid)` with the default `Job::pgid == -1` calls `kill(1, sig)`, which signals **init**; with pgid 0 it signals jfsh's own process group. It must reject `pgid <= 1`. | code reading |
@@ -452,7 +458,6 @@ Severity:
 | B24 | `src/editor/editor.cpp:50` | Raw mode clears `ISIG` but `read_line` has no case for Ctrl-C (`\x03`) or Ctrl-Z, so Ctrl-C at the prompt does nothing instead of discarding the line. | code reading |
 | B29 | `src/editor/editor.cpp:132` | `read_key_sequence` returns `{}` when `read()` returns 0 (EOF/hangup) or -1. The caller loops forever, so a closed terminal leaves jfsh spinning at 100% CPU. | code reading |
 | B44 | `src/main.cpp:134`, `src/agent/provider.cpp:30` | `ProviderConfig::from_env()` picks the default model **before** `--provider` is applied, so `--provider anthropic` with no `--llm-model` sends `llama3` to Anthropic. An unknown `JFSH_PROVIDER` leaves the kind at its default silently. | code reading |
-| B60 | `src/parser/parser.cpp:213`, `:145` | `par_redir` consumes only the redirection operator, so its target is picked up by `par_simple` as an ordinary argument: `echo hi > f` parses as `echo hi f` and would print `hi f` to stdout instead of writing `f`. | code reading |
 
 ### Medium
 
@@ -463,9 +468,9 @@ Severity:
 | B27 | `src/editor/editor.cpp` | No `SIGWINCH` handling; `Editor::terminal_width()` exists but is never called. | code reading |
 | B28 | `src/editor/editor.cpp:115` | Tab completion inserts `candidates[0].substr(mBuf.cursor)`, using the **line** cursor as an offset into a **word** candidate. That only works when the word starts at column 0. `main.cpp:184` installs a completer that returns nothing anyway. | code reading |
 | B30 | `src/glob/glob.cpp:29` | `pattern_match` doesn't implement `[...]` although its comment says it does, so `file[0-9]` never matches. It also ignores `\` escapes, and `glob_expand` only splits the pattern at the last `/`, so `src/*/x.cpp` fails. | **confirmed** by `GlobPatternMatch.DISABLED_BracketExpressions` |
-| B31 | `src/main.cpp:235` | stdin mode runs each physical line separately: multi-line constructs can't work, and a line longer than 4095 bytes is split by `fgets` into **two commands**. | code reading |
+| B31 | `src/main.cpp:232` | stdin mode runs each physical line separately: multi-line constructs can't work, and a line longer than 4095 bytes is split by `fgets` into **two commands**. | code reading |
 | B32 | `src/main.cpp:84` | Unknown options are ignored silently, as is `-c` with no argument (`main.cpp:58`), a second script argument and everything after the script (the positional parameters). `--router` with an unknown value silently means heuristic, and `--provider` with an unknown value silently means Ollama (`main.cpp:143`). | code reading |
-| B33 | `src/main.cpp:220`, `:223` | `xtrace` output is printed **after** the command runs, without `PS4`. `errexit` is applied by the REPL to every interactive line (so one failed command exits the interactive shell), with none of zsh's exemptions. | code reading |
+| B33 | `src/main.cpp:220` | `errexit` is applied by the REPL to every interactive line (so one failed command exits the interactive shell), with none of zsh's exemptions. (The xtrace half of this bug is fixed: the executor traces before running.) | code reading |
 | B34 | `src/prompt/prompt.cpp:128` | Numeric prompt arguments aren't parsed: the default `PS1` `%n@%m %1~ %# ` renders as `user@host 1~ % `. | **confirmed** |
 | B35 | `src/prompt/prompt.cpp:123`, `:128` | `%F{color}` always emits "default colour" and ignores the colour. Unsupported escapes fall into `default:` and print the letter, so `%B…%b` renders as `B…b`. | **confirmed**: `%Bx%b` → `Bxb` |
 | B36 | `src/prompt/prompt.cpp:79` | `%~` uses a bare prefix compare: with `HOME=/Users/a` and cwd `/Users/ab`, it renders `~b`. | code reading |
@@ -481,7 +486,7 @@ Severity:
 | B47 | `include/jfsh/agent/provider.hh:25` | `temperature`, `top_p` and `seed` in `ModelParams` are never sent to any provider. | code reading |
 | B48 | `include/jfsh/agent/openrouter.hh:24` | The `HTTP-Referer`/`X-Title` headers the header comment promises are never sent. `OpenAIBackend::http_post` supports `extra_headers` (`src/agent/openai.cpp:92`), but `OpenRouterBackend` never passes any, and `chat_stream` makes its own curl request (`openai.cpp:187`) with no way to add headers, so both paths need it. | code reading |
 | B58 | `src/history/history.cpp:20`, `:51` | `HIST_IGNORE_ALL_DUPS` is inverted: `should_suppress` drops the **new** command when it duplicates any older entry, so the old entry stays where it was. zsh removes the older entry and appends the new one. The erase loop in `add()` that was meant to do this is dead code, since `should_suppress` has already returned. | code reading |
-| B59 | `src/lexer/lexer.cpp:192` | `read_redir` only starts on `<`/`>` and only looks at one following character: `&>` and `&>>` lex as `&` then a redirection, `>&-`/`<&-` lex as `>&` plus a word `-`, and `>>|` is split. Conversely, any `<`/`>` followed by `<`, `>`, `\|`, `&` or `-` is kept as one token, so invalid pairs like `<-`, `><` and `>-` are accepted. | code reading |
+| B59 | `src/lexer/lexer.cpp:126`, `:192` | Redirection lexing is incomplete. `read_token` routes `&>` to `read_redir('&')`, but it has already consumed the `>`, so `&>file` lexes as a bare `&` redirection and `&>>` as `&>` followed by `>`. `>&-`/`<&-` lex as `>&` plus a word `-`, and `>>\|` is split. Conversely, any `<`/`>` followed by `<`, `>`, `\|`, `&` or `-` is kept as one token, so invalid pairs like `<-`, `><` and `>-` are accepted. | code reading |
 
 ### Low
 
@@ -497,3 +502,15 @@ Severity:
 | B56 | `cmake/CompilerOptions.cmake` | Release builds use `-march=native`, so binaries only run on CPUs like the build machine's. simdjson already dispatches at runtime. `-Wno-unused-parameter` is still on "for the stub phase". |
 | B57 | `src/main.cpp` | `curl_global_init` is never called, and the HTTP code relies on `curl_easy_init`'s implicit, non-thread-safe init. |
 | B61 | `src/prompt/prompt.cpp:78` | `%~` (and the B36 prefix check) reads `HOME` with `getenv`, not from the shell's `ParamTable`, so changing `HOME` inside jfsh won't affect the prompt. |
+
+### Fixed
+
+| ID | Fixed by |
+|---|---|
+| B1 | M0/M1: parser and executor share the prefix layout documented in `wordcode.hh`. |
+| B2 | M0: `exec_string` lexes, parses and executes. |
+| B3 | `StringInputSource`/`FileInputSource::unget(-1)` are no-ops; regression test `Lexer.TrailingOperatorAtEofTerminates`. |
+| B9 | `Parser::parse` fails on leftover tokens and on an empty error message. |
+| B11 | `{` no longer misparses as a function definition: brace groups and functions are a "not supported yet" error until M4. |
+| B12 | External commands use `execve` with `make_envp()`, which now emits each name once with its innermost value. |
+| B60 | A redirection is a "not supported yet" parse error instead of turning its target into an argument; M2 notes that `par_redir` must consume the target. |

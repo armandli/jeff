@@ -57,13 +57,63 @@ enum WCOpcode : WordCode {
   WC_MAX,
 };
 
+// ---------------------------------------------------------------------------
+// Bytecode layout.  Every construct is PREFIX: its opcode comes first, and
+// operands that a reader may need to skip carry an explicit length, so the
+// executor can jump over an un-taken branch without decoding it.
+//
+//   program  := list* WC_END
+//   list     := WC_LIST(flags, skip)     sublist
+//                 flags: WC_LIST_ASYNC (`&`), WC_LIST_END (last list element)
+//                 skip:  words in the sublist chain that follows
+//   sublist  := WC_SUBLIST(flags, skip)  pipeline  [sublist]
+//                 flags: connector to the NEXT element (WC_SUBLIST_END, _AND,
+//                        _OR) | WC_SUBLIST_NOT (negate this pipeline)
+//                 skip:  words in this element's pipeline
+//                 The chain continues while the connector is AND or OR.
+//   pipeline := WC_PIPE(n)  command{n}
+//   command  := simple | compound (M4: WC_IF, WC_WHILE, …)
+//   simple   := assign*  WC_SIMPLE(argc)  WC_STRING(word){argc}
+//                 argc may be 0 for an assignment-only command
+//   assign   := WC_ASSIGN(flags)  WC_STRING(name)  WC_STRING(value)
+//                 flags: WC_ASSIGN_APPEND (`name+=value`)
+//
+// WC_STRING's operand indexes CompiledProgram::strs.  Words are stored as
+// written (quotes included); expansion happens at execution time.
+// ---------------------------------------------------------------------------
+
 inline constexpr WordCode WC_LIST_ASYNC = 1u;  // & (background)
 inline constexpr WordCode WC_LIST_END   = 2u;  // last in list
+inline constexpr int      kWCListFlagBits = 2;
 
 inline constexpr WordCode WC_SUBLIST_END  = 0u;
 inline constexpr WordCode WC_SUBLIST_AND  = 1u;    // &&
 inline constexpr WordCode WC_SUBLIST_OR   = 2u;    // ||
 inline constexpr WordCode WC_SUBLIST_NOT  = 4u;    // !
+inline constexpr WordCode WC_SUBLIST_TYPE = 3u;    // mask for END/AND/OR
+inline constexpr int      kWCSublistFlagBits = 3;
+
+inline constexpr WordCode WC_ASSIGN_APPEND = 1u;   // name+=value
+
+constexpr WordCode make_wc_list(WordCode flags, WordCode skip) noexcept {
+  return make_wc(WC_LIST, (skip << kWCListFlagBits) | flags);
+}
+constexpr WordCode wc_list_flags(WordCode w) noexcept {
+  return wc_data(w) & ((1u << kWCListFlagBits) - 1u);
+}
+constexpr WordCode wc_list_skip(WordCode w) noexcept {
+  return wc_data(w) >> kWCListFlagBits;
+}
+
+constexpr WordCode make_wc_sublist(WordCode flags, WordCode skip) noexcept {
+  return make_wc(WC_SUBLIST, (skip << kWCSublistFlagBits) | flags);
+}
+constexpr WordCode wc_sublist_flags(WordCode w) noexcept {
+  return wc_data(w) & ((1u << kWCSublistFlagBits) - 1u);
+}
+constexpr WordCode wc_sublist_skip(WordCode w) noexcept {
+  return wc_data(w) >> kWCSublistFlagBits;
+}
 
 enum RedirType : WordCode {
   REDIR_READ      = 0,   // <
@@ -106,6 +156,9 @@ struct ExecState {
   std::string_view str(std::size_t offset) const noexcept {
     return prog->strs[offset];
   }
+
+  // Fetch a WC_STRING operand and return the string it refers to.
+  std::string_view fetch_str() noexcept { return str(wc_data(fetch())); }
 };
 
 }  // namespace jfsh
