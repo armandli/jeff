@@ -34,7 +34,7 @@ add_subdirectory(src/json)
 add_subdirectory(src/inference)
 add_subdirectory(src/mcp)
 add_subdirectory(src/cli)
-add_subdirectory(server)
+add_subdirectory(src/server)
 
 # ---- C++ unit tests (GoogleTest) ----------------------------------------------
 option(JEFF_BUILD_TESTS "Build the C++ unit tests in tests/" ON)
