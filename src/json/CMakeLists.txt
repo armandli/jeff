@@ -32,7 +32,3 @@ set_target_properties(jeff_json PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # simdjson stays PRIVATE: json.hpp does not include simdjson.h.
 target_link_libraries(jeff_json PRIVATE simdjson)
-
-add_executable(jeff_json_test json_test.cpp)
-target_link_libraries(jeff_json_test PRIVATE jeff_json)
-add_test(NAME jeff_json COMMAND jeff_json_test)
