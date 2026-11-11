@@ -1,8 +1,9 @@
 # jfsh — remaining work
 
-Status as of 2026-11-10 (after `gtest-unit-tests`, commit `e58a779`).
+Status as of 2026-11-10 (after `gtest-unit-tests`, commit `e58a779`); bug list re-verified
+against the code on 2026-11-11.
 
-jfsh builds on macOS and has gtest coverage for the pieces that work. **It cannot run a
+jfsh builds on macOS and Linux and has gtest coverage for the pieces that work. **It cannot run a
 single shell command yet**: `jfsh -c 'echo hi'` prints nothing and exits 0. The System 1
 router and the LLM agent layer work end to end; the shell language underneath them is
 scaffolding.
@@ -445,12 +446,13 @@ Severity:
 | B18 | `include/jfsh/exec/executor.hh:40` | `break_level` and `cont_level` are `bool`, so `break 2` / `continue 3` can't be represented. `builtin_break` and `builtin_continue` ignore N (`src/builtins/builtins.cpp:103`). | code reading |
 | B19 | `src/builtins/builtins.cpp:340` (and ~45 others) | Unimplemented builtins return 0. `test`/`[` always succeed (`[ -f /missing ] && rm …` takes the true branch), and `kill`, `wait`, `export`, `read` and `cd`-stack builtins all report success while doing nothing. | code reading |
 | B20 | `src/builtins/builtins.cpp:185` | `cd` returns `chdir()`'s `-1` directly as the exit status (255) with no error message, and never updates `PWD`/`OLDPWD`. | code reading |
-| B21 | `src/builtins/builtins.cpp:436`, `:140` | `builtin_zpty` is defined but never registered. Its TODO text was also pasted into `builtin_read`'s comment. | code reading |
-| B22 | `src/core/signals.cpp:119`, `include/jfsh/core/signals.hh:68` | The SIGCHLD handler does a read-modify-write on plain `uint64_t` fields (`PendingSignals::mark`), which is not async-signal-safe. Use `volatile std::sig_atomic_t` flags or `std::atomic<uint64_t>` with lock-free ops, and install with `sigaction` + `SA_RESTART`. Nothing ever calls `dispatch_pending()`, so even the flag is unused. | code reading |
+| B21 | `src/builtins/builtins.cpp:436`, `:11` | `builtin_zpty` is defined and declared in `builtins.hh` but never registered in `BuiltinTable::register_all()`. | code reading |
+| B22 | `src/core/signals.cpp:119`, `include/jfsh/core/signals.hh:68` | The SIGCHLD handler does a read-modify-write on plain `uint64_t` fields (`PendingSignals::mark`), which is not async-signal-safe. Use `volatile std::sig_atomic_t` flags or `std::atomic<uint64_t>` with lock-free ops, and install with `sigaction` + `SA_RESTART`. `dispatch_pending()` is only called from `SignalManager::unblock()`, and nothing calls `block()`/`unblock()`, so even the flag is never acted on. | code reading |
 | B23 | `src/core/signals.cpp:119` (`SignalManager::init`) | Interactive mode is ignored: no process groups, no `tcsetpgrp`, `SIGINT`/`SIGTSTP`/`SIGTTOU` keep their default dispositions. While a foreground command runs (raw mode off), Ctrl-C reaches jfsh too and **kills the shell**. | code reading |
 | B24 | `src/editor/editor.cpp:50` | Raw mode clears `ISIG` but `read_line` has no case for Ctrl-C (`\x03`) or Ctrl-Z, so Ctrl-C at the prompt does nothing instead of discarding the line. | code reading |
 | B29 | `src/editor/editor.cpp:132` | `read_key_sequence` returns `{}` when `read()` returns 0 (EOF/hangup) or -1. The caller loops forever, so a closed terminal leaves jfsh spinning at 100% CPU. | code reading |
 | B44 | `src/main.cpp:134`, `src/agent/provider.cpp:30` | `ProviderConfig::from_env()` picks the default model **before** `--provider` is applied, so `--provider anthropic` with no `--llm-model` sends `llama3` to Anthropic. An unknown `JFSH_PROVIDER` leaves the kind at its default silently. | code reading |
+| B60 | `src/parser/parser.cpp:213`, `:145` | `par_redir` consumes only the redirection operator, so its target is picked up by `par_simple` as an ordinary argument: `echo hi > f` parses as `echo hi f` and would print `hi f` to stdout instead of writing `f`. | code reading |
 
 ### Medium
 
@@ -458,11 +460,11 @@ Severity:
 |---|---|---|---|
 | B25 | `src/editor/editor.cpp:96` | The cursor and backspace work on bytes, so editing any multi-byte UTF-8 character corrupts the line. `PromptRenderer::visual_width` (`src/prompt/prompt.cpp:143`) counts bytes too. | code reading |
 | B26 | `src/editor/editor.cpp:146` | `refresh_display` rewrites the whole prompt with a single `\r`, so prompts containing newlines are reprinted on every keystroke and lines wider than the terminal break. It also recomputes the prompt (`getpwuid`, `gethostname`, `getcwd`) on every key. | code reading |
-| B27 | `src/editor/editor.cpp` | No `SIGWINCH` handling; the terminal width is read but never used. | code reading |
+| B27 | `src/editor/editor.cpp` | No `SIGWINCH` handling; `Editor::terminal_width()` exists but is never called. | code reading |
 | B28 | `src/editor/editor.cpp:115` | Tab completion inserts `candidates[0].substr(mBuf.cursor)`, using the **line** cursor as an offset into a **word** candidate. That only works when the word starts at column 0. `main.cpp:184` installs a completer that returns nothing anyway. | code reading |
 | B30 | `src/glob/glob.cpp:29` | `pattern_match` doesn't implement `[...]` although its comment says it does, so `file[0-9]` never matches. It also ignores `\` escapes, and `glob_expand` only splits the pattern at the last `/`, so `src/*/x.cpp` fails. | **confirmed** by `GlobPatternMatch.DISABLED_BracketExpressions` |
 | B31 | `src/main.cpp:235` | stdin mode runs each physical line separately: multi-line constructs can't work, and a line longer than 4095 bytes is split by `fgets` into **two commands**. | code reading |
-| B32 | `src/main.cpp:84` | Unknown options are ignored silently, as are a second script argument and everything after the script (the positional parameters). `--router` with an unknown value silently means heuristic, and `--provider` with an unknown value silently means Ollama (`main.cpp:143`). | code reading |
+| B32 | `src/main.cpp:84` | Unknown options are ignored silently, as is `-c` with no argument (`main.cpp:58`), a second script argument and everything after the script (the positional parameters). `--router` with an unknown value silently means heuristic, and `--provider` with an unknown value silently means Ollama (`main.cpp:143`). | code reading |
 | B33 | `src/main.cpp:220`, `:223` | `xtrace` output is printed **after** the command runs, without `PS4`. `errexit` is applied by the REPL to every interactive line (so one failed command exits the interactive shell), with none of zsh's exemptions. | code reading |
 | B34 | `src/prompt/prompt.cpp:128` | Numeric prompt arguments aren't parsed: the default `PS1` `%n@%m %1~ %# ` renders as `user@host 1~ % `. | **confirmed** |
 | B35 | `src/prompt/prompt.cpp:123`, `:128` | `%F{color}` always emits "default colour" and ignores the colour. Unsupported escapes fall into `default:` and print the letter, so `%B…%b` renders as `B…b`. | **confirmed**: `%Bx%b` → `Bxb` |
@@ -472,12 +474,14 @@ Severity:
 | B39 | `src/history/history.cpp:104` | `load()` treats every line as one command: zsh `EXTENDED_HISTORY` lines keep their `: ts:0;` prefix, and multi-line commands come back as several entries. `sync()` (`:131`) just calls `load()` and duplicates everything. | code reading |
 | B40 | `src/history/history.cpp:15` | `should_suppress` returns early when `no_store` is set, which skips the `ignore_dups`/`ignore_all` checks. `no_store` is supposed to drop `history`/`fc -l` lines themselves. | code reading |
 | B41 | `src/core/jobs.cpp:106`, `:68`, `:9` | `reap()` frees slots without updating `mCurrent`/`mPrevious`, so `%+` can point to a dead job. Killed processes set `JobStatus::Done`, never `Signalled`. `Job::exit_status` ignores `PIPEFAIL`. `notify_changes` only prints for `JOB_NOTIFY`, which nothing sets. | code reading |
-| B42 | `src/router/router.cpp:20` | `HeuristicRouter` runs `system("zsh -n -c …")` for **every** line, which costs a fork plus exec of `/bin/sh` and `zsh`. If zsh isn't installed, `system` returns 127 and **every line is routed to the LLM**. `zsh -n` also accepts natural language like `what is ls`, so the heuristic almost never chooses the agent. | code reading |
+| B42 | `src/router/router.cpp:20` | `HeuristicRouter` runs `system("zsh -n -c …")` for **every** line, which costs a fork plus exec of `/bin/sh` and `zsh`. If zsh isn't installed, `system` returns 127 and **every line is routed to the LLM**. `zsh -n` also accepts most natural language (`what is ls`), so only lines that happen to be invalid syntax, such as an unbalanced apostrophe in `what's ls`, reach the agent. | code reading |
 | B43 | `src/router/jeff.cpp:83`, `src/router/jev.cpp:111` | When the service is down, each line waits for the full timeout (1 s for jeff, 10 s for JEV), prints a warning and falls back. There's no backoff, so the shell becomes unusable. JEV also sends `Authorization: Bearer ` with an empty key. | code reading |
-| B45 | `src/agent/provider.cpp:35` | The default Anthropic model `claude-opus-4-7` is outdated; it should probably be `claude-opus-5-5`. | code reading |
+| B45 | `src/agent/provider.cpp:35`, `include/jfsh/agent/provider.hh:43` | The default Anthropic model `claude-opus-4-7` (in `from_env()` and the `default_anthropic` default argument) is outdated; it should probably be `claude-opus-5-5`. | code reading |
 | B46 | `include/jfsh/agent/provider.hh:37` | `timeout_ms = 30000` is applied as `CURLOPT_TIMEOUT_MS`, a **total** transfer limit, so any streamed answer longer than 30 s is cut off. | code reading |
 | B47 | `include/jfsh/agent/provider.hh:25` | `temperature`, `top_p` and `seed` in `ModelParams` are never sent to any provider. | code reading |
-| B48 | `include/jfsh/agent/openrouter.hh:24` | The `HTTP-Referer`/`X-Title` headers the header comment promises are never sent; `OpenAIBackend::http_post`'s `extra_headers` parameter is unused. | code reading |
+| B48 | `include/jfsh/agent/openrouter.hh:24` | The `HTTP-Referer`/`X-Title` headers the header comment promises are never sent. `OpenAIBackend::http_post` supports `extra_headers` (`src/agent/openai.cpp:92`), but `OpenRouterBackend` never passes any, and `chat_stream` makes its own curl request (`openai.cpp:187`) with no way to add headers, so both paths need it. | code reading |
+| B58 | `src/history/history.cpp:20`, `:51` | `HIST_IGNORE_ALL_DUPS` is inverted: `should_suppress` drops the **new** command when it duplicates any older entry, so the old entry stays where it was. zsh removes the older entry and appends the new one. The erase loop in `add()` that was meant to do this is dead code, since `should_suppress` has already returned. | code reading |
+| B59 | `src/lexer/lexer.cpp:192` | `read_redir` only starts on `<`/`>` and only looks at one following character: `&>` and `&>>` lex as `&` then a redirection, `>&-`/`<&-` lex as `>&` plus a word `-`, and `>>|` is split. Conversely, any `<`/`>` followed by `<`, `>`, `\|`, `&` or `-` is kept as one token, so invalid pairs like `<-`, `><` and `>-` are accepted. | code reading |
 
 ### Low
 
@@ -486,9 +490,10 @@ Severity:
 | B49 | `src/agent/agent.cpp` | The non-streaming path of `Agent::handle` prints a newline even when the request failed. |
 | B50 | `src/core/options.cpp` | `kOptionInfo` is indexed by `info.index`, but nothing checks that the table order matches `OptIndex` or that it is complete. A `static_assert` or startup check would catch a missing row, which would otherwise zero-initialize and crash `find()` on a null name. |
 | B51 | `include/jfsh/core/param.hh:63` | It uses `std::unique_ptr` without `#include <memory>` and only compiles through `types.hh`. |
-| B52 | `src/editor/completion.cpp:83` | `complete_commands` doesn't check the executable bit, deduplicate across `PATH` or sort. `complete_files` lists dotfiles when the prefix doesn't start with `.`, and adds no `/` to directories. |
+| B52 | `src/editor/completion.cpp:83` | `complete_commands` doesn't check the executable bit, deduplicate across `PATH` or sort. It also lists `.` and `..`. `complete_files` lists dotfiles when the prefix is empty, and adds no `/` to directories. |
 | B53 | `src/modules/module.cpp` | `ModuleManager` is never instantiated. Its `resolve_path` maps `zsh/x` → `zsh_x.so` but has no default search path, so `zmodload` can't work even once implemented. |
 | B54 | `src/editor/editor.cpp` (`read_line`, non-tty path) | It prints `PS1` even when stdin is not a terminal, which pollutes the output of `jfsh -i < file`. |
-| B55 | `CMakeLists.txt` | The link line lists `jfsh_core`, `jfsh_lexer` and `jfsh_parser` more than once, which produces the `ld: warning: ignoring duplicate libraries` warning. |
+| B55 | `CMakeLists.txt` | Possibly macOS only: Apple's linker was reported to warn `ld: warning: ignoring duplicate libraries` for `jfsh_core`, `jfsh_lexer` and `jfsh_parser`. Not reproducible on Linux: `CMakeLists.txt` lists no library twice, the library graph has no cycles, and the generated link line has each `.a` once. Re-check on macOS before fixing; if it persists, it is CMake's static-library ordering, not a duplicate in our files. |
 | B56 | `cmake/CompilerOptions.cmake` | Release builds use `-march=native`, so binaries only run on CPUs like the build machine's. simdjson already dispatches at runtime. `-Wno-unused-parameter` is still on "for the stub phase". |
 | B57 | `src/main.cpp` | `curl_global_init` is never called, and the HTTP code relies on `curl_easy_init`'s implicit, non-thread-safe init. |
+| B61 | `src/prompt/prompt.cpp:78` | `%~` (and the B36 prefix check) reads `HOME` with `getenv`, not from the shell's `ParamTable`, so changing `HOME` inside jfsh won't affect the prompt. |
