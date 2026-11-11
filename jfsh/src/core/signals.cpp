@@ -1,6 +1,10 @@
 #include <csignal>
 #include <cstring>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
+#include <jfsh/core/jobs.hh>
 #include <jfsh/core/signals.hh>
 
 namespace jfsh {
@@ -116,8 +120,50 @@ bool PendingSignals::test(int sig) const noexcept {
   return (hi >> (sig - 64)) & 1;
 }
 
-void SignalManager::init(bool /*interactive*/) {
-  std::signal(SIGCHLD, [](int) { Signals.note_sigchld(); });
+// SIGCHLD handler.  Must be async-signal-safe: only writes one byte to the
+// self-pipe, which dispatch_pending() will later drain.  Using the pipe
+// means we never call waitpid or malloc from a signal handler context.
+static void sigchld_handler(int) {
+  int err = errno;
+  char byte = 1;
+  int fd = Signals.self_pipe_write_fd();
+  if (fd >= 0) {
+    ssize_t n;
+    do { n = ::write(fd, &byte, 1); } while (n < 0 and errno == EINTR);
+    (void)n;
+  }
+  errno = err;
+}
+
+void SignalManager::note_sigchld() noexcept { mPending.mark(SIGCHLD); }
+
+void SignalManager::init(bool interactive) {
+  mInteractive = interactive;
+
+  // Open a self-pipe (both ends CLOEXEC + nonblocking so handlers never
+  // stall and children never inherit the parent's drain fds).  Fallback
+  // for platforms without pipe2 (BSDs, old glibc) uses pipe + fcntl.
+  int pfd[2] = {-1, -1};
+#if defined(O_CLOEXEC) && defined(__linux__)
+  if (::pipe2(pfd, O_CLOEXEC | O_NONBLOCK) != 0) pfd[0] = pfd[1] = -1;
+#else
+  if (::pipe(pfd) == 0) {
+    for (int fd : {pfd[0], pfd[1]}) {
+      int fl = ::fcntl(fd, F_GETFL, 0);
+      ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+      int fdfl = ::fcntl(fd, F_GETFD, 0);
+      ::fcntl(fd, F_SETFD, fdfl | FD_CLOEXEC);
+    }
+  }
+#endif
+  mSelfPipe[0] = pfd[0];
+  mSelfPipe[1] = pfd[1];
+
+  struct sigaction sa{};
+  sa.sa_handler = sigchld_handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+  ::sigaction(SIGCHLD, &sa, nullptr);
 }
 
 void SignalManager::block()   { ++mBlockDepth; }
@@ -130,20 +176,21 @@ void SignalManager::unblock() {
 }
 
 void SignalManager::dispatch_pending() {
-  if (mPending.test(SIGCHLD)) {
-    mPending.clear(SIGCHLD);
-    // TODO(signals/sigchld): Call waitpid(-1, &status, WNOHANG|WUNTRACED)
-    //   in a loop until it returns 0 or -1; for each pid found call
-    //   Jobs.update(pid, status) to update job/process state, then
-    //   Jobs.notify_changes() if the NOTIFY option is set.
+  // Drain whatever bytes are queued in the self-pipe.  We do not care about
+  // the count — each byte means "SIGCHLD fired at least once", and waitpid
+  // in a loop below collects every child that actually exited.
+  if (mSelfPipe[0] >= 0) {
+    char buf[64];
+    while (::read(mSelfPipe[0], buf, sizeof buf) > 0) {}
   }
-  // TODO(signals/dispatch): For each set bit in mPending_ (other than SIGCHLD):
-  //   1. Look up mTraps[sig].action
-  //   2. If TrapAction::Command: push the command string onto an eval queue
-  //      (do NOT call exec directly here — we may be in a signal handler context).
-  //   3. After the pending set is cleared, drain the eval queue from the
-  //      main REPL loop using exec_string().
-  //   4. For SIGINT: set ctx_.break_level and clear pending input if interactive.
+
+  // Reap every child whose state has changed.
+  for (;;) {
+    int status = 0;
+    pid_t pid = ::waitpid(-1, &status, WNOHANG | WUNTRACED);
+    if (pid <= 0) break;
+    Jobs.update(pid, status);
+  }
 }
 
 Result<void> SignalManager::kill_job(Pid pgid, int sig) noexcept {

@@ -1,6 +1,8 @@
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <jfsh/builtins/builtins.hh>
@@ -221,9 +223,31 @@ int builtin_jobs(std::vector<std::string>& args, ExecContext& ctx) {
   (void)args; (void)ctx; return 0;
 }
 int builtin_wait(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/wait): waitpid() for specific pids/job-ids, or all children
-  //   if no args.  Returns exit status of the waited process.
-  (void)args; (void)ctx; return 0;
+  // Minimal: with no args, wait for every running job; with a pid, wait
+  // for that one.  Returns the last reaped exit status.  Does not yet
+  // support %jobid forms or -n.
+  int rc = 0;
+  if (args.size() <= 1) {
+    for (;;) {
+      int status = 0;
+      pid_t pid = waitpid(-1, &status, 0);
+      if (pid <= 0) break;
+      ctx.jobs.update(pid, status);
+      if (WIFEXITED(status))        rc = WEXITSTATUS(status);
+      else if (WIFSIGNALED(status)) rc = 128 + WTERMSIG(status);
+    }
+    return rc;
+  }
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    pid_t pid = static_cast<pid_t>(std::atoi(args[i].c_str()));
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 and errno == EINTR) {}
+    if (errno == ECHILD) continue;
+    ctx.jobs.update(pid, status);
+    if (WIFEXITED(status))        rc = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status)) rc = 128 + WTERMSIG(status);
+  }
+  return rc;
 }
 int builtin_disown(std::vector<std::string>& args, ExecContext& ctx) {
   // TODO(builtin/disown): Mark job JOB_DISOWNED so SIGHUP is not sent on exit.

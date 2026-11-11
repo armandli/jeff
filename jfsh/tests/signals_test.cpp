@@ -1,7 +1,10 @@
 #include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
+#include <jfsh/core/jobs.hh>
 #include <jfsh/core/signals.hh>
 
 namespace jfsh {
@@ -33,6 +36,32 @@ TEST(SignalNames, SigToNameRoundTrips) {
   }
   EXPECT_STREQ(SignalTable::sig_to_name(SIGINT), "INT");
   EXPECT_STREQ(SignalTable::sig_to_name(-1), "UNKNOWN");
+}
+
+// The self-pipe SIGCHLD handler should deliver a child's exit through
+// dispatch_pending(), which calls Jobs.update to drop its slot.
+TEST(SignalSelfPipe, SigchldReachesJobTable) {
+  Signals.init(false);
+  pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) _exit(42);
+
+  int jid = Jobs.alloc(pid, 0, "test-child");
+  Process p; p.pid = pid; p.status = ProcStatus::Running;
+  Jobs.add_process(jid, std::move(p));
+
+  // Give the child a moment to actually exit so SIGCHLD queues.  Then
+  // drain the self-pipe and reap.
+  for (int i = 0; i < 100; ++i) {
+    Signals.dispatch_pending();
+    auto job = Jobs.get(jid);
+    if (job and job->get().is_done()) {
+      EXPECT_EQ(job->get().procs.front().exit_code, 42);
+      return;
+    }
+    usleep(5'000);
+  }
+  FAIL() << "SIGCHLD did not propagate through self-pipe within 500 ms";
 }
 
 }  // namespace

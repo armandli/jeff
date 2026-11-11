@@ -145,18 +145,20 @@ bool Parser::par_sublist() {
   }
 }
 
-// pipeline := WC_PIPE(n) command{n}
+// pipeline := WC_PIPE(count|stderr_mask) command{n}
 bool Parser::par_pline() {
-  std::size_t head = emit(make_wc(WC_PIPE, 0));
-  WordCode n = 0;
+  std::size_t head = emit(make_wc_pipe(0, 0));
+  WordCode n           = 0;
+  WordCode stderr_mask = 0;
   for (;;) {
     if (not par_cmd()) return false;
     ++n;
     if (not (at(TokType::TK_PIPE) or at(TokType::TK_PIPEAMP))) break;
+    if (at(TokType::TK_PIPEAMP)) stderr_mask |= (1u << (n - 1));
     mLex.consume();
     skip_newlines();
   }
-  patch(head, make_wc(WC_PIPE, n));
+  patch(head, make_wc_pipe(n, stderr_mask));
   return true;
 }
 
@@ -206,14 +208,31 @@ static bool is_reserved_word(TokType t) noexcept {
       or t == TokType::TK_BANG;
 }
 
-// simple := (WC_ASSIGN WC_STRING(name) WC_STRING(value))*
-//           WC_SIMPLE(argc) WC_STRING(word){argc}
+// simple := (assign | redir)* WC_SIMPLE(argc) WC_STRING{argc}
 bool Parser::par_simple() {
   std::vector<std::string> words;
   int nassign = 0;
+  int nredir  = 0;
   for (;;) {
     const auto& tok = mLex.peek();
-    if (tok.type == TokType::TK_REDIR) return par_redir();
+    if (tok.type == TokType::TK_REDIR) {
+      // Process substitution reads like a redirection to the lexer, but it
+      // behaves like a WORD whose value is `/dev/fd/N` once the pipe is up.
+      // Forward it through as an argument; the executor sets up the pipe
+      // during word expansion and substitutes the path in-place.
+      if (tok.text.size() >= 2
+          and tok.text.back() == ')'
+          and (tok.text.substr(0, 2) == "<("
+               or tok.text.substr(0, 2) == ">("
+               or tok.text.substr(0, 2) == "=(")) {
+        words.push_back(tok.text);
+        mLex.consume();
+        continue;
+      }
+      if (not par_redir()) return false;
+      ++nredir;
+      continue;
+    }
     if (tok.type == TokType::TK_WORD) {
       bool append = false;
       std::size_t len = words.empty() ? assignment_name_len(tok.text, append) : 0;
@@ -235,7 +254,8 @@ bool Parser::par_simple() {
     }
     break;
   }
-  if (words.empty() and nassign == 0) return error_near(mLex.peek());
+  if (words.empty() and nassign == 0 and nredir == 0)
+    return error_near(mLex.peek());
   emit(make_wc(WC_SIMPLE, static_cast<WordCode>(words.size())));
   for (auto& w : words) emit_str(std::move(w));
   return true;
@@ -289,12 +309,113 @@ bool Parser::par_cond() { return unsupported("`[[ … ]]'"); }
 //   Emit WC_ARITH with expression string ref.
 bool Parser::par_arith() { return unsupported("`(( … ))'"); }
 
-// TODO(parser/redir): Parse fd[redir_type]target:
-//   fd is optional integer prefix; redir_type from RedirType enum;
-//   target word or here-doc delimiter.
-//   register_heredoc() when REDIR_HEREDOC / REDIR_HEREDOCD encountered.
-//   Emit WC_REDIR with RedirType and string indices.
-bool Parser::par_redir() { return unsupported("redirection"); }
+// Split a redirection token `text` (produced by the lexer) into an optional
+// leading fd prefix (as an int, or -1 when absent) and the operator string.
+// `2>&1` → (2, ">&"), `>>` → (-1, ">>"), `3<` → (3, "<").  The special form
+// `2>&1` keeps `1` as a separate argument the caller reads next — this
+// helper only detects the fd BEFORE the operator, not after.
+static std::pair<int, std::string> split_redir_token(const std::string& text) {
+  std::size_t i = 0;
+  while (i < text.size()
+         and std::isdigit(static_cast<unsigned char>(text[i]))) ++i;
+  if (i == 0) return {-1, text};
+  if (i >= text.size()) return {-1, text};
+  int fd = std::atoi(text.substr(0, i).c_str());
+  return {fd, text.substr(i)};
+}
+
+static bool op_to_redir_type(const std::string& op, RedirType& out) noexcept {
+  if (op == "<")   { out = REDIR_READ;       return true; }
+  if (op == ">")   { out = REDIR_WRITE;      return true; }
+  if (op == ">>")  { out = REDIR_APPEND;     return true; }
+  if (op == ">|")  { out = REDIR_CLOBBER;    return true; }
+  if (op == "<>")  { out = REDIR_READWRITE;  return true; }
+  if (op == "<<")  { out = REDIR_HEREDOC;    return true; }
+  if (op == "<<-") { out = REDIR_HEREDOCD;   return true; }
+  if (op == "<<<") { out = REDIR_HERESTR;    return true; }
+  if (op == ">&")  { out = REDIR_MERGE;      return true; }
+  if (op == "<&")  { out = REDIR_IN_DUP;     return true; }
+  if (op == "&>")  { out = REDIR_MERGEOUT;   return true; }
+  if (op == "&>>") { out = REDIR_APPEND_ERR; return true; }
+  if (op == "<(")  { out = REDIR_PROC_IN;    return true; }
+  if (op == ">(")  { out = REDIR_PROC_OUT;   return true; }
+  if (op == "=(")  { out = REDIR_PROC_EQ;    return true; }
+  return false;
+}
+
+// Strip one layer of outer quotes from a here-doc delimiter and report
+// whether any were present.  `'EOF'` → ("EOF", true); `EOF` → ("EOF", false).
+static std::string heredoc_unquote(std::string_view raw, bool& quoted) {
+  std::string out;
+  quoted = false;
+  for (std::size_t i = 0; i < raw.size(); ++i) {
+    char c = raw[i];
+    if (c == '\'' or c == '"' or c == '\\') { quoted = true; continue; }
+    out += c;
+  }
+  return out;
+}
+
+bool Parser::par_redir() {
+  LexToken op_tok = mLex.next_token();
+  // Process substitution tokens look like `<(cmd)` / `>(cmd)` / `=(cmd)` —
+  // the lexer already slurped the balanced parens into text, so recognize
+  // them by prefix before invoking the general operator table.
+  if (op_tok.text.size() >= 2 and op_tok.text.back() == ')'
+      and (op_tok.text.substr(0, 2) == "<("
+           or op_tok.text.substr(0, 2) == ">("
+           or op_tok.text.substr(0, 2) == "=(")) {
+    RedirType type =
+        op_tok.text[0] == '<' ? REDIR_PROC_IN :
+        op_tok.text[0] == '>' ? REDIR_PROC_OUT : REDIR_PROC_EQ;
+    std::string body =
+        op_tok.text.substr(2, op_tok.text.size() - 3);  // strip `<(` and `)`
+    emit(make_wc_redir(type, -1));
+    emit_str(std::move(body));
+    return true;
+  }
+
+  auto [fd, op] = split_redir_token(op_tok.text);
+  RedirType type;
+  if (not op_to_redir_type(op, type))
+    return unsupported("redirection `" + op_tok.text + "'");
+
+  // REDIR_CLOSE is >&- with no target.
+  if (type == REDIR_MERGE or type == REDIR_IN_DUP) {
+    const auto& tgt = mLex.peek();
+    if (tgt.type == TokType::TK_WORD and tgt.text == "-") {
+      mLex.consume();
+      emit(make_wc_redir(REDIR_CLOSE, fd));
+      emit_str("");
+      return true;
+    }
+  }
+
+  // Normal redirs: expect a WORD target.
+  const auto& tgt = mLex.peek();
+  if (tgt.type != TokType::TK_WORD) {
+    error("expected target after `" + op_tok.text + "'");
+    return false;
+  }
+  std::string target = tgt.text;
+  mLex.consume();
+
+  if (type == REDIR_HEREDOC or type == REDIR_HEREDOCD) {
+    bool quoted = false;
+    std::string delim = heredoc_unquote(target, quoted);
+    mLex.register_heredoc(delim, type == REDIR_HEREDOCD, not quoted);
+    // Read the body now so it is captured before the next token advances
+    // past the newline.  The lexer returns the body as a plain string.
+    std::string body = mLex.read_heredoc();
+    emit(make_wc_redir(type, fd));
+    emit_str(std::move(body));
+    return true;
+  }
+
+  emit(make_wc_redir(type, fd));
+  emit_str(std::move(target));
+  return true;
+}
 
 // Scalar `name=value` / `name+=value` words are recognized in par_simple.
 // TODO(parser/assign): Array assignments `name=(a b c)` / `name+=(…)` — the

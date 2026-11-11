@@ -102,7 +102,32 @@ TEST(Parser, ListElementsAndAsync) {
 }
 
 TEST(Parser, PipelineCountsItsCommands) {
-  EXPECT_NE(listing("a | b |& c").find("PIPE 3\n"), std::string::npos);
+  // The PIPE line encodes both the stage count and a per-connector `|&` mask
+  // using the character `&` for the second connector in `a | b |& c`.
+  EXPECT_NE(listing("a | b |& c").find("PIPE 3 |&"), std::string::npos);
+  EXPECT_NE(listing("a | b | c").find("PIPE 3 ||"),  std::string::npos);
+}
+
+TEST(Parser, RedirectionsAttachToSimpleCommands) {
+  // A simple command with a `>` redirection: WC_REDIR + target string come
+  // before WC_SIMPLE.
+  EXPECT_NE(listing("echo hi > f").find("REDIR >\nSTRING \"f\"\nSIMPLE 2\n"),
+            std::string::npos);
+  // Fd prefix is recorded on the WC_REDIR instruction itself.
+  EXPECT_NE(listing("a 2>err").find("REDIR > fd=2"), std::string::npos);
+  // `>&-` closes an fd — explicit target is empty.
+  EXPECT_NE(listing("a >&-").find("REDIR >&-"), std::string::npos);
+}
+
+TEST(Parser, HeredocBodyLandsInStringTable) {
+  // Unquoted <<EOF: body in disassembly is the content between the opening
+  // line and the EOF marker.  The disassembler emits raw newlines inside the
+  // STRING literal rather than escaped ones.
+  auto out = listing("cat <<EOF\nhello\nEOF\n");
+  EXPECT_NE(out.find("REDIR <<\nSTRING \"hello\n\""), std::string::npos);
+  // <<-EOF strips one leading tab per line.
+  auto out2 = listing("cat <<-END\n\tx\n\ty\n\tEND\n");
+  EXPECT_NE(out2.find("STRING \"x\ny\n\""), std::string::npos);
 }
 
 // Reserved words are only special in command position (bug B7).
@@ -122,7 +147,6 @@ TEST(Parser, UnimplementedConstructsFailClearly) {
   EXPECT_EQ(listing("if true; then a; fi"), "error: `if' is not supported yet");
   EXPECT_EQ(listing("{ a; }"),
             "error: brace group or function definition is not supported yet");
-  EXPECT_EQ(listing("echo hi > f"), "error: redirection is not supported yet");
 }
 
 TEST(Parser, ErrorCarriesTheLineNumber) {

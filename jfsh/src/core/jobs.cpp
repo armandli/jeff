@@ -15,7 +15,9 @@ int Job::exit_status() const noexcept {
 int JobTable::find_free_slot() noexcept {
   for (int i = 1; i < static_cast<int>(mTable.size()); ++i)
     if (mTable[static_cast<std::size_t>(i)].job_id == 0) return i;
-  return static_cast<int>(mTable.size());
+  // Slot 0 is permanently reserved so job ids start at 1.
+  int n = static_cast<int>(mTable.size());
+  return n < 1 ? 1 : n;
 }
 
 int JobTable::alloc(Pid pgid, std::uint32_t flags, std::string text) {

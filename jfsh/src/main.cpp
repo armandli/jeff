@@ -222,7 +222,9 @@ int main(int argc, char* argv[]) {
 
       history.add(line);
 
+      jfsh::Signals.dispatch_pending();
       jfsh::Jobs.notify_changes();
+      jfsh::Jobs.reap();
 
       if (ctx.exiting) break;
     }

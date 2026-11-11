@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <gtest/gtest.h>
@@ -324,17 +325,188 @@ TEST(Exec, XtracePrintsPs4AndTheExpandedCommandFirst) {
   EXPECT_EQ(sh.run("echo it''s").err, "trace> echo its\n");
 }
 
-// ---- not supported yet ---------------------------------------------------------
+// ---- M2 features ---------------------------------------------------------
 
-TEST(Exec, UnsupportedConstructsFailWithStatus1) {
+TEST(Exec, PipelinePassesDataBetweenStages) {
   Shell sh;
-  auto r = sh.run("echo a | cat");
-  EXPECT_EQ(r.rc, 1);
-  EXPECT_EQ(r.err, "jfsh: pipelines are not supported yet\n");
+  auto r = sh.run("echo hello | tr a-z A-Z");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "HELLO\n");
+}
 
-  r = sh.run("true &");
+TEST(Exec, ThreeStagePipeline) {
+  Shell sh;
+  auto r = sh.run("echo abc | tr a-z A-Z | tr A-Z 0-9");
+  EXPECT_EQ(r.rc, 0);
+}
+
+TEST(Exec, PipefailReflectsFirstFailingStage) {
+  Shell sh;
+  auto r = sh.run("false | true");
+  EXPECT_EQ(r.rc, 0);  // without pipefail, last stage wins
+  sh.opts.set(OPT_PIPEFAIL);
+  r = sh.run("false | true");
   EXPECT_EQ(r.rc, 1);
-  EXPECT_EQ(r.err, "jfsh: background jobs (&) are not supported yet\n");
+}
+
+TEST(Exec, PipelineStderrMerge) {
+  Shell sh;
+  // sh -c 'echo out; echo err 1>&2' writes to both; |& should capture both.
+  auto r = sh.run("sh -c 'echo xx 1>&2' |& cat");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_NE(r.out.find("xx"), std::string::npos);
+}
+
+TEST(Exec, BackgroundJobReturnsImmediately) {
+  Shell sh;
+  auto r = sh.run("sleep 0.05 &");
+  EXPECT_EQ(r.rc, 0);
+  // $! should be set to a positive pid.
+  EXPECT_GT(sh.ctx.last_bg_pid, 0);
+  // Wait for the child to exit so it doesn't leak into the next test.
+  int status = 0;
+  waitpid(sh.ctx.last_bg_pid, &status, 0);
+}
+
+TEST(Exec, RedirectWriteCreatesFile) {
+  Shell sh;
+  TempDir dir;
+  auto out = (dir.path / "o").string();
+  auto r = sh.run("echo hi > " + out);
+  EXPECT_EQ(r.rc, 0);
+  std::ifstream f{out};
+  std::string got((std::istreambuf_iterator<char>(f)),
+                  std::istreambuf_iterator<char>());
+  EXPECT_EQ(got, "hi\n");
+}
+
+TEST(Exec, RedirectAppendPreservesFile) {
+  Shell sh;
+  TempDir dir;
+  auto out = (dir.path / "o").string();
+  sh.run("echo a > " + out);
+  auto r = sh.run("echo b >> " + out);
+  EXPECT_EQ(r.rc, 0);
+  std::ifstream f{out};
+  std::string got((std::istreambuf_iterator<char>(f)),
+                  std::istreambuf_iterator<char>());
+  EXPECT_EQ(got, "a\nb\n");
+}
+
+TEST(Exec, RedirectReadDeliversFileAsStdin) {
+  Shell sh;
+  TempDir dir;
+  auto in = (dir.path / "i").string();
+  std::ofstream{in} << "hello\n";
+  auto r = sh.run("cat < " + in);
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "hello\n");
+}
+
+TEST(Exec, HeredocDeliversBody) {
+  Shell sh;
+  auto r = sh.run("cat <<EOF\nhello\nworld\nEOF\n");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "hello\nworld\n");
+}
+
+TEST(Exec, HeredocStripTabsWithDashOperator) {
+  Shell sh;
+  auto r = sh.run("cat <<-END\n\tx\n\ty\n\tEND\n");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "x\ny\n");
+}
+
+TEST(Exec, HerestringDeliversStringPlusNewline) {
+  Shell sh;
+  auto r = sh.run("cat <<< hello");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "hello\n");
+}
+
+TEST(Exec, StderrRedirectToFile) {
+  Shell sh;
+  TempDir dir;
+  auto errfile = (dir.path / "e").string();
+  auto r = sh.run("sh -c 'echo err 1>&2' 2> " + errfile);
+  EXPECT_EQ(r.rc, 0);
+  std::ifstream f{errfile};
+  std::string got((std::istreambuf_iterator<char>(f)),
+                  std::istreambuf_iterator<char>());
+  EXPECT_EQ(got, "err\n");
+}
+
+TEST(Exec, MergeStderrIntoStdout) {
+  Shell sh;
+  auto r = sh.run("sh -c 'echo out; echo err 1>&2' 2>&1");
+  EXPECT_EQ(r.rc, 0);
+  // Both lines reach stdout; order is "out\nerr\n" for the sh above.
+  EXPECT_NE(r.out.find("out"), std::string::npos);
+  EXPECT_NE(r.out.find("err"), std::string::npos);
+}
+
+TEST(Exec, NoClobberRefusesExistingFile) {
+  Shell sh;
+  TempDir dir;
+  auto path = (dir.path / "o").string();
+  std::ofstream{path} << "orig";
+  sh.opts.unset(OPT_CLOBBER);
+  auto r = sh.run("echo new > " + path);
+  EXPECT_NE(r.rc, 0);
+  std::ifstream f{path};
+  std::string got((std::istreambuf_iterator<char>(f)),
+                  std::istreambuf_iterator<char>());
+  EXPECT_EQ(got, "orig");
+}
+
+TEST(Exec, ClobberOperatorOverridesNoClobber) {
+  Shell sh;
+  TempDir dir;
+  auto path = (dir.path / "o").string();
+  std::ofstream{path} << "orig";
+  sh.opts.unset(OPT_CLOBBER);
+  auto r = sh.run("echo new >| " + path);
+  EXPECT_EQ(r.rc, 0);
+  std::ifstream f{path};
+  std::string got((std::istreambuf_iterator<char>(f)),
+                  std::istreambuf_iterator<char>());
+  EXPECT_EQ(got, "new\n");
+}
+
+TEST(Exec, ProcessSubstitutionInput) {
+  Shell sh;
+  auto r = sh.run("cat <(echo via-procsub)");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "via-procsub\n");
+}
+
+TEST(Exec, WaitBuiltinCollectsBackgroundExit) {
+  Shell sh;
+  sh.run("true &");
+  auto r = sh.run("wait");
+  EXPECT_EQ(r.rc, 0);
+}
+
+TEST(Exec, MultiosTeesToBothTargets) {
+  Shell sh;
+  TempDir dir;
+  sh.opts.set(OPT_MULTIOS);
+  auto a = (dir.path / "a").string();
+  auto b = (dir.path / "b").string();
+  auto r = sh.run("echo x > " + a + " > " + b);
+  EXPECT_EQ(r.rc, 0);
+  // The tee helper runs asynchronously; give it a moment to flush and
+  // exit so both target files have their data on disk.
+  for (int i = 0; i < 50; ++i) {
+    std::ifstream fa{a}, fb{b};
+    std::string va((std::istreambuf_iterator<char>(fa)),
+                   std::istreambuf_iterator<char>());
+    std::string vb((std::istreambuf_iterator<char>(fb)),
+                   std::istreambuf_iterator<char>());
+    if (va == "x\n" and vb == "x\n") return;
+    usleep(10'000);
+  }
+  FAIL() << "multios did not deliver x\\n to both targets";
 }
 
 TEST(Exec, ParseErrorReportsTheLineAndRunsNothing) {

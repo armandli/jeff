@@ -31,6 +31,19 @@ static const struct { const char* word; TokType type; } KEYWORDS[] = {
 Lexer::Lexer(InputSource& src) : mSrc{src} {}
 Lexer::~Lexer() = default;
 
+// Scoop balanced parentheses so `<(…)`, `>(…)` and `=(…)` become a single
+// TK_REDIR token whose text holds the entire substitution source.
+static void slurp_balanced_paren(InputSource& src, std::string& text) {
+  int depth = 1;
+  for (;;) {
+    int c = src.next_char();
+    if (c == -1) break;
+    text += static_cast<char>(c);
+    if (c == '(') ++depth;
+    else if (c == ')') { if (--depth == 0) break; }
+  }
+}
+
 bool Lexer::is_keyword(std::string_view s) const noexcept {
   for (auto* k = KEYWORDS; k->word; ++k)
     if (s == k->word) return true;
@@ -78,16 +91,23 @@ std::string Lexer::read_heredoc() {
   if (mHeredocQueue.empty()) return {};
   auto spec = std::move(mHeredocQueue.front());
   mHeredocQueue.erase(mHeredocQueue.begin());
+  // Discard anything left on the opening line (the newline terminating it)
+  // so the body starts cleanly.  Comments or trailing spaces after the
+  // delimiter are not part of the body.
+  int c;
+  while ((c = mSrc.next_char()) != -1 and c != '\n') {}
   std::string body;
   std::string line_buf;
   for (;;) {
-    int c = mSrc.next_char();
+    c = mSrc.next_char();
     if (c == -1) break;
     if (c == '\n') {
-      if (line_buf == spec.delim) break;
-      if (spec.strip_tabs and not line_buf.empty() and line_buf[0] == '\t')
-        line_buf = line_buf.substr(1);
-      body += line_buf + '\n';
+      std::string_view check = line_buf;
+      if (spec.strip_tabs)
+        while (not check.empty() and check.front() == '\t')
+          check.remove_prefix(1);
+      if (check == spec.delim) break;
+      body += (spec.strip_tabs ? std::string(check) : line_buf) + '\n';
       line_buf.clear();
     } else {
       line_buf += static_cast<char>(c);
@@ -119,8 +139,8 @@ LexToken Lexer::read_token() {
       case '&': {
         int n = mSrc.next_char();
         if (n == '&') return {TokType::TK_AMPAMP,   "&&", mSrc.line()};
-        if (n == '>') return read_redir('&');
         if (n == '(') return {TokType::TK_AMPPAREN, "&(", mSrc.line()};
+        if (n == '>') { mSrc.unget(n); return read_redir('&'); }
         mSrc.unget(n);
         return {TokType::TK_AMP, "&", mSrc.line()};
       }
@@ -159,9 +179,20 @@ LexToken Lexer::read_word(int first_char) {
   int  ln        = mSrc.line();
   bool in_single = false;
   bool in_double = false;
+  bool all_digits_so_far =
+      std::isdigit(static_cast<unsigned char>(first_char)) != 0;
   for (;;) {
     if (c == -1) break;
     if (not in_single and not in_double) {
+      // Fd prefix: `2>`, `12<foo` etc.  When the word so far is all ASCII
+      // digits and the next character is a redirection operator, hand the
+      // whole lot over to read_redir and bake the fd into the token text.
+      if (all_digits_so_far and not text.empty()
+          and (c == '<' or c == '>')) {
+        LexToken redir = read_redir(c);
+        redir.text = text + redir.text;
+        return redir;
+      }
       if (c == ' ' or c == '\t' or c == '\n'
           or c == ';' or c == '&' or c == '|'
           or c == '(' or c == ')' or c == '{' or c == '}'
@@ -169,7 +200,14 @@ LexToken Lexer::read_word(int first_char) {
         mSrc.unget(c);
         break;
       }
+      // `=(` at the start of a word is zsh's =(cmd) substitution.
+      if (text == "=" and c == '(') {
+        std::string body = "=(";
+        slurp_balanced_paren(mSrc, body);
+        return {TokType::TK_REDIR, body, ln};
+      }
     }
+    if (not std::isdigit(static_cast<unsigned char>(c))) all_digits_so_far = false;
     if (c == '\'' and not in_double) in_single = not in_single;
     if (c == '"'  and not in_single) in_double = not in_double;
     if (c == '\\' and not in_single) {
@@ -199,8 +237,14 @@ LexToken Lexer::read_redir(int first_char) {
       if      (n == '-') text += '-';
       else if (n == '<') text += '<';
       else               mSrc.unget(n);
+    } else if (text == "&>") {
+      int n = mSrc.next_char();
+      if (n == '>') text += '>';
+      else          mSrc.unget(n);
+    } else if (text == "<(" or text == ">(") {
+      slurp_balanced_paren(mSrc, text);
     } else if (text == ">>" or text == ">|" or text == ">&"
-               or text == "<>" or text == "&>" or text == "<(") {
+               or text == "<>" or text == "<&") {
       // ok
     } else if (c != '>' and c != '<' and c != '|'
                and c != '&' and c != '-') {

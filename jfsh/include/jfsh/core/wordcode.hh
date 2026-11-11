@@ -71,12 +71,22 @@ enum WCOpcode : WordCode {
 //                        _OR) | WC_SUBLIST_NOT (negate this pipeline)
 //                 skip:  words in this element's pipeline
 //                 The chain continues while the connector is AND or OR.
-//   pipeline := WC_PIPE(n)  command{n}
+//   pipeline := WC_PIPE(count|stderr_mask)  command{n}
+//                 low 8 bits: stage count n
+//                 upper bits: bit i set ⇔ pipe between stage i and i+1 is `|&`
 //   command  := simple | compound (M4: WC_IF, WC_WHILE, …)
-//   simple   := assign*  WC_SIMPLE(argc)  WC_STRING(word){argc}
+//   simple   := (assign | redir)*  WC_SIMPLE(argc)  WC_STRING(word){argc}
 //                 argc may be 0 for an assignment-only command
+//                 redirs and assigns may interleave in any order
 //   assign   := WC_ASSIGN(flags)  WC_STRING(name)  WC_STRING(value)
 //                 flags: WC_ASSIGN_APPEND (`name+=value`)
+//   redir    := WC_REDIR(type|fd|has_fd)  WC_STRING(target_or_body)
+//                 low 5 bits: RedirType
+//                 bits 5–9:   fd (0–31), meaningful only when has_fd is set
+//                 bit 10:     has_fd flag (user wrote a prefix `2>`, `3<`)
+//                 target_or_body is the here-doc body for REDIR_HEREDOC{,D},
+//                 empty for REDIR_CLOSE, the subcommand source for
+//                 REDIR_PROC_{IN,OUT,EQ}, otherwise the target word
 //
 // WC_STRING's operand indexes CompiledProgram::strs.  Words are stored as
 // written (quotes included); expansion happens at execution time.
@@ -116,21 +126,58 @@ constexpr WordCode wc_sublist_skip(WordCode w) noexcept {
 }
 
 enum RedirType : WordCode {
-  REDIR_READ      = 0,   // <
-  REDIR_WRITE     = 1,   // >
-  REDIR_APPEND    = 2,   // >>
-  REDIR_HEREDOC   = 3,   // <<
-  REDIR_HEREDOCD  = 4,   // <<- (strip tabs)
-  REDIR_HERESTR   = 5,   // <<<
-  REDIR_READWRITE = 6,   // <>
-  REDIR_CLOBBER   = 7,   // >|
-  REDIR_MERGE     = 8,   // >&
-  REDIR_MERGEOUT  = 9,   // &>
-  REDIR_PROC_IN   = 10,  // <(cmd)  process substitution
-  REDIR_PROC_OUT  = 11,  // >(cmd)
-  REDIR_PROC_EQ   = 12,  // =(cmd)  zsh-specific
-  REDIR_CLOSE     = 13,  // >&-
+  REDIR_READ        = 0,   // <
+  REDIR_WRITE       = 1,   // >
+  REDIR_APPEND      = 2,   // >>
+  REDIR_HEREDOC     = 3,   // <<
+  REDIR_HEREDOCD    = 4,   // <<- (strip tabs)
+  REDIR_HERESTR     = 5,   // <<<
+  REDIR_READWRITE   = 6,   // <>
+  REDIR_CLOBBER     = 7,   // >|
+  REDIR_MERGE       = 8,   // >&N
+  REDIR_MERGEOUT    = 9,   // &>
+  REDIR_PROC_IN     = 10,  // <(cmd)  process substitution
+  REDIR_PROC_OUT    = 11,  // >(cmd)
+  REDIR_PROC_EQ     = 12,  // =(cmd)  zsh-specific
+  REDIR_CLOSE       = 13,  // >&-
+  REDIR_IN_DUP      = 14,  // <&N
+  REDIR_APPEND_ERR  = 15,  // &>>
+  REDIR_TYPE_MAX,
 };
+
+inline constexpr int WC_REDIR_TYPE_BITS = 5;
+inline constexpr int WC_REDIR_FD_BITS   = 5;
+inline constexpr WordCode WC_REDIR_HAS_FD_BIT = 1u << 10;
+
+constexpr WordCode make_wc_redir(RedirType type, int fd) noexcept {
+  WordCode packed = static_cast<WordCode>(type);
+  if (fd >= 0) {
+    packed |= WC_REDIR_HAS_FD_BIT;
+    packed |= static_cast<WordCode>(fd & 0x1f) << WC_REDIR_TYPE_BITS;
+  }
+  return make_wc(WC_REDIR, packed);
+}
+constexpr RedirType wc_redir_type(WordCode w) noexcept {
+  return static_cast<RedirType>(wc_data(w) & 0x1fu);
+}
+constexpr bool wc_redir_has_fd(WordCode w) noexcept {
+  return (wc_data(w) & WC_REDIR_HAS_FD_BIT) != 0u;
+}
+constexpr int wc_redir_fd(WordCode w) noexcept {
+  return static_cast<int>((wc_data(w) >> WC_REDIR_TYPE_BITS) & 0x1fu);
+}
+
+inline constexpr int WC_PIPE_COUNT_BITS = 8;
+
+constexpr WordCode make_wc_pipe(WordCode n, WordCode stderr_mask) noexcept {
+  return make_wc(WC_PIPE, n | (stderr_mask << WC_PIPE_COUNT_BITS));
+}
+constexpr WordCode wc_pipe_count(WordCode w) noexcept {
+  return wc_data(w) & ((1u << WC_PIPE_COUNT_BITS) - 1u);
+}
+constexpr bool wc_pipe_stderr(WordCode w, unsigned i) noexcept {
+  return ((wc_data(w) >> WC_PIPE_COUNT_BITS) >> i) & 1u;
+}
 
 struct CompiledProgram {
   std::vector<WordCode>    prog;      // bytecode stream
