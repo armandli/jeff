@@ -45,6 +45,13 @@ struct ExecContext {
   int  exit_val    = 0;
 };
 
+// A `name=value` (or `name+=value`) word in front of a simple command.
+struct Assignment {
+  std::string name;
+  std::string value;
+  bool        append = false;
+};
+
 struct Executor {
   explicit Executor(ExecContext& ctx);
 
@@ -52,14 +59,20 @@ struct Executor {
   int exec_string(std::string_view src);
   int exec_simple(
     std::vector<std::string> args,
-    std::vector<std::string> assigns,
+    std::vector<Assignment>  assigns,
     ExecFlags flags = EF_NONE);
+
+  // Path to run for a command name: the name itself when it contains `/`,
+  // otherwise a $PATH search (cached while HASH_CMDS is set).  Fails with
+  // FileNotFound (exit 127) or PermissionDenied (exit 126).
+  Result<std::string> find_command(std::string_view name);
 
 protected:
   int exec_list   (ExecState& es, ExecFlags);
   int exec_sublist(ExecState& es, ExecFlags);
   int exec_pline  (ExecState& es, ExecFlags);
   int exec_cmd    (ExecState& es, ExecFlags);
+  int exec_simple_cmd(ExecState& es, ExecFlags);
 
   int exec_if      (ExecState& es);
   int exec_while   (ExecState& es);
@@ -74,12 +87,16 @@ protected:
   int exec_always  (ExecState& es);
 
   int  do_fork(ExecState& es, ExecFlags);
-  int  do_exec(std::vector<std::string>& args);
+  int  run_external(
+    const std::vector<std::string>& args,
+    const std::vector<Assignment>&  assigns);
   void setup_redirects(ExecState& es);
-  void expand_args(ExecState& es, std::vector<std::string>& out);
-  void apply_assigns(
-    const std::vector<std::string>& assigns,
-    bool export_flag);
+  std::vector<std::string> expand_words(const std::vector<std::string>& words);
+  std::string              expand_value(std::string_view value);
+  int  apply_assigns(const std::vector<Assignment>& assigns);
+  void trace(
+    const std::vector<std::string>& args,
+    const std::vector<Assignment>&  assigns);
 
   bool is_builtin(std::string_view name) const noexcept;
   int  call_builtin(
@@ -92,6 +109,8 @@ protected:
 
 private:
   ExecContext& mCtx;
+  HashTable<std::string> mCmdHash;     // command name → resolved path
+  std::string            mHashedPath;  // $PATH the hash was built against
 };
 
 }  // namespace jfsh

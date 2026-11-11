@@ -1,10 +1,14 @@
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <jfsh/builtins/builtins.hh>
 #include <jfsh/exec/executor.hh>
+#include <jfsh/lexer/input.hh>
+#include <jfsh/parser/parser.hh>
 
 namespace jfsh {
 
@@ -27,63 +31,124 @@ int Executor::exec(const CompiledProgram& prog) {
 }
 
 int Executor::exec_string(std::string_view src) {
-  // TODO(exec): Wire up parse_string once StringInputSource is exposed from lexer/input.cpp.
-  //   Steps:
-  //   1. Create StringInputSource(src)
-  //   2. Create Lexer(source)
-  //   3. Create Parser(lexer)
-  //   4. auto prog = parser.parse()  — returns Result<ProgRef>
-  //   5. if (!prog) report error and return 1
-  //   6. return exec(*prog)
-  (void)src;
-  return 0;
+  StringInputSource in{std::string(src)};
+  Lexer lex{in};
+  // Comments are always recognized in scripts and -c strings, but
+  // interactively only with INTERACTIVE_COMMENTS.
+  if (not mCtx.opts.interactive() or mCtx.opts.get(OPT_INTERACTIVECOMMENTS))
+    lex.push_state(LEX_SKIPCOMMENTS);
+  Parser parser{lex};
+  auto prog = parser.parse();
+  if (not prog) {
+    std::fprintf(stderr, "jfsh:%d: %s\n",
+                 prog.error().code, prog.error().message.c_str());
+    mCtx.last_exit = 1;
+    return 1;
+  }
+  return exec(**prog);
+}
+
+// Value an assignment in front of a command gives its name for that command
+// only.  Fails, like a real assignment would, on a readonly parameter.
+static Result<std::string> prefix_value(const ParamTable& params,
+                                        const Assignment& a) {
+  auto existing = params.lookup(a.name);
+  if (existing and existing->get().is_readonly())
+    return std::unexpected(ShellError{ErrorKind::ExecError,
+        "read-only variable: " + a.name});
+  if (a.append and existing) return existing->get().scalar() + a.value;
+  return a.value;
 }
 
 int Executor::exec_simple(std::vector<std::string> args,
-                          std::vector<std::string> assigns,
+                          std::vector<Assignment>  assigns,
                           ExecFlags flags) {
-  if (args.empty()) {
-    apply_assigns(assigns, false);
-    return 0;
-  }
+  args = expand_words(args);
+  for (auto& a : assigns) a.value = expand_value(a.value);
+  if (mCtx.opts.xtrace()) trace(args, assigns);
+
+  // With no command word the assignments set shell parameters.
+  if (args.empty()) return apply_assigns(assigns);
+
+  // TODO(M4): shell functions are looked up here, before builtins.  Aliases
+  //   never reach this point: they are expanded by the lexer (M7).
   if (auto def = s_builtins.find(args[0])) {
-    return def->get().fn(args, mCtx);
+    // zsh keeps assignments in front of a special builtin only under
+    // POSIX_BUILTINS; otherwise they last while the builtin runs.
+    if ((def->get().flags & BINF_SPECIAL) and mCtx.opts.get(OPT_POSIXBUILTINS)) {
+      if (int rc = apply_assigns(assigns)) return rc;
+      return def->get().fn(args, mCtx);
+    }
+    mCtx.params.push_scope();
+    int rc = 0;
+    for (const auto& a : assigns) {
+      auto value = prefix_value(mCtx.params, a);
+      if (not value) {
+        std::fprintf(stderr, "jfsh: %s\n", value.error().message.c_str());
+        rc = 1;
+        break;
+      }
+      auto outer = mCtx.params.lookup(a.name);
+      std::uint32_t attrs = PM_SCALAR;
+      if (outer and outer->get().is_exported()) attrs |= PM_EXPORTED;
+      mCtx.params.assign(a.name, std::move(*value), attrs);
+    }
+    if (rc == 0) rc = def->get().fn(args, mCtx);
+    mCtx.params.pop_scope();
+    return rc;
   }
-  return do_exec(args);
+  return run_external(args, assigns);
 }
 
 int Executor::exec_list(ExecState& es, ExecFlags flags) {
   int rc = 0;
   while (not es.at_end()) {
-    WordCode w  = es.fetch();
-    WordCode op = wc_code(w);
-    if (op == WC_END) break;
-    if (op == WC_LIST) {
-      rc = exec_sublist(es, flags);
-      if (wc_data(w) & WC_LIST_END) break;
+    WordCode w = es.fetch();
+    if (wc_code(w) != WC_LIST) break;  // WC_END
+    std::size_t end = es.pc + wc_list_skip(w);
+    if (wc_list_flags(w) & WC_LIST_ASYNC) {
+      // TODO(M2): run the sublist as a background job.
+      std::fprintf(stderr, "jfsh: background jobs (&) are not supported yet\n");
+      rc = mCtx.last_exit = 1;
     } else {
-      break;
+      rc = exec_sublist(es, flags);
     }
+    es.pc = end;
+    if (mCtx.exiting) return mCtx.exit_val;
   }
   return rc;
 }
 
+// Runs a chain of pipelines joined by && / ||.  A pipeline whose connector
+// rules it out is skipped, but the chain goes on: in `false && a || b`, `a`
+// is skipped and `b` runs.
 int Executor::exec_sublist(ExecState& es, ExecFlags flags) {
-  int rc = exec_pline(es, flags);
-  while (not es.at_end()) {
-    WordCode w  = es.peek();
-    WordCode op = wc_code(w);
-    if (op != WC_SUBLIST) break;
-    es.fetch();
-    WordCode flag = wc_data(w);
-    if ((flag & WC_SUBLIST_AND) and rc != 0) return rc;
-    if ((flag & WC_SUBLIST_OR)  and rc == 0) return rc;
-    rc = exec_pline(es, flags);
+  int  rc   = 0;
+  bool skip = false;
+  for (;;) {
+    WordCode    w   = es.fetch();  // WC_SUBLIST
+    WordCode    f   = wc_sublist_flags(w);
+    std::size_t end = es.pc + wc_sublist_skip(w);
+    if (not skip) {
+      rc = exec_pline(es, flags);
+      if (f & WC_SUBLIST_NOT) rc = (rc == 0) ? 1 : 0;
+      mCtx.last_exit = rc;
+    }
+    es.pc = end;
+    if (mCtx.exiting) return rc;
+    WordCode type = f & WC_SUBLIST_TYPE;
+    if (type == WC_SUBLIST_END) return rc;
+    skip = (type == WC_SUBLIST_AND) ? rc != 0 : rc == 0;
   }
-  return rc;
 }
 
 int Executor::exec_pline(ExecState& es, ExecFlags flags) {
+  WordCode n = wc_data(es.fetch());  // WC_PIPE
+  if (n != 1) {
+    // TODO(M2): pipelines.
+    std::fprintf(stderr, "jfsh: pipelines are not supported yet\n");
+    return 1;
+  }
   return exec_cmd(es, flags);
 }
 
@@ -92,7 +157,8 @@ int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
   WordCode w  = es.peek();
   WordCode op = wc_code(w);
   switch (op) {
-    case WC_SIMPLE:  { es.fetch(); return exec_simple({}, {}, flags); }
+    case WC_ASSIGN:
+    case WC_SIMPLE:  return exec_simple_cmd(es, flags);
     case WC_IF:      { es.fetch(); return exec_if(es);           }
     case WC_WHILE:   { es.fetch(); return exec_while(es);        }
     case WC_FOR:     { es.fetch(); return exec_for(es);          }
@@ -106,6 +172,23 @@ int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
     case WC_ALWAYS:  { es.fetch(); return exec_always(es);       }
     default:         return 0;
   }
+}
+
+// simple := (WC_ASSIGN WC_STRING(name) WC_STRING(value))*
+//           WC_SIMPLE(argc) WC_STRING(word){argc}
+int Executor::exec_simple_cmd(ExecState& es, ExecFlags flags) {
+  std::vector<Assignment> assigns;
+  while (wc_code(es.peek()) == WC_ASSIGN) {
+    bool append = wc_data(es.fetch()) & WC_ASSIGN_APPEND;
+    std::string name{es.fetch_str()};
+    std::string value{es.fetch_str()};
+    assigns.push_back({std::move(name), std::move(value), append});
+  }
+  WordCode argc = wc_data(es.fetch());  // WC_SIMPLE
+  std::vector<std::string> words;
+  words.reserve(argc);
+  for (WordCode i = 0; i < argc; ++i) words.emplace_back(es.fetch_str());
+  return exec_simple(std::move(words), std::move(assigns), flags);
 }
 
 // TODO(exec/if): Read WC_IF bytecode layout:
@@ -165,6 +248,40 @@ int Executor::exec_always(ExecState&) { return 0; }
 //   REDIR_HERESTR, REDIR_MERGE, REDIR_PROC_IN/OUT (process substitution), etc.
 void Executor::setup_redirects(ExecState&) {}
 
+// Quote removal, the last step of word expansion: '…' is literal, "…"
+// keeps backslash only before $ ` " \ and newline, and an unquoted
+// backslash escapes the next character.  A backslash-newline disappears.
+static std::string remove_quotes(std::string_view w) {
+  constexpr std::string_view kDquoteEscapes = "$`\"\\\n";
+  enum class Quote { None, Single, Double } q = Quote::None;
+  std::string out;
+  out.reserve(w.size());
+  for (std::size_t i = 0; i < w.size(); ++i) {
+    char c = w[i];
+    bool escape = c == '\\' and i + 1 < w.size()
+        and (q == Quote::None
+             or (q == Quote::Double
+                 and kDquoteEscapes.find(w[i + 1]) != std::string_view::npos));
+    if (q == Quote::Single) {
+      if (c == '\'') q = Quote::None;
+      else           out += c;
+    } else if (escape) {
+      if (w[i + 1] != '\n') out += w[i + 1];
+      ++i;
+    } else if (q == Quote::Double) {
+      if (c == '"') q = Quote::None;
+      else          out += c;
+    } else if (c == '\'') {
+      q = Quote::Single;
+    } else if (c == '"') {
+      q = Quote::Double;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
 // TODO(exec/expand): Word expansion pipeline (mirrors zsh's prefork/postfork):
 //   1. Tilde expansion  (~, ~user)
 //   2. Parameter expansion  ($var, ${var:-default}, ${#var}, ${var##pat}, etc.)
@@ -173,12 +290,65 @@ void Executor::setup_redirects(ExecState&) {}
 //   5. Word splitting  (IFS)
 //   6. Glob expansion  (*, ?, [...], **/...)
 //   7. Quote removal
-void Executor::expand_args(ExecState&, std::vector<std::string>&) {}
+//   Only step 7 is implemented so far.
+std::vector<std::string> Executor::expand_words(
+    const std::vector<std::string>& words) {
+  std::vector<std::string> out;
+  out.reserve(words.size());
+  for (const auto& w : words) out.push_back(remove_quotes(w));
+  return out;
+}
 
-// TODO(exec/assign): Apply name=value assignments from the WC_ASSIGN block.
-//   With export_flag=true (from `export`), mark each param PM_EXPORTED.
-//   Must handle array assignments: arr=(a b c) and hash assignments: hash=(k v).
-void Executor::apply_assigns(const std::vector<std::string>&, bool) {}
+// Assignment values get the same expansions minus word splitting and
+// globbing.
+std::string Executor::expand_value(std::string_view value) {
+  return remove_quotes(value);
+}
+
+// TODO(exec/assign): Array and hash assignments, arr=(a b c) / hash=(k v),
+//   once the lexer keeps `name=(` together (bug B8).
+int Executor::apply_assigns(const std::vector<Assignment>& assigns) {
+  for (const auto& a : assigns) {
+    if (auto r = mCtx.params.set_scalar(a.name, a.value, a.append); not r) {
+      std::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// Quotes a word for xtrace output only when it needs it, as zsh does.
+static std::string trace_quote(std::string_view w) {
+  constexpr std::string_view kSafe =
+      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+      "_@%+=:,./-";
+  if (not w.empty() and w.find_first_not_of(kSafe) == std::string_view::npos)
+    return std::string(w);
+  std::string out = "'";
+  for (char c : w) {
+    if (c == '\'') out += "'\\''";
+    else           out += c;
+  }
+  return out + "'";
+}
+
+// TODO(M9): PS4 is printed as is; it should go through prompt expansion
+//   (zsh's default is `+%N:%i> `).
+void Executor::trace(const std::vector<std::string>& args,
+                     const std::vector<Assignment>&  assigns) {
+  auto ps4 = mCtx.params.lookup("PS4");
+  std::string line = (ps4 and ps4->get().is_set()) ? ps4->get().scalar() : "+ ";
+  bool first = true;
+  auto add = [&](const std::string& word) {
+    if (not first) line += ' ';
+    line += word;
+    first = false;
+  };
+  for (const auto& a : assigns)
+    add(a.name + (a.append ? "+=" : "=") + trace_quote(a.value));
+  for (const auto& w : args) add(trace_quote(w));
+  std::fprintf(stderr, "%s\n", line.c_str());
+}
 
 bool Executor::is_builtin(std::string_view name) const noexcept {
   return s_builtins.find(name).has_value();
@@ -198,21 +368,127 @@ int Executor::call_function(std::string_view /*name*/,
 
 int Executor::do_fork(ExecState&, ExecFlags) { return 0; }
 
-int Executor::do_exec(std::vector<std::string>& args) {
-  std::vector<const char*> argv;
-  for (auto& a : args) argv.push_back(a.c_str());
-  argv.push_back(nullptr);
+static bool is_executable_file(const std::string& path) {
+  struct stat st{};
+  return stat(path.c_str(), &st) == 0 and S_ISREG(st.st_mode)
+     and access(path.c_str(), X_OK) == 0;
+}
 
-  pid_t pid = fork();
-  if (pid < 0) return 1;
-  if (pid == 0) {
-    execvp(argv[0], const_cast<char* const*>(argv.data()));
-    std::fprintf(stderr, "jfsh: %s: %s\n", argv[0], std::strerror(errno));
-    _exit(127);
+Result<std::string> Executor::find_command(std::string_view name) {
+  if (name.find('/') != std::string_view::npos) return std::string(name);
+
+  std::string path_var;
+  if (auto p = mCtx.params.lookup("PATH"); p and p->get().is_set())
+    path_var = p->get().scalar();
+  if (path_var != mHashedPath) {
+    mCmdHash.clear();
+    mHashedPath = path_var;
   }
+  bool hashing = mCtx.opts.get(OPT_HASHCMDS);
+  std::string key(name);
+  if (hashing) {
+    auto it = mCmdHash.find(key);
+    if (it != mCmdHash.end() and is_executable_file(it->second)) return it->second;
+  }
+
+  // An empty $PATH component means the current directory.  A matching file
+  // that is not executable is remembered, so the error can say why.
+  bool denied = false;
+  std::size_t start = 0;
+  while (not path_var.empty() and start <= path_var.size()) {
+    std::size_t end = path_var.find(':', start);
+    if (end == std::string::npos) end = path_var.size();
+    std::string dir = path_var.substr(start, end - start);
+    start = end + 1;
+    std::string candidate = (dir.empty() ? "." : dir) + "/" + key;
+    if (is_executable_file(candidate)) {
+      if (hashing) mCmdHash[key] = candidate;
+      return candidate;
+    }
+    struct stat st{};
+    if (stat(candidate.c_str(), &st) == 0 and S_ISREG(st.st_mode)) denied = true;
+  }
+  if (denied)
+    return std::unexpected(ShellError{ErrorKind::PermissionDenied,
+        "permission denied: " + key});
+  return std::unexpected(ShellError{ErrorKind::FileNotFound,
+      "command not found: " + key});
+}
+
+static std::vector<char*> c_strings(std::vector<std::string>& v) {
+  std::vector<char*> out;
+  out.reserve(v.size() + 1);
+  for (auto& s : v) out.push_back(s.data());
+  out.push_back(nullptr);
+  return out;
+}
+
+int Executor::run_external(const std::vector<std::string>& args,
+                           const std::vector<Assignment>&  assigns) {
+  auto path = find_command(args[0]);
+  if (not path) {
+    std::fprintf(stderr, "jfsh: %s\n", path.error().message.c_str());
+    return path.error().kind == ErrorKind::PermissionDenied ? 126 : 127;
+  }
+
+  // The child's environment is the shell's exported parameters plus the
+  // command's prefix assignments, which are exported to it alone.
+  std::vector<std::string> env = mCtx.params.make_envp();
+  for (const auto& a : assigns) {
+    auto value = prefix_value(mCtx.params, a);
+    if (not value) {
+      std::fprintf(stderr, "jfsh: %s\n", value.error().message.c_str());
+      return 1;
+    }
+    std::string prefix = a.name + "=";
+    std::erase_if(env, [&](const std::string& e) { return e.starts_with(prefix); });
+    env.push_back(prefix + *value);
+  }
+  std::vector<std::string> argv_s = args;
+  auto argv = c_strings(argv_s);
+  auto envp = c_strings(env);
+
+  // Builtins write through stdio; flush so their output precedes the child's.
+  std::fflush(nullptr);
+  pid_t pid = fork();
+  if (pid < 0) {
+    std::fprintf(stderr, "jfsh: fork failed: %s\n", std::strerror(errno));
+    return 1;
+  }
+  if (pid == 0) {
+    execve(path->c_str(), argv.data(), envp.data());
+    int err = errno;
+    if (err == ENOEXEC) {
+      // Neither a binary nor a #! script: run it with /bin/sh, as zsh does.
+      std::vector<std::string> sh_s{"/bin/sh", *path};
+      sh_s.insert(sh_s.end(), args.begin() + 1, args.end());
+      auto sh_argv = c_strings(sh_s);
+      execve("/bin/sh", sh_argv.data(), envp.data());
+      err = errno;
+    }
+    const char* name = args[0].c_str();
+    if (err == ENOENT) {
+      std::fprintf(stderr, "jfsh: no such file or directory: %s\n", name);
+      _exit(127);
+    }
+    if (err == EACCES or err == EISDIR or err == EPERM)
+      std::fprintf(stderr, "jfsh: permission denied: %s\n", name);
+    else
+      std::fprintf(stderr, "jfsh: %s: %s\n", name, std::strerror(err));
+    _exit(126);
+  }
+
+  // TODO(M6): wait with WUNTRACED and record stopped jobs.
   int status = 0;
-  waitpid(pid, &status, 0);
-  return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+  while (waitpid(pid, &status, 0) < 0) {
+    if (errno != EINTR) {
+      std::fprintf(stderr, "jfsh: waitpid: %s\n", std::strerror(errno));
+      return 1;
+    }
+  }
+  if (WIFEXITED(status))   return WEXITSTATUS(status);
+  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+  return 1;
 }
 
 }  // namespace jfsh

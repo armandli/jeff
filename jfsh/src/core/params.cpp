@@ -92,6 +92,26 @@ Param& ParamTable::assign(
   return p;
 }
 
+Result<void> ParamTable::set_scalar(
+    std::string_view name, std::string value, bool append) {
+  if (auto existing = lookup(name)) {
+    Param& p = existing->get();
+    if (p.is_readonly())
+      return std::unexpected(ShellError{ErrorKind::ExecError,
+          "read-only variable: " + std::string(name)});
+    if (append) value = p.scalar() + value;
+    p.set(std::move(value));
+    return {};
+  }
+  if (mScopes.empty()) mScopes.emplace_back();
+  auto& p = mScopes.front()[std::string(name)];
+  p.name  = name;
+  p.flags = PM_SCALAR;
+  p.scope = 0;
+  p.set(std::move(value));
+  return {};
+}
+
 Param& ParamTable::declare_local(std::string name, std::uint32_t flags) {
   if (mScopes.empty()) mScopes.emplace_back();
   auto& scope = mScopes.back();
@@ -102,20 +122,25 @@ Param& ParamTable::declare_local(std::string name, std::uint32_t flags) {
   return p;
 }
 
-void ParamTable::push_scope() { mScopes.emplace_back(); }
-
-void ParamTable::pop_scope() {
-  if (not mScopes.empty()) mScopes.pop_back();
+// mScopes[0] is the global scope and is never popped.
+void ParamTable::push_scope() {
+  if (mScopes.empty()) mScopes.emplace_back();
+  mScopes.emplace_back();
 }
 
+void ParamTable::pop_scope() {
+  if (mScopes.size() > 1) mScopes.pop_back();
+}
+
+// The innermost definition of a name decides whether, and with which value,
+// it is exported; outer definitions it shadows are skipped.
 std::vector<std::string> ParamTable::make_envp() const {
   std::vector<std::string> env;
-  for (auto const& scope : mScopes) {
-    for (auto const& [name, p] : scope) {
-      if (p.is_exported() and p.is_set() and p.is_scalar())
-        env.push_back(name + "=" + p.scalar());
-    }
-  }
+  for_each([&](const Param& p) {
+    if (not p.is_exported() or not p.is_set()) return;
+    if (p.is_scalar())       env.push_back(p.name + "=" + p.scalar());
+    else if (p.is_integer()) env.push_back(p.name + "=" + std::to_string(p.integer()));
+  });
   return env;
 }
 

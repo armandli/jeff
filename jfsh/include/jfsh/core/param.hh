@@ -9,6 +9,7 @@
 #include <cstdint>
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -97,6 +98,14 @@ struct ParamTable {
     std::string name,
     ParamValue value,
     std::uint32_t flags = 0);
+
+  // Shell assignment (`name=value`, `name+=value`): updates the innermost
+  // existing parameter in place, keeping its attributes (e.g. PM_EXPORTED),
+  // or creates a new global.  Fails on a readonly parameter.
+  Result<void> set_scalar(
+    std::string_view name,
+    std::string value,
+    bool append = false);
 
   // Declare local — creates in current scope without setting.
   Param& declare_local(

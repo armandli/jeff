@@ -59,8 +59,11 @@ protected:
   const LexToken& cur() { return mLex.peek(); }
   bool   eat(TokType t);
   bool   at(TokType t) const noexcept;
+  bool   at_list_terminator() const noexcept;
   void   skip_newlines();
   void   error(std::string msg);
+  bool   error_near(const LexToken& tok);       // always returns false
+  bool   unsupported(std::string_view what);    // always returns false
 
 private:
   Lexer&           mLex;
@@ -68,6 +71,10 @@ private:
   ShellError       mError;
   CompiledProgram* mProg = nullptr;
 };
+
+// Human-readable listing of the bytecode, one instruction per line
+// (src/parser/text.cpp).  Used by tests and for debugging.
+std::string disassemble(const CompiledProgram& prog);
 
 }  // namespace jfsh
 
