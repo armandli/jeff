@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <jfsh/builtins/builtins.h>
+#include <jfsh/builtins/math.h>
 #include <jfsh/exec/executor.h>
 
 namespace jfsh {
@@ -471,12 +472,19 @@ int builtin_sched(std::vector<std::string>& args, ExecContext& ctx) {
   //   Implemented via SIGALRM or a checked event queue in the REPL loop.
   (void)args; (void)ctx; return 0;
 }
+// `let expr…`: evaluates each expression; the status is 0 when the last
+// one is non-zero, 1 when it is zero, and 2 on an error.
 int builtin_let(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/let): Evaluate one or more arithmetic expressions.
-  //   Each arg is evaluated; return 0 if the last result is non-zero.
-  //   Delegate to the math evaluator in builtins/math.cpp.
-  //   `let "x = 1 + 2"` is equivalent to `(( x = 1 + 2 ))`.
-  (void)args; (void)ctx; return 0;
+  long long last = 0;
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    auto v = arith_eval(args[i], ctx.params);
+    if (not v) {
+      std::fprintf(stderr, "jfsh: let: %s\n", v.error().message.c_str());
+      return 2;
+    }
+    last = *v;
+  }
+  return last != 0 ? 0 : 1;
 }
 
 }  // namespace jfsh

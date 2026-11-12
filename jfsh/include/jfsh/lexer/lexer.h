@@ -90,14 +90,19 @@ struct Lexer {
 
   void set_alias_expansion(bool on) noexcept { mAliasExpand = on; }
 
-  void        register_heredoc(std::string delim, bool strip_tabs, bool expand);
-  std::string read_heredoc();
+  // Here-documents: the parser registers each delimiter as it parses the
+  // redirection; the lexer reads the bodies, in order, when it reaches the
+  // end of that line, and take_heredocs() hands them over.
+  void                     register_heredoc(std::string delim, bool strip_tabs, bool expand);
+  std::vector<std::string> take_heredocs();
 
 protected:
   LexToken read_token();
   LexToken read_word(int first_char);
   LexToken read_redir(int first_char);
   LexToken read_heredoc_delimiter();
+  LexToken newline_token();
+  void     read_heredoc_bodies();
   bool     is_keyword(std::string_view s) const noexcept;
 
 private:
@@ -113,6 +118,7 @@ private:
   bool                      mAliasExpand = true;
   std::vector<LexFlags>     mStateStack;
   std::vector<HeredocSpec>  mHeredocQueue;
+  std::vector<std::string>  mHeredocBodies;
 };
 
 }  // namespace jfsh

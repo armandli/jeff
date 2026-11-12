@@ -79,17 +79,23 @@ enum WCOpcode : WordCode {
 //                 argc may be 0 for an assignment-only command
 //                 redirs and assigns may interleave in any order
 //   assign   := WC_ASSIGN(flags)  WC_STRING(name)  WC_STRING(value)
-//                 flags: WC_ASSIGN_APPEND (`name+=value`)
+//                 flags: WC_ASSIGN_APPEND (`name+=value`),
+//                        WC_ASSIGN_ARRAY (`name=(…)`: value is the text
+//                        between the parentheses, split into words and
+//                        expanded at execution time)
 //   redir    := WC_REDIR(type|fd|has_fd)  WC_STRING(target_or_body)
 //                 low 5 bits: RedirType
 //                 bits 5–9:   fd (0–31), meaningful only when has_fd is set
 //                 bit 10:     has_fd flag (user wrote a prefix `2>`, `3<`)
+//                 bit 11:     literal flag: a here-doc whose delimiter was
+//                             quoted, so its body is not expanded
 //                 target_or_body is the here-doc body for REDIR_HEREDOC{,D},
 //                 empty for REDIR_CLOSE, the subcommand source for
 //                 REDIR_PROC_{IN,OUT,EQ}, otherwise the target word
 //
 // WC_STRING's operand indexes CompiledProgram::strs.  Words are stored as
-// written (quotes included); expansion happens at execution time.
+// written (quotes and `$…` included); the executor expands them at run time
+// (src/exec/subst.cpp).
 // ---------------------------------------------------------------------------
 
 inline constexpr WordCode WC_LIST_ASYNC = 1u;  // & (background)
@@ -104,6 +110,7 @@ inline constexpr WordCode WC_SUBLIST_TYPE = 3u;    // mask for END/AND/OR
 inline constexpr int      WC_SUBLIST_FLAG_BITS = 3;
 
 inline constexpr WordCode WC_ASSIGN_APPEND = 1u;   // name+=value
+inline constexpr WordCode WC_ASSIGN_ARRAY  = 2u;   // name=(…)
 
 constexpr WordCode make_wc_list(WordCode flags, WordCode skip) noexcept {
   return make_wc(WC_LIST, (skip << WC_LIST_FLAG_BITS) | flags);
@@ -147,10 +154,13 @@ enum RedirType : WordCode {
 
 inline constexpr int WC_REDIR_TYPE_BITS = 5;
 inline constexpr int WC_REDIR_FD_BITS   = 5;
-inline constexpr WordCode WC_REDIR_HAS_FD_BIT = 1u << 10;
+inline constexpr WordCode WC_REDIR_HAS_FD_BIT  = 1u << 10;
+inline constexpr WordCode WC_REDIR_LITERAL_BIT = 1u << 11;
 
-constexpr WordCode make_wc_redir(RedirType type, int fd) noexcept {
+constexpr WordCode make_wc_redir(RedirType type, int fd,
+                                 bool literal = false) noexcept {
   WordCode packed = static_cast<WordCode>(type);
+  if (literal) packed |= WC_REDIR_LITERAL_BIT;
   if (fd >= 0) {
     packed |= WC_REDIR_HAS_FD_BIT;
     packed |= static_cast<WordCode>(fd & 0x1f) << WC_REDIR_TYPE_BITS;
@@ -162,6 +172,9 @@ constexpr RedirType wc_redir_type(WordCode w) noexcept {
 }
 constexpr bool wc_redir_has_fd(WordCode w) noexcept {
   return (wc_data(w) & WC_REDIR_HAS_FD_BIT) != 0u;
+}
+constexpr bool wc_redir_literal(WordCode w) noexcept {
+  return (wc_data(w) & WC_REDIR_LITERAL_BIT) != 0u;
 }
 constexpr int wc_redir_fd(WordCode w) noexcept {
   return static_cast<int>((wc_data(w) >> WC_REDIR_TYPE_BITS) & 0x1fu);

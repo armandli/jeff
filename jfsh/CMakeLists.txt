@@ -38,13 +38,12 @@ target_include_directories(jfsh_core PUBLIC include)
 target_link_libraries(jfsh_core PUBLIC jfsh_compiler_options Threads::Threads)
 
 # ---------------------------------------------------------------------------
-# jfsh_lexer — tokeniser, input management, parameter/command substitution.
-#              Mirrors zsh Src/{lex,input,subst}.c
+# jfsh_lexer — tokeniser and input management.
+#              Mirrors zsh Src/{lex,input}.c
 # ---------------------------------------------------------------------------
 add_library(jfsh_lexer STATIC
   src/lexer/lexer.cpp
   src/lexer/input.cpp
-  src/lexer/subst.cpp
 )
 target_include_directories(jfsh_lexer PUBLIC include)
 target_link_libraries(jfsh_lexer PUBLIC jfsh_core jfsh_compiler_options)
@@ -86,10 +85,11 @@ target_link_libraries(jfsh_builtins PUBLIC jfsh_core jfsh_compiler_options)
 # ---------------------------------------------------------------------------
 # jfsh_exec — command executor: list → pipeline → command dispatch, context,
 #             redirections, job/fork management.
-#             Mirrors zsh Src/{exec,loop,context}.c
+#             word expansion. Mirrors zsh Src/{exec,loop,context,subst}.c
 # ---------------------------------------------------------------------------
 add_library(jfsh_exec STATIC
   src/exec/executor.cpp
+  src/exec/subst.cpp
   src/exec/loop.cpp
   src/exec/context.cpp
 )

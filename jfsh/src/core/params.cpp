@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <iterator>
 
 #include <jfsh/core/param.h>
 
@@ -109,6 +110,43 @@ Result<void> ParamTable::set_scalar(
   p.flags = PM_SCALAR;
   p.scope = 0;
   p.set(std::move(value));
+  return {};
+}
+
+Result<void> ParamTable::set_array(
+    std::string_view name, std::vector<std::string> words, bool append) {
+  if (auto existing = lookup(name)) {
+    Param& p = existing->get();
+    if (p.is_readonly())
+      return std::unexpected(ShellError{ErrorKind::ExecError,
+          "read-only variable: " + std::string(name)});
+    if (p.is_hash()) {
+      if (words.size() % 2 != 0)
+        return std::unexpected(ShellError{ErrorKind::ExecError,
+            "bad set of key/value pairs for associative array"});
+      auto map = append ? p.hash() : std::unordered_map<std::string, std::string>{};
+      for (std::size_t i = 0; i < words.size(); i += 2)
+        map[words[i]] = std::move(words[i + 1]);
+      p.set(std::move(map));
+      return {};
+    }
+    if (append) {
+      auto old = p.is_array() ? p.array()
+               : (p.is_set() ? std::vector<std::string>{p.scalar()}
+                             : std::vector<std::string>{});
+      old.insert(old.end(), std::make_move_iterator(words.begin()),
+                 std::make_move_iterator(words.end()));
+      words = std::move(old);
+    }
+    p.set(std::move(words));
+    return {};
+  }
+  if (mScopes.empty()) mScopes.emplace_back();
+  auto& p = mScopes.front()[std::string(name)];
+  p.name  = name;
+  p.flags = PM_ARRAY;
+  p.scope = 0;
+  p.set(std::move(words));
   return {};
 }
 

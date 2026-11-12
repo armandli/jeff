@@ -1,14 +1,15 @@
 # jfsh — remaining work
 
-Status as of 2026-11-11: M1 (simple commands) is done, along with the part of M0 it
-needed.
+Status as of 2026-11-12: M1 (simple commands), M2 (pipelines, redirections, lists,
+background jobs) and M3 (word expansion) are done, along with the part of M0 they needed.
 
 jfsh builds on macOS and Linux and has gtest coverage for the pieces that work. It runs
-**simple commands** joined by `;`, newlines, `&&`, `||` and `!`: builtins and `$PATH`
-executables, with `NAME=value` assignments, quote removal, and zsh's exit statuses. Anything
-else (pipelines, `&`, redirections, compound commands, `$var` and other expansions) is either
-reported as "not supported yet" or, for expansions, left as literal text. The System 1
-router and the LLM agent layer work end to end.
+**simple commands**, pipelines and background jobs joined by `;`, newlines, `&&`, `||` and
+`!`, with redirections, here-documents, `NAME=value` and `NAME=(…)` assignments, and the
+full word expansion pipeline (parameters, command and arithmetic substitution, splitting,
+braces, tilde, globbing). Compound commands (`if`, loops, functions, subshells, `[[ ]]`,
+`(( ))`) are reported as "not supported yet". The System 1 router and the LLM agent layer
+work end to end.
 
 This file has two parts:
 
@@ -93,7 +94,8 @@ are an error (B9). `disassemble()` (`src/parser/text.cpp`) backs `tests/parser_t
 - Function lookup ahead of builtins (M4); aliases are expanded by the lexer (M7).
 - `PS4` is printed raw; prompt escapes such as zsh's default `+%N:%i> ` need M9.
 - Assigning to an integer parameter stores text; zsh evaluates it arithmetically (M5).
-- Array assignments `a=(x y)` need lexer fix B8 [parser/assign], [exec/assign].
+- Array assignments `a=(x y)` landed with M3; subscripted assignments `a[i]=x` are still
+  to do [parser/assign], [exec/assign].
 - There is still no way to turn on `xtrace` from the shell until `set -x`/`setopt` exist (M7).
 
 ### M2. Pipelines, redirections, lists, background
@@ -113,9 +115,10 @@ are an error (B9). `disassemble()` (`src/parser/text.cpp`) backs `tests/parser_t
   token's text (bug B10 fixed), recognizes `&>>` and `<&`, and slurps balanced
   parens for `<(…)` / `>(…)` / `=(…)`.
 - Here-documents: `par_redir` registers the delimiter with
-  `Lexer::register_heredoc`, reads the body with `Lexer::read_heredoc`, stores
-  it in the string table as the `WC_REDIR + WC_STRING` target.  `<<-` strips
-  leading tabs, quoted delimiters mark the body as literal (expansion is M3).
+  `Lexer::register_heredoc` and stores the body in the string table as the
+  `WC_REDIR + WC_STRING` target (since M3 the lexer reads it at the end of the
+  line, see B62).  `<<-` strips leading tabs; quoted delimiters mark the body
+  as literal.
 - `NOCLOBBER`: `>` on an existing file fails with `EEXIST`; `>|` always
   truncates.
 - fds are saved and restored around builtins via `SavedFds` (RAII).
@@ -135,40 +138,63 @@ are an error (B9). `disassemble()` (`src/parser/text.cpp`) backs `tests/parser_t
 **Left to other milestones**
 - The builtin `wait` lands as a minimal version (pid list or no args);
   full `%jobid`, `-n`, `-f` wait for M6.
-- Expansion inside here-doc bodies and command-substitution `` `…` `` /
-  `$(…)` is M3; today the body is stored verbatim.
+- Expansion inside here-doc bodies and command substitution landed with M3.
+- With MULTIOS, zsh concatenates several input redirections to one fd
+  (`cat <a <b`); jfsh still lets the last one win.
 
 ### M3. Word expansion [exec/expand], [subst/*]
 
-Order, per zsh: history (interactive only, before parsing) → alias → process substitution →
-parameter / command / arithmetic substitution (left to right) → word splitting → brace
-expansion → filename generation (globbing) → quote removal.
+**Done.** The expander is `src/exec/subst.cpp` (`Expander`, documented in
+`include/jfsh/exec/subst.h`); `Executor::expand_command` runs it over a simple command's
+assignments, words and redirection targets. Tests: `tests/subst_test.cpp`.
+- **Lexer (bug B8 fixed):** `$(…)`, `${…}`, `$((…))`, `$[…]`, backquotes and `$'…'` stay
+  in one word, nested to any depth and with quotes tracked inside them. `{`/`}` are
+  reserved only as words of their own, so `a{b,c}`, `{1..3}` and `{}` are words; `(…)`
+  inside a word (`*.(c|h)`, `*(.)`, `name=(…)`) and `<lo-hi>` stay in the word.
+- **Here-documents:** the lexer now reads bodies when it reaches the end of the line
+  (`Lexer::take_heredocs`), so the rest of the line and the following lines still parse
+  (they used to be swallowed, bug B62). Bodies are expanded unless the delimiter was quoted
+  (new `literal` bit in `WC_REDIR`).
+- **Quotes:** `'…'`, `"…"` (with `\$ \` \" \\ \newline`), `$'…'` C escapes, `\`.
+- **Parameters:** `$name`, `${name}`, `$1`…`${10}`, `$#`, `$@`, `$*`, `$argv`, `$?`, `$$`,
+  `$!`, `$-`, `$0`, `$PPID`, `$RANDOM`; `$name[sub]` without braces; `$#name`, `$=name`,
+  `$~name`. Positional parameters live in `ExecContext::positional`/`arg0`, set from
+  `jfsh script args…` and `jfsh -c cmd name args…`.
+  - Operators: `- := = ::= ? + ` (with and without `:`), `# ## % %%`, `/ // /# /% :/`,
+    `:offset:length`, the modifiers `:h :t :r :e :u :l :q :Q :a :A` (chainable), `${#x}`,
+    `${+x}`, `${=x}`/`${==x}`, `${~x}`.
+  - Subscripts `[i]`, `[i,j]`, negative indices, `[@]`, `[*]`, scalar character
+    ranges, associative-array keys; nested `${${x#a}%b}` and `${(f)"$(cmd)"}`.
+  - Flags `U L C j:…: s:…: f F q qq q- Q k v o O i n u @ P t z p`.
+  - Unset parameters expand to nothing, or fail under `NO_UNSET`.
+- **Command substitution:** `$(…)` and `` `…` `` fork, capture stdout, strip trailing
+  newlines and set `$?` (so `x=$(false)` returns 1).
+- **Arithmetic:** `$((…))` and `$[…]` through a new integer evaluator
+  (`include/jfsh/builtins/math.h`) with zsh's operator precedence, assignments, `++`/`--`,
+  `0x`, `0b` and `base#n` literals and recursive evaluation of names. `let` uses it.
+- **Splitting:** unquoted arrays become separate words with empty elements removed; command
+  substitutions split on `$IFS`; scalars only with `SH_WORD_SPLIT` or `${=x}`; `"$@"` and
+  `"${a[@]}"` keep elements apart; empty unquoted words disappear.
+- **Brace expansion:** `{a,b}`, nested, `{1..5}`, `{5..1}`, `{01..10..2}`, `{a..e}`,
+  `BRACE_CCL` `{abc}`, `IGNORE_BRACES`. Braces from quotes or expansions are literal.
+- **Tilde and equals:** `~`, `~/x`, `~user`, `~+`, `~-`; after `=` and `:` in assignments,
+  and in arguments under `MAGIC_EQUAL_SUBST`. `=cmd` expands to the command's path (`EQUALS`).
+- **Globbing (bug B30 fixed):** see "Glob" below. Characters that came from quotes or
+  expansions are literal unless `GLOB_SUBST` or `${~x}`.
+- Redirection targets are expanded like words; several results (`> {a,b}`) become several
+  redirections that MULTIOS fans out. `<<<` and `>&$fd` targets stay one word.
 
-**Requirements**
-- **Lexer support first** (bug B8): `$(...)`, `${...}`, `$((...))` and backquotes must
-  stay part of one word, nested to any depth, and quotes must be tracked inside them.
-- Quotes: `'…'` literal; `"…"` allows `$` and `` ` ``; `$'…'` C escapes; `\` escapes.
-  Quote removal is the last step.
-- Parameters [subst/param]: `$name`, `${name}`, `$1…$9`, `${10}`, `$#`, `$@`, `$*`, `$?`,
-  `$$`, `$!`, `$-`, `$0`. Also:
-  - the `${…}` operators: `:-`, `:=`, `:?`, `:+`, `#`, `##`, `%`, `%%`, `/`, `//`, `#name`;
-  - subscripts `[i]`, `[i,j]`, `[@]`, `[*]`, and associative-array keys;
-  - the zsh flags `${(U)x}`, `(L)`, `(j:,:)`, `(s:,:)`, `(f)`, `(q)`, `(Q)`, `(k)`, `(v)`,
-    `(o)`, `(O)`.
-- Unset parameters expand to empty, or fail with `NOUNSET`.
-- Command substitution [subst/cmd]: fork, capture stdout through a pipe, strip trailing
-  newlines, set `$?`.
-- Arithmetic substitution `$((expr))` → M5 evaluator [subst/arith].
-- Tilde [subst/tilde]: `~`, `~user`, `~+`, `~-`, and after `=`/`:` in assignments.
-- Word splitting [subst/wordsplit]: zsh does **not** split unquoted parameter expansions
-  unless `SH_WORD_SPLIT` is set; command substitutions are split on `IFS`.
-- Brace expansion `{a,b}`, `{1..5}`, `{a..e}`, `{01..10..2}` (needs lexer fix B8).
-- Globbing [subst/glob], [glob/*]:
-  - `*`, `?`, `[...]` (missing today, bug B30), `[!...]`/`[^...]`, `**/` [glob/recurse];
-  - `EXTENDED_GLOB` operators `^`, `~`, `#`, `##`, `(a|b)` [glob/extglob];
-  - qualifiers `(.)`, `(/)`, `(@)`, `(om)`, `(N)`, `(D)` [glob/quals];
-  - the options `NULL_GLOB`, `NOMATCH` (default error "no matches found"), `GLOB_DOTS`,
-    `CASE_GLOB`, `NUMERIC_GLOB_SORT` [glob/numeric] and `MARK_DIRS` [glob/mark].
+**Left**
+- `${^x}`/`RC_EXPAND_PARAM`, `${x:#pat}`, subscript flags `[(r)pat]`/`[(i)pat]`, padding
+  flags `(l:n:)`/`(r:n:)`, `(%)`, `(e)`, `(D)`, `(V)`, `(c)`/`(w)`, the `:s/x/y/` modifier
+  and `KSH_ARRAYS` indexing [subst/param].
+- A failed `${x?}` should make a non-interactive shell exit; jfsh only fails the
+  command [subst/errexit].
+- In `${x:-word}`, unquoted pattern characters in `word` should still glob.
+- Floating-point arithmetic and `OCTAL_ZEROES` [math/float], [math/octal]; `(( … ))` as a
+  command needs the M5 parser.
+- `NO_GLOB` (`set -f`) has no option slot yet; `CSH_NULL_GLOB` is not honoured.
+- History expansion still happens in the REPL before parsing (`HistoryManager::expand`).
 
 ### M4. Compound commands and functions [parser/*], [exec/*]
 
@@ -368,8 +394,14 @@ Every stub currently returns 0, which is actively harmful: `[ -f /nonexistent ]`
 
 ### Glob, modules, misc
 
-- **Glob:** see M3. `glob_expand` must also handle a `/` inside a pattern segment
-  (`src/*/x.cpp`), which currently only splits on the last `/`.
+- **Glob:** done with M3 (`src/glob/glob.cpp`). `CompiledPattern` matches `*`, `?`,
+  `[…]` (ranges, `!`/`^`, `[:class:]`), `\` escapes, `(a|b)` and `<lo-hi>`, and under
+  `EXTENDED_GLOB` `x#`, `x##`, `^pat` and `a~b` (whole-path exclusion). `glob_expand`
+  walks multi-segment paths, `**/` and `***/`, honours `GLOB_DOTS`, `CASE_GLOB`,
+  `NULL_GLOB`, `NOMATCH` ("no matches found"), `MARK_DIRS` and `NUMERIC_GLOB_SORT`, and the
+  qualifiers `. / @ * = p % r w x R W X ^ - N D`, `o`/`O` by `n L m a c`, and `[n,m]`.
+  Still missing: globbing flags `(#i)`/`(#b)`/`(#a1)`, `KSH_GLOB`, the size/age/owner
+  qualifiers, `(e:…:)` and `:` modifiers in qualifiers [glob/extglob], [glob/quals].
 - **Modules:**
   - `ModuleManager` is never instantiated;
   - `zmodload` needs search paths (`$module_path`);
@@ -431,8 +463,10 @@ Every stub currently returns 0, which is actively harmful: `[ -f /nonexistent ]`
   `jfsh`, with their outputs compared. Generate expected outputs from zsh in CI.
 - Interactive tests: drive the editor through a pty (`forkpty`) and assert on screen
   output.
-- Enable the two `DISABLED_` tests (`GlobPatternMatch.DISABLED_BracketExpressions`,
-  `Lexer.DISABLED_SubstitutionsStayOneWord`) as their features land.
+- The two former `DISABLED_` tests (`GlobPatternMatch.BracketExpressions`,
+  `Lexer.SubstitutionsStayOneWord`) are enabled since M3.
+- `tests/shell_fixture.h` holds the in-process `Shell`/`TempDir` helpers shared by
+  `exec_test.cpp` and `subst_test.cpp`.
 - Run the suite under ASan/UBSan in CI. jfsh's Debug build has no sanitizer flags yet,
   although the top-level build does. (The suite passed under ASan + UBSan + LeakSanitizer
   when M1 landed, using a scratch build with `-fsanitize=address,undefined`.)
@@ -460,7 +494,6 @@ Severity:
 | ID | Location | Bug | Evidence |
 |---|---|---|---|
 | B7 | `src/lexer/lexer.cpp:185` | Reserved words are still lexed as keyword tokens in every position. `par_simple` now turns them back into words after the command word, so `echo done` works, but every later construct that takes words (`for x in …` lists, `case` patterns, `[[ ]]` operands) must do the same, or the lexer should only produce keywords in command position. | code reading |
-| B8 | `src/lexer/lexer.cpp:167` | `(`, `)`, `{` and `}` always end a word, so `$(cmd)`, `${var}`, `$((1+2))`, `a{b,c}` and `f(x)`-style globs are split into several tokens. | **confirmed** by `Lexer.DISABLED_SubstitutionsStayOneWord` |
 | B10 | `src/lexer/lexer.cpp:192` | Fd-number prefixes are not part of the redirection: `2>&1` lexes as word `2`, redir `>&`, word `1`, so `2` becomes a command argument. | code reading |
 | B13 | `src/core/params.cpp:83` | Shell assignments now go through `set_scalar`, which updates the right scope and enforces readonly. The lower-level `assign()` still writes into the innermost scope, ignores `PM_READONLY`, and with `flags` 0 makes the parameter `PM_SCALAR` even for an integer or array value; `typeset`/`local`/`export` (M7) must not use it for plain updates. | code reading |
 | B14 | `src/exec/executor.cpp` (`run_external`) | `waitpid` now retries on `EINTR`, but there is no `WUNTRACED`: a stopped child (Ctrl-Z) leaves the shell blocked in `waitpid`. Part of M6. | code reading |
@@ -485,9 +518,8 @@ Severity:
 | B26 | `src/editor/editor.cpp:146` | `refresh_display` rewrites the whole prompt with a single `\r`, so prompts containing newlines are reprinted on every keystroke and lines wider than the terminal break. It also recomputes the prompt (`getpwuid`, `gethostname`, `getcwd`) on every key. | code reading |
 | B27 | `src/editor/editor.cpp` | No `SIGWINCH` handling; `Editor::terminal_width()` exists but is never called. | code reading |
 | B28 | `src/editor/editor.cpp:115` | Tab completion inserts `candidates[0].substr(mBuf.cursor)`, using the **line** cursor as an offset into a **word** candidate. That only works when the word starts at column 0. `main.cpp:184` installs a completer that returns nothing anyway. | code reading |
-| B30 | `src/glob/glob.cpp:29` | `pattern_match` doesn't implement `[...]` although its comment says it does, so `file[0-9]` never matches. It also ignores `\` escapes, and `glob_expand` only splits the pattern at the last `/`, so `src/*/x.cpp` fails. | **confirmed** by `GlobPatternMatch.DISABLED_BracketExpressions` |
 | B31 | `src/main.cpp:232` | stdin mode runs each physical line separately: multi-line constructs can't work, and a line longer than 4095 bytes is split by `fgets` into **two commands**. | code reading |
-| B32 | `src/main.cpp:84` | Unknown options are ignored silently, as is `-c` with no argument (`main.cpp:58`), a second script argument and everything after the script (the positional parameters). `--router` with an unknown value silently means heuristic, and `--provider` with an unknown value silently means Ollama (`main.cpp:143`). | code reading |
+| B32 | `src/main.cpp:84` | Unknown options are ignored silently, as is `-c` with no argument (`main.cpp:58`). (Arguments after the script, or after `-c cmd`, now become `$0` and the positional parameters.) `--router` with an unknown value silently means heuristic, and `--provider` with an unknown value silently means Ollama (`main.cpp:143`). | code reading |
 | B33 | `src/main.cpp:220` | `errexit` is applied by the REPL to every interactive line (so one failed command exits the interactive shell), with none of zsh's exemptions. (The xtrace half of this bug is fixed: the executor traces before running.) | code reading |
 | B34 | `src/prompt/prompt.cpp:128` | Numeric prompt arguments aren't parsed: the default `PS1` `%n@%m %1~ %# ` renders as `user@host 1~ % `. | **confirmed** |
 | B35 | `src/prompt/prompt.cpp:123`, `:128` | `%F{color}` always emits "default colour" and ignores the colour. Unsupported escapes fall into `default:` and print the letter, so `%B…%b` renders as `B…b`. | **confirmed**: `%Bx%b` → `Bxb` |
@@ -534,4 +566,7 @@ Severity:
 | B11 | `{` no longer misparses as a function definition: brace groups and functions are a "not supported yet" error until M4. |
 | B12 | External commands use `execve` with `make_envp()`, which now emits each name once with its innermost value. |
 | B22 | M2: SIGCHLD uses the self-pipe trick — the handler writes one byte, `dispatch_pending` drains the pipe and reaps via `waitpid` + `Jobs.update`. |
+| B8 | M3: the lexer keeps `$(…)`, `${…}`, `$((…))`, backquotes, `$'…'`, brace expansions, `(…)` glob groups, `<lo-hi>` and `name=(…)` inside one word. |
+| B30 | M3: `CompiledPattern` implements `[…]`, escapes and groups; `glob_expand` walks every `/`-separated segment. |
+| B62 | M3: `Lexer::read_heredoc` threw away the rest of the line after `<<EOF`, newline included, so `cat <<EOF \| x` lost `\| x` and the command after the body became extra arguments. Bodies are now read when the lexer reaches the newline. |
 | B60 | M2: `par_redir` consumes the target word and emits `WC_REDIR + WC_STRING`, so redirections no longer turn their target into an argument. |

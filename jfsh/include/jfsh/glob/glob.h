@@ -11,6 +11,7 @@
 
 #include <cstdint>
 
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -69,6 +70,33 @@ struct GlobPattern {
   static GlobPattern compile(std::string_view pat, GlobFlags flags = GLOB_NONE);
 };
 
+// A pattern compiled once and matched many times.  Syntax, in the escaped
+// form the expander produces (a `\` makes the next character literal):
+//   *  ?  [abc] [a-z] [!x] [^x] [[:alpha:]]   (a|b)   <lo-hi>
+// and, with `extended`, zsh's EXTENDED_GLOB operators:
+//   x#  (zero or more x)   x##  (one or more)   ^pat  (not pat)   a~b  (a but not b)
+struct CompiledPattern {
+  struct Node;
+  struct Impl;
+
+  static CompiledPattern compile(std::string_view pattern,
+                                 bool case_insensitive = false,
+                                 bool extended = false);
+
+  // Whole-string match.
+  bool matches(std::string_view str) const;
+  // Length of the shortest (or longest) prefix of `str` that matches, or
+  // npos when none does.
+  std::size_t match_prefix(std::string_view str, bool longest) const;
+
+private:
+  std::shared_ptr<const Impl> mImpl;
+};
+
+// Expands `pat` against the file system.  `pat.raw` is in the escaped form
+// described above; qualifiers like `(.)` or `(N)` at the end are honoured.
+// Returns the sorted matches; with none, an error under NOMATCH, nothing
+// under NULL_GLOB, and otherwise the pattern itself with escapes removed.
 Result<std::vector<std::string>> glob_expand(
   const GlobPattern& pat,
   const OptionState& opts);
@@ -87,7 +115,11 @@ bool ext_pattern_match(
   std::string_view pattern,
   std::string_view str) noexcept;
 
-bool has_glob_chars(std::string_view s) noexcept;
+// True when `s` contains an unescaped pattern character.
+bool has_glob_chars(std::string_view s, bool extended = false) noexcept;
+
+// Removes the `\` escapes of a pattern, leaving its literal text.
+std::string glob_unescape(std::string_view s);
 
 }  // namespace jfsh
 

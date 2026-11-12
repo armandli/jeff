@@ -130,6 +130,37 @@ TEST(Parser, HeredocBodyLandsInStringTable) {
   EXPECT_NE(out2.find("STRING \"x\ny\n\""), std::string::npos);
 }
 
+TEST(Parser, QuotedHeredocDelimiterMarksTheBodyLiteral) {
+  EXPECT_NE(listing("cat <<'EOF'\n$x\nEOF\n").find("REDIR << literal\nSTRING \"$x\n\""),
+            std::string::npos);
+  EXPECT_NE(listing("cat <<EOF\n$x\nEOF\n").find("REDIR <<\nSTRING \"$x\n\""),
+            std::string::npos);
+}
+
+// The body is read at the end of the line, so the rest of that line and
+// the next lines still parse as commands (an M2 bug).
+TEST(Parser, HeredocLeavesTheRestOfTheLineAndTheNextCommand) {
+  auto out = listing("cat <<A | tr a b\nbody\nA\necho next\n");
+  EXPECT_NE(out.find("PIPE 2"), std::string::npos) << out;
+  EXPECT_NE(out.find("STRING \"body\n\""), std::string::npos) << out;
+  EXPECT_NE(out.find("STRING \"next\""), std::string::npos) << out;
+}
+
+TEST(Parser, ArrayAssignment) {
+  EXPECT_EQ(listing("a=(x 'y z') b+=(1)"),
+            "LIST end skip=9\n"
+            "SUBLIST - skip=8\n"
+            "PIPE 1\n"
+            "ASSIGN array\n"
+            "STRING \"a\"\n"
+            "STRING \"x 'y z'\"\n"
+            "ASSIGN append|array\n"
+            "STRING \"b\"\n"
+            "STRING \"1\"\n"
+            "SIMPLE 0\n"
+            "END\n");
+}
+
 // Reserved words are only special in command position (bug B7).
 TEST(Parser, ReservedWordsAreArgumentsAfterTheCommandWord) {
   EXPECT_NE(listing("echo done in if !").find("SIMPLE 5\n"), std::string::npos);

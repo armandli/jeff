@@ -12,9 +12,10 @@ add_executable(jfsh_tests
   params_test.cpp
   parser_test.cpp
   signals_test.cpp
+  subst_test.cpp
 )
 target_link_libraries(jfsh_tests PRIVATE
-  jfsh_core jfsh_lexer jfsh_parser jfsh_exec jfsh_glob jfsh_history jfsh_agent
+  jfsh_core jfsh_lexer jfsh_parser jfsh_exec jfsh_glob jfsh_builtins jfsh_history jfsh_agent
   GTest::gtest_main
   jfsh_compiler_options
 )

@@ -1,28 +1,19 @@
 #include <jfsh/glob/glob.h>
 
-// Extended-glob pattern compiler (requires EXTENDED_GLOB option).
+// Pattern matching and filename generation live in glob.cpp:
+// CompiledPattern handles * ? [...] (a|b) <n-m> and, under EXTENDED_GLOB,
+// x# x## ^pat a~b; glob_expand walks multi-segment paths, **/ and ***/,
+// and the qualifiers . / @ * = p % r w x R W X ^ N D o/O{n,L,m,a,c} [n,m].
 //
-// TODO(glob/extglob): Implement zsh extended glob operators:
-//   #    zero or more occurrences of previous pattern (like * in regex)
-//   ##   one or more occurrences (like + in regex)
-//   ^    negate: matches anything not matching the following pattern
-//   ~    exception: matches left side except what matches right side
-//   (pat1|pat2)  alternation group
+// TODO(glob/extglob): zsh's globbing flags `(#i)`, `(#l)`, `(#b)` and
+//   approximate matching `(#a1)`; KSH_GLOB's `@(…)`, `*(…)`, `+(…)`.
 //
-// TODO(glob/recurse): Implement **/pattern recursive glob (GLOB_RECURSE flag).
-//   Walk the directory tree depth-first; match filename against the final
-//   component pattern, include both files and directories as appropriate.
+// TODO(glob/quals): the remaining qualifiers — size `L±N`, age `m±N`,
+//   ownership `u:name:`/`g:name:`, `(e:…:)` code, `(+fn)`, and `:` modifiers
+//   inside the qualifier list (`*(:t)`).
 //
-// TODO(glob/quals): Implement zsh glob qualifiers inside parentheses.
-//   Parse the GlobQualifier list from the GlobPattern.quals vector.
-//   Apply each qualifier as a stat(2) filter on candidate matches.
-//   Sorting qualifiers: n (name), L (size), m (mtime), a (atime), c (ctime).
-//   Ordering qualifiers: o (ascending), O (descending).
-//
-// TODO(glob/numeric): Implement NUMERIC_GLOB_SORT option — when set, sort
-//   match results numerically rather than lexicographically.
-//
-// TODO(glob/mark): Implement the MARK_DIRS option — append / to matched dirs.
+// TODO(glob/cache): CompiledPattern is rebuilt for every directory; a small
+//   cache would help `**/` walks of large trees.
 
 namespace jfsh {
 }  // namespace jfsh

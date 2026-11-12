@@ -13,6 +13,7 @@
 
 #include <jfsh/builtins/builtins.h>
 #include <jfsh/exec/executor.h>
+#include <jfsh/exec/subst.h>
 #include <jfsh/lexer/input.h>
 #include <jfsh/parser/parser.h>
 
@@ -62,17 +63,24 @@ static Result<std::string> prefix_value(const ParamTable& params,
   if (existing and existing->get().is_readonly())
     return std::unexpected(ShellError{ErrorKind::ExecError,
         "read-only variable: " + a.name});
-  if (a.append and existing) return existing->get().scalar() + a.value;
-  return a.value;
+  std::string value = a.value;
+  if (a.array) {
+    value.clear();
+    for (std::size_t i = 0; i < a.elements.size(); ++i) {
+      if (i) value += ' ';
+      value += a.elements[i];
+    }
+  }
+  if (a.append and existing) return existing->get().scalar() + value;
+  return value;
 }
 
 int Executor::exec_simple(std::vector<std::string> args,
                           std::vector<Assignment>  assigns,
                           std::vector<Redirection> redirs,
                           ExecFlags flags) {
-  args = expand_words(args);
-  for (auto& a : assigns) a.value = expand_value(a.value);
-  for (auto& r : redirs)  r.target = expand_value(r.target);
+  std::optional<int> subst_status;
+  if (not expand_command(args, assigns, redirs, subst_status)) return 1;
   auto psubst = expand_procsubst(args);
   struct PSubstGuard {
     Executor* exec;
@@ -91,6 +99,8 @@ int Executor::exec_simple(std::vector<std::string> args,
     }
     int rc = apply_assigns(assigns);
     std::fflush(nullptr);
+    // `x=$(cmd)` has cmd's status.
+    if (rc == 0 and subst_status) rc = *subst_status;
     return rc;
   }
 
@@ -123,9 +133,10 @@ int Executor::exec_simple(std::vector<std::string> args,
         break;
       }
       auto outer = mCtx.params.lookup(a.name);
-      std::uint32_t attrs = PM_SCALAR;
+      std::uint32_t attrs = a.array ? PM_ARRAY : PM_SCALAR;
       if (outer and outer->get().is_exported()) attrs |= PM_EXPORTED;
-      mCtx.params.assign(a.name, std::move(*value), attrs);
+      if (a.array) mCtx.params.assign(a.name, a.elements, attrs);
+      else         mCtx.params.assign(a.name, std::move(*value), attrs);
     }
     if (rc == 0) rc = def->get().fn(args, mCtx);
     mCtx.params.pop_scope();
@@ -320,16 +331,20 @@ int Executor::exec_simple_cmd(ExecState& es, ExecFlags flags) {
   for (;;) {
     WordCode op = wc_code(es.peek());
     if (op == WC_ASSIGN) {
-      bool append = wc_data(es.fetch()) & WC_ASSIGN_APPEND;
-      std::string name{es.fetch_str()};
-      std::string value{es.fetch_str()};
-      assigns.push_back({std::move(name), std::move(value), append});
+      WordCode f = wc_data(es.fetch());
+      Assignment a;
+      a.name   = std::string(es.fetch_str());
+      a.value  = std::string(es.fetch_str());
+      a.append = f & WC_ASSIGN_APPEND;
+      a.array  = f & WC_ASSIGN_ARRAY;
+      assigns.push_back(std::move(a));
     } else if (op == WC_REDIR) {
       WordCode w = es.fetch();
       Redirection r;
       r.type   = wc_redir_type(w);
-      r.fd     = wc_redir_has_fd(w) ? wc_redir_fd(w) : -1;
-      r.target = std::string(es.fetch_str());
+      r.fd      = wc_redir_has_fd(w) ? wc_redir_fd(w) : -1;
+      r.literal = wc_redir_literal(w);
+      r.target  = std::string(es.fetch_str());
       redirs.push_back(std::move(r));
     } else {
       break;
@@ -504,7 +519,9 @@ int Executor::procsubst_in(std::string_view src) {
     ::close(pfd[0]);
     ::dup2(pfd[1], 1);
     if (pfd[1] != 1) ::close(pfd[1]);
-    _exit(exec_string(src));
+    int rc = exec_string(src);
+    std::fflush(nullptr);
+    _exit(rc);
   }
   ::close(pfd[1]);
   return pfd[0];
@@ -521,7 +538,9 @@ int Executor::procsubst_out(std::string_view src) {
     ::close(pfd[1]);
     ::dup2(pfd[0], 0);
     if (pfd[0] != 0) ::close(pfd[0]);
-    _exit(exec_string(src));
+    int rc = exec_string(src);
+    std::fflush(nullptr);
+    _exit(rc);
   }
   ::close(pfd[0]);
   return pfd[1];
@@ -538,7 +557,9 @@ std::string Executor::procsubst_eq(std::string_view src) {
   if (pid == 0) {
     ::dup2(fd, 1);
     if (fd != 1) ::close(fd);
-    _exit(exec_string(src));
+    int rc = exec_string(src);
+    std::fflush(nullptr);
+    _exit(rc);
   }
   int status = 0;
   while (::waitpid(pid, &status, 0) < 0 and errno == EINTR) {}
@@ -831,68 +852,84 @@ bool Executor::apply_redirects_child(const std::vector<Redirection>& redirs) {
 }
 
 
-// Quote removal, the last step of word expansion: '…' is literal, "…"
-// keeps backslash only before $ ` " \ and newline, and an unquoted
-// backslash escapes the next character.  A backslash-newline disappears.
-static std::string remove_quotes(std::string_view w) {
-  constexpr std::string_view kDquoteEscapes = "$`\"\\\n";
-  enum class Quote { None, Single, Double } q = Quote::None;
-  std::string out;
-  out.reserve(w.size());
-  for (std::size_t i = 0; i < w.size(); ++i) {
-    char c = w[i];
-    bool escape = c == '\\' and i + 1 < w.size()
-        and (q == Quote::None
-             or (q == Quote::Double
-                 and kDquoteEscapes.find(w[i + 1]) != std::string_view::npos));
-    if (q == Quote::Single) {
-      if (c == '\'') q = Quote::None;
-      else           out += c;
-    } else if (escape) {
-      if (w[i + 1] != '\n') out += w[i + 1];
-      ++i;
-    } else if (q == Quote::Double) {
-      if (c == '"') q = Quote::None;
-      else          out += c;
-    } else if (c == '\'') {
-      q = Quote::Single;
-    } else if (c == '"') {
-      q = Quote::Double;
+// Word expansion for one simple command (see include/jfsh/exec/subst.h).
+// A redirection target that expands to several words becomes several
+// redirections of the same kind, which MULTIOS then fans out.
+bool Executor::expand_command(std::vector<std::string>& args,
+                              std::vector<Assignment>&  assigns,
+                              std::vector<Redirection>& redirs,
+                              std::optional<int>&       subst_status) {
+  Expander ex{*this, mCtx};
+  auto fail = [&](const ShellError& e) {
+    std::fprintf(stderr, "jfsh: %s\n", e.message.c_str());
+    subst_status = ex.subst_status();
+    return false;
+  };
+  // Assignment values are expanded first, then the arguments, then the
+  // redirection targets.
+  for (auto& a : assigns) {
+    if (a.array) {
+      auto el = ex.array_elements(a.value);
+      if (not el) return fail(el.error());
+      a.elements = std::move(*el);
     } else {
-      out += c;
+      auto v = ex.scalar(a.value, /*assignment=*/true);
+      if (not v) return fail(v.error());
+      a.value = std::move(*v);
     }
   }
-  return out;
+  auto words = ex.words(args);
+  if (not words) return fail(words.error());
+  args = std::move(*words);
+
+  std::vector<Redirection> out;
+  out.reserve(redirs.size());
+  for (auto& r : redirs) {
+    switch (r.type) {
+      case REDIR_HEREDOC: case REDIR_HEREDOCD:
+        if (not r.literal) {
+          auto body = ex.heredoc(r.target);
+          if (not body) return fail(body.error());
+          r.target = std::move(*body);
+        }
+        out.push_back(std::move(r));
+      break; case REDIR_HERESTR: case REDIR_MERGE: case REDIR_IN_DUP: {
+        auto v = ex.scalar(r.target);
+        if (not v) return fail(v.error());
+        r.target = std::move(*v);
+        out.push_back(std::move(r));
+      }
+      break; case REDIR_CLOSE: case REDIR_PROC_IN: case REDIR_PROC_OUT:
+      case REDIR_PROC_EQ:
+        out.push_back(std::move(r));
+      break; default: {
+        std::string word = r.target;
+        auto targets = ex.words({r.target});
+        if (not targets) return fail(targets.error());
+        if (targets->empty())
+          return fail(ShellError{ErrorKind::ExecError,
+              "no such file or directory: " + word});
+        if (targets->size() > 1 and not mCtx.opts.get(OPT_MULTIOS))
+          return fail(ShellError{ErrorKind::ExecError, "ambiguous redirect: " + word});
+        for (auto& t : *targets) {
+          Redirection copy = r;
+          copy.target = std::move(t);
+          out.push_back(std::move(copy));
+        }
+      }
+    }
+  }
+  redirs = std::move(out);
+  subst_status = ex.subst_status();
+  return true;
 }
 
-// TODO(exec/expand): Word expansion pipeline (mirrors zsh's prefork/postfork):
-//   1. Tilde expansion  (~, ~user)
-//   2. Parameter expansion  ($var, ${var:-default}, ${#var}, ${var##pat}, etc.)
-//   3. Command substitution  $(cmd), `cmd`
-//   4. Arithmetic substitution  $((expr))
-//   5. Word splitting  (IFS)
-//   6. Glob expansion  (*, ?, [...], **/...)
-//   7. Quote removal
-//   Only step 7 is implemented so far.
-std::vector<std::string> Executor::expand_words(
-    const std::vector<std::string>& words) {
-  std::vector<std::string> out;
-  out.reserve(words.size());
-  for (const auto& w : words) out.push_back(remove_quotes(w));
-  return out;
-}
-
-// Assignment values get the same expansions minus word splitting and
-// globbing.
-std::string Executor::expand_value(std::string_view value) {
-  return remove_quotes(value);
-}
-
-// TODO(exec/assign): Array and hash assignments, arr=(a b c) / hash=(k v),
-//   once the lexer keeps `name=(` together (bug B8).
+// TODO(exec/assign): subscripted assignments `a[i]=x`, `h[key]=x`.
 int Executor::apply_assigns(const std::vector<Assignment>& assigns) {
   for (const auto& a : assigns) {
-    if (auto r = mCtx.params.set_scalar(a.name, a.value, a.append); not r) {
+    auto r = a.array ? mCtx.params.set_array(a.name, a.elements, a.append)
+                     : mCtx.params.set_scalar(a.name, a.value, a.append);
+    if (not r) {
       std::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
       return 1;
     }
@@ -927,8 +964,15 @@ void Executor::trace(const std::vector<std::string>& args,
     line += word;
     first = false;
   };
-  for (const auto& a : assigns)
-    add(a.name + (a.append ? "+=" : "=") + trace_quote(a.value));
+  for (const auto& a : assigns) {
+    std::string value = trace_quote(a.value);
+    if (a.array) {
+      value = "(";
+      for (const auto& e : a.elements) value += ' ' + trace_quote(e);
+      value += " )";
+    }
+    add(a.name + (a.append ? "+=" : "=") + value);
+  }
   for (const auto& w : args) add(trace_quote(w));
   std::fprintf(stderr, "%s\n", line.c_str());
 }
