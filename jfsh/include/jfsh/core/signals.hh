@@ -83,9 +83,18 @@ struct SignalManager {
   void unblock();
   bool is_blocked() const noexcept { return mBlockDepth > 0; }
 
-  void note_sigchld() noexcept { mPending.mark(SIGCHLD); }
+  // Called from the SIGCHLD handler (async-signal-safe): writes one byte
+  // into a self-pipe so dispatch_pending() can reap at a later point.
+  void note_sigchld() noexcept;
 
+  // Drain the self-pipe and run waitpid in a non-blocking loop, feeding
+  // each exit to JobTable::update.  Safe to call anytime; no-op when the
+  // self-pipe has no pending byte.
   void dispatch_pending();
+
+  // Write-side fd of the self-pipe.  Public so the signal handler can
+  // find it via the Signals global without additional state.
+  int self_pipe_write_fd() const noexcept { return mSelfPipe[1]; }
 
   static Result<void> kill_job(Pid pgid, int sig) noexcept;
 
@@ -94,7 +103,9 @@ struct SignalManager {
 private:
   SignalTable    mTraps;
   PendingSignals mPending;
-  int            mBlockDepth = 0;
+  int            mBlockDepth    = 0;
+  int            mSelfPipe[2]   = {-1, -1};
+  bool           mInteractive   = false;
 };
 
 extern SignalManager Signals;

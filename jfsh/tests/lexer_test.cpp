@@ -72,7 +72,24 @@ TEST(Lexer, Redirections) {
   std::vector<std::string> redirs;
   for (const auto& t : toks)
     if (t.type == TokType::TK_REDIR) redirs.push_back(t.text);
-  EXPECT_EQ(redirs, (std::vector<std::string>{">", ">>", "<", ">&", "<<-"}));
+  EXPECT_EQ(redirs, (std::vector<std::string>{">", ">>", "<", "2>&", "<<-"}));
+}
+
+TEST(Lexer, RedirectionsFdPrefixAndNewOps) {
+  auto toks = lex_all("a 2>out 12<in &>>errlog <&0 >&-");
+  std::vector<std::string> redirs;
+  for (const auto& t : toks)
+    if (t.type == TokType::TK_REDIR) redirs.push_back(t.text);
+  EXPECT_EQ(redirs, (std::vector<std::string>{"2>", "12<", "&>>", "<&", ">&"}));
+}
+
+TEST(Lexer, ProcessSubstitutionKeepsBalancedParens) {
+  auto toks = lex_all("diff <(echo a | wc) <(echo b)");
+  std::vector<std::string> redirs;
+  for (const auto& t : toks)
+    if (t.type == TokType::TK_REDIR) redirs.push_back(t.text);
+  EXPECT_EQ(redirs,
+            (std::vector<std::string>{"<(echo a | wc)", "<(echo b)"}));
 }
 
 TEST(Lexer, GroupingTokens) {

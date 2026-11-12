@@ -98,27 +98,45 @@ are an error (B9). `disassemble()` (`src/parser/text.cpp`) backs `tests/parser_t
 
 ### M2. Pipelines, redirections, lists, background
 
-**Requirements**
-- Pipelines `a | b | c` and `|&` (stderr too): create pipes, fork each stage, put all
-  stages in one process group, wait for all of them. The exit status is the last
-  stage's, or the rightmost failure when `PIPEFAIL` is set. `! pipeline` negates it.
-- `&` runs the sublist as a background job, sets `$!` and prints `[N] pid` in interactive
-  shells. (`;`, newlines, `&&` and `||` already work; `&` and multi-command pipelines are
-  currently rejected at run time with "not supported yet", and `WC_PIPE` does not yet
-  record which segments are `|&`.)
-- Redirections [parser/redir], [exec/redirects]:
-  - `par_redir` must consume the target word too (today any redirection is a
-    "not supported yet" parse error);
-  - `<`, `>`, `>>`, `>|`, `<>`, `<<`, `<<-`, `<<<`, `>&N`, `<&N`, `>&-`, `&>`, `&>>`;
-  - optional fd prefix (`2>`, `3<`), which the lexer currently drops (bug B10);
-  - here-documents: bodies are read after the current line, expanded unless the
-    delimiter is quoted, with tabs stripped for `<<-`;
-  - `NOCLOBBER`: `>` on an existing file fails unless `>|` is used;
-  - fds are saved and restored around builtins and functions, which run in-process;
-  - zsh `MULTIOS` (`> a > b` tees) is a later nice-to-have.
-- Process substitution `<(cmd)`, `>(cmd)` via `/dev/fd/N`, and `=(cmd)` via a temp file
-  [subst/cmd].
-- `EF_NOFORK`: exec the last command of a subshell or `-c` string directly.
+**Done.** Implemented in the M2 PR:
+- Pipelines `a | b | c` and `|&` (`WC_PIPE` now encodes `n` plus a per-connector
+  stderr bitmask). All stages fork, dup pipe ends, share one process group, and
+  are collected in order; `PIPEFAIL` picks the worst exit instead of the last.
+  `! pipeline` still comes out of `WC_SUBLIST_NOT`.
+- `&` forks a child that re-enters `exec_sublist`, registers the pid in
+  `JobTable` with `JOB_ASYNC|JOB_NOTIFY`, sets `$!`, and prints `[N] pid` on
+  stderr in interactive shells.
+- Full redirection set (`src/parser/parser.cpp::par_redir`,
+  `src/exec/executor.cpp::apply_redirects`): `<`, `>`, `>>`, `>|`, `<>`, `<<`,
+  `<<-`, `<<<`, `>&N`, `<&N`, `>&-`, `&>`, `&>>`, plus the fd prefix (`2>`,
+  `12<`, `2>&1`). The lexer now bakes digit prefixes into the `TK_REDIR`
+  token's text (bug B10 fixed), recognizes `&>>` and `<&`, and slurps balanced
+  parens for `<(…)` / `>(…)` / `=(…)`.
+- Here-documents: `par_redir` registers the delimiter with
+  `Lexer::register_heredoc`, reads the body with `Lexer::read_heredoc`, stores
+  it in the string table as the `WC_REDIR + WC_STRING` target.  `<<-` strips
+  leading tabs, quoted delimiters mark the body as literal (expansion is M3).
+- `NOCLOBBER`: `>` on an existing file fails with `EEXIST`; `>|` always
+  truncates.
+- fds are saved and restored around builtins via `SavedFds` (RAII).
+- `MULTIOS`: multiple output redirs targeting the same fd fork an in-shell
+  tee helper that reads from a pipe and writes to all targets.
+- Process substitution `<(cmd)`, `>(cmd)`, `=(cmd)`: the parser passes
+  proc-sub tokens through as arguments; `Executor::expand_procsubst` forks
+  subshells, exposes their pipe fds through `/dev/fd/N` (or a tmp path for
+  `=(…)`), and releases the resources after the command finishes.
+- `EF_NOFORK`: `run_external` honours the flag by `execve`-ing in place.
+- Bug B22 fix: SIGCHLD is handled with a self-pipe.  `SignalManager::init`
+  opens `pipe2(..., O_CLOEXEC|O_NONBLOCK)`, the handler writes one byte,
+  and `dispatch_pending()` drains the pipe and calls `waitpid` + `Jobs.update`
+  from the REPL (`src/main.cpp`).
+- Bug B4 fix: `JobTable::alloc` never returns `id=0` (slot 0 reserved).
+
+**Left to other milestones**
+- The builtin `wait` lands as a minimal version (pid list or no args);
+  full `%jobid`, `-n`, `-f` wait for M6.
+- Expansion inside here-doc bodies and command-substitution `` `…` `` /
+  `$(…)` is M3; today the body is stored verbatim.
 
 ### M3. Word expansion [exec/expand], [subst/*]
 
@@ -510,7 +528,10 @@ Severity:
 | B1 | M0/M1: parser and executor share the prefix layout documented in `wordcode.hh`. |
 | B2 | M0: `exec_string` lexes, parses and executes. |
 | B3 | `StringInputSource`/`FileInputSource::unget(-1)` are no-ops; regression test `Lexer.TrailingOperatorAtEofTerminates`. |
+| B4 | M2: `JobTable::find_free_slot` reserves slot 0 so the first `alloc` returns id 1. |
 | B9 | `Parser::parse` fails on leftover tokens and on an empty error message. |
+| B10 | M2: the lexer bakes digit fd prefixes into the `TK_REDIR` token (`2>`, `12<`, `2>&1`). |
 | B11 | `{` no longer misparses as a function definition: brace groups and functions are a "not supported yet" error until M4. |
 | B12 | External commands use `execve` with `make_envp()`, which now emits each name once with its innermost value. |
-| B60 | A redirection is a "not supported yet" parse error instead of turning its target into an argument; M2 notes that `par_redir` must consume the target. |
+| B22 | M2: SIGCHLD uses the self-pipe trick — the handler writes one byte, `dispatch_pending` drains the pipe and reaps via `waitpid` + `Jobs.update`. |
+| B60 | M2: `par_redir` consumes the target word and emits `WC_REDIR + WC_STRING`, so redirections no longer turn their target into an argument. |

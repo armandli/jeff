@@ -75,6 +75,25 @@ std::string disassemble(const CompiledProgram& prog) {
       }
       break; case WC_ASSIGN:
         out += ' ' + flag_names({{wc_data(w) & WC_ASSIGN_APPEND, "append"}});
+      break; case WC_PIPE: {
+        WordCode n = wc_pipe_count(w);
+        out += ' ' + std::to_string(n);
+        std::string err;
+        for (unsigned i = 0; i + 1 < n; ++i)
+          err += wc_pipe_stderr(w, i) ? '&' : '|';
+        if (not err.empty()) out += ' ' + err;
+      }
+      break; case WC_REDIR: {
+        static const char* const NAMES[REDIR_TYPE_MAX] = {
+          "<", ">", ">>", "<<", "<<-", "<<<", "<>", ">|",
+          ">&N", "&>", "<(", ">(", "=(", ">&-", "<&N", "&>>",
+        };
+        RedirType t = wc_redir_type(w);
+        out += ' ';
+        out += t < REDIR_TYPE_MAX ? NAMES[t] : "?";
+        if (wc_redir_has_fd(w))
+          out += " fd=" + std::to_string(wc_redir_fd(w));
+      }
       break; case WC_STRING: {
         WordCode idx = wc_data(w);
         out += idx < prog.strs.size() ? " \"" + prog.strs[idx] + '"'
