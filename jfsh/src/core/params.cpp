@@ -1,6 +1,6 @@
 #include <algorithm>
 
-#include <jfsh/core/param.hh>
+#include <jfsh/core/param.h>
 
 namespace jfsh {
 

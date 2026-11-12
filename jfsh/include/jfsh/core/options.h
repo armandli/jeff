@@ -1,6 +1,6 @@
-#ifndef JFSH_CORE_OPTIONS_HH
-#define JFSH_CORE_OPTIONS_HH
-// jfsh/core/options.hh — shell options (setopt / unsetopt).
+#ifndef JFSH_CORE_OPTIONS_H
+#define JFSH_CORE_OPTIONS_H
+// jfsh/core/options.h — shell options (setopt / unsetopt).
 //
 // Mirrors zsh's options.c and the Options array indexed by OptIndex.
 // Every zsh option is reproduced here so jfsh accepts the same setopt/unsetopt
@@ -253,4 +253,4 @@ extern const OptionInfo OPTION_INFO[OPT_COUNT];
 
 }  // namespace jfsh
 
-#endif  // JFSH_CORE_OPTIONS_HH
+#endif  // JFSH_CORE_OPTIONS_H

@@ -1,4 +1,4 @@
-#include <jfsh/editor/editor.hh>
+#include <jfsh/editor/editor.h>
 
 // Vi-mode command dispatch (normal-mode motions, operators, text objects).
 //

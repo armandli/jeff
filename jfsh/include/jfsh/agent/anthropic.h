@@ -1,11 +1,11 @@
-#ifndef JFSH_AGENT_ANTHROPIC_HH
-#define JFSH_AGENT_ANTHROPIC_HH
-// jfsh/agent/anthropic.hh — Anthropic Messages API backend.
+#ifndef JFSH_AGENT_ANTHROPIC_H
+#define JFSH_AGENT_ANTHROPIC_H
+// jfsh/agent/anthropic.h — Anthropic Messages API backend.
 //
 // Implements AgentBackend using POST /v1/messages with the x-api-key header.
 
-#include <jfsh/agent/agent.hh>
-#include <jfsh/agent/provider.hh>
+#include <jfsh/agent/agent.h>
+#include <jfsh/agent/provider.h>
 
 namespace jfsh {
 
@@ -33,4 +33,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_AGENT_ANTHROPIC_HH
+#endif  // JFSH_AGENT_ANTHROPIC_H

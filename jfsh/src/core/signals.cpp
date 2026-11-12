@@ -4,8 +4,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <jfsh/core/jobs.hh>
-#include <jfsh/core/signals.hh>
+#include <jfsh/core/jobs.h>
+#include <jfsh/core/signals.h>
 
 namespace jfsh {
 

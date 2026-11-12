@@ -1,6 +1,6 @@
-#ifndef JFSH_ROUTER_JEV_HH
-#define JFSH_ROUTER_JEV_HH
-// jfsh/router/jev.hh — System 1 router backed by TypeSafe JEV cloud API.
+#ifndef JFSH_ROUTER_JEV_H
+#define JFSH_ROUTER_JEV_H
+// jfsh/router/jev.h — System 1 router backed by TypeSafe JEV cloud API.
 //
 // Sends every candidate line to POST /v1/systemone as a "choice" question
 // with two options: "run" (execute as shell) or "agent" (forward to LLM).
@@ -12,8 +12,8 @@
 #include <string>
 #include <string_view>
 
-#include <jfsh/core/types.hh>
-#include <jfsh/router/router.hh>
+#include <jfsh/core/types.h>
+#include <jfsh/router/router.h>
 
 namespace jfsh {
 
@@ -34,4 +34,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_ROUTER_JEV_HH
+#endif  // JFSH_ROUTER_JEV_H

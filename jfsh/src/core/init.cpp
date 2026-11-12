@@ -1,8 +1,8 @@
-#include <jfsh/core/jobs.hh>
-#include <jfsh/core/options.hh>
-#include <jfsh/core/param.hh>
-#include <jfsh/core/signals.hh>
-#include <jfsh/core/types.hh>
+#include <jfsh/core/jobs.h>
+#include <jfsh/core/options.h>
+#include <jfsh/core/param.h>
+#include <jfsh/core/signals.h>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 

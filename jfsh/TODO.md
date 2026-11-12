@@ -52,16 +52,16 @@ Milestones M0–M4 are the minimum for jfsh to be usable as a shell. The router/
 ### M0. Bytecode contract and `exec_string`
 
 **Done** (with M1): the prefix layout for lists, sublists, pipelines, simple commands and
-assignments is written down in `include/jfsh/core/wordcode.hh`, with skip lengths on
+assignments is written down in `include/jfsh/core/wordcode.h`, with skip lengths on
 `WC_LIST` and `WC_SUBLIST` so un-taken branches are jumped over; the parser and executor
 follow it (bug B1). `StringInputSource`/`FileInputSource` are public in
-`include/jfsh/lexer/input.hh`. `Parser::parse_string` and `Executor::exec_string` work,
+`include/jfsh/lexer/input.h`. `Parser::parse_string` and `Executor::exec_string` work,
 parse errors print `jfsh:LINE: parse error near `X'` with status 1, and leftover tokens
 are an error (B9). `disassemble()` (`src/parser/text.cpp`) backs `tests/parser_test.cpp`.
 
 **Remaining**
 - Each construct that lands later (redirections in M2, compound commands in M4, `[[ ]]` and
-  `(( ))` in M5) adds its layout to the comment in `wordcode.hh`, its own
+  `(( ))` in M5) adds its layout to the comment in `wordcode.h`, its own
   `disassemble()` formatting, and parser tests asserting the exact bytecode.
 - The source-text decompiler for `functions`/`which` [text/decompile] is still to do.
 
@@ -467,11 +467,11 @@ Severity:
 | B15 | `src/core/options.cpp:225` | `OptionState::find` strips a leading `no` **before** matching, so the real options `nomatch` and `notify` can never be found. The negation it detects is thrown away, so `noextendedglob` resolves to `extendedglob` and the caller can't tell. | **confirmed**: `find("nomatch")` = not found; `find("noextendedglob")` = `extendedglob` |
 | B16 | `src/core/signals.cpp:69` | `trap 'cmd' SIG` (`TrapAction::Command`) installs no handler at all, so command traps never fire. `set_trap` also calls `std::signal` on `SIGKILL`/`SIGSTOP` and ignores the failure. | code reading |
 | B17 | `src/core/signals.cpp:149` | `kill_job(pgid)` with the default `Job::pgid == -1` calls `kill(1, sig)`, which signals **init**; with pgid 0 it signals jfsh's own process group. It must reject `pgid <= 1`. | code reading |
-| B18 | `include/jfsh/exec/executor.hh:40` | `break_level` and `cont_level` are `bool`, so `break 2` / `continue 3` can't be represented. `builtin_break` and `builtin_continue` ignore N (`src/builtins/builtins.cpp:103`). | code reading |
+| B18 | `include/jfsh/exec/executor.h:40` | `break_level` and `cont_level` are `bool`, so `break 2` / `continue 3` can't be represented. `builtin_break` and `builtin_continue` ignore N (`src/builtins/builtins.cpp:103`). | code reading |
 | B19 | `src/builtins/builtins.cpp:340` (and ~45 others) | Unimplemented builtins return 0. `test`/`[` always succeed (`[ -f /missing ] && rm …` takes the true branch), and `kill`, `wait`, `export`, `read` and `cd`-stack builtins all report success while doing nothing. | code reading |
 | B20 | `src/builtins/builtins.cpp:185` | `cd` returns `chdir()`'s `-1` directly as the exit status (255) with no error message, and never updates `PWD`/`OLDPWD`. | code reading |
-| B21 | `src/builtins/builtins.cpp:436`, `:11` | `builtin_zpty` is defined and declared in `builtins.hh` but never registered in `BuiltinTable::register_all()`. | code reading |
-| B22 | `src/core/signals.cpp:119`, `include/jfsh/core/signals.hh:68` | The SIGCHLD handler does a read-modify-write on plain `uint64_t` fields (`PendingSignals::mark`), which is not async-signal-safe. Use `volatile std::sig_atomic_t` flags or `std::atomic<uint64_t>` with lock-free ops, and install with `sigaction` + `SA_RESTART`. `dispatch_pending()` is only called from `SignalManager::unblock()`, and nothing calls `block()`/`unblock()`, so even the flag is never acted on. | code reading |
+| B21 | `src/builtins/builtins.cpp:436`, `:11` | `builtin_zpty` is defined and declared in `builtins.h` but never registered in `BuiltinTable::register_all()`. | code reading |
+| B22 | `src/core/signals.cpp:119`, `include/jfsh/core/signals.h:68` | The SIGCHLD handler does a read-modify-write on plain `uint64_t` fields (`PendingSignals::mark`), which is not async-signal-safe. Use `volatile std::sig_atomic_t` flags or `std::atomic<uint64_t>` with lock-free ops, and install with `sigaction` + `SA_RESTART`. `dispatch_pending()` is only called from `SignalManager::unblock()`, and nothing calls `block()`/`unblock()`, so even the flag is never acted on. | code reading |
 | B23 | `src/core/signals.cpp:119` (`SignalManager::init`) | Interactive mode is ignored: no process groups, no `tcsetpgrp`, `SIGINT`/`SIGTSTP`/`SIGTTOU` keep their default dispositions. While a foreground command runs (raw mode off), Ctrl-C reaches jfsh too and **kills the shell**. | code reading |
 | B24 | `src/editor/editor.cpp:50` | Raw mode clears `ISIG` but `read_line` has no case for Ctrl-C (`\x03`) or Ctrl-Z, so Ctrl-C at the prompt does nothing instead of discarding the line. | code reading |
 | B29 | `src/editor/editor.cpp:132` | `read_key_sequence` returns `{}` when `read()` returns 0 (EOF/hangup) or -1. The caller loops forever, so a closed terminal leaves jfsh spinning at 100% CPU. | code reading |
@@ -499,10 +499,10 @@ Severity:
 | B41 | `src/core/jobs.cpp:106`, `:68`, `:9` | `reap()` frees slots without updating `mCurrent`/`mPrevious`, so `%+` can point to a dead job. Killed processes set `JobStatus::Done`, never `Signalled`. `Job::exit_status` ignores `PIPEFAIL`. `notify_changes` only prints for `JOB_NOTIFY`, which nothing sets. | code reading |
 | B42 | `src/router/router.cpp:20` | `HeuristicRouter` runs `system("zsh -n -c …")` for **every** line, which costs a fork plus exec of `/bin/sh` and `zsh`. If zsh isn't installed, `system` returns 127 and **every line is routed to the LLM**. `zsh -n` also accepts most natural language (`what is ls`), so only lines that happen to be invalid syntax, such as an unbalanced apostrophe in `what's ls`, reach the agent. | code reading |
 | B43 | `src/router/jeff.cpp:83`, `src/router/jev.cpp:111` | When the service is down, each line waits for the full timeout (1 s for jeff, 10 s for JEV), prints a warning and falls back. There's no backoff, so the shell becomes unusable. JEV also sends `Authorization: Bearer ` with an empty key. | code reading |
-| B45 | `src/agent/provider.cpp:35`, `include/jfsh/agent/provider.hh:43` | The default Anthropic model `claude-opus-4-7` (in `from_env()` and the `default_anthropic` default argument) is outdated; it should probably be `claude-opus-5-5`. | code reading |
-| B46 | `include/jfsh/agent/provider.hh:37` | `timeout_ms = 30000` is applied as `CURLOPT_TIMEOUT_MS`, a **total** transfer limit, so any streamed answer longer than 30 s is cut off. | code reading |
-| B47 | `include/jfsh/agent/provider.hh:25` | `temperature`, `top_p` and `seed` in `ModelParams` are never sent to any provider. | code reading |
-| B48 | `include/jfsh/agent/openrouter.hh:24` | The `HTTP-Referer`/`X-Title` headers the header comment promises are never sent. `OpenAIBackend::http_post` supports `extra_headers` (`src/agent/openai.cpp:92`), but `OpenRouterBackend` never passes any, and `chat_stream` makes its own curl request (`openai.cpp:187`) with no way to add headers, so both paths need it. | code reading |
+| B45 | `src/agent/provider.cpp:35`, `include/jfsh/agent/provider.h:43` | The default Anthropic model `claude-opus-4-7` (in `from_env()` and the `default_anthropic` default argument) is outdated; it should probably be `claude-opus-5-5`. | code reading |
+| B46 | `include/jfsh/agent/provider.h:37` | `timeout_ms = 30000` is applied as `CURLOPT_TIMEOUT_MS`, a **total** transfer limit, so any streamed answer longer than 30 s is cut off. | code reading |
+| B47 | `include/jfsh/agent/provider.h:25` | `temperature`, `top_p` and `seed` in `ModelParams` are never sent to any provider. | code reading |
+| B48 | `include/jfsh/agent/openrouter.h:24` | The `HTTP-Referer`/`X-Title` headers the header comment promises are never sent. `OpenAIBackend::http_post` supports `extra_headers` (`src/agent/openai.cpp:92`), but `OpenRouterBackend` never passes any, and `chat_stream` makes its own curl request (`openai.cpp:187`) with no way to add headers, so both paths need it. | code reading |
 | B58 | `src/history/history.cpp:20`, `:51` | `HIST_IGNORE_ALL_DUPS` is inverted: `should_suppress` drops the **new** command when it duplicates any older entry, so the old entry stays where it was. zsh removes the older entry and appends the new one. The erase loop in `add()` that was meant to do this is dead code, since `should_suppress` has already returned. | code reading |
 | B59 | `src/lexer/lexer.cpp:126`, `:192` | Redirection lexing is incomplete. `read_token` routes `&>` to `read_redir('&')`, but it has already consumed the `>`, so `&>file` lexes as a bare `&` redirection and `&>>` as `&>` followed by `>`. `>&-`/`<&-` lex as `>&` plus a word `-`, and `>>\|` is split. Conversely, any `<`/`>` followed by `<`, `>`, `\|`, `&` or `-` is kept as one token, so invalid pairs like `<-`, `><` and `>-` are accepted. | code reading |
 
@@ -512,7 +512,7 @@ Severity:
 |---|---|---|
 | B49 | `src/agent/agent.cpp` | The non-streaming path of `Agent::handle` prints a newline even when the request failed. |
 | B50 | `src/core/options.cpp` | `kOptionInfo` is indexed by `info.index`, but nothing checks that the table order matches `OptIndex` or that it is complete. A `static_assert` or startup check would catch a missing row, which would otherwise zero-initialize and crash `find()` on a null name. |
-| B51 | `include/jfsh/core/param.hh:63` | It uses `std::unique_ptr` without `#include <memory>` and only compiles through `types.hh`. |
+| B51 | `include/jfsh/core/param.h:63` | It uses `std::unique_ptr` without `#include <memory>` and only compiles through `types.h`. |
 | B52 | `src/editor/completion.cpp:83` | `complete_commands` doesn't check the executable bit, deduplicate across `PATH` or sort. It also lists `.` and `..`. `complete_files` lists dotfiles when the prefix is empty, and adds no `/` to directories. |
 | B53 | `src/modules/module.cpp` | `ModuleManager` is never instantiated. Its `resolve_path` maps `zsh/x` → `zsh_x.so` but has no default search path, so `zmodload` can't work even once implemented. |
 | B54 | `src/editor/editor.cpp` (`read_line`, non-tty path) | It prints `PS1` even when stdin is not a terminal, which pollutes the output of `jfsh -i < file`. |
@@ -525,7 +525,7 @@ Severity:
 
 | ID | Fixed by |
 |---|---|
-| B1 | M0/M1: parser and executor share the prefix layout documented in `wordcode.hh`. |
+| B1 | M0/M1: parser and executor share the prefix layout documented in `wordcode.h`. |
 | B2 | M0: `exec_string` lexes, parses and executes. |
 | B3 | `StringInputSource`/`FileInputSource::unget(-1)` are no-ops; regression test `Lexer.TrailingOperatorAtEofTerminates`. |
 | B4 | M2: `JobTable::find_free_slot` reserves slot 0 so the first `alloc` returns id 1. |

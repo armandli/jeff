@@ -3,7 +3,7 @@
 
 #include <algorithm>
 
-#include <jfsh/editor/completion.hh>
+#include <jfsh/editor/completion.h>
 
 namespace jfsh {
 

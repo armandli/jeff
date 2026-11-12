@@ -3,7 +3,7 @@
 #include <string>
 #include <utility>
 
-#include <jfsh/parser/parser.hh>
+#include <jfsh/parser/parser.h>
 
 // Decompiler: convert a CompiledProgram back to source text.
 // Used by `functions` / `typeset -f` to print function bodies.

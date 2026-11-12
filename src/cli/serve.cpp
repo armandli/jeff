@@ -1,5 +1,5 @@
-#include "../inference/model.hpp"
-#include "../mcp/server.hpp"
+#include "../inference/model.h"
+#include "../mcp/server.h"
 #include <iostream>
 #include <memory>
 

@@ -1,6 +1,6 @@
-#ifndef JFSH_AGENT_PROVIDER_HH
-#define JFSH_AGENT_PROVIDER_HH
-// jfsh/agent/provider.hh — LLM provider configuration.
+#ifndef JFSH_AGENT_PROVIDER_H
+#define JFSH_AGENT_PROVIDER_H
+// jfsh/agent/provider.h — LLM provider configuration.
 
 #include <cstdint>
 
@@ -8,7 +8,7 @@
 #include <string>
 #include <variant>
 
-#include <jfsh/core/types.hh>
+#include <jfsh/core/types.h>
 
 namespace jeff::json { class Value; }
 
@@ -72,4 +72,4 @@ std::optional<std::string> api_error_message(const jeff::json::Value& response);
 
 }  // namespace jfsh
 
-#endif  // JFSH_AGENT_PROVIDER_HH
+#endif  // JFSH_AGENT_PROVIDER_H

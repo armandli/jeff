@@ -1,7 +1,7 @@
 #include <cerrno>
 #include <cstring>
 
-#include <jfsh/core/types.hh>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 

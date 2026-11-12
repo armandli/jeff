@@ -14,7 +14,7 @@
 //
 // Default model: <repo_root>/checkpoints/exp_005_shell_router/best
 
-#include "router_common.hpp"
+#include "router_common.h"
 
 namespace fs = std::filesystem;
 

@@ -1,4 +1,4 @@
-#include <jfsh/agent/openrouter.hh>
+#include <jfsh/agent/openrouter.h>
 
 namespace jfsh {
 

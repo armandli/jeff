@@ -2,9 +2,9 @@
 
 #include <curl/curl.h>
 
-#include <json.hpp>
+#include <json.h>
 
-#include <jfsh/router/jeff.hh>
+#include <jfsh/router/jeff.h>
 
 namespace jfsh {
 

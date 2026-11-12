@@ -1,4 +1,4 @@
-#include "../inference/model.hpp"
+#include "../inference/model.h"
 #include <iostream>
 #include <string>
 

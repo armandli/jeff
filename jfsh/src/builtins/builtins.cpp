@@ -5,8 +5,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <jfsh/builtins/builtins.hh>
-#include <jfsh/exec/executor.hh>
+#include <jfsh/builtins/builtins.h>
+#include <jfsh/exec/executor.h>
 
 namespace jfsh {
 

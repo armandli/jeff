@@ -1,12 +1,12 @@
-#ifndef JFSH_AGENT_OLLAMA_HH
-#define JFSH_AGENT_OLLAMA_HH
-// jfsh/agent/ollama.hh — Ollama local LLM backend.
+#ifndef JFSH_AGENT_OLLAMA_H
+#define JFSH_AGENT_OLLAMA_H
+// jfsh/agent/ollama.h — Ollama local LLM backend.
 //
 // Implements AgentBackend using Ollama's REST API (POST /api/chat).
 // Default base URL: http://localhost:11434.
 
-#include <jfsh/agent/agent.hh>
-#include <jfsh/agent/provider.hh>
+#include <jfsh/agent/agent.h>
+#include <jfsh/agent/provider.h>
 
 namespace jfsh {
 
@@ -35,4 +35,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_AGENT_OLLAMA_HH
+#endif  // JFSH_AGENT_OLLAMA_H

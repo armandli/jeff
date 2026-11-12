@@ -1,7 +1,7 @@
 #include <cstdio>
 #include <string>
 
-#include <jfsh/lexer/input.hh>
+#include <jfsh/lexer/input.h>
 
 namespace jfsh {
 

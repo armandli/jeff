@@ -1,7 +1,7 @@
 #include <cctype>
 #include <cstring>
 
-#include <jfsh/lexer/lexer.hh>
+#include <jfsh/lexer/lexer.h>
 
 namespace jfsh {
 

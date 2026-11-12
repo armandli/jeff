@@ -1,8 +1,8 @@
 #include <curl/curl.h>
 
-#include <json.hpp>
+#include <json.h>
 
-#include <jfsh/agent/ollama.hh>
+#include <jfsh/agent/ollama.h>
 
 namespace jfsh {
 

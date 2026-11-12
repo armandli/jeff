@@ -4,7 +4,7 @@
 
 #include <algorithm>
 
-#include <jfsh/glob/glob.hh>
+#include <jfsh/glob/glob.h>
 
 namespace jfsh {
 

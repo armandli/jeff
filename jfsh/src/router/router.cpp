@@ -1,9 +1,9 @@
 #include <cstdio>
 #include <cstring>
 
-#include <jfsh/router/jeff.hh>
-#include <jfsh/router/jev.hh>
-#include <jfsh/router/router.hh>
+#include <jfsh/router/jeff.h>
+#include <jfsh/router/jev.h>
+#include <jfsh/router/router.h>
 
 namespace jfsh {
 

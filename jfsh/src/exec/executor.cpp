@@ -11,10 +11,10 @@
 #include <unordered_map>
 #include <utility>
 
-#include <jfsh/builtins/builtins.hh>
-#include <jfsh/exec/executor.hh>
-#include <jfsh/lexer/input.hh>
-#include <jfsh/parser/parser.hh>
+#include <jfsh/builtins/builtins.h>
+#include <jfsh/exec/executor.h>
+#include <jfsh/lexer/input.h>
+#include <jfsh/parser/parser.h>
 
 namespace jfsh {
 

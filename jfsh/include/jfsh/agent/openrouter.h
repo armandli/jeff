@@ -1,13 +1,13 @@
-#ifndef JFSH_AGENT_OPENROUTER_HH
-#define JFSH_AGENT_OPENROUTER_HH
-// jfsh/agent/openrouter.hh — OpenRouter backend.
+#ifndef JFSH_AGENT_OPENROUTER_H
+#define JFSH_AGENT_OPENROUTER_H
+// jfsh/agent/openrouter.h — OpenRouter backend.
 //
 // OpenRouter exposes an OpenAI-compatible API so this is a thin wrapper
 // around OpenAIBackend that sets the correct base URL and adds the
 // HTTP-Referer / X-Title headers OpenRouter recommends.
 
-#include <jfsh/agent/openai.hh>
-#include <jfsh/agent/provider.hh>
+#include <jfsh/agent/openai.h>
+#include <jfsh/agent/provider.h>
 
 namespace jfsh {
 
@@ -31,4 +31,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_AGENT_OPENROUTER_HH
+#endif  // JFSH_AGENT_OPENROUTER_H

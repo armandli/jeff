@@ -1,6 +1,6 @@
-#ifndef JFSH_GLOB_GLOB_HH
-#define JFSH_GLOB_GLOB_HH
-// jfsh/glob/glob.hh — pathname globbing and pattern matching.
+#ifndef JFSH_GLOB_GLOB_H
+#define JFSH_GLOB_GLOB_H
+// jfsh/glob/glob.h — pathname globbing and pattern matching.
 //
 // Mirrors zsh's glob.c / pattern.c.  Supports:
 //   Basic:   * ? [...]
@@ -15,8 +15,8 @@
 #include <string_view>
 #include <vector>
 
-#include <jfsh/core/options.hh>
-#include <jfsh/core/types.hh>
+#include <jfsh/core/options.h>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 
@@ -91,4 +91,4 @@ bool has_glob_chars(std::string_view s) noexcept;
 
 }  // namespace jfsh
 
-#endif  // JFSH_GLOB_GLOB_HH
+#endif  // JFSH_GLOB_GLOB_H

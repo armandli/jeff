@@ -3,8 +3,8 @@
 
 #include <gtest/gtest.h>
 
-#include <jfsh/lexer/input.hh>
-#include <jfsh/lexer/lexer.hh>
+#include <jfsh/lexer/input.h>
+#include <jfsh/lexer/lexer.h>
 
 namespace jfsh {
 namespace {

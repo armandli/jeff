@@ -1,6 +1,6 @@
-#ifndef JFSH_CORE_PARAM_HH
-#define JFSH_CORE_PARAM_HH
-// jfsh/core/param.hh — shell parameters (variables).
+#ifndef JFSH_CORE_PARAM_H
+#define JFSH_CORE_PARAM_H
+// jfsh/core/param.h — shell parameters (variables).
 //
 // Mirrors zsh's Param struct and params.c.  Every shell variable — scalars,
 // integers, floats, arrays, associative arrays — is a Param.  Special params
@@ -16,7 +16,7 @@
 #include <variant>
 #include <vector>
 
-#include <jfsh/core/types.hh>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 
@@ -130,4 +130,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_CORE_PARAM_HH
+#endif  // JFSH_CORE_PARAM_H

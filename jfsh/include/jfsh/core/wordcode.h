@@ -1,6 +1,6 @@
-#ifndef JFSH_CORE_WORDCODE_HH
-#define JFSH_CORE_WORDCODE_HH
-// jfsh/core/wordcode.hh — compiled shell program representation.
+#ifndef JFSH_CORE_WORDCODE_H
+#define JFSH_CORE_WORDCODE_H
+// jfsh/core/wordcode.h — compiled shell program representation.
 //
 // Mirrors zsh's Eprog / WordCode architecture from Src/parse.c and zsh.h.
 //
@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-#include <jfsh/core/types.hh>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 
@@ -210,4 +210,4 @@ struct ExecState {
 
 }  // namespace jfsh
 
-#endif  // JFSH_CORE_WORDCODE_HH
+#endif  // JFSH_CORE_WORDCODE_H

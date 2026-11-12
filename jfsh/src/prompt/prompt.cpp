@@ -3,7 +3,7 @@
 #include <pwd.h>
 #include <unistd.h>
 
-#include <jfsh/prompt/prompt.hh>
+#include <jfsh/prompt/prompt.h>
 
 namespace jfsh {
 

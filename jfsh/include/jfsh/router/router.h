@@ -1,6 +1,6 @@
-#ifndef JFSH_ROUTER_ROUTER_HH
-#define JFSH_ROUTER_ROUTER_HH
-// jfsh/router/router.hh — System 1 decision router.
+#ifndef JFSH_ROUTER_ROUTER_H
+#define JFSH_ROUTER_ROUTER_H
+// jfsh/router/router.h — System 1 decision router.
 //
 // The router intercepts every command line before execution and classifies it:
 //   RUN   → execute normally as a shell command
@@ -17,7 +17,7 @@
 #include <string>
 #include <string_view>
 
-#include <jfsh/core/types.hh>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 
@@ -83,4 +83,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_ROUTER_ROUTER_HH
+#endif  // JFSH_ROUTER_ROUTER_H

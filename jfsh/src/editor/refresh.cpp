@@ -1,4 +1,4 @@
-#include <jfsh/editor/editor.hh>
+#include <jfsh/editor/editor.h>
 
 // Terminal display refresh — full ZLE-style screen management.
 //

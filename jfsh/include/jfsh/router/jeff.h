@@ -1,6 +1,6 @@
-#ifndef JFSH_ROUTER_JEFF_HH
-#define JFSH_ROUTER_JEFF_HH
-// jfsh/router/jeff.hh — System 1 router backed by the local jeff-server.
+#ifndef JFSH_ROUTER_JEFF_H
+#define JFSH_ROUTER_JEFF_H
+// jfsh/router/jeff.h — System 1 router backed by the local jeff-server.
 //
 // Sends every candidate line to POST /classify on the running jeff-server
 // binary (127.0.0.1:8765 by default). Falls back to HeuristicRouter on any
@@ -11,8 +11,8 @@
 #include <string>
 #include <string_view>
 
-#include <jfsh/core/types.hh>
-#include <jfsh/router/router.hh>
+#include <jfsh/core/types.h>
+#include <jfsh/router/router.h>
 
 namespace jfsh {
 
@@ -33,4 +33,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_ROUTER_JEFF_HH
+#endif  // JFSH_ROUTER_JEFF_H

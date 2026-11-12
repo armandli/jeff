@@ -2,8 +2,8 @@
 
 #include <filesystem>
 
-#include <jfsh/builtins/builtins.hh>
-#include <jfsh/modules/module.hh>
+#include <jfsh/builtins/builtins.h>
+#include <jfsh/modules/module.h>
 
 namespace jfsh {
 

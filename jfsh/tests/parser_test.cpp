@@ -2,8 +2,8 @@
 
 #include <gtest/gtest.h>
 
-#include <jfsh/lexer/input.hh>
-#include <jfsh/parser/parser.hh>
+#include <jfsh/lexer/input.h>
+#include <jfsh/parser/parser.h>
 
 namespace jfsh {
 namespace {

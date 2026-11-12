@@ -1,6 +1,6 @@
-#ifndef JFSH_CORE_JOBS_HH
-#define JFSH_CORE_JOBS_HH
-// jfsh/core/jobs.hh — job control structures.
+#ifndef JFSH_CORE_JOBS_H
+#define JFSH_CORE_JOBS_H
+// jfsh/core/jobs.h — job control structures.
 //
 // Mirrors zsh's Job/Process structs and job.c.  Every pipeline the user runs
 // is a Job; each stage of the pipeline is a Process.
@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include <jfsh/core/types.hh>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 
@@ -113,4 +113,4 @@ extern JobTable Jobs;
 
 }  // namespace jfsh
 
-#endif  // JFSH_CORE_JOBS_HH
+#endif  // JFSH_CORE_JOBS_H

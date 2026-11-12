@@ -1,4 +1,4 @@
-#include <jfsh/editor/editor.hh>
+#include <jfsh/editor/editor.h>
 
 namespace jfsh {
 

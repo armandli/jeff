@@ -1,6 +1,6 @@
-#ifndef JFSH_MODULES_MODULE_HH
-#define JFSH_MODULES_MODULE_HH
-// jfsh/modules/module.hh — loadable module interface.
+#ifndef JFSH_MODULES_MODULE_H
+#define JFSH_MODULES_MODULE_H
+// jfsh/modules/module.h — loadable module interface.
 //
 // Mirrors zsh's module.c / Src/Modules/*.  Modules are dynamically loaded
 // shared objects that can register additional builtins, parameters, and
@@ -15,12 +15,12 @@
 #include <string_view>
 #include <vector>
 
-#include <jfsh/core/types.hh>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 
-struct BuiltinDef;   // forward — defined in builtins.hh
-struct ExecContext;  // forward — defined in executor.hh
+struct BuiltinDef;   // forward — defined in builtins.h
+struct ExecContext;  // forward — defined in executor.h
 
 struct ModuleFeatures {
   std::vector<BuiltinDef> builtins;
@@ -73,4 +73,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_MODULES_MODULE_HH
+#endif  // JFSH_MODULES_MODULE_H

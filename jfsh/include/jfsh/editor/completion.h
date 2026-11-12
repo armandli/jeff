@@ -1,6 +1,6 @@
-#ifndef JFSH_EDITOR_COMPLETION_HH
-#define JFSH_EDITOR_COMPLETION_HH
-// jfsh/editor/completion.hh — tab-completion engine.
+#ifndef JFSH_EDITOR_COMPLETION_H
+#define JFSH_EDITOR_COMPLETION_H
+// jfsh/editor/completion.h — tab-completion engine.
 //
 // Mirrors zsh's Completion/ subsystem (compsys).
 
@@ -11,8 +11,8 @@
 #include <string_view>
 #include <vector>
 
-#include <jfsh/core/param.hh>
-#include <jfsh/core/types.hh>
+#include <jfsh/core/param.h>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 
@@ -67,4 +67,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_EDITOR_COMPLETION_HH
+#endif  // JFSH_EDITOR_COMPLETION_H
