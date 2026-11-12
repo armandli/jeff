@@ -3,9 +3,9 @@
 
 #include <curl/curl.h>
 
-#include <json.hpp>
+#include <json.h>
 
-#include <jfsh/router/jev.hh>
+#include <jfsh/router/jev.h>
 
 namespace jfsh {
 

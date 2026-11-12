@@ -3,7 +3,7 @@
 #include <fstream>
 #include <sstream>
 
-#include <jfsh/history/history.hh>
+#include <jfsh/history/history.h>
 
 namespace jfsh {
 

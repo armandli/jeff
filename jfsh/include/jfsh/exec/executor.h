@@ -1,6 +1,6 @@
-#ifndef JFSH_EXEC_EXECUTOR_HH
-#define JFSH_EXEC_EXECUTOR_HH
-// jfsh/exec/executor.hh — shell executor.
+#ifndef JFSH_EXEC_EXECUTOR_H
+#define JFSH_EXEC_EXECUTOR_H
+// jfsh/exec/executor.h — shell executor.
 //
 // Mirrors zsh's exec.c hierarchy:
 //   execlist() → execpline() → execpline2() → execcmd() → execsimple()
@@ -11,12 +11,12 @@
 #include <string>
 #include <vector>
 
-#include <jfsh/core/jobs.hh>
-#include <jfsh/core/options.hh>
-#include <jfsh/core/param.hh>
-#include <jfsh/core/signals.hh>
-#include <jfsh/core/types.hh>
-#include <jfsh/core/wordcode.hh>
+#include <jfsh/core/jobs.h>
+#include <jfsh/core/options.h>
+#include <jfsh/core/param.h>
+#include <jfsh/core/signals.h>
+#include <jfsh/core/types.h>
+#include <jfsh/core/wordcode.h>
 
 namespace jfsh {
 
@@ -173,4 +173,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_EXEC_EXECUTOR_HH
+#endif  // JFSH_EXEC_EXECUTOR_H

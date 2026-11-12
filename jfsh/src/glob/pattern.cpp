@@ -1,4 +1,4 @@
-#include <jfsh/glob/glob.hh>
+#include <jfsh/glob/glob.h>
 
 // Extended-glob pattern compiler (requires EXTENDED_GLOB option).
 //

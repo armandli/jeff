@@ -2,12 +2,12 @@
 
 #include <gtest/gtest.h>
 
-#include <json.hpp>
+#include <json.h>
 
-#include <jfsh/agent/anthropic.hh>
-#include <jfsh/agent/ollama.hh>
-#include <jfsh/agent/openai.hh>
-#include <jfsh/agent/provider.hh>
+#include <jfsh/agent/anthropic.h>
+#include <jfsh/agent/ollama.h>
+#include <jfsh/agent/openai.h>
+#include <jfsh/agent/provider.h>
 
 namespace jfsh {
 namespace {

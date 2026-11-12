@@ -3,22 +3,22 @@
 #include <cstring>
 #include <unistd.h>
 
-#include <jfsh/agent/agent.hh>
-#include <jfsh/agent/provider.hh>
-#include <jfsh/router/jeff.hh>
-#include <jfsh/router/jev.hh>
-#include <jfsh/core/jobs.hh>
-#include <jfsh/core/options.hh>
-#include <jfsh/core/param.hh>
-#include <jfsh/core/signals.hh>
-#include <jfsh/core/types.hh>
-#include <jfsh/editor/editor.hh>
-#include <jfsh/exec/executor.hh>
-#include <jfsh/history/history.hh>
-#include <jfsh/lexer/lexer.hh>
-#include <jfsh/parser/parser.hh>
-#include <jfsh/prompt/prompt.hh>
-#include <jfsh/router/router.hh>
+#include <jfsh/agent/agent.h>
+#include <jfsh/agent/provider.h>
+#include <jfsh/router/jeff.h>
+#include <jfsh/router/jev.h>
+#include <jfsh/core/jobs.h>
+#include <jfsh/core/options.h>
+#include <jfsh/core/param.h>
+#include <jfsh/core/signals.h>
+#include <jfsh/core/types.h>
+#include <jfsh/editor/editor.h>
+#include <jfsh/exec/executor.h>
+#include <jfsh/history/history.h>
+#include <jfsh/lexer/lexer.h>
+#include <jfsh/parser/parser.h>
+#include <jfsh/prompt/prompt.h>
+#include <jfsh/router/router.h>
 
 extern char** environ;
 

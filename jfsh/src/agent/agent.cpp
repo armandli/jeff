@@ -1,10 +1,10 @@
 #include <cstdio>
 
-#include <jfsh/agent/agent.hh>
-#include <jfsh/agent/anthropic.hh>
-#include <jfsh/agent/ollama.hh>
-#include <jfsh/agent/openai.hh>
-#include <jfsh/agent/openrouter.hh>
+#include <jfsh/agent/agent.h>
+#include <jfsh/agent/anthropic.h>
+#include <jfsh/agent/ollama.h>
+#include <jfsh/agent/openai.h>
+#include <jfsh/agent/openrouter.h>
 
 namespace jfsh {
 

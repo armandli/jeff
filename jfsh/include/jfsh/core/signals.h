@@ -1,6 +1,6 @@
-#ifndef JFSH_CORE_SIGNALS_HH
-#define JFSH_CORE_SIGNALS_HH
-// jfsh/core/signals.hh — signal handling and trap management.
+#ifndef JFSH_CORE_SIGNALS_H
+#define JFSH_CORE_SIGNALS_H
+// jfsh/core/signals.h — signal handling and trap management.
 //
 // Mirrors zsh's signal.c / trap.c.  Covers:
 //   - Installing signal handlers (sigaction wrappers)
@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-#include <jfsh/core/types.hh>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 
@@ -112,4 +112,4 @@ extern SignalManager Signals;
 
 }  // namespace jfsh
 
-#endif  // JFSH_CORE_SIGNALS_HH
+#endif  // JFSH_CORE_SIGNALS_H

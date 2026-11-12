@@ -1,4 +1,4 @@
-#include <jfsh/core/types.hh>
+#include <jfsh/core/types.h>
 
 // HashTable<V> is a template alias over std::unordered_map; no extra impl needed.
 

@@ -2,9 +2,9 @@
 
 #include <string_view>
 
-#include <json.hpp>
+#include <json.h>
 
-#include <jfsh/agent/provider.hh>
+#include <jfsh/agent/provider.h>
 
 namespace jfsh {
 

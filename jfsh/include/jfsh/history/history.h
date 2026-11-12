@@ -1,6 +1,6 @@
-#ifndef JFSH_HISTORY_HISTORY_HH
-#define JFSH_HISTORY_HISTORY_HH
-// jfsh/history/history.hh — command history management.
+#ifndef JFSH_HISTORY_HISTORY_H
+#define JFSH_HISTORY_HISTORY_H
+// jfsh/history/history.h — command history management.
 //
 // Mirrors zsh's hist.c.  Tracks history entries, implements history
 // expansion (! bang-history), and handles HISTFILE read/write with
@@ -14,7 +14,7 @@
 #include <string_view>
 #include <vector>
 
-#include <jfsh/core/types.hh>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 
@@ -79,4 +79,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_HISTORY_HISTORY_HH
+#endif  // JFSH_HISTORY_HISTORY_H

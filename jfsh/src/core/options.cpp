@@ -3,7 +3,7 @@
 #include <cstring>
 #include <string>
 
-#include <jfsh/core/options.hh>
+#include <jfsh/core/options.h>
 
 namespace jfsh {
 

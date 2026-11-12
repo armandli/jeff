@@ -1,8 +1,8 @@
 #include <curl/curl.h>
 
-#include <json.hpp>
+#include <json.h>
 
-#include <jfsh/agent/anthropic.hh>
+#include <jfsh/agent/anthropic.h>
 
 namespace jfsh {
 

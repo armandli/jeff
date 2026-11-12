@@ -1,6 +1,6 @@
-#ifndef JFSH_LEXER_INPUT_HH
-#define JFSH_LEXER_INPUT_HH
-// jfsh/lexer/input.hh — concrete InputSources for the lexer.
+#ifndef JFSH_LEXER_INPUT_H
+#define JFSH_LEXER_INPUT_H
+// jfsh/lexer/input.h — concrete InputSources for the lexer.
 //
 // Mirrors zsh's input.c.  StringInputSource backs `-c`, `eval`, scripts read
 // into memory and tests; FileInputSource reads a stream incrementally.
@@ -8,7 +8,7 @@
 #include <cstdio>
 #include <string>
 
-#include <jfsh/lexer/lexer.hh>
+#include <jfsh/lexer/lexer.h>
 
 namespace jfsh {
 
@@ -39,4 +39,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_LEXER_INPUT_HH
+#endif  // JFSH_LEXER_INPUT_H

@@ -1,6 +1,6 @@
-#ifndef JFSH_AGENT_AGENT_HH
-#define JFSH_AGENT_AGENT_HH
-// jfsh/agent/agent.hh — LLM agent that handles AGENT-classified commands.
+#ifndef JFSH_AGENT_AGENT_H
+#define JFSH_AGENT_AGENT_H
+// jfsh/agent/agent.h — LLM agent that handles AGENT-classified commands.
 //
 // When the router classifies a line as AGENT, the Agent receives the full
 // conversation context and the user's input, sends a chat completion request
@@ -12,8 +12,8 @@
 #include <string_view>
 #include <vector>
 
-#include <jfsh/agent/provider.hh>
-#include <jfsh/core/types.hh>
+#include <jfsh/agent/provider.h>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 
@@ -62,4 +62,4 @@ std::unique_ptr<AgentBackend> make_backend(const ProviderConfig& cfg);
 
 }  // namespace jfsh
 
-#endif  // JFSH_AGENT_AGENT_HH
+#endif  // JFSH_AGENT_AGENT_H

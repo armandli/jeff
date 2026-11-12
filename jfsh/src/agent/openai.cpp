@@ -4,9 +4,9 @@
 
 #include <curl/curl.h>
 
-#include <json.hpp>
+#include <json.h>
 
-#include <jfsh/agent/openai.hh>
+#include <jfsh/agent/openai.h>
 
 namespace jfsh {
 

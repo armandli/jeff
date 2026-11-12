@@ -1,13 +1,13 @@
-#ifndef JFSH_PARSER_PARSER_HH
-#define JFSH_PARSER_PARSER_HH
-// jfsh/parser/parser.hh — shell parser.
+#ifndef JFSH_PARSER_PARSER_H
+#define JFSH_PARSER_PARSER_H
+// jfsh/parser/parser.h — shell parser.
 //
 // Mirrors zsh's parse.c: par_list() → par_sublist() → par_pline() →
 // par_cmd() → par_simple().  Consumes tokens from the Lexer and emits
 // a CompiledProgram (WordCode bytecode + string table).
 
-#include <jfsh/core/wordcode.hh>
-#include <jfsh/lexer/lexer.hh>
+#include <jfsh/core/wordcode.h>
+#include <jfsh/lexer/lexer.h>
 
 namespace jfsh {
 
@@ -78,4 +78,4 @@ std::string disassemble(const CompiledProgram& prog);
 
 }  // namespace jfsh
 
-#endif  // JFSH_PARSER_PARSER_HH
+#endif  // JFSH_PARSER_PARSER_H

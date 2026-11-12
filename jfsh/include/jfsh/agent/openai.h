@@ -1,12 +1,12 @@
-#ifndef JFSH_AGENT_OPENAI_HH
-#define JFSH_AGENT_OPENAI_HH
-// jfsh/agent/openai.hh — OpenAI chat completion backend.
+#ifndef JFSH_AGENT_OPENAI_H
+#define JFSH_AGENT_OPENAI_H
+// jfsh/agent/openai.h — OpenAI chat completion backend.
 //
 // Implements AgentBackend using the OpenAI REST API (POST /v1/chat/completions).
 // Also compatible with OpenRouter (which uses the same API shape).
 
-#include <jfsh/agent/agent.hh>
-#include <jfsh/agent/provider.hh>
+#include <jfsh/agent/agent.h>
+#include <jfsh/agent/provider.h>
 
 namespace jfsh {
 
@@ -33,4 +33,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_AGENT_OPENAI_HH
+#endif  // JFSH_AGENT_OPENAI_H

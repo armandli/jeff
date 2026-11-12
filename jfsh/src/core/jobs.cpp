@@ -2,7 +2,7 @@
 #include <cstdio>
 #include <sys/wait.h>
 
-#include <jfsh/core/jobs.hh>
+#include <jfsh/core/jobs.h>
 
 namespace jfsh {
 

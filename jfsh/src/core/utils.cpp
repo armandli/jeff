@@ -1,4 +1,4 @@
-#include <jfsh/core/types.hh>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 }  // namespace jfsh

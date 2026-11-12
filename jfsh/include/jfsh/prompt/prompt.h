@@ -1,6 +1,6 @@
-#ifndef JFSH_PROMPT_PROMPT_HH
-#define JFSH_PROMPT_PROMPT_HH
-// jfsh/prompt/prompt.hh — prompt expansion and rendering.
+#ifndef JFSH_PROMPT_PROMPT_H
+#define JFSH_PROMPT_PROMPT_H
+// jfsh/prompt/prompt.h — prompt expansion and rendering.
 //
 // Mirrors zsh's prompt.c.  Expands PROMPT / PS1 / PS2 / PS3 / PS4
 // (and RPROMPT / RPS1 / RPS2) percent-escape sequences, colors, and
@@ -9,9 +9,9 @@
 #include <string>
 #include <string_view>
 
-#include <jfsh/core/options.hh>
-#include <jfsh/core/param.hh>
-#include <jfsh/core/types.hh>
+#include <jfsh/core/options.h>
+#include <jfsh/core/param.h>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 
@@ -57,4 +57,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_PROMPT_PROMPT_HH
+#endif  // JFSH_PROMPT_PROMPT_H

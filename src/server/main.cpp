@@ -18,8 +18,8 @@
 #include <string_view>
 
 #include <httplib.h>
-#include "json.hpp"
-#include "model.hpp"
+#include "json.h"
+#include "model.h"
 
 static std::atomic<httplib::Server*> g_server{nullptr};
 

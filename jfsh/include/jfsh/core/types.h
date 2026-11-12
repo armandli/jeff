@@ -1,6 +1,6 @@
-#ifndef JFSH_CORE_TYPES_HH
-#define JFSH_CORE_TYPES_HH
-// jfsh/core/types.hh — fundamental types shared across all subsystems.
+#ifndef JFSH_CORE_TYPES_H
+#define JFSH_CORE_TYPES_H
+// jfsh/core/types.h — fundamental types shared across all subsystems.
 //
 // Mirrors the low-level types in zsh's zsh.h (LinkList, HashTable, Heap,
 // metafy helpers) but expressed in C++26 idioms.
@@ -93,4 +93,4 @@ struct Thingy {
 
 }  // namespace jfsh
 
-#endif  // JFSH_CORE_TYPES_HH
+#endif  // JFSH_CORE_TYPES_H

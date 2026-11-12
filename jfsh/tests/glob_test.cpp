@@ -1,13 +1,13 @@
 #include <gtest/gtest.h>
 
-#include <jfsh/glob/glob.hh>
+#include <jfsh/glob/glob.h>
 
 namespace jfsh {
 namespace {
 
 TEST(GlobPatternMatch, LiteralsAndWildcards) {
   EXPECT_TRUE(pattern_match("main.cpp", "main.cpp"));
-  EXPECT_FALSE(pattern_match("main.cpp", "main.hh"));
+  EXPECT_FALSE(pattern_match("main.cpp", "main.h"));
   EXPECT_TRUE(pattern_match("*.cpp", "main.cpp"));
   EXPECT_TRUE(pattern_match("*.cpp", ".cpp"));
   EXPECT_FALSE(pattern_match("*.cpp", "main.cpp.bak"));

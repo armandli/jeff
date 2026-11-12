@@ -1,4 +1,4 @@
-#include <jfsh/lexer/lexer.hh>
+#include <jfsh/lexer/lexer.h>
 
 // Parameter, command, and arithmetic substitution expansion.
 //

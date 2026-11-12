@@ -1,5 +1,5 @@
-#include "model.hpp"
-#include "tokenizer.hpp"
+#include "model.h"
+#include "tokenizer.h"
 #include <stdexcept>
 
 namespace jeff {

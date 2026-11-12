@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../inference/model.hpp"
+#include "../inference/model.h"
 #include <memory>
 #include <string>
 

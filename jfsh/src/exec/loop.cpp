@@ -1,4 +1,4 @@
-#include <jfsh/exec/executor.hh>
+#include <jfsh/exec/executor.h>
 
 // REPL loop helpers (interactive prompt-read-execute cycle).
 //

@@ -15,7 +15,7 @@
 // Default model-key: modernbert_base
 // Available keys:    modernbert_base | modernbert_large | roberta_base
 
-#include "router_common.hpp"
+#include "router_common.h"
 
 namespace fs = std::filesystem;
 

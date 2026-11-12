@@ -1,6 +1,6 @@
-#ifndef JFSH_BUILTINS_BUILTINS_HH
-#define JFSH_BUILTINS_BUILTINS_HH
-// jfsh/builtins/builtins.hh — shell builtin commands.
+#ifndef JFSH_BUILTINS_BUILTINS_H
+#define JFSH_BUILTINS_BUILTINS_H
+// jfsh/builtins/builtins.h — shell builtin commands.
 //
 // Mirrors zsh's builtin.c / bltins1.c / bltins2.c.
 // Each builtin is a function: (argv, ExecContext&) → exit_code.
@@ -12,13 +12,13 @@
 #include <string_view>
 #include <vector>
 
-#include <jfsh/core/options.hh>
-#include <jfsh/core/param.hh>
-#include <jfsh/core/types.hh>
+#include <jfsh/core/options.h>
+#include <jfsh/core/param.h>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 
-struct ExecContext;  // forward — defined in executor.hh
+struct ExecContext;  // forward — defined in executor.h
 
 enum BuiltinFlags : std::uint32_t {
   BINF_NONE     = 0,
@@ -134,4 +134,4 @@ int builtin_let       (std::vector<std::string>&, ExecContext&);
 
 }  // namespace jfsh
 
-#endif  // JFSH_BUILTINS_BUILTINS_HH
+#endif  // JFSH_BUILTINS_BUILTINS_H

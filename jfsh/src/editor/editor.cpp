@@ -4,8 +4,8 @@
 #include <termios.h>
 #include <unistd.h>
 
-#include <jfsh/editor/completion.hh>
-#include <jfsh/editor/editor.hh>
+#include <jfsh/editor/completion.h>
+#include <jfsh/editor/editor.h>
 
 namespace jfsh {
 

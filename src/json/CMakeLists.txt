@@ -30,5 +30,5 @@ target_compile_features(jeff_json PUBLIC cxx_std_20)
 target_compile_options(jeff_json PRIVATE -Wall -Wextra -Wpedantic)
 set_target_properties(jeff_json PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# simdjson stays PRIVATE: json.hpp does not include simdjson.h.
+# simdjson stays PRIVATE: json.h does not include simdjson.h.
 target_link_libraries(jeff_json PRIVATE simdjson)

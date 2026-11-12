@@ -1,6 +1,6 @@
-#ifndef JFSH_LEXER_LEXER_HH
-#define JFSH_LEXER_LEXER_HH
-// jfsh/lexer/lexer.hh — shell lexer (tokenizer).
+#ifndef JFSH_LEXER_LEXER_H
+#define JFSH_LEXER_LEXER_H
+// jfsh/lexer/lexer.h — shell lexer (tokenizer).
 //
 // Mirrors zsh's lex.c: gettok() / gettokstr() / zshlex().
 
@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include <jfsh/core/types.hh>
+#include <jfsh/core/types.h>
 
 namespace jfsh {
 
@@ -117,4 +117,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_LEXER_LEXER_HH
+#endif  // JFSH_LEXER_LEXER_H

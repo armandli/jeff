@@ -1,6 +1,6 @@
-#ifndef JFSH_EDITOR_EDITOR_HH
-#define JFSH_EDITOR_EDITOR_HH
-// jfsh/editor/editor.hh — ZLE (Zsh Line Editor).
+#ifndef JFSH_EDITOR_EDITOR_H
+#define JFSH_EDITOR_EDITOR_H
+// jfsh/editor/editor.h — ZLE (Zsh Line Editor).
 //
 // Mirrors the ZLE subsystem in zsh's Src/Zle/.  Provides vi and emacs
 // editing modes, keymaps, history navigation, and inline completion.
@@ -12,10 +12,10 @@
 #include <string>
 #include <vector>
 
-#include <jfsh/core/options.hh>
-#include <jfsh/core/types.hh>
-#include <jfsh/history/history.hh>
-#include <jfsh/prompt/prompt.hh>
+#include <jfsh/core/options.h>
+#include <jfsh/core/types.h>
+#include <jfsh/history/history.h>
+#include <jfsh/prompt/prompt.h>
 
 namespace jfsh {
 
@@ -114,4 +114,4 @@ private:
 
 }  // namespace jfsh
 
-#endif  // JFSH_EDITOR_EDITOR_HH
+#endif  // JFSH_EDITOR_EDITOR_H
