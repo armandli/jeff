@@ -74,7 +74,8 @@ std::string disassemble(const CompiledProgram& prog) {
         out += " skip=" + std::to_string(wc_sublist_skip(w));
       }
       break; case WC_ASSIGN:
-        out += ' ' + flag_names({{wc_data(w) & WC_ASSIGN_APPEND, "append"}});
+        out += ' ' + flag_names({{wc_data(w) & WC_ASSIGN_APPEND, "append"},
+                                 {wc_data(w) & WC_ASSIGN_ARRAY,  "array"}});
       break; case WC_PIPE: {
         WordCode n = wc_pipe_count(w);
         out += ' ' + std::to_string(n);
@@ -93,6 +94,7 @@ std::string disassemble(const CompiledProgram& prog) {
         out += t < REDIR_TYPE_MAX ? NAMES[t] : "?";
         if (wc_redir_has_fd(w))
           out += " fd=" + std::to_string(wc_redir_fd(w));
+        if (wc_redir_literal(w)) out += " literal";
       }
       break; case WC_STRING: {
         WordCode idx = wc_data(w);

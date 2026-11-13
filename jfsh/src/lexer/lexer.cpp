@@ -1,6 +1,8 @@
 #include <cctype>
 #include <cstring>
 
+#include <utility>
+
 #include <jfsh/lexer/lexer.h>
 
 namespace jfsh {
@@ -42,6 +44,126 @@ static void slurp_balanced_paren(InputSource& src, std::string& text) {
     if (c == '(') ++depth;
     else if (c == ')') { if (--depth == 0) break; }
   }
+}
+
+// Characters that end an unquoted word.
+static bool is_word_break(int c) noexcept {
+  return c == ' ' or c == '\t' or c == '\n' or c == ';' or c == '&'
+      or c == '|' or c == '(' or c == ')' or c == '<' or c == '>';
+}
+
+static void slurp_nested(InputSource& src, std::string& text, char open,
+                         char close);
+
+// Appends a backquoted command substitution up to and including its closing
+// backquote.  A backslash keeps the next character.
+static void slurp_backquote(InputSource& src, std::string& text) {
+  for (int c; (c = src.next_char()) != -1;) {
+    text += static_cast<char>(c);
+    if (c == '`') return;
+    if (c == '\\') {
+      int n = src.next_char();
+      if (n == -1) return;
+      text += static_cast<char>(n);
+    }
+  }
+}
+
+// Appends a double-quoted string up to and including its closing quote.
+// Substitutions inside it are slurped whole so a `"` in `$(…)` doesn't end it.
+static void slurp_dquote(InputSource& src, std::string& text) {
+  for (int c; (c = src.next_char()) != -1;) {
+    text += static_cast<char>(c);
+    if (c == '"') return;
+    if (c == '\\') {
+      int n = src.next_char();
+      if (n == -1) return;
+      text += static_cast<char>(n);
+    } else if (c == '`') {
+      slurp_backquote(src, text);
+    } else if (c == '$') {
+      int n = src.next_char();
+      if (n == '(' or n == '{') {
+        text += static_cast<char>(n);
+        slurp_nested(src, text, static_cast<char>(n), n == '(' ? ')' : '}');
+      } else {
+        src.unget(n);
+      }
+    }
+  }
+}
+
+// Appends text up to and including the `close` that balances an `open` the
+// caller has already consumed.  Quotes, backslashes, backquotes and nested
+// `$(…)`/`${…}` are tracked so their contents can't close it early.
+static void slurp_nested(InputSource& src, std::string& text, char open,
+                         char close) {
+  int depth = 1;
+  for (int c; (c = src.next_char()) != -1;) {
+    text += static_cast<char>(c);
+    if (c == '\\') {
+      int n = src.next_char();
+      if (n == -1) return;
+      text += static_cast<char>(n);
+    } else if (c == '\'') {
+      for (int q; (q = src.next_char()) != -1;) {
+        text += static_cast<char>(q);
+        if (q == '\'') break;
+      }
+    } else if (c == '"') {
+      slurp_dquote(src, text);
+    } else if (c == '`') {
+      slurp_backquote(src, text);
+    } else if (c == '$') {
+      int n = src.next_char();
+      if ((n == '(' or n == '{') and n != open) {
+        text += static_cast<char>(n);
+        slurp_nested(src, text, static_cast<char>(n), n == '(' ? ')' : '}');
+      } else {
+        src.unget(n);
+      }
+    } else if (c == open) {
+      ++depth;
+    } else if (c == close and --depth == 0) {
+      return;
+    }
+  }
+}
+
+// After a `<` inside a word: reads the rest of a zsh numeric glob `<lo-hi>`
+// (either bound optional) into `text`.  On anything else nothing is
+// consumed and false is returned.
+static bool read_numeric_range(InputSource& src, std::string& text) {
+  std::string seen;
+  bool dash = false;
+  for (;;) {
+    int c = src.next_char();
+    if (c != -1) seen += static_cast<char>(c);
+    if (c != -1 and std::isdigit(c)) continue;
+    if (c == '-' and not dash) { dash = true; continue; }
+    if (c == '>' and dash) {
+      text += '<';
+      text += seen;
+      return true;
+    }
+    if (c == -1) src.unget(-1);
+    for (auto it = seen.rbegin(); it != seen.rend(); ++it)
+      src.unget(static_cast<unsigned char>(*it));
+    return false;
+  }
+}
+
+// `NAME=` or `NAME+=`: the start of an assignment, where a following `(`
+// opens an array value instead of ending the word.
+static bool is_assignment_prefix(std::string_view w) noexcept {
+  if (w.empty() or w.back() != '=') return false;
+  w.remove_suffix(1);
+  if (not w.empty() and w.back() == '+') w.remove_suffix(1);
+  if (w.empty() or std::isdigit(static_cast<unsigned char>(w[0]))) return false;
+  for (char c : w)
+    if (not std::isalnum(static_cast<unsigned char>(c)) and c != '_')
+      return false;
+  return true;
 }
 
 bool Lexer::is_keyword(std::string_view s) const noexcept {
@@ -87,33 +209,45 @@ void Lexer::register_heredoc(std::string delim, bool strip_tabs, bool expand) {
   mHeredocQueue.push_back({std::move(delim), strip_tabs, expand});
 }
 
-std::string Lexer::read_heredoc() {
-  if (mHeredocQueue.empty()) return {};
-  auto spec = std::move(mHeredocQueue.front());
-  mHeredocQueue.erase(mHeredocQueue.begin());
-  // Discard anything left on the opening line (the newline terminating it)
-  // so the body starts cleanly.  Comments or trailing spaces after the
-  // delimiter are not part of the body.
-  int c;
-  while ((c = mSrc.next_char()) != -1 and c != '\n') {}
-  std::string body;
-  std::string line_buf;
-  for (;;) {
-    c = mSrc.next_char();
-    if (c == -1) break;
-    if (c == '\n') {
+std::vector<std::string> Lexer::take_heredocs() {
+  // Input that ends before the bodies (`cat <<EOF` alone) gets empty ones.
+  mHeredocBodies.resize(mHeredocBodies.size() + mHeredocQueue.size());
+  mHeredocQueue.clear();
+  return std::exchange(mHeredocBodies, {});
+}
+
+// Reads the body of every pending here-document, starting on the line after
+// the one that registered them.
+void Lexer::read_heredoc_bodies() {
+  for (auto& spec : mHeredocQueue) {
+    std::string body;
+    std::string line_buf;
+    for (;;) {
+      int c = mSrc.next_char();
+      if (c == -1) {
+        if (not line_buf.empty() and line_buf != spec.delim) body += line_buf;
+        break;
+      }
+      if (c != '\n') {
+        line_buf += static_cast<char>(c);
+        continue;
+      }
       std::string_view check = line_buf;
       if (spec.strip_tabs)
-        while (not check.empty() and check.front() == '\t')
-          check.remove_prefix(1);
+        while (not check.empty() and check.front() == '\t') check.remove_prefix(1);
       if (check == spec.delim) break;
-      body += (spec.strip_tabs ? std::string(check) : line_buf) + '\n';
+      body += std::string(check) + '\n';
       line_buf.clear();
-    } else {
-      line_buf += static_cast<char>(c);
     }
+    mHeredocBodies.push_back(std::move(body));
   }
-  return body;
+  mHeredocQueue.clear();
+}
+
+LexToken Lexer::newline_token() {
+  int ln = mSrc.line();
+  if (not mHeredocQueue.empty()) read_heredoc_bodies();
+  return {TokType::TK_NEWLINE, "\n", ln};
 }
 
 LexToken Lexer::read_token() {
@@ -122,10 +256,10 @@ LexToken Lexer::read_token() {
     if (c == -1) return {TokType::TK_EOF, {}, mSrc.line()};
     if (c == '#' and (mFlags & LEX_SKIPCOMMENTS)) {
       while ((c = mSrc.next_char()) != -1 and c != '\n') {}
-      if (c == '\n') return {TokType::TK_NEWLINE, "\n", mSrc.line()};
+      if (c == '\n') return newline_token();
       return {TokType::TK_EOF, {}, mSrc.line()};
     }
-    if (c == '\n') return {TokType::TK_NEWLINE, "\n", mSrc.line()};
+    if (c == '\n') return newline_token();
     if (c == ' ' or c == '\t') continue;
     switch (c) {
       case ';': {
@@ -152,8 +286,17 @@ LexToken Lexer::read_token() {
         return {TokType::TK_PIPE, "|", mSrc.line()};
       }
       case '!': return {TokType::TK_BANG,   "!",  mSrc.line()};
-      case '{': return {TokType::TK_LBRACE, "{",  mSrc.line()};
-      case '}': return {TokType::TK_RBRACE, "}",  mSrc.line()};
+      // `{` and `}` are reserved only as words of their own; otherwise they
+      // start a word (`{a,b}`, `{1..3}`, `{}`) for brace expansion.
+      case '{':
+      case '}': {
+        int n = mSrc.next_char();
+        mSrc.unget(n);
+        if (n == -1 or is_word_break(n))
+          return c == '{' ? LexToken{TokType::TK_LBRACE, "{", mSrc.line()}
+                          : LexToken{TokType::TK_RBRACE, "}", mSrc.line()};
+        return read_word(c);
+      }
       case '(': {
         int n = mSrc.next_char();
         if (n == '(') return {TokType::TK_DLPAREN, "((", mSrc.line()};
@@ -193,18 +336,71 @@ LexToken Lexer::read_word(int first_char) {
         redir.text = text + redir.text;
         return redir;
       }
-      if (c == ' ' or c == '\t' or c == '\n'
-          or c == ';' or c == '&' or c == '|'
-          or c == '(' or c == ')' or c == '{' or c == '}'
-          or c == '<' or c == '>') {
-        mSrc.unget(c);
-        break;
-      }
       // `=(` at the start of a word is zsh's =(cmd) substitution.
       if (text == "=" and c == '(') {
         std::string body = "=(";
         slurp_balanced_paren(mSrc, body);
         return {TokType::TK_REDIR, body, ln};
+      }
+      // `name=(…)` is an array assignment, and inside a word `(…)` is a
+      // glob group or qualifier (`*.(c|h)`, `*(.)`).  `name()` is left
+      // alone: it is a function definition.
+      if (c == '(' and not text.empty()) {
+        int n = mSrc.next_char();
+        mSrc.unget(n);
+        if (n != ')' or is_assignment_prefix(text)) {
+          text += '(';
+          slurp_nested(mSrc, text, '(', ')');
+          all_digits_so_far = false;
+          c = mSrc.next_char();
+          continue;
+        }
+      }
+      if (c == '<' and not text.empty() and read_numeric_range(mSrc, text)) {
+        all_digits_so_far = false;
+        c = mSrc.next_char();
+        continue;
+      }
+      if (is_word_break(c)) {
+        mSrc.unget(c);
+        break;
+      }
+    }
+    if (not in_single) {
+      // Substitutions are one unit of the word, whatever they contain.
+      if (c == '$') {
+        int n = mSrc.next_char();
+        if (n == '(' or n == '{') {
+          text += '$';
+          text += static_cast<char>(n);
+          slurp_nested(mSrc, text, static_cast<char>(n), n == '(' ? ')' : '}');
+          all_digits_so_far = false;
+          c = mSrc.next_char();
+          continue;
+        }
+        if (n == '\'' and not in_double) {
+          // $'…' — C-style escapes; `\'` does not end it.
+          text += "$'";
+          for (int q; (q = mSrc.next_char()) != -1;) {
+            text += static_cast<char>(q);
+            if (q == '\'') break;
+            if (q == '\\') {
+              int e = mSrc.next_char();
+              if (e == -1) break;
+              text += static_cast<char>(e);
+            }
+          }
+          all_digits_so_far = false;
+          c = mSrc.next_char();
+          continue;
+        }
+        mSrc.unget(n);
+      } else if (c == '`') {
+        text += '`';
+        slurp_backquote(mSrc, text);
+        all_digits_so_far = false;
+        c = mSrc.next_char();
+        continue;
       }
     }
     if (not std::isdigit(static_cast<unsigned char>(c))) all_digits_so_far = false;

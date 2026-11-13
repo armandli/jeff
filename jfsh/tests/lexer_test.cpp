@@ -135,11 +135,58 @@ TEST(Lexer, TrailingOperatorAtEofTerminates) {
   }
 }
 
-// Known gap: '(' and '{' end a word, so $(...) and ${...} are split into several
-// tokens. Enable once command/parameter substitution lexing lands (TODO subst/*).
-TEST(Lexer, DISABLED_SubstitutionsStayOneWord) {
+// Substitutions are one unit of a word, however they nest (bug B8).
+TEST(Lexer, SubstitutionsStayOneWord) {
   EXPECT_EQ(words(lex_all("echo $(date +%s) ${HOME}/x")),
             (std::vector<std::string>{"echo", "$(date +%s)", "${HOME}/x"}));
+  EXPECT_EQ(words(lex_all("echo $((1 + (2*3))) `a b` ${x:-a b} $(a $(b) \")\")")),
+            (std::vector<std::string>{"echo", "$((1 + (2*3)))", "`a b`", "${x:-a b}",
+                                      "$(a $(b) \")\")"}));
+  EXPECT_EQ(words(lex_all("echo \"$(echo \")\")\" x")),
+            (std::vector<std::string>{"echo", "\"$(echo \")\")\"", "x"}));
+}
+
+TEST(Lexer, DollarSingleQuotesKeepEscapedQuotes) {
+  EXPECT_EQ(words(lex_all("echo $'it\\'s' x")),
+            (std::vector<std::string>{"echo", "$'it\\'s'", "x"}));
+}
+
+TEST(Lexer, BracesAreReservedOnlyAsWholeWords) {
+  using enum TokType;
+  EXPECT_EQ(types(lex_all("{ a{b,c} {1..3} {} }")),
+            (std::vector<TokType>{TK_LBRACE, TK_WORD, TK_WORD, TK_WORD, TK_RBRACE}));
+  EXPECT_EQ(words(lex_all("x a{b,c}d")), (std::vector<std::string>{"x", "a{b,c}d"}));
+}
+
+TEST(Lexer, ParenthesesInsideAWord) {
+  EXPECT_EQ(words(lex_all("a=(x 'y z') b+=(1) *.(c|h) *(.) f()")),
+            (std::vector<std::string>{"a=(x 'y z')", "b+=(1)", "*.(c|h)", "*(.)", "f", "(", ")"}));
+}
+
+TEST(Lexer, NumericGlobInsideAWord) {
+  using enum TokType;
+  auto toks = lex_all("ls f<1-5>.txt a<b");
+  EXPECT_EQ(types(toks), (std::vector<TokType>{TK_WORD, TK_WORD, TK_WORD, TK_REDIR, TK_WORD}));
+  EXPECT_EQ(toks[1].text, "f<1-5>.txt");
+}
+
+TEST(Lexer, HeredocBodiesAreReadAtTheEndOfTheLine) {
+  StringInputSource in{"cat <<A <<B | x\nbody a\nA\nbody b\nB\nnext\n"};
+  Lexer lex{in};
+  std::vector<std::string> seen;
+  for (;;) {
+    auto t = lex.next_token();
+    if (t.is_eof()) break;
+    if (t.type == TokType::TK_REDIR) {
+      auto delim = lex.next_token();
+      seen.push_back(delim.text);
+      lex.register_heredoc(delim.text, false, true);
+      continue;
+    }
+    seen.push_back(t.is_newline() ? "NL" : t.text);
+  }
+  EXPECT_EQ(seen, (std::vector<std::string>{"cat", "A", "B", "|", "x", "NL", "next", "NL"}));
+  EXPECT_EQ(lex.take_heredocs(), (std::vector<std::string>{"body a\n", "body b\n"}));
 }
 
 }  // namespace

@@ -8,6 +8,9 @@
 
 #include <cstdint>
 
+#include <unistd.h>
+
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -43,22 +46,31 @@ struct ExecContext {
   int  return_val  = 0;
   bool exiting     = false;
   int  exit_val    = 0;
+
+  std::vector<std::string> positional{};    // $1 … $N, also $@ $* $argv
+  std::string              arg0 = "jfsh";   // $0
+  Pid                      shell_pid = ::getpid();  // $$, unchanged in subshells
 };
 
-// A `name=value` (or `name+=value`) word in front of a simple command.
+// A `name=value` (or `name+=value`, `name=(…)`) word in front of a simple
+// command.  For an array assignment `value` holds the source between the
+// parentheses until expansion fills `elements`.
 struct Assignment {
-  std::string name;
-  std::string value;
-  bool        append = false;
+  std::string              name;
+  std::string              value;
+  bool                     append = false;
+  bool                     array  = false;
+  std::vector<std::string> elements;
 };
 
 // A single redirection decoded from the bytecode.  `fd == -1` means the
 // user did not write an explicit fd prefix; the executor picks the default
 // for `type` (0 for reads, 1 for writes, 2 for stderr merges).
 struct Redirection {
-  RedirType   type   = REDIR_READ;
-  int         fd     = -1;
+  RedirType   type    = REDIR_READ;
+  int         fd      = -1;
   std::string target;
+  bool        literal = false;   // here-doc with a quoted delimiter
 };
 
 // RAII guard that restores a set of fds when it goes out of scope.
@@ -149,8 +161,14 @@ protected:
   };
   ProcSubstResources expand_procsubst(std::vector<std::string>& args);
   void               procsubst_release(ProcSubstResources& res) noexcept;
-  std::vector<std::string> expand_words(const std::vector<std::string>& words);
-  std::string              expand_value(std::string_view value);
+  // Expands the words, assignments and redirection targets of a simple
+  // command in place (src/exec/subst.cpp does the work).  Prints the error
+  // and returns false when an expansion fails.  `subst_status` receives
+  // the status of the last command substitution, if any ran.
+  bool expand_command(std::vector<std::string>& args,
+                      std::vector<Assignment>&  assigns,
+                      std::vector<Redirection>& redirs,
+                      std::optional<int>&       subst_status);
   int  apply_assigns(const std::vector<Assignment>& assigns);
   void trace(
     const std::vector<std::string>& args,
@@ -164,6 +182,9 @@ protected:
   int  call_function(
     std::string_view name,
     std::vector<std::string>& args);
+
+public:
+  ExecContext& context() noexcept { return mCtx; }
 
 private:
   ExecContext& mCtx;

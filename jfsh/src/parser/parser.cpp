@@ -19,8 +19,13 @@ Result<ProgRef> Parser::parse() {
   if (not ok and mError.message.empty()) error_near(mLex.peek());
   if (not ok) {
     mProg = nullptr;
+    mPendingHeredocs.clear();
     return std::unexpected(mError);
   }
+  auto bodies = mLex.take_heredocs();
+  for (std::size_t i = 0; i < mPendingHeredocs.size() and i < bodies.size(); ++i)
+    prog->strs[mPendingHeredocs[i]] = std::move(bodies[i]);
+  mPendingHeredocs.clear();
   emit(make_wc(WC_END, 0));
   mProg = nullptr;
   return prog;
@@ -237,9 +242,15 @@ bool Parser::par_simple() {
       bool append = false;
       std::size_t len = words.empty() ? assignment_name_len(tok.text, append) : 0;
       if (len) {
-        emit(make_wc(WC_ASSIGN, append ? WC_ASSIGN_APPEND : 0));
+        std::string value = tok.text.substr(len + (append ? 2 : 1));
+        WordCode flags = append ? WC_ASSIGN_APPEND : 0;
+        if (value.size() >= 2 and value.front() == '(' and value.back() == ')') {
+          flags |= WC_ASSIGN_ARRAY;
+          value = value.substr(1, value.size() - 2);
+        }
+        emit(make_wc(WC_ASSIGN, flags));
         emit_str(tok.text.substr(0, len));
-        emit_str(tok.text.substr(len + (append ? 2 : 1)));
+        emit_str(std::move(value));
         ++nassign;
       } else {
         words.push_back(tok.text);
@@ -404,11 +415,10 @@ bool Parser::par_redir() {
     bool quoted = false;
     std::string delim = heredoc_unquote(target, quoted);
     mLex.register_heredoc(delim, type == REDIR_HEREDOCD, not quoted);
-    // Read the body now so it is captured before the next token advances
-    // past the newline.  The lexer returns the body as a plain string.
-    std::string body = mLex.read_heredoc();
-    emit(make_wc_redir(type, fd));
-    emit_str(std::move(body));
+    // The lexer reads the body once it reaches the end of this line;
+    // parse() fills the placeholder in.
+    emit(make_wc_redir(type, fd, quoted));
+    mPendingHeredocs.push_back(emit_str({}));
     return true;
   }
 
@@ -417,10 +427,9 @@ bool Parser::par_redir() {
   return true;
 }
 
-// Scalar `name=value` / `name+=value` words are recognized in par_simple.
-// TODO(parser/assign): Array assignments `name=(a b c)` / `name+=(…)` — the
-//   lexer currently splits the word at `(` (bug B8), so they reach the parser
-//   as `name=` followed by TK_LPAREN and fail as a parse error.
-bool Parser::par_assign() { return unsupported("array assignment"); }
+// `name=value`, `name+=value`, `name=(…)` and `name+=(…)` words are all
+// recognized in par_simple; the lexer keeps an array value in one word.
+// TODO(parser/assign): subscripted assignments `name[i]=value`.
+bool Parser::par_assign() { return unsupported("subscripted assignment"); }
 
 }  // namespace jfsh

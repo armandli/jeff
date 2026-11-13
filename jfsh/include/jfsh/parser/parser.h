@@ -6,6 +6,8 @@
 // par_cmd() → par_simple().  Consumes tokens from the Lexer and emits
 // a CompiledProgram (WordCode bytecode + string table).
 
+#include <vector>
+
 #include <jfsh/core/wordcode.h>
 #include <jfsh/lexer/lexer.h>
 
@@ -70,6 +72,7 @@ private:
   ParseFlags       mFlags;
   ShellError       mError;
   CompiledProgram* mProg = nullptr;
+  std::vector<std::size_t> mPendingHeredocs;   // strs indices awaiting bodies
 };
 
 // Human-readable listing of the bytecode, one instruction per line

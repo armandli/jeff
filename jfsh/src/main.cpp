@@ -3,6 +3,9 @@
 #include <cstring>
 #include <unistd.h>
 
+#include <string>
+#include <vector>
+
 #include <jfsh/agent/agent.h>
 #include <jfsh/agent/provider.h>
 #include <jfsh/router/jeff.h>
@@ -52,6 +55,7 @@ int main(int argc, char* argv[]) {
   std::string jeff_url;       // overrides JeffConfig::base_url
   std::string typesafe_key;
   std::string jev_model;
+  std::vector<std::string> rest;   // $0 and the positional parameters
 
   for (int i = 1; i < argc; ++i) {
     std::string_view arg(argv[i]);
@@ -81,9 +85,15 @@ int main(int argc, char* argv[]) {
     } else if (arg == "--help" or arg == "-h") {
       print_usage(argv[0]);
       return 0;
+    } else if (arg[0] != '-' and not eval_cmd.empty()) {
+      // `-c cmd name args…`: $0 and the positional parameters.
+      rest.assign(argv + i, argv + argc);
+      break;
     } else if (arg[0] != '-' and script_path.empty()) {
       script_path = std::string(arg);
       interactive = false;
+      rest.assign(argv + i + 1, argv + argc);
+      break;
     }
   }
 
@@ -148,6 +158,14 @@ int main(int argc, char* argv[]) {
   auto agent = jfsh::Agent::create(provider_cfg);
 
   jfsh::ExecContext ctx{params, opts, jfsh::Jobs, jfsh::Signals, 0, -1};
+  ctx.arg0 = argv[0];
+  if (not script_path.empty()) {
+    ctx.arg0       = script_path;
+    ctx.positional = std::move(rest);
+  } else if (not eval_cmd.empty() and not rest.empty()) {
+    ctx.arg0       = rest.front();
+    ctx.positional.assign(rest.begin() + 1, rest.end());
+  }
   jfsh::Executor executor(ctx);
 
   if (not eval_cmd.empty()) {

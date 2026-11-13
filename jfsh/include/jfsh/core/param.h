@@ -107,6 +107,14 @@ struct ParamTable {
     std::string value,
     bool append = false);
 
+  // Array assignment (`name=(…)`, `name+=(…)`), with set_scalar's scoping
+  // and readonly rules.  An existing associative array takes the words as
+  // key/value pairs.
+  Result<void> set_array(
+    std::string_view name,
+    std::vector<std::string> words,
+    bool append = false);
+
   // Declare local — creates in current scope without setting.
   Param& declare_local(
     std::string name,
