@@ -36,6 +36,7 @@ static const char* opcode_name(WordCode op) noexcept {
     "END", "LIST", "SUBLIST", "PIPE", "REDIR", "SIMPLE", "TYPESET", "ASSIGN",
     "IF", "WHILE", "FOR", "CASE", "SELECT", "REPEAT", "SUBSH", "FUNCDEF",
     "FOR_COND", "ALWAYS", "TRY", "COND", "ARITH", "AUTOFN", "STRING",
+    "CURSH", "WORDS",
   };
   static_assert(std::size(kNames) == WC_MAX);
   return op < WC_MAX ? kNames[op] : "?";
@@ -51,6 +52,27 @@ static std::string flag_names(
     out += name;
   }
   return out.empty() ? "-" : out;
+}
+
+// The type field of a compound command header, or nullptr when the
+// construct has only one form.
+static const char* cmd_type_name(WordCode op, WordCode type) noexcept {
+  switch (op) {
+    case WC_IF:
+      return type == WC_IF_HEAD ? "head" : type == WC_IF_IF ? "if" : "else";
+    case WC_WHILE:
+      return type == WC_WHILE_UNTIL ? "until" : "while";
+    case WC_FOR: case WC_SELECT:
+      return type == WC_FOR_ARGS ? "args" : "in";
+    case WC_CASE: {
+      static const char* const kArms[] = {"head", ";;", ";&", ";|"};
+      return type < std::size(kArms) ? kArms[type] : "?";
+    }
+    case WC_FUNCDEF:
+      return type == WC_FUNCDEF_ANON ? "anon" : "named";
+    default:
+      return nullptr;
+  }
 }
 
 std::string disassemble(const CompiledProgram& prog) {
@@ -101,6 +123,11 @@ std::string disassemble(const CompiledProgram& prog) {
         out += idx < prog.strs.size() ? " \"" + prog.strs[idx] + '"'
                                       : " <bad index " + std::to_string(idx) + '>';
       }
+      break; case WC_IF: case WC_WHILE: case WC_FOR: case WC_CASE:
+      case WC_SELECT: case WC_REPEAT: case WC_SUBSH: case WC_CURSH:
+      case WC_FUNCDEF: case WC_FOR_COND: case WC_TRY: case WC_ARITH:
+        if (auto* type = cmd_type_name(op, wc_cmd_type(w))) out += ' ' + std::string(type);
+        out += " skip=" + std::to_string(wc_cmd_skip(w));
       break; case WC_END:
         ;
       break; default:

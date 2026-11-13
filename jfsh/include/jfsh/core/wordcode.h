@@ -54,6 +54,8 @@ enum WCOpcode : WordCode {
   WC_ARITH     = 20,  // (( arithmetic ))
   WC_AUTOFN    = 21,  // anonymous function () { }
   WC_STRING    = 22,  // string literal reference into strs table
+  WC_CURSH     = 23,  // { brace group } run in the current shell
+  WC_WORDS     = 24,  // count of the WC_STRING words that follow
   WC_MAX,
 };
 
@@ -74,10 +76,19 @@ enum WCOpcode : WordCode {
 //   pipeline := WC_PIPE(count|stderr_mask)  command{n}
 //                 low 8 bits: stage count n
 //                 upper bits: bit i set ⇔ pipe between stage i and i+1 is `|&`
-//   command  := simple | compound (M4: WC_IF, WC_WHILE, …)
+//   command  := simple | redir* compound
+//                 redirections written after a compound command are moved
+//                 in front of it; what follows them tells the two apart (a
+//                 simple command goes on with WC_ASSIGN, WC_SIMPLE or
+//                 WC_TYPESET)
 //   simple   := (assign | redir)*  WC_SIMPLE(argc)  WC_STRING(word){argc}
 //                 argc may be 0 for an assignment-only command
 //                 redirs and assigns may interleave in any order
+//   simple   |= (assign | redir)*  WC_TYPESET(n)  item{n}
+//                 for typeset, local, declare, export, readonly, integer
+//                 and float: item is WC_STRING(word) for the command name,
+//                 options and bare names, or an assign for `name=value`,
+//                 whose value is expanded as an assignment (no splitting)
 //   assign   := WC_ASSIGN(flags)  WC_STRING(name)  WC_STRING(value)
 //                 flags: WC_ASSIGN_APPEND (`name+=value`),
 //                        WC_ASSIGN_ARRAY (`name=(…)`: value is the text
@@ -92,6 +103,31 @@ enum WCOpcode : WordCode {
 //                 target_or_body is the here-doc body for REDIR_HEREDOC{,D},
 //                 empty for REDIR_CLOSE, the subcommand source for
 //                 REDIR_PROC_{IN,OUT,EQ}, otherwise the target word
+//
+// Compound commands.  Each header is op(type, skip): the low 3 bits are a
+// type, the rest the number of words after the header up to the end of the
+// construct.  A body is a nested program, list* WC_END.
+//   words    := WC_WORDS(n)  WC_STRING{n}
+//   if       := WC_IF(HEAD, skip)  branch+
+//   branch   := WC_IF(IF, skip) body(cond) body(then)    `if` and each `elif`
+//             | WC_IF(ELSE, skip) body
+//                 a branch's skip reaches the next branch
+//   while    := WC_WHILE(WHILE|UNTIL, skip)  body(cond)  body
+//   for      := WC_FOR(IN|ARGS, skip)  words(names)  [words(values)]  body
+//                 IN has the value list; ARGS (`for x; do`) loops over "$@"
+//   cfor     := WC_FOR_COND(0, skip)  WC_STRING(init) WC_STRING(cond)
+//               WC_STRING(step)  body
+//   select   := WC_SELECT(IN|ARGS, skip)  as for
+//   repeat   := WC_REPEAT(0, skip)  WC_STRING(count)  body
+//   case     := WC_CASE(HEAD, skip)  WC_STRING(subject)  arm*
+//   arm      := WC_CASE(BREAK|FALL|TESTNEXT, skip)  words(patterns)  body
+//                 the arm's terminator: `;;`, `;&` or `;|`
+//   subsh    := WC_SUBSH(0, skip)  body                  `( … )`
+//   cursh    := WC_CURSH(0, skip)  body                  `{ … }`
+//   try      := WC_TRY(0, skip)  body  body(always)      `{ … } always { … }`
+//   funcdef  := WC_FUNCDEF(NAMED, skip)  words(names)  body
+//             | WC_FUNCDEF(ANON, skip)  body  words(args)   `() { … } args`
+//   arith    := WC_ARITH(0, 1)  WC_STRING(expr)          `(( … ))`
 //
 // WC_STRING's operand indexes CompiledProgram::strs.  Words are stored as
 // written (quotes and `$…` included); the executor expands them at run time
@@ -190,6 +226,37 @@ constexpr WordCode wc_pipe_count(WordCode w) noexcept {
 }
 constexpr bool wc_pipe_stderr(WordCode w, unsigned i) noexcept {
   return ((wc_data(w) >> WC_PIPE_COUNT_BITS) >> i) & 1u;
+}
+
+inline constexpr int      WC_CMD_TYPE_BITS = 3;
+
+inline constexpr WordCode WC_IF_HEAD = 0u;
+inline constexpr WordCode WC_IF_IF   = 1u;
+inline constexpr WordCode WC_IF_ELSE = 2u;
+
+inline constexpr WordCode WC_WHILE_WHILE = 0u;
+inline constexpr WordCode WC_WHILE_UNTIL = 1u;
+
+inline constexpr WordCode WC_FOR_IN   = 0u;   // also WC_SELECT
+inline constexpr WordCode WC_FOR_ARGS = 1u;
+
+inline constexpr WordCode WC_CASE_HEAD     = 0u;
+inline constexpr WordCode WC_CASE_BREAK    = 1u;   // ;;
+inline constexpr WordCode WC_CASE_FALL     = 2u;   // ;&
+inline constexpr WordCode WC_CASE_TESTNEXT = 3u;   // ;|
+
+inline constexpr WordCode WC_FUNCDEF_NAMED = 0u;
+inline constexpr WordCode WC_FUNCDEF_ANON  = 1u;
+
+// Header of a compound command (see the layout above).
+constexpr WordCode make_wc_cmd(WordCode op, WordCode type, WordCode skip) noexcept {
+  return make_wc(op, (skip << WC_CMD_TYPE_BITS) | type);
+}
+constexpr WordCode wc_cmd_type(WordCode w) noexcept {
+  return wc_data(w) & ((1u << WC_CMD_TYPE_BITS) - 1u);
+}
+constexpr WordCode wc_cmd_skip(WordCode w) noexcept {
+  return wc_data(w) >> WC_CMD_TYPE_BITS;
 }
 
 struct CompiledProgram {

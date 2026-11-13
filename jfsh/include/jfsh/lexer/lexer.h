@@ -32,7 +32,7 @@ enum class TokType : std::uint16_t {
   TK_LPAREN,       // (
   TK_RPAREN,       // )
   TK_DLPAREN,      // ((
-  TK_DRPAREN,      // ))
+  TK_DRPAREN,      // ))  (unused: see Lexer::read_arith)
   TK_LBRACE,       // {
   TK_RBRACE,       // }
   TK_REDIR,        // any < > << >> <> >| >& &> <<< <( >( =( etc.
@@ -90,11 +90,20 @@ struct Lexer {
 
   void set_alias_expansion(bool on) noexcept { mAliasExpand = on; }
 
+  // After a `((` token (and with nothing peeked past it): the raw text up
+  // to the `))` that closes it, with nested parentheses kept.  nullopt when
+  // the input ends first.
+  std::optional<std::string> read_arith();
+
   // Here-documents: the parser registers each delimiter as it parses the
   // redirection; the lexer reads the bodies, in order, when it reaches the
   // end of that line, and take_heredocs() hands them over.
   void                     register_heredoc(std::string delim, bool strip_tabs, bool expand);
   std::vector<std::string> take_heredocs();
+
+  // The input ended inside a quote, after a trailing backslash, or before
+  // a here-document's delimiter line: more input would continue it.
+  bool incomplete() const noexcept { return mIncomplete; }
 
 protected:
   LexToken read_token();
@@ -116,6 +125,7 @@ private:
   std::optional<LexToken>   mPeeked;
   LexFlags                  mFlags       = LEX_NORMAL;
   bool                      mAliasExpand = true;
+  bool                      mIncomplete  = false;
   std::vector<LexFlags>     mStateStack;
   std::vector<HeredocSpec>  mHeredocQueue;
   std::vector<std::string>  mHeredocBodies;

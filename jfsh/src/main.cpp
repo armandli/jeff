@@ -208,6 +208,15 @@ int main(int argc, char* argv[]) {
 
       std::string line = std::move(*line_opt);
       if (line.empty()) continue;
+      // An unfinished `if`, loop, quote or here-document goes on over the
+      // next lines, read after PS2.
+      bool comments = opts.get(jfsh::OPT_INTERACTIVECOMMENTS);
+      while (jfsh::is_incomplete(line, comments)) {
+        auto more = editor.read_line(/*continuation=*/true);
+        if (not more) break;
+        line += '\n';
+        line += *more;
+      }
 
       auto expanded = history.expand(line);
       if (not expanded) {
@@ -247,16 +256,23 @@ int main(int argc, char* argv[]) {
       if (ctx.exiting) break;
     }
   } else {
-    std::string line;
+    // Lines are gathered until they make a whole command, so constructs
+    // spanning lines work, and so do lines longer than the buffer.
+    std::string pending;
     char buf[4096];
-    while (std::fgets(buf, sizeof buf, stdin)) {
-      line = buf;
-      if (not line.empty() and line.back() == '\n') line.pop_back();
-      if (line.empty()) continue;
-      ctx.last_exit = executor.exec_string(line);
-      if (opts.errexit() and ctx.last_exit != 0) break;
-      if (ctx.exiting) break;
+    auto run = [&] {
+      bool blank = pending.find_first_not_of(" \t\n") == std::string::npos;
+      if (not blank) ctx.last_exit = executor.exec_string(pending);
+      pending.clear();
+      return not (ctx.exiting or (opts.errexit() and ctx.last_exit != 0));
+    };
+    bool more = true;
+    while (more and std::fgets(buf, sizeof buf, stdin)) {
+      pending += buf;
+      if (pending.back() != '\n' or jfsh::is_incomplete(pending)) continue;
+      more = run();
     }
+    if (more and not pending.empty()) run();
   }
 
   if (not hist_opts.histfile.empty()) history.save(hist_opts.histfile);

@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <pwd.h>
 #include <unistd.h>
 
 #include <gtest/gtest.h>
@@ -298,7 +299,9 @@ TEST(Subst, TildeExpansion) {
   sh.run("p=~/a:~/b; q=x~");
   EXPECT_EQ(sh.get("p"), "/home/t/a:/home/t/b");
   EXPECT_EQ(sh.get("q"), "x~");
-  EXPECT_EQ(out(sh, "echo ~root"), "/root\n");
+  struct passwd* root = getpwnam("root");
+  ASSERT_NE(root, nullptr);
+  EXPECT_EQ(out(sh, "echo ~root"), std::string(root->pw_dir) + "\n");  // /var/root on macOS
   EXPECT_EQ(sh.run("echo ~no_such_user_xyz").err,
             "jfsh: no such user or named directory: no_such_user_xyz\n");
   EXPECT_EQ(out(sh, "echo --a=~/x"), "--a=~/x\n");

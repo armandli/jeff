@@ -81,6 +81,14 @@ ParamTable::lookup(std::string_view name) const noexcept {
   return std::nullopt;
 }
 
+std::optional<std::reference_wrapper<Param>>
+ParamTable::lookup_local(std::string_view name) noexcept {
+  if (mScopes.empty()) return std::nullopt;
+  auto it = mScopes.back().find(std::string(name));
+  if (it == mScopes.back().end()) return std::nullopt;
+  return std::ref(it->second);
+}
+
 Param& ParamTable::assign(
     std::string name, ParamValue value, std::uint32_t flags) {
   if (mScopes.empty()) mScopes.emplace_back();

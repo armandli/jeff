@@ -1,3 +1,4 @@
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -92,11 +93,40 @@ TEST(Lexer, ProcessSubstitutionKeepsBalancedParens) {
             (std::vector<std::string>{"<(echo a | wc)", "<(echo b)"}));
 }
 
+// `))` is two tokens so nested subshells close; the parser reads the
+// inside of `(( … ))` raw with Lexer::read_arith.
 TEST(Lexer, GroupingTokens) {
   using enum TokType;
   EXPECT_EQ(types(lex_all("( a ) { b } (( c ))")),
             (std::vector<TokType>{TK_LPAREN, TK_WORD, TK_RPAREN, TK_LBRACE, TK_WORD,
-                                  TK_RBRACE, TK_DLPAREN, TK_WORD, TK_DRPAREN}));
+                                  TK_RBRACE, TK_DLPAREN, TK_WORD, TK_RPAREN,
+                                  TK_RPAREN}));
+}
+
+TEST(Lexer, ReadArithStopsAtTheClosingParens) {
+  StringInputSource in{"(( (a+1) * 2 )) rest"};
+  Lexer lex{in};
+  EXPECT_EQ(lex.next_token().type, TokType::TK_DLPAREN);
+  EXPECT_EQ(lex.read_arith(), " (a+1) * 2 ");
+  EXPECT_EQ(lex.next_token().text, "rest");
+  StringInputSource open{"(( 1 +"};
+  Lexer lex2{open};
+  lex2.next_token();
+  EXPECT_EQ(lex2.read_arith(), std::nullopt);
+}
+
+TEST(Lexer, ReportsInputCutOffInsideAQuote) {
+  auto incomplete = [](std::string src) {
+    StringInputSource in{std::move(src)};
+    Lexer lex{in};
+    while (not lex.next_token().is_eof()) {}
+    lex.take_heredocs();
+    return lex.incomplete();
+  };
+  EXPECT_TRUE(incomplete("echo 'abc"));
+  EXPECT_TRUE(incomplete("echo \"abc"));
+  EXPECT_TRUE(incomplete("echo abc\\"));
+  EXPECT_FALSE(incomplete("echo 'abc'"));
 }
 
 TEST(Lexer, NewlinesAndLineNumbers) {

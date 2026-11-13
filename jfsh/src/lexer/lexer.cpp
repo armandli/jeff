@@ -211,6 +211,7 @@ void Lexer::register_heredoc(std::string delim, bool strip_tabs, bool expand) {
 
 std::vector<std::string> Lexer::take_heredocs() {
   // Input that ends before the bodies (`cat <<EOF` alone) gets empty ones.
+  if (not mHeredocQueue.empty()) mIncomplete = true;
   mHeredocBodies.resize(mHeredocBodies.size() + mHeredocQueue.size());
   mHeredocQueue.clear();
   return std::exchange(mHeredocBodies, {});
@@ -225,6 +226,7 @@ void Lexer::read_heredoc_bodies() {
     for (;;) {
       int c = mSrc.next_char();
       if (c == -1) {
+        if (line_buf != spec.delim) mIncomplete = true;
         if (not line_buf.empty() and line_buf != spec.delim) body += line_buf;
         break;
       }
@@ -303,17 +305,38 @@ LexToken Lexer::read_token() {
         mSrc.unget(n);
         return {TokType::TK_LPAREN, "(", mSrc.line()};
       }
-      case ')': {
-        int n = mSrc.next_char();
-        if (n == ')') return {TokType::TK_DRPAREN, "))", mSrc.line()};
-        mSrc.unget(n);
-        return {TokType::TK_RPAREN, ")", mSrc.line()};
-      }
+      // `))` is two tokens, so `(a; (b))` closes both subshells; the end of
+      // an arithmetic `(( … ))` is found by read_arith instead.
+      case ')': return {TokType::TK_RPAREN, ")", mSrc.line()};
       case '<':
       case '>': return read_redir(c);
       default:  return read_word(c);
     }
   }
+}
+
+std::optional<std::string> Lexer::read_arith() {
+  std::string text;
+  int depth = 0;
+  for (int c; (c = mSrc.next_char()) != -1;) {
+    if (c == '(') {
+      ++depth;
+    } else if (c == ')') {
+      if (depth > 0) {
+        --depth;
+      } else {
+        int n = mSrc.next_char();
+        if (n == ')') return text;
+        if (n == -1) return std::nullopt;
+        text += ')';
+        c = n;
+      }
+    } else if (c == '\n') {
+      if (not mHeredocQueue.empty()) read_heredoc_bodies();
+    }
+    text += static_cast<char>(c);
+  }
+  return std::nullopt;
 }
 
 LexToken Lexer::read_word(int first_char) {
@@ -409,13 +432,15 @@ LexToken Lexer::read_word(int first_char) {
     if (c == '\\' and not in_single) {
       text += static_cast<char>(c);
       c = mSrc.next_char();
-      if (c != -1) text += static_cast<char>(c);
+      if (c == -1) mIncomplete = true;
+      else         text += static_cast<char>(c);
       c = mSrc.next_char();
       continue;
     }
     text += static_cast<char>(c);
     c = mSrc.next_char();
   }
+  if (in_single or in_double) mIncomplete = true;
   if (not text.empty() and is_keyword(text)) {
     for (auto* k = KEYWORDS; k->word; ++k)
       if (text == k->word) return {k->type, text, ln};

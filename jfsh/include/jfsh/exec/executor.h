@@ -40,12 +40,16 @@ struct ExecContext {
 
   int  last_exit   = 0;     // $?
   Pid  last_bg_pid = -1;    // $!
-  bool break_level = 0;     // `break N` counter
-  bool cont_level  = 0;     // `continue N` counter
+  int  break_level = 0;     // loops still to leave after `break N`/`continue N`
+  bool continuing  = false; // … and the last of them goes on (`continue`)
+  int  loop_depth  = 0;     // loops being run, functions included
+  int  func_depth  = 0;     // function calls being run (FUNCNEST)
   bool returning   = false;
   int  return_val  = 0;
   bool exiting     = false;
   int  exit_val    = 0;
+
+  HashTable<ProgRef> functions{};  // shell functions: name → body
 
   std::vector<std::string> positional{};    // $1 … $N, also $@ $* $argv
   std::string              arg0 = "jfsh";   // $0
@@ -102,11 +106,14 @@ struct Executor {
 
   int exec(const CompiledProgram& prog);
   int exec_string(std::string_view src);
+  // `typeset_args` are the `name=value` arguments of typeset and its
+  // variants: expanded like assignments, then passed on as `name=value`.
   int exec_simple(
     std::vector<std::string> args,
     std::vector<Assignment>  assigns,
     std::vector<Redirection> redirs,
-    ExecFlags flags = EF_NONE);
+    ExecFlags flags = EF_NONE,
+    std::vector<Assignment>  typeset_args = {});
 
   // Path to run for a command name: the name itself when it contains `/`,
   // otherwise a $PATH search (cached while HASH_CMDS is set).  Fails with
@@ -120,17 +127,31 @@ protected:
   int exec_cmd    (ExecState& es, ExecFlags);
   int exec_simple_cmd(ExecState& es, ExecFlags);
 
-  int exec_if      (ExecState& es);
-  int exec_while   (ExecState& es);
-  int exec_for     (ExecState& es);
-  int exec_case    (ExecState& es);
-  int exec_select  (ExecState& es);
-  int exec_repeat  (ExecState& es);
-  int exec_subsh   (ExecState& es, ExecFlags);
-  int exec_funcdef (ExecState& es);
-  int exec_cond    (ExecState& es);
-  int exec_arith   (ExecState& es);
-  int exec_always  (ExecState& es);
+  // Compound commands: es.pc is just past the header `head`, and is left
+  // at the end of the construct.
+  int exec_compound(ExecState& es, ExecFlags);
+  int exec_if      (ExecState& es, WordCode head);
+  int exec_while   (ExecState& es, WordCode head);
+  int exec_for     (ExecState& es, WordCode head);
+  int exec_for_cond(ExecState& es, WordCode head);
+  int exec_case    (ExecState& es, WordCode head);
+  int exec_select  (ExecState& es, WordCode head);
+  int exec_repeat  (ExecState& es, WordCode head);
+  int exec_subsh   (ExecState& es, WordCode head, ExecFlags);
+  int exec_funcdef (ExecState& es, WordCode head);
+  int exec_cond    (ExecState& es, WordCode head);
+  int exec_arith   (ExecState& es, WordCode head);
+  int exec_always  (ExecState& es, WordCode head);
+
+  // The values a `for`/`select` loops over; false (after printing the
+  // error) when their expansion fails.
+  bool loop_values(ExecState& es, WordCode head, std::vector<std::string>& names,
+                   std::vector<std::string>& values);
+  // True while a break, continue, return or exit is unwinding the lists.
+  bool interrupted() const noexcept;
+  // After a loop's body: whether the loop stops.  Consumes one level of a
+  // pending `break N`/`continue N`.
+  bool loop_done() noexcept;
 
   int  do_fork(ExecState& es, ExecFlags);
   int  run_external(
@@ -179,9 +200,13 @@ protected:
     std::string_view name,
     std::vector<std::string>& args,
     ExecContext& ctx);
+  // Runs a shell function: `args[0]` is its name, the rest become $1 …
   int  call_function(
-    std::string_view name,
+    const ProgRef& body,
     std::vector<std::string>& args);
+  // Puts the assignments in front of a builtin or function into a new
+  // scope, which the caller pops.  Returns non-zero on a readonly name.
+  int  push_prefix_assigns(const std::vector<Assignment>& assigns, bool exported);
 
 public:
   ExecContext& context() noexcept { return mCtx; }

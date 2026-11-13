@@ -1665,6 +1665,11 @@ Result<std::string> Expander::heredoc(std::string_view body) {
   return out;
 }
 
+Result<long long> Expander::arith(std::string_view expr) {
+  Scan scan{*this, Mode::Heredoc};
+  return scan.arith(expr);
+}
+
 Result<std::string> Expander::pattern(std::string_view word) {
   Scan scan{*this, Mode::Scalar};
   if (auto r = scan.scan(word); not r) return std::unexpected(r.error());

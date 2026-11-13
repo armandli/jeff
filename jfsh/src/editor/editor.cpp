@@ -53,21 +53,24 @@ void Editor::enter_raw_mode() {
   raw.c_oflag &= static_cast<tcflag_t>(~OPOST);
   raw.c_cc[VMIN]  = 1;
   raw.c_cc[VTIME] = 0;
-  tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+  // TCSADRAIN, not TCSAFLUSH: input typed or pasted ahead (the next lines
+  // of a multi-line command) must survive the switch.
+  tcsetattr(STDIN_FILENO, TCSADRAIN, &raw);
   mRawModeActive = true;
 }
 
 void Editor::exit_raw_mode() {
-  tcsetattr(STDIN_FILENO, TCSAFLUSH, &OrigTermios);
+  tcsetattr(STDIN_FILENO, TCSADRAIN, &OrigTermios);
   mRawModeActive = false;
 }
 
-std::optional<std::string> Editor::read_line() {
+std::optional<std::string> Editor::read_line(bool continuation) {
   mBuf.text.clear();
-  mBuf.cursor = 0;
-  mHistPos    = -1;
+  mBuf.cursor    = 0;
+  mHistPos       = -1;
+  mContinuation  = continuation;
 
-  std::string ps1 = mPrompt.primary();
+  std::string ps1 = continuation ? mPrompt.continuation() : mPrompt.primary();
   std::fwrite(ps1.c_str(), 1, ps1.size(), stdout);
   std::fflush(stdout);
 
@@ -144,7 +147,7 @@ std::string Editor::read_key_sequence() {
 }
 
 void Editor::refresh_display() {
-  std::string ps1    = mPrompt.primary();
+  std::string ps1    = mContinuation ? mPrompt.continuation() : mPrompt.primary();
   int         ps1_width = PromptRenderer::visual_width(ps1);
   // CR + erase line
   write(STDOUT_FILENO, "\r\x1b[K", 4);
