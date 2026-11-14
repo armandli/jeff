@@ -25,6 +25,7 @@
 #include <string_view>
 #include <vector>
 
+#include <jfsh/builtins/math.h>
 #include <jfsh/core/types.h>
 
 namespace jfsh {
@@ -57,8 +58,9 @@ struct Expander {
   Result<std::string> pattern(std::string_view word);
 
   // An arithmetic expression, as in `$((…))`: substitutions are expanded
-  // first, then the text is evaluated.  Used by `(( ))`, `for ((;;))` and
-  // `repeat`.
+  // first, then the text is evaluated.  Used by `(( ))`, `for ((;;))`,
+  // `[[ -eq ]]`, and as an integer by `repeat` and subscripts.
+  Result<MathNum>   math(std::string_view expr);
   Result<long long> arith(std::string_view expr);
 
   // Status of the last command substitution run, if any.

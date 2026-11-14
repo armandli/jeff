@@ -219,18 +219,18 @@ static std::string normalize_option_name(std::string_view name) {
   return s;
 }
 
-const OptionInfo* OptionState::find(std::string_view name) noexcept {
+const OptionInfo* OptionState::find(std::string_view name, bool* negated) noexcept {
   std::string norm = normalize_option_name(name);
-  bool negated = false;
-  if (norm.size() > 2 and norm.substr(0, 2) == "no") {
-    negated = true;
-    norm = norm.substr(2);
-  }
-  (void)negated;
-
+  if (negated) *negated = false;
+  for (const auto& info : OPTION_INFO)
+    if (normalize_option_name(info.name) == norm) return &info;
+  if (norm.size() <= 2 or not norm.starts_with("no")) return nullptr;
+  norm = norm.substr(2);
   for (const auto& info : OPTION_INFO) {
-    if (normalize_option_name(info.name) == norm)
+    if (normalize_option_name(info.name) == norm) {
+      if (negated) *negated = true;
       return &info;
+    }
   }
   return nullptr;
 }

@@ -232,6 +232,10 @@ bool Parser::par_cmd() {
     case TokType::TK_LBRACE:   ok = par_cursh();   break;
     case TokType::TK_FUNCTION: ok = par_funcdef(); break;
     case TokType::TK_DLPAREN:  ok = par_arith();   break;
+    case TokType::TK_WORD:
+      if (mLex.peek().text != "[[") return par_simple();
+      ok = par_cond();
+      break;
     default:                   return par_simple();
   }
   return ok and par_trailing_redirs(start);
@@ -631,10 +635,139 @@ bool Parser::par_function_body() {
   return par_sublist_body();
 }
 
-// TODO(parser/cond): `[[ … ]]` (M5).  `[[` is still an ordinary word: parse
-//   unary/binary test operators (-f, -d, =, ==, =~, <, >, -eq, etc.) and
-//   && || ! ( ), and emit WC_COND with operand string refs.
-bool Parser::par_cond() { return unsupported("`[[ … ]]'"); }
+void Parser::insert(std::size_t start, WordCode w) {
+  auto at = static_cast<std::ptrdiff_t>(start);
+  mProg->prog.insert(mProg->prog.begin() + at, w);
+  mProg->line_map.insert(mProg->line_map.begin() + at,
+                         static_cast<std::uint32_t>(mLex.line()));
+}
+
+bool Parser::at_cond_word() noexcept {
+  return at_word() and not (at(TokType::TK_WORD) and mLex.peek().text == "]]");
+}
+
+// `[[ cond ]]`, read with the lexer in LEX_COND state, so `<` and `>` are
+// words.  Newlines may come between the parts.
+//   or      := and (|| and)*
+//   and     := not (&& not)*
+//   not     := ! not | primary
+//   primary := ( or ) | word | unop word | word binop word
+bool Parser::par_cond() {
+  mLex.consume();  // [[
+  mLex.push_state(static_cast<LexFlags>(mLex.state() | LEX_COND));
+  bool ok = par_cond_or();
+  if (ok) {
+    skip_newlines();
+    if (at(TokType::TK_WORD) and mLex.peek().text == "]]") {
+      mLex.pop_state();
+      mLex.consume();
+      return true;
+    }
+    ok = error_near(mLex.peek());
+  }
+  mLex.pop_state();
+  return ok;
+}
+
+// cond := WC_COND(OR, skip) cond cond, left-associative; the header goes in
+// front of the left side once the `||` is seen.
+bool Parser::par_cond_or() {
+  std::size_t start = mProg->prog.size();
+  if (not par_cond_and()) return false;
+  for (;;) {
+    skip_newlines();
+    if (not eat(TokType::TK_PIPEPIPE)) return true;
+    skip_newlines();
+    if (not par_cond_and()) return false;
+    insert(start, make_wc_cmd(WC_COND, WC_COND_OR,
+                              static_cast<WordCode>(mProg->prog.size() - start)));
+  }
+}
+
+bool Parser::par_cond_and() {
+  std::size_t start = mProg->prog.size();
+  if (not par_cond_not()) return false;
+  for (;;) {
+    skip_newlines();
+    if (not eat(TokType::TK_AMPAMP)) return true;
+    skip_newlines();
+    if (not par_cond_not()) return false;
+    insert(start, make_wc_cmd(WC_COND, WC_COND_AND,
+                              static_cast<WordCode>(mProg->prog.size() - start)));
+  }
+}
+
+bool Parser::par_cond_not() {
+  skip_newlines();
+  if (not eat(TokType::TK_BANG)) return par_cond_primary();
+  std::size_t head = emit(make_wc_cmd(WC_COND, WC_COND_NOT, 0));
+  if (not par_cond_not()) return false;
+  patch(head, make_wc_cmd(WC_COND, WC_COND_NOT, words_after(*mProg, head)));
+  return true;
+}
+
+static bool is_cond_pattern_op(std::string_view op) noexcept {
+  return op == "=" or op == "==" or op == "!=" or op == "=~";
+}
+
+static bool is_cond_binary_op(std::string_view op) noexcept {
+  return is_cond_pattern_op(op) or op == "<" or op == ">"
+      or op == "-nt" or op == "-ot" or op == "-ef" or op == "-eq" or op == "-ne"
+      or op == "-lt" or op == "-le" or op == "-gt" or op == "-ge";
+}
+
+bool Parser::par_cond_primary() {
+  skip_newlines();
+  if (eat(TokType::TK_LPAREN)) {
+    if (not par_cond_or()) return false;
+    skip_newlines();
+    return expect(TokType::TK_RPAREN);
+  }
+  if (not at_cond_word()) return error_near(mLex.peek());
+  std::string w1 = mLex.peek().text;
+  mLex.consume();
+  // A single word: true when it is not empty.
+  if (not at_cond_word()) {
+    emit(make_wc_cmd(WC_COND, WC_COND_STR, 1));
+    emit_str(std::move(w1));
+    return true;
+  }
+  std::string w2 = mLex.peek().text;
+  // `-x arg`, unless the second word is an operator (`-n = -n`).  An
+  // unknown `-x` is reported when the condition runs, as zsh does.
+  bool binary = is_cond_binary_op(w2)
+             or ((w1.size() < 2 or w1[0] != '-') and w2.size() > 1 and w2[0] == '-');
+  if (not binary) {
+    if (w1.size() < 2 or w1[0] != '-') {
+      error("parse error: condition expected: " + w1);
+      return false;
+    }
+    mLex.consume();
+    emit(make_wc_cmd(WC_COND, WC_COND_UNARY, 2));
+    emit_str(std::move(w1));
+    emit_str(std::move(w2));
+    return true;
+  }
+  mLex.consume();
+  std::string w3;
+  if (is_cond_pattern_op(w2)) {
+    auto pat = mLex.read_cond_pattern();
+    if (not pat or *pat == "]]") {
+      if (pat) mLex.unread({TokType::TK_WORD, *pat, mLex.line()});
+      return error_near(mLex.peek());
+    }
+    w3 = std::move(*pat);
+  } else {
+    if (not at_cond_word()) return error_near(mLex.peek());
+    w3 = mLex.peek().text;
+    mLex.consume();
+  }
+  emit(make_wc_cmd(WC_COND, WC_COND_BINARY, 3));
+  emit_str(std::move(w2));
+  emit_str(std::move(w1));
+  emit_str(std::move(w3));
+  return true;
+}
 
 // arith := WC_ARITH(0, 1) WC_STRING(expr)
 bool Parser::par_arith() {

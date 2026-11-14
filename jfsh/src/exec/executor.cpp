@@ -13,6 +13,8 @@
 #include <utility>
 
 #include <jfsh/builtins/builtins.h>
+#include <jfsh/builtins/cond.h>
+#include <jfsh/builtins/math.h>
 #include <jfsh/exec/executor.h>
 #include <jfsh/exec/subst.h>
 #include <jfsh/glob/glob.h>
@@ -633,19 +635,19 @@ int Executor::exec_for_cond(ExecState& es, WordCode head) {
   std::string step(es.fetch_str());
   std::size_t body = es.pc;
   Expander ex{*this, mCtx};
-  auto eval = [&](const std::string& expr, long long& value) {
-    value = 1;
+  auto eval = [&](const std::string& expr, bool& value) {
+    value = true;
     if (is_blank(expr)) return true;
-    auto v = ex.arith(expr);
+    auto v = ex.math(expr);
     if (not v) {
       std::fprintf(stderr, "jfsh: %s\n", v.error().message.c_str());
       return false;
     }
-    value = *v;
+    value = v->truthy();
     return true;
   };
   int rc = 0;
-  long long value = 0;
+  bool value = false;
   if (not eval(init, value)) {
     es.pc = end;
     return 1;
@@ -656,7 +658,7 @@ int Executor::exec_for_cond(ExecState& es, WordCode head) {
       rc = 1;
       break;
     }
-    if (value == 0) break;
+    if (not value) break;
     es.pc = body;
     rc = exec_list(es, EF_NONE);
     if (loop_done()) break;
@@ -872,24 +874,87 @@ int Executor::exec_funcdef(ExecState& es, WordCode head) {
   return 0;
 }
 
-// TODO(exec/cond): Evaluate a [[ ]] expression tree (M5).
-//   Opcodes inside the cond block: WC_COND_STR, WC_COND_REGEX, WC_COND_AND/OR/NOT
-//   Delegate to builtins/cond.cpp evaluator.
+// cond := WC_COND(type, skip) …, a `[[ ]]` tree (see wordcode.h).  The
+// status is 0 when true, 1 when false, 2 on an error and 3 for `-o` with
+// no such option; `&&` and `||` stop at an error.  Operands are expanded
+// without splitting or globbing; the right side of = == != is a pattern,
+// of =~ an extended regex, and -eq … -ge compare arithmetic expressions.
 int Executor::exec_cond(ExecState& es, WordCode head) {
-  es.pc += wc_cmd_skip(head);
-  return 0;
+  std::size_t end = es.pc + wc_cmd_skip(head);
+  Expander ex{*this, mCtx};
+  auto finish = [&](int rc) {
+    es.pc = end;
+    return rc;
+  };
+  auto fail = [&](const ShellError& e) {
+    std::fprintf(stderr, "jfsh: %s\n", e.message.c_str());
+    return finish(1);
+  };
+  switch (wc_cmd_type(head)) {
+    case WC_COND_NOT: {
+      int rc = exec_cond(es, es.fetch());
+      return finish(rc < 2 ? 1 - rc : rc);
+    }
+    case WC_COND_AND: case WC_COND_OR: {
+      int rc = exec_cond(es, es.fetch());
+      if (rc == (wc_cmd_type(head) == WC_COND_AND ? 0 : 1)) rc = exec_cond(es, es.fetch());
+      return finish(rc);
+    }
+    case WC_COND_STR: {
+      auto word = ex.scalar(es.fetch_str());
+      if (not word) return fail(word.error());
+      return finish(word->empty() ? 1 : 0);
+    }
+    case WC_COND_UNARY: {
+      std::string op(es.fetch_str());
+      auto arg = ex.scalar(es.fetch_str());
+      if (not arg) return fail(arg.error());
+      return finish(cond_unary(op, *arg, mCtx, ""));
+    }
+    default:
+      break;
+  }
+  std::string op(es.fetch_str());
+  std::string_view lhs_word = es.fetch_str();
+  std::string_view rhs_word = es.fetch_str();
+  if (cond_is_numeric(op)) {
+    auto l = ex.math(lhs_word);
+    if (not l) return fail(l.error());
+    auto r = ex.math(rhs_word);
+    if (not r) return fail(r.error());
+    bool fl = l->is_float or r->is_float;
+    int cmp = fl ? (l->as_float() < r->as_float() ? -1 : l->as_float() > r->as_float() ? 1 : 0)
+                 : (l->i < r->i ? -1 : l->i > r->i ? 1 : 0);
+    return finish(cond_compare(op, cmp));
+  }
+  auto lhs = ex.scalar(lhs_word);
+  if (not lhs) return fail(lhs.error());
+  if (op == "=" or op == "==" or op == "!=") {
+    auto pat = ex.pattern(rhs_word);
+    if (not pat) return fail(pat.error());
+    bool match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob()).matches(*lhs);
+    return finish(match == (op != "!=") ? 0 : 1);
+  }
+  auto rhs = ex.scalar(rhs_word);
+  if (not rhs) return fail(rhs.error());
+  if (op == "=~") return finish(cond_regex(*lhs, *rhs, mCtx, ""));
+  if (op == "<")  return finish(*lhs < *rhs ? 0 : 1);
+  if (op == ">")  return finish(*lhs > *rhs ? 0 : 1);
+  if (op == "-nt" or op == "-ot" or op == "-ef") return finish(cond_file_binary(op, *lhs, *rhs));
+  std::fprintf(stderr, "jfsh: unknown condition: %s\n", op.c_str());
+  return finish(2);
 }
 
 // arith := WC_ARITH(0, 1) WC_STRING(expr).  Status 0 when the value is
 // non-zero, 1 when it is zero, 2 on an error.
 int Executor::exec_arith(ExecState& es, WordCode) {
   Expander ex{*this, mCtx};
-  auto v = ex.arith(es.fetch_str());
+  auto v = ex.math(es.fetch_str());
   if (not v) {
     std::fprintf(stderr, "jfsh: %s\n", v.error().message.c_str());
     return 2;
   }
-  return *v != 0 ? 0 : 1;
+  return v->truthy() ? 0 : 1;
 }
 
 // try := WC_TRY(0, skip) body body(always).  The always block runs however
@@ -1422,10 +1487,34 @@ bool Executor::expand_command(std::vector<std::string>& args,
   return true;
 }
 
+// `name=value` on an integer or float parameter keeps its type: the value
+// is an arithmetic expression, and `name+=value` adds it, as in zsh.
+static Result<void> set_numeric(ParamTable& params, const OptionState& opts,
+                                Param& p, const Assignment& a) {
+  if (p.is_readonly())
+    return std::unexpected(ShellError{ErrorKind::ExecError, "read-only variable: " + a.name});
+  auto v = math_eval(a.value, params, math_options(opts));
+  if (not v) return std::unexpected(v.error());
+  MathNum n = *v;
+  if (a.append) {
+    MathNum old = p.is_float() ? MathNum::of(p.floatv()) : MathNum::of(p.integer());
+    n = (old.is_float or n.is_float) ? MathNum::of(old.as_float() + n.as_float())
+                                     : MathNum::of(static_cast<long long>(
+                                           static_cast<unsigned long long>(old.i) + n.i));
+  }
+  if (p.is_float()) p.set(n.as_float());
+  else              p.set(n.as_int());
+  return {};
+}
+
 // TODO(exec/assign): subscripted assignments `a[i]=x`, `h[key]=x`.
 int Executor::apply_assigns(const std::vector<Assignment>& assigns) {
   for (const auto& a : assigns) {
+    auto p = mCtx.params.lookup(a.name);
+    bool numeric = not a.array and p and p->get().is_set()
+               and (p->get().is_integer() or p->get().is_float());
     auto r = a.array ? mCtx.params.set_array(a.name, a.elements, a.append)
+           : numeric ? set_numeric(mCtx.params, mCtx.opts, p->get(), a)
                      : mCtx.params.set_scalar(a.name, a.value, a.append);
     if (not r) {
       std::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
