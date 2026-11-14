@@ -128,6 +128,13 @@ enum WCOpcode : WordCode {
 //   funcdef  := WC_FUNCDEF(NAMED, skip)  words(names)  body
 //             | WC_FUNCDEF(ANON, skip)  body  words(args)   `() { … } args`
 //   arith    := WC_ARITH(0, 1)  WC_STRING(expr)          `(( … ))`
+//   cond     := WC_COND(NOT, skip)  cond                 `[[ … ]]`, a tree
+//             | WC_COND(AND|OR, skip)  cond cond           of these nodes
+//             | WC_COND(UNARY, 2)  WC_STRING(op) WC_STRING(arg)
+//             | WC_COND(BINARY, 3)  WC_STRING(op) WC_STRING(lhs) WC_STRING(rhs)
+//             | WC_COND(STR, 1)  WC_STRING(word)         `[[ word ]]`
+//                 the right side of = == != =~ is kept as written, so
+//                 `(a|b)` stays one operand
 //
 // WC_STRING's operand indexes CompiledProgram::strs.  Words are stored as
 // written (quotes and `$…` included); the executor expands them at run time
@@ -244,6 +251,13 @@ inline constexpr WordCode WC_CASE_HEAD     = 0u;
 inline constexpr WordCode WC_CASE_BREAK    = 1u;   // ;;
 inline constexpr WordCode WC_CASE_FALL     = 2u;   // ;&
 inline constexpr WordCode WC_CASE_TESTNEXT = 3u;   // ;|
+
+inline constexpr WordCode WC_COND_NOT    = 0u;
+inline constexpr WordCode WC_COND_AND    = 1u;
+inline constexpr WordCode WC_COND_OR     = 2u;
+inline constexpr WordCode WC_COND_UNARY  = 3u;
+inline constexpr WordCode WC_COND_BINARY = 4u;
+inline constexpr WordCode WC_COND_STR    = 5u;
 
 inline constexpr WordCode WC_FUNCDEF_NAMED = 0u;
 inline constexpr WordCode WC_FUNCDEF_ANON  = 1u;

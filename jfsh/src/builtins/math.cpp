@@ -1,14 +1,43 @@
 #include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
+#include <limits>
 #include <string>
 
 #include <jfsh/builtins/math.h>
 
-// TODO(math/float): floating-point arithmetic (FORCE_FLOAT, `1.5`, `typeset
-//   -F`) and the zsh/mathfunc functions (sin, sqrt, …).
-// TODO(math/octal): OCTAL_ZEROES (`010` is 8) and C_BASES output.
+// TODO(math/mathfunc): the zsh/mathfunc functions (sin, sqrt, int, …), once
+//   zmodload exists.
+// TODO(math/output): output bases `$(( [#16] x ))` and C_BASES.
 
 namespace jfsh {
+
+long long MathNum::as_int() const noexcept {
+  if (not is_float) return i;
+  if (std::isnan(d)) return 0;
+  constexpr double LIMIT = 9223372036854775807.0;
+  if (d >= LIMIT)  return std::numeric_limits<long long>::max();
+  if (d <= -LIMIT) return std::numeric_limits<long long>::min();
+  return static_cast<long long>(d);
+}
+
+MathOptions math_options(const OptionState& opts) noexcept {
+  return {opts.get(OPT_FORCEFLOAT), opts.get(OPT_OCTALZEROES), opts.get(OPT_CPRECEDENCES)};
+}
+
+std::string format_math(const MathNum& n) {
+  if (not n.is_float) return std::to_string(n.i);
+  if (std::isnan(n.d)) return "NaN";
+  if (std::isinf(n.d)) return n.d < 0 ? "-Inf" : "Inf";
+  char buf[64];
+  std::snprintf(buf, sizeof buf, "%.17g", n.d);
+  std::string s = buf;
+  if (s.find_first_of(".e") == std::string::npos) s += '.';
+  return s;
+}
+
 namespace {
 
 constexpr int MAX_DEPTH = 64;
@@ -24,18 +53,76 @@ long long wneg(long long a) noexcept { return wrap(U{0} - static_cast<U>(a)); }
 long long wshl(long long a, long long n) noexcept { return wrap(static_cast<U>(a) << (n & 63)); }
 long long wshr(long long a, long long n) noexcept { return a >> (n & 63); }
 
+long long ipow(long long b, long long e) noexcept {
+  long long r = 1;
+  for (; e > 0; e >>= 1, b = wmul(b, b))
+    if (e & 1) r = wmul(r, b);
+  return r;
+}
+
+bool is_ident_start(char c) noexcept {
+  return std::isalpha(static_cast<unsigned char>(c)) or c == '_';
+}
+bool is_ident_char(char c) noexcept {
+  return std::isalnum(static_cast<unsigned char>(c)) or c == '_';
+}
+
+// Value of digit c, or 99 when it is not one.  zsh's base#digits also
+// takes `@` and `_` as digits 62 and 63 above base 36; they are not
+// supported here.
+int digit_value(char c) noexcept {
+  auto u = static_cast<unsigned char>(c);
+  if (std::isdigit(u)) return c - '0';
+  if (std::isalpha(u)) return std::tolower(u) - 'a' + 10;
+  return 99;
+}
+
+// Binary operators (assignment and `?:` are handled on their own levels).
+// Higher binds tighter.
+struct BinOp {
+  std::string_view text;
+  int              zsh_prec;
+  int              c_prec;
+};
+
+// Longest first, so `**` is not taken for `*` nor `<=` for `<`.
+constexpr BinOp BIN_OPS[] = {
+  {"**", 10, 15},
+  {"<<", 14, 12}, {">>", 14, 12},
+  {"<=",  7, 11}, {">=",  7, 11},
+  {"==",  6, 10}, {"!=",  6, 10},
+  {"&&",  5,  6}, {"||",  4,  4}, {"^^",  4,  5},
+  {"<",   7, 11}, {">",   7, 11},
+  {"+",   8, 13}, {"-",   8, 13},
+  {"*",   9, 14}, {"/",   9, 14}, {"%",   9, 14},
+  {"&",  13,  9}, {"^",  12,  8}, {"|",  11,  7},
+};
+
+// The binary operator each compound assignment applies.
+constexpr std::string_view ASSIGN_OPS[] = {
+  "**=", "<<=", ">>=", "&&=", "||=", "^^=",
+  "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|=",
+};
+
 struct Arith {
   std::string_view s;
   ParamTable&      params;
+  MathOptions      opts;
   int              depth;
-  std::size_t      pos  = 0;
+  std::size_t      pos = 0;
   std::string      err;
 
-  // An lvalue is a parameter name; anything else has an empty name.
+  // An lvalue is a parameter name, with the text of its subscript when it
+  // is `name[sub]`; anything else has an empty name.
   struct Val {
-    long long   v = 0;
+    MathNum     n;
     std::string name;
+    std::string sub;
+    bool        indexed = false;
   };
+
+  static Val num(MathNum n) { return {n, {}, {}, false}; }
+  static Val num(long long v) { return num(MathNum::of(v)); }
 
   bool failed() const noexcept { return not err.empty(); }
 
@@ -43,317 +130,435 @@ struct Arith {
     if (err.empty()) err = std::move(msg);
   }
 
+  void bad(std::string_view msg) { fail("bad math expression: " + std::string(msg)); }
+
   void skip_ws() {
     while (pos < s.size() and std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
   }
 
-  // Consumes `op` when it comes next and is not the start of a longer
-  // operator listed in `unless`.
-  bool eat(std::string_view op, std::string_view unless = {}) {
+  bool at(std::string_view op) {
     skip_ws();
-    if (s.substr(pos, op.size()) != op) return false;
-    for (std::size_t i = 0; i < unless.size(); ++i)
-      if (pos + op.size() < s.size() and s[pos + op.size()] == unless[i]) return false;
+    return s.substr(pos, op.size()) == op;
+  }
+
+  bool eat(std::string_view op) {
+    if (not at(op)) return false;
     pos += op.size();
     return true;
   }
 
-  long long lookup(const std::string& name) {
-    auto p = params.lookup(name);
-    if (not p or not p->get().is_set()) return 0;
-    const Param& param = p->get();
-    if (param.is_integer()) return param.integer();
-    std::string text = param.is_array()
-        ? (param.array().empty() ? std::string{} : param.array().front())
-        : param.scalar();
-    if (text.empty()) return 0;
-    if (depth >= MAX_DEPTH) { fail(name + ": max recursion depth exceeded"); return 0; }
-    Arith sub{text, params, depth + 1, 0, {}};
-    long long v = sub.run();
+  // The rest of the input, for "operator expected at `…'".
+  std::string rest() const { return std::string(s.substr(pos)); }
+
+  // A sub-evaluation of `text` with the same parameters and options.
+  MathNum eval_sub(std::string_view text, const std::string& what) {
+    if (depth >= MAX_DEPTH) { fail("math recursion limit exceeded: " + what); return {}; }
+    Arith sub{text, params, opts, depth + 1, 0, {}};
+    MathNum v = sub.run();
     if (sub.failed()) fail(sub.err);
     return v;
   }
 
-  long long rvalue(const Val& v) {
-    return v.name.empty() ? v.v : lookup(v.name);
+  // ---------------------------------------------------------------------
+  // Parameters.
+  // ---------------------------------------------------------------------
+
+  // The 0-based position of 1-based (or negative, from the end) index i in
+  // an array of n elements, or -1 when it is before the start.
+  static long long array_slot(long long i, long long n) noexcept {
+    if (i < 0) i += n + 1;
+    return i - 1;
   }
 
-  void store(const Val& lv, long long v, bool live) {
-    if (not live) return;
-    if (lv.name.empty()) { fail("lvalue required"); return; }
-    if (auto r = params.set_scalar(lv.name, std::to_string(v)); not r)
-      fail(r.error().message);
+  MathNum lookup(const Val& v) {
+    auto p = params.lookup(v.name);
+    if (not p or not p->get().is_set()) return {};
+    const Param& param = p->get();
+    std::string text;
+    if (v.indexed) {
+      if (param.is_hash()) {
+        auto h = param.hash();
+        auto it = h.find(v.sub);
+        if (it == h.end()) return {};
+        text = it->second;
+      } else {
+        long long i = eval_sub(v.sub, v.name).as_int();
+        auto arr = param.is_array() ? param.array() : std::vector<std::string>{param.scalar()};
+        long long slot = array_slot(i, static_cast<long long>(arr.size()));
+        if (failed() or slot < 0 or slot >= static_cast<long long>(arr.size())) return {};
+        text = arr[static_cast<std::size_t>(slot)];
+      }
+    } else if (param.is_integer()) {
+      return MathNum::of(param.integer());
+    } else if (param.is_float()) {
+      return MathNum::of(param.floatv());
+    } else if (param.is_array()) {
+      for (const auto& e : param.array()) text += (text.empty() ? "" : " ") + e;
+    } else {
+      text = param.scalar();
+    }
+    if (text.empty()) return {};
+    return eval_sub(text, v.name);
   }
 
-  Val number() {
-    std::size_t start = pos;
-    long long base = 10;
-    if (s.substr(pos, 2) == "0x" or s.substr(pos, 2) == "0X") { base = 16; pos += 2; }
-    else if (s.substr(pos, 2) == "0b" or s.substr(pos, 2) == "0B") { base = 2; pos += 2; }
-    std::size_t digits_start = pos;
-    while (pos < s.size() and std::isalnum(static_cast<unsigned char>(s[pos]))) ++pos;
-    if (base == 10 and pos < s.size() and s[pos] == '#') {
-      base = std::stoll(std::string(s.substr(start, pos - start)));
+  MathNum rvalue(const Val& v) {
+    if (failed()) return {};
+    return v.name.empty() ? v.n : lookup(v);
+  }
+
+  void store(const Val& lv, MathNum v, bool live) {
+    if (not live or failed()) return;
+    if (lv.name.empty()) { bad("lvalue required"); return; }
+    auto p = params.lookup(lv.name);
+    if (p and p->get().is_readonly()) { fail("read-only variable: " + lv.name); return; }
+    if (lv.indexed) { store_element(lv, v); return; }
+    if (p and p->get().is_set()) {
+      Param& param = p->get();
+      if (param.is_integer())    param.set(v.as_int());
+      else if (param.is_float()) param.set(v.as_float());
+      else if (auto r = params.set_scalar(lv.name, format_math(v)); not r) fail(r.error().message);
+      return;
+    }
+    // A new parameter takes the type of the value, as in zsh.
+    if (auto r = params.set_scalar(lv.name, {}); not r) { fail(r.error().message); return; }
+    Param& param = params.lookup(lv.name)->get();
+    if (v.is_float) param.set(v.d);
+    else            param.set(v.i);
+  }
+
+  void store_element(const Val& lv, MathNum v) {
+    std::string text = format_math(v);
+    auto p = params.lookup(lv.name);
+    if (p and p->get().is_hash()) {
+      auto h = p->get().hash();
+      h[lv.sub] = std::move(text);
+      p->get().set(std::move(h));
+      return;
+    }
+    long long i = eval_sub(lv.sub, lv.name).as_int();
+    if (failed()) return;
+    std::vector<std::string> arr;
+    if (p and p->get().is_set())
+      arr = p->get().is_array() ? p->get().array() : std::vector<std::string>{p->get().scalar()};
+    long long slot = array_slot(i, static_cast<long long>(arr.size()));
+    if (slot < 0) { fail(lv.name + ": assignment to invalid subscript range"); return; }
+    if (slot >= static_cast<long long>(arr.size())) arr.resize(static_cast<std::size_t>(slot) + 1);
+    arr[static_cast<std::size_t>(slot)] = std::move(text);
+    if (auto r = params.set_array(lv.name, std::move(arr)); not r) fail(r.error().message);
+  }
+
+  // ---------------------------------------------------------------------
+  // Operands.
+  // ---------------------------------------------------------------------
+
+  // Digits valid in `base`, with `_` separators, from pos; they are
+  // appended to `digits` without the separators.
+  void read_digits(int base, std::string& digits) {
+    while (pos < s.size() and (s[pos] == '_' or digit_value(s[pos]) < base)) {
+      if (s[pos] != '_') digits += s[pos];
       ++pos;
-      digits_start = pos;
-      while (pos < s.size() and (std::isalnum(static_cast<unsigned char>(s[pos]))
-                                 or s[pos] == '_' or s[pos] == '@')) ++pos;
-      if (base < 2 or base > 36) { fail("invalid base: " + std::to_string(base)); return {}; }
     }
-    if (pos < s.size() and s[pos] == '.') { fail("floating point is not supported"); return {}; }
+  }
+
+  MathNum to_integer(const std::string& digits, int base) {
     long long v = 0;
-    for (std::size_t i = digits_start; i < pos; ++i) {
-      int c = static_cast<unsigned char>(s[i]);
-      int d = std::isdigit(c) ? c - '0'
-            : std::isalpha(c) ? std::tolower(c) - 'a' + 10 : 99;
-      if (d >= base) { fail("bad math expression: " + std::string(s.substr(start))); return {}; }
-      v = wadd(wmul(v, base), d);
+    for (char c : digits) v = wadd(wmul(v, base), digit_value(c));
+    if (opts.force_float) return MathNum::of(static_cast<double>(v));
+    return MathNum::of(v);
+  }
+
+  MathNum number() {
+    std::string digits;
+    if (s.substr(pos, 2) == "0x" or s.substr(pos, 2) == "0X") {
+      pos += 2;
+      read_digits(16, digits);
+      return to_integer(digits, 16);
     }
-    if (pos == digits_start) { fail("bad math expression: " + std::string(s.substr(start))); return {}; }
-    return {v, {}};
+    if (s.substr(pos, 2) == "0b" or s.substr(pos, 2) == "0B") {
+      pos += 2;
+      read_digits(2, digits);
+      return to_integer(digits, 2);
+    }
+    std::size_t start = pos;
+    read_digits(10, digits);
+    if (pos < s.size() and s[pos] == '#' and not digits.empty()) {
+      int base = digits.size() > 2 ? 99 : std::stoi(digits);
+      if (base < 2 or base > 36) {
+        fail("invalid base (must be 2 to 36 inclusive): " + digits);
+        return {};
+      }
+      ++pos;
+      digits.clear();
+      read_digits(base, digits);
+      return to_integer(digits, base);
+    }
+    bool fraction = pos < s.size() and s[pos] == '.';
+    bool exponent = false;
+    if (fraction) {
+      ++pos;
+      digits += '.';
+      read_digits(10, digits);
+    }
+    if (pos < s.size() and (s[pos] == 'e' or s[pos] == 'E')) {
+      std::size_t e = pos + 1;
+      if (e < s.size() and (s[e] == '+' or s[e] == '-')) ++e;
+      if (e < s.size() and std::isdigit(static_cast<unsigned char>(s[e]))) {
+        digits += s.substr(pos, e - pos);
+        pos = e;
+        read_digits(10, digits);
+        exponent = true;
+      }
+    }
+    if (fraction or exponent) return MathNum::of(std::strtod(digits.c_str(), nullptr));
+    if (opts.octal_zeroes and digits.size() > 1 and digits[0] == '0') {
+      pos = start;
+      digits.clear();
+      read_digits(8, digits);
+      return to_integer(digits, 8);
+    }
+    return to_integer(digits, 10);
+  }
+
+  // `name[sub]`: the text between the brackets, which may nest.
+  bool subscript(std::string& out) {
+    int nest = 1;
+    std::size_t start = ++pos;
+    for (; pos < s.size(); ++pos) {
+      if (s[pos] == '[') ++nest;
+      else if (s[pos] == ']' and --nest == 0) break;
+    }
+    if (pos >= s.size()) { bad("']' expected"); return false; }
+    out = std::string(s.substr(start, pos - start));
+    ++pos;
+    return true;
   }
 
   Val primary(bool live) {
     skip_ws();
-    if (pos >= s.size()) { fail("bad math expression: operand expected at end of string"); return {}; }
+    if (pos >= s.size()) { bad("operand expected at end of string"); return {}; }
     char c = s[pos];
     if (c == '(') {
       ++pos;
-      long long v = comma(live);
-      if (not eat(")")) fail("bad math expression: ')' expected");
-      return {v, {}};
+      Val v = num(comma(live));
+      if (not failed() and not eat(")")) bad("')' expected");
+      return v;
     }
-    if (std::isdigit(static_cast<unsigned char>(c))) return number();
-    if (std::isalpha(static_cast<unsigned char>(c)) or c == '_') {
+    if (std::isdigit(static_cast<unsigned char>(c))
+        or (c == '.' and pos + 1 < s.size() and std::isdigit(static_cast<unsigned char>(s[pos + 1]))))
+      return num(number());
+    if (is_ident_start(c)) {
       std::size_t start = pos;
-      while (pos < s.size() and (std::isalnum(static_cast<unsigned char>(s[pos])) or s[pos] == '_'))
-        ++pos;
-      return {0, std::string(s.substr(start, pos - start))};
+      while (pos < s.size() and is_ident_char(s[pos])) ++pos;
+      std::string name(s.substr(start, pos - start));
+      auto lower = name;
+      for (char& ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      if (lower == "nan") return num(MathNum::of(std::numeric_limits<double>::quiet_NaN()));
+      if (lower == "inf") return num(MathNum::of(std::numeric_limits<double>::infinity()));
+      Val v{{}, std::move(name), {}, false};
+      if (pos < s.size() and s[pos] == '[') v.indexed = subscript(v.sub);
+      return v;
     }
-    fail(std::string("bad math expression: illegal character: ") + c);
+    bad("operand expected at `" + rest() + "'");
     return {};
+  }
+
+  // `++`/`--` on an lvalue; returns the new value, or the old one for a
+  // postfix operator.
+  Val step(Val lv, bool inc, bool postfix, bool live) {
+    if (lv.name.empty()) { bad("lvalue required"); return {}; }
+    MathNum old = rvalue(lv);
+    MathNum nv = old.is_float ? MathNum::of(old.d + (inc ? 1.0 : -1.0))
+                              : MathNum::of(inc ? wadd(old.i, 1) : wsub(old.i, 1));
+    store(lv, nv, live);
+    return num(postfix ? old : nv);
   }
 
   Val postfix(bool live) {
     Val v = primary(live);
     if (failed()) return {};
-    if (eat("++") or eat("--")) {
-      bool inc = s[pos - 1] == '+';
-      long long old = rvalue(v);
-      store(v, inc ? wadd(old, 1) : wsub(old, 1), live);
-      return {old, {}};
+    if (at("++") or at("--")) {
+      bool inc = s[pos] == '+';
+      pos += 2;
+      return step(std::move(v), inc, true, live);
     }
     return v;
   }
 
   Val unary(bool live) {
-    if (eat("++") or eat("--")) {
-      bool inc = s[pos - 1] == '+';
-      Val v = unary(live);
-      long long nv = wadd(rvalue(v), inc ? 1 : -1);
-      store(v, nv, live);
-      return {nv, {}};
+    if (at("++") or at("--")) {
+      bool inc = s[pos] == '+';
+      pos += 2;
+      return step(unary(live), inc, false, live);
     }
-    if (eat("+")) return {rvalue(unary(live)), {}};
-    if (eat("-")) return {wneg(rvalue(unary(live))), {}};
-    if (eat("!", "=")) return {rvalue(unary(live)) == 0, {}};
-    if (eat("~")) return {~rvalue(unary(live)), {}};
+    if (eat("+")) return num(rvalue(unary(live)));
+    if (eat("-")) {
+      MathNum v = rvalue(unary(live));
+      return num(v.is_float ? MathNum::of(-v.d) : MathNum::of(wneg(v.i)));
+    }
+    if (at("!") and not at("!=")) {
+      ++pos;
+      return num(rvalue(unary(live)).truthy() ? 0LL : 1LL);
+    }
+    if (eat("~")) return num(~rvalue(unary(live)).as_int());
     return postfix(live);
   }
 
-  static long long ipow(long long b, long long e) {
-    long long r = 1;
-    for (; e > 0; e >>= 1, b = wmul(b, b))
-      if (e & 1) r = wmul(r, b);
-    return r;
-  }
+  // ---------------------------------------------------------------------
+  // Binary operators.
+  // ---------------------------------------------------------------------
 
-  Val power(bool live) {
-    Val b = unary(live);
-    if (eat("**", "=")) {
-      long long e = rvalue(power(live));
-      if (e < 0) { fail("negative exponent"); return {}; }
-      return {ipow(rvalue(b), e), {}};
+  MathNum divide(MathNum a, MathNum b, bool mod, bool live) {
+    if (a.is_float or b.is_float) {
+      double x = a.as_float(), y = b.as_float();
+      return MathNum::of(mod ? std::fmod(x, y) : x / y);
     }
-    return b;
-  }
-
-  long long divide(long long a, long long b, bool mod, bool live) {
-    if (b == 0) {
+    if (b.i == 0) {
       if (live) fail("division by zero");
-      return 0;
+      return {};
     }
-    if (b == -1) return mod ? 0 : wneg(a);   // LLONG_MIN / -1 overflows
-    return mod ? a % b : a / b;
+    if (b.i == -1) return MathNum::of(mod ? 0LL : wneg(a.i));  // LLONG_MIN / -1 overflows
+    return MathNum::of(mod ? a.i % b.i : a.i / b.i);
   }
 
-  Val mul(bool live) {
-    Val l = power(live);
+  MathNum power(MathNum a, MathNum b) {
+    if (a.is_float or b.is_float or b.i < 0)
+      return MathNum::of(std::pow(a.as_float(), b.as_float()));
+    return MathNum::of(ipow(a.i, b.i));
+  }
+
+  // Applies a binary operator other than && || ^^ (the short-circuiting
+  // ones are done by the caller).
+  MathNum apply(std::string_view op, MathNum a, MathNum b, bool live) {
+    bool fl = a.is_float or b.is_float;
+    auto cmp = [&](auto f) {
+      return MathNum::of(static_cast<long long>(fl ? f(a.as_float(), b.as_float()) : f(a.i, b.i)));
+    };
+    if (op == "+")  return fl ? MathNum::of(a.as_float() + b.as_float()) : MathNum::of(wadd(a.i, b.i));
+    if (op == "-")  return fl ? MathNum::of(a.as_float() - b.as_float()) : MathNum::of(wsub(a.i, b.i));
+    if (op == "*")  return fl ? MathNum::of(a.as_float() * b.as_float()) : MathNum::of(wmul(a.i, b.i));
+    if (op == "/")  return divide(a, b, false, live);
+    if (op == "%")  return divide(a, b, true, live);
+    if (op == "**") return power(a, b);
+    if (op == "<")  return cmp([](auto x, auto y) { return x < y; });
+    if (op == "<=") return cmp([](auto x, auto y) { return x <= y; });
+    if (op == ">")  return cmp([](auto x, auto y) { return x > y; });
+    if (op == ">=") return cmp([](auto x, auto y) { return x >= y; });
+    if (op == "==") return cmp([](auto x, auto y) { return x == y; });
+    if (op == "!=") return cmp([](auto x, auto y) { return x != y; });
+    long long x = a.as_int(), y = b.as_int();
+    if (op == "<<") return MathNum::of(wshl(x, y));
+    if (op == ">>") return MathNum::of(wshr(x, y));
+    if (op == "&")  return MathNum::of(x & y);
+    if (op == "^")  return MathNum::of(x ^ y);
+    if (op == "|")  return MathNum::of(x | y);
+    if (op == "&&") return MathNum::of(static_cast<long long>(a.truthy() and b.truthy()));
+    if (op == "||") return MathNum::of(static_cast<long long>(a.truthy() or b.truthy()));
+    return MathNum::of(static_cast<long long>(a.truthy() != b.truthy()));  // ^^
+  }
+
+  // The binary operator at pos, unless it starts an assignment operator.
+  const BinOp* peek_binop() {
+    skip_ws();
+    for (auto op : ASSIGN_OPS)
+      if (s.substr(pos, op.size()) == op) return nullptr;
+    for (const auto& op : BIN_OPS)
+      if (s.substr(pos, op.text.size()) == op.text) return &op;
+    return nullptr;
+  }
+
+  int prec(const BinOp& op) const noexcept {
+    return opts.c_precedences ? op.c_prec : op.zsh_prec;
+  }
+
+  Val binary(int min_prec, bool live) {
+    Val l = unary(live);
     for (;;) {
-      if (eat("*", "*=")) { long long a = rvalue(l); l = {wmul(a, rvalue(power(live))), {}}; }
-      else if (eat("/", "=")) { long long a = rvalue(l); l = {divide(a, rvalue(power(live)), false, live), {}}; }
-      else if (eat("%", "=")) { long long a = rvalue(l); l = {divide(a, rvalue(power(live)), true, live), {}}; }
-      else return l;
-    }
-  }
-
-  Val add(bool live) {
-    Val l = mul(live);
-    for (;;) {
-      if (eat("+", "+=")) { long long a = rvalue(l); l = {wadd(a, rvalue(mul(live))), {}}; }
-      else if (eat("-", "-=")) { long long a = rvalue(l); l = {wsub(a, rvalue(mul(live))), {}}; }
-      else return l;
-    }
-  }
-
-  Val shift(bool live) {
-    Val l = add(live);
-    for (;;) {
-      if (eat("<<", "=")) { long long a = rvalue(l); l = {wshl(a, rvalue(add(live))), {}}; }
-      else if (eat(">>", "=")) { long long a = rvalue(l); l = {wshr(a, rvalue(add(live))), {}}; }
-      else return l;
-    }
-  }
-
-  Val band(bool live) {
-    Val l = shift(live);
-    while (eat("&", "&=")) l = {rvalue(l) & rvalue(shift(live)), {}};
-    return l;
-  }
-
-  Val bxor(bool live) {
-    Val l = band(live);
-    while (eat("^", "^=")) l = {rvalue(l) ^ rvalue(band(live)), {}};
-    return l;
-  }
-
-  Val bor(bool live) {
-    Val l = bxor(live);
-    while (eat("|", "|=")) l = {rvalue(l) | rvalue(bxor(live)), {}};
-    return l;
-  }
-
-  Val rel(bool live) {
-    Val l = bor(live);
-    for (;;) {
-      if (eat("<=")) l = {rvalue(l) <= rvalue(bor(live)), {}};
-      else if (eat(">=")) l = {rvalue(l) >= rvalue(bor(live)), {}};
-      else if (eat("<", "<")) l = {rvalue(l) < rvalue(bor(live)), {}};
-      else if (eat(">", ">")) l = {rvalue(l) > rvalue(bor(live)), {}};
-      else return l;
-    }
-  }
-
-  Val eq(bool live) {
-    Val l = rel(live);
-    for (;;) {
-      if (eat("==")) l = {rvalue(l) == rvalue(rel(live)), {}};
-      else if (eat("!=")) l = {rvalue(l) != rvalue(rel(live)), {}};
-      else return l;
-    }
-  }
-
-  Val land(bool live) {
-    Val l = eq(live);
-    while (eat("&&", "=")) {
-      bool lv = rvalue(l) != 0;
-      bool rv = rvalue(eq(live and lv)) != 0;
-      l = {lv and rv, {}};
-    }
-    return l;
-  }
-
-  Val lor(bool live) {
-    Val l = land(live);
-    for (;;) {
-      if (eat("||", "=")) {
-        bool lv = rvalue(l) != 0;
-        bool rv = rvalue(land(live and not lv)) != 0;
-        l = {lv or rv, {}};
-      } else if (eat("^^", "=")) {
-        bool lv = rvalue(l) != 0;
-        bool rv = rvalue(land(live)) != 0;
-        l = {lv != rv, {}};
-      } else {
-        return l;
-      }
+      if (failed()) return {};
+      const BinOp* op = peek_binop();
+      if (not op or prec(*op) < min_prec) return l;
+      pos += op->text.size();
+      MathNum a = rvalue(l);
+      bool rhs_live = live;
+      if (op->text == "&&") rhs_live = live and a.truthy();
+      if (op->text == "||") rhs_live = live and not a.truthy();
+      // `**` is right-associative; the others are left-associative.
+      int next = op->text == "**" ? prec(*op) : prec(*op) + 1;
+      MathNum b = rvalue(binary(next, rhs_live));
+      if (failed()) return {};
+      l = num(apply(op->text, a, b, live));
     }
   }
 
   Val ternary(bool live) {
-    Val c = lor(live);
-    if (not eat("?")) return c;
-    bool cv = rvalue(c) != 0;
-    long long a = rvalue(assign(live and cv));
-    if (not eat(":")) { fail("bad math expression: ':' expected"); return {}; }
-    long long b = rvalue(ternary(live and not cv));
-    return {cv ? a : b, {}};
+    Val c = binary(0, live);
+    if (failed() or not eat("?")) return c;
+    bool cv = rvalue(c).truthy();
+    MathNum a = rvalue(assign(live and cv));
+    if (failed()) return {};
+    if (not eat(":")) { bad("':' expected"); return {}; }
+    MathNum b = rvalue(ternary(live and not cv));
+    return num(cv ? a : b);
   }
 
   Val assign(bool live) {
-    std::size_t save = pos;
     Val l = ternary(live);
-    if (failed() or l.name.empty()) return l;
-    static constexpr std::string_view OPS[] = {
-      "**=", "<<=", ">>=", "&&=", "||=", "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|=",
-    };
-    for (auto op : OPS) {
-      if (eat(op)) {
-        long long r = rvalue(assign(live));
-        long long a = lookup(l.name);
-        long long v = 0;
-        std::string_view o = op.substr(0, op.size() - 1);
-        if      (o == "**") v = r < 0 ? 0 : ipow(a, r);
-        else if (o == "<<") v = wshl(a, r);
-        else if (o == ">>") v = wshr(a, r);
-        else if (o == "&&") v = a and r;
-        else if (o == "||") v = a or r;
-        else if (o == "+")  v = wadd(a, r);
-        else if (o == "-")  v = wsub(a, r);
-        else if (o == "*")  v = wmul(a, r);
-        else if (o == "/")  v = divide(a, r, false, live);
-        else if (o == "%")  v = divide(a, r, true, live);
-        else if (o == "&")  v = a & r;
-        else if (o == "^")  v = a ^ r;
-        else                v = a | r;
-        store(l, v, live);
-        return {v, {}};
-      }
+    if (failed()) return {};
+    skip_ws();
+    for (auto op : ASSIGN_OPS) {
+      if (not eat(op)) continue;
+      if (l.name.empty()) { bad("lvalue required"); return {}; }
+      std::string_view bop = op.substr(0, op.size() - 1);
+      MathNum a = rvalue(l);
+      // `&&=` and `||=` only evaluate the right side when it matters.
+      bool rhs_live = live;
+      if (bop == "&&") rhs_live = live and a.truthy();
+      if (bop == "||") rhs_live = live and not a.truthy();
+      MathNum r = rvalue(assign(rhs_live));
+      if (failed()) return {};
+      MathNum v = apply(bop, a, r, live);
+      store(l, v, live);
+      return num(v);
     }
-    if (eat("=", "=")) {
-      long long r = rvalue(assign(live));
+    if (at("=") and not at("==")) {
+      ++pos;
+      if (l.name.empty()) { bad("lvalue required"); return {}; }
+      MathNum r = rvalue(assign(live));
       store(l, r, live);
-      return {r, {}};
+      return num(r);
     }
-    (void)save;
     return l;
   }
 
-  long long comma(bool live) {
-    long long v = rvalue(assign(live));
+  MathNum comma(bool live) {
+    MathNum v = rvalue(assign(live));
     while (not failed() and eat(",")) v = rvalue(assign(live));
     return v;
   }
 
-  long long run() {
+  MathNum run() {
     skip_ws();
-    if (pos >= s.size()) return 0;
-    long long v = comma(true);
+    if (pos >= s.size()) return {};
+    MathNum v = comma(true);
     skip_ws();
-    if (not failed() and pos < s.size())
-      fail("bad math expression: illegal character: " + std::string(1, s[pos]));
+    if (not failed() and pos < s.size()) bad("operator expected at `" + rest() + "'");
     return v;
   }
 };
 
 }  // namespace
 
-Result<long long> arith_eval(std::string_view expr, ParamTable& params) {
-  Arith a{expr, params, 0, 0, {}};
-  long long v = a.run();
+Result<MathNum> math_eval(std::string_view expr, ParamTable& params, MathOptions opts) {
+  Arith a{expr, params, opts, 0, 0, {}};
+  MathNum v = a.run();
   if (a.failed())
     return std::unexpected(ShellError{ErrorKind::BadSubstitution, a.err});
   return v;
+}
+
+Result<long long> arith_eval(std::string_view expr, ParamTable& params, MathOptions opts) {
+  auto v = math_eval(expr, params, opts);
+  if (not v) return std::unexpected(v.error());
+  return v->as_int();
 }
 
 }  // namespace jfsh

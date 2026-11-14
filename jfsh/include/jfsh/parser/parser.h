@@ -60,6 +60,15 @@ protected:
   // `{ list }`, or any single command (`f() echo hi`).
   bool par_function_body();
   bool par_cond();
+  bool par_cond_or();
+  bool par_cond_and();
+  bool par_cond_not();
+  bool par_cond_primary();
+  // An operand inside [[ ]]: a word, or a reserved word used as one, but
+  // not the closing `]]`.
+  bool at_cond_word() noexcept;
+  // Puts a header in front of the instructions from `start` on.
+  void insert(std::size_t start, WordCode w);
   bool par_arith();
   bool par_redir();
   bool par_assign();
