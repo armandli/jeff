@@ -1,4 +1,5 @@
 #include <string>
+#include <string_view>
 
 #include <gtest/gtest.h>
 
@@ -175,9 +176,136 @@ TEST(Parser, RejectsLeftoverAndMisplacedTokens) {
 }
 
 TEST(Parser, UnimplementedConstructsFailClearly) {
-  EXPECT_EQ(listing("if true; then a; fi"), "error: `if' is not supported yet");
-  EXPECT_EQ(listing("{ a; }"),
-            "error: brace group or function definition is not supported yet");
+  EXPECT_EQ(listing("time a"), "error: parse error near `time'");
+}
+
+// ---- compound commands (M4) ------------------------------------------------
+
+// The listing of a body holding one command of one word.
+std::string body(std::string_view word) {
+  return "LIST end skip=4\nSUBLIST - skip=3\nPIPE 1\nSIMPLE 1\n"
+         "STRING \"" + std::string(word) + "\"\nEND\n";
+}
+
+// The listing of a program holding one command whose own words, after
+// the PIPE, are `cmd` (n words).
+std::string program(std::size_t n, const std::string& cmd) {
+  return "LIST end skip=" + std::to_string(n + 2) + "\n"
+         "SUBLIST - skip=" + std::to_string(n + 1) + "\n"
+         "PIPE 1\n" + cmd + "END\n";
+}
+
+TEST(Parser, IfHasABranchPerConditionAndElse) {
+  EXPECT_EQ(listing("if a; then b; elif c; then d; else e; fi"),
+            program(34,
+                    "IF head skip=33\n"
+                    "IF if skip=12\n" + body("a") + body("b") +
+                    "IF if skip=12\n" + body("c") + body("d") +
+                    "IF else skip=6\n" + body("e")));
+}
+
+TEST(Parser, WhileAndUntil) {
+  EXPECT_EQ(listing("while a; do b; done"),
+            program(13, "WHILE while skip=12\n" + body("a") + body("b")));
+  EXPECT_EQ(listing("until a\ndo\n  b\ndone"),
+            program(13, "WHILE until skip=12\n" + body("a") + body("b")));
+}
+
+TEST(Parser, ForForms) {
+  EXPECT_EQ(listing("for x y in 1 2; do b; done"),
+            program(13, "FOR in skip=12\nWORDS 2\nSTRING \"x\"\nSTRING \"y\"\n"
+                        "WORDS 2\nSTRING \"1\"\nSTRING \"2\"\n" + body("b")));
+  EXPECT_EQ(listing("for x (1) b"),
+            program(11, "FOR in skip=10\nWORDS 1\nSTRING \"x\"\n"
+                        "WORDS 1\nSTRING \"1\"\n" + body("b")));
+  EXPECT_EQ(listing("for x; do b; done"),
+            program(9, "FOR args skip=8\nWORDS 1\nSTRING \"x\"\n" + body("b")));
+  EXPECT_EQ(listing("for ((i=0; i<2; i++)) { b }"),
+            program(10, "FOR_COND skip=9\nSTRING \"i=0\"\nSTRING \" i<2\"\n"
+                        "STRING \" i++\"\n" + body("b")));
+  // Reserved words in the value list are values (bug B7).
+  EXPECT_NE(listing("for x in do done; do b; done")
+                .find("WORDS 2\nSTRING \"do\"\nSTRING \"done\"\n"),
+            std::string::npos);
+}
+
+TEST(Parser, CaseArmsCarryTheirTerminator) {
+  EXPECT_EQ(listing("case $x in a|b) c;; (d) e;& f) g;| esac"),
+            program(30,
+                    "CASE head skip=29\nSTRING \"$x\"\n"
+                    "CASE ;; skip=9\nWORDS 2\nSTRING \"a\"\nSTRING \"b\"\n" + body("c") +
+                    "CASE ;& skip=8\nWORDS 1\nSTRING \"d\"\n" + body("e") +
+                    "CASE ;| skip=8\nWORDS 1\nSTRING \"f\"\n" + body("g")));
+  // The last arm may leave out `;;`.
+  EXPECT_EQ(listing("case x in\n  a) b\nesac"),
+            program(11, "CASE head skip=10\nSTRING \"x\"\n"
+                        "CASE ;; skip=8\nWORDS 1\nSTRING \"a\"\n" + body("b")));
+}
+
+TEST(Parser, GroupsAndSubshells) {
+  EXPECT_EQ(listing("{ a }"), program(7, "CURSH skip=6\n" + body("a")));
+  EXPECT_EQ(listing("( a )"), program(7, "SUBSH skip=6\n" + body("a")));
+  EXPECT_EQ(listing("{ a } always { b }"),
+            program(13, "TRY skip=12\n" + body("a") + body("b")));
+  // `))` closes two subshells.
+  EXPECT_EQ(listing("((a))").substr(0, 5), "LIST ");
+  EXPECT_EQ(listing("(a; (b))").find("error"), std::string::npos);
+}
+
+TEST(Parser, RedirectionsAfterACompoundCommandGoInFront) {
+  EXPECT_EQ(listing("( a ) > out 2>&1"),
+            program(11, "REDIR >\nSTRING \"out\"\nREDIR >&N fd=2\nSTRING \"1\"\n"
+                        "SUBSH skip=6\n" + body("a")));
+}
+
+TEST(Parser, FunctionDefinitions) {
+  std::string named = "FUNCDEF named skip=9\nWORDS 2\nSTRING \"f\"\nSTRING \"g\"\n" + body("a");
+  EXPECT_EQ(listing("f g () { a; }"), program(10, named));
+  EXPECT_EQ(listing("function f g { a }"), program(10, named));
+  EXPECT_EQ(listing("f() a"),
+            program(9, "FUNCDEF named skip=8\nWORDS 1\nSTRING \"f\"\n" + body("a")));
+  EXPECT_EQ(listing("() { a } x y"),
+            program(10, "FUNCDEF anon skip=9\n" + body("a") +
+                        "WORDS 2\nSTRING \"x\"\nSTRING \"y\"\n"));
+  EXPECT_EQ(listing("f() {\n}"),
+            program(4, "FUNCDEF named skip=3\nWORDS 1\nSTRING \"f\"\nEND\n"));
+}
+
+TEST(Parser, ArithmeticCommandKeepsItsTextRaw) {
+  EXPECT_EQ(listing("(( x > 1 ))"), program(2, "ARITH skip=1\nSTRING \" x > 1 \"\n"));
+}
+
+TEST(Parser, TypesetArgumentsAreAssignments) {
+  EXPECT_EQ(listing("local -a x=$(a b) y z=(1 2)"),
+            program(10, "TYPESET 5\nSTRING \"local\"\nSTRING \"-a\"\n"
+                        "ASSIGN -\nSTRING \"x\"\nSTRING \"$(a b)\"\nSTRING \"y\"\n"
+                        "ASSIGN array\nSTRING \"z\"\nSTRING \"1 2\"\n"));
+  // Only the unquoted command word counts.
+  EXPECT_NE(listing("echo local x=1").find("SIMPLE 3\n"), std::string::npos);
+}
+
+TEST(Parser, CompoundCommandErrors) {
+  EXPECT_EQ(listing("if a; then b"), "error: parse error: unexpected end of input");
+  EXPECT_EQ(listing("if a; then b; done"), "error: parse error near `done'");
+  EXPECT_EQ(listing("for in a; do b; done"), "error: parse error near `in'");
+  EXPECT_EQ(listing("case x in a b) c;; esac"), "error: parse error near `b'");
+  EXPECT_EQ(listing("for ((a;b)); do c; done"), "error: parse error near `((a;b))'");
+  EXPECT_EQ(listing("{ a } <(b)"), "error: parse error near `<(b)'");
+}
+
+TEST(Parser, IncompleteInputAsksForMore) {
+  EXPECT_TRUE(is_incomplete("if a; then"));
+  EXPECT_TRUE(is_incomplete("for x in a b\ndo"));
+  EXPECT_TRUE(is_incomplete("f() {"));
+  EXPECT_TRUE(is_incomplete("case x in"));
+  EXPECT_TRUE(is_incomplete("(( 1 +"));
+  EXPECT_TRUE(is_incomplete("echo 'open"));
+  EXPECT_TRUE(is_incomplete("cat <<E\nbody"));
+  EXPECT_TRUE(is_incomplete("a &&"));
+  EXPECT_FALSE(is_incomplete("if a; then b; fi"));
+  EXPECT_FALSE(is_incomplete("cat <<E\nbody\nE\n"));
+  EXPECT_FALSE(is_incomplete("echo )"));      // an error, not unfinished
+  EXPECT_FALSE(is_incomplete("echo # if"));
 }
 
 TEST(Parser, ErrorCarriesTheLineNumber) {

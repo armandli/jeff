@@ -56,6 +56,11 @@ struct Expander {
   // characters that were quoted come back backslash-escaped.
   Result<std::string> pattern(std::string_view word);
 
+  // An arithmetic expression, as in `$((…))`: substitutions are expanded
+  // first, then the text is evaluated.  Used by `(( ))`, `for ((;;))` and
+  // `repeat`.
+  Result<long long> arith(std::string_view expr);
+
   // Status of the last command substitution run, if any.
   std::optional<int> subst_status() const noexcept { return mSubstStatus; }
 

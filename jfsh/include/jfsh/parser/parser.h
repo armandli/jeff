@@ -30,6 +30,8 @@ struct Parser {
 
   int  line()      const noexcept { return mLex.line(); }
   bool has_error() const noexcept { return not mError.message.empty(); }
+  // The parse failed only because the input ended too early.
+  bool incomplete() const noexcept { return mIncomplete; }
 
   const ShellError& error() const noexcept { return mError; }
 
@@ -52,16 +54,36 @@ protected:
   bool par_select();
   bool par_repeat();
   bool par_subsh();
+  bool par_cursh();
   bool par_funcdef();
+  bool par_funcdef_body(std::vector<std::string> names);
+  // `{ list }`, or any single command (`f() echo hi`).
+  bool par_function_body();
   bool par_cond();
   bool par_arith();
   bool par_redir();
   bool par_assign();
 
+  // A nested program: list* WC_END.
+  bool par_body();
+  // `do list done`, `{ list }`, or with SHORT_LOOPS a single sublist.
+  bool par_loop_body();
+  // One sublist wrapped as a body (`f() cmd`, `for x (a b) cmd`).
+  bool par_sublist_body();
+  // `for`/`select` after the keyword: names, then the value list.
+  bool par_for_words(std::size_t head, WordCode op);
+  // Redirections after a compound command that starts at `start`, moved in
+  // front of it.
+  bool par_trailing_redirs(std::size_t start);
+  void emit_words(std::vector<std::string> words);
+
   const LexToken& cur() { return mLex.peek(); }
   bool   eat(TokType t);
   bool   at(TokType t) const noexcept;
   bool   at_list_terminator() const noexcept;
+  // A word, or a reserved word used as one (`for x in do done`).
+  bool   at_word() const noexcept;
+  bool   expect(TokType t);                     // eat it, or a parse error
   void   skip_newlines();
   void   error(std::string msg);
   bool   error_near(const LexToken& tok);       // always returns false
@@ -71,9 +93,15 @@ private:
   Lexer&           mLex;
   ParseFlags       mFlags;
   ShellError       mError;
+  bool             mIncomplete = false;
   CompiledProgram* mProg = nullptr;
   std::vector<std::size_t> mPendingHeredocs;   // strs indices awaiting bodies
 };
+
+// True when `src` is the start of a program cut off too early: an open
+// `if`, loop, brace, quote or here-document.  An interactive shell then
+// reads more lines; `comments` says whether `#` starts a comment.
+bool is_incomplete(std::string_view src, bool comments = true);
 
 // Human-readable listing of the bytecode, one instruction per line
 // (src/parser/text.cpp).  Used by tests and for debugging.

@@ -1,9 +1,12 @@
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include <algorithm>
 
 #include <jfsh/builtins/builtins.h>
 #include <jfsh/builtins/math.h>
@@ -102,11 +105,37 @@ void BuiltinTable::for_each(std::function<void(const BuiltinDef&)> fn) const {
 }
 
 int builtin_colon     (std::vector<std::string>&, ExecContext&) { return 0; }
-int builtin_break     (std::vector<std::string>&, ExecContext& ctx) {
-  ctx.break_level = 1; return 0;
+// `break [N]` / `continue [N]`: leave, or start the next pass of, the Nth
+// enclosing loop.  N past the outermost loop means the outermost.
+static int loop_control(std::vector<std::string>& args, ExecContext& ctx,
+                        bool cont) {
+  const char* name = args[0].c_str();
+  long n = 1;
+  if (args.size() > 1) {
+    auto v = arith_eval(args[1], ctx.params);
+    if (not v) {
+      std::fprintf(stderr, "jfsh: %s: %s\n", name, v.error().message.c_str());
+      return 1;
+    }
+    if (*v < 1) {
+      std::fprintf(stderr, "jfsh: %s: argument is not positive: %lld\n", name, *v);
+      return 1;
+    }
+    n = static_cast<long>(std::min<long long>(*v, ctx.loop_depth));
+  }
+  if (ctx.loop_depth == 0) {
+    std::fprintf(stderr, "jfsh: %s: not in while, until, select, or repeat loop\n", name);
+    return 1;
+  }
+  ctx.break_level = static_cast<int>(std::min<long>(n, ctx.loop_depth));
+  ctx.continuing  = cont;
+  return 0;
 }
-int builtin_continue  (std::vector<std::string>&, ExecContext& ctx) {
-  ctx.cont_level = 1; return 0;
+int builtin_break(std::vector<std::string>& args, ExecContext& ctx) {
+  return loop_control(args, ctx, false);
+}
+int builtin_continue(std::vector<std::string>& args, ExecContext& ctx) {
+  return loop_control(args, ctx, true);
 }
 int builtin_dot(std::vector<std::string>& args, ExecContext&) {
   // TODO(builtin/dot): Source args[1] into the current shell environment.
@@ -132,18 +161,19 @@ int builtin_exit(std::vector<std::string>& args, ExecContext& ctx) {
   ctx.exit_val = args.size() > 1 ? std::atoi(args[1].c_str()) : ctx.last_exit;
   return ctx.exit_val;
 }
+static int typeset_common(std::vector<std::string>& args, ExecContext& ctx,
+                          std::string_view implied);
+
+// `export` is `typeset -gx`; `-n` takes the export attribute away.
+// TODO(builtin/export): `-p` and the bare `export` listing (M7).
 int builtin_export(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/export): For each arg:
-  //   name=value → assign and mark PM_EXPORTED
-  //   name       → mark existing param PM_EXPORTED
-  //   -n name    → remove PM_EXPORTED flag
-  //   -p         → print all exported vars in `export name=value` form
-  (void)args; (void)ctx; return 0;
+  for (auto& a : args)
+    if (a == "-n") a = "+x";
+  return typeset_common(args, ctx, "gx");
 }
+// `readonly` is `typeset -gr`.
 int builtin_readonly(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/readonly): Like export but sets PM_READONLY.
-  //   Writing to a readonly param is an error.
-  (void)args; (void)ctx; return 0;
+  return typeset_common(args, ctx, "gr");
 }
 int builtin_return(std::vector<std::string>& args, ExecContext& ctx) {
   ctx.returning  = true;
@@ -261,32 +291,162 @@ int builtin_kill(std::vector<std::string>& args, ExecContext& ctx) {
   //   Accept %jobid notation.
   (void)args; (void)ctx; return 0;
 }
+// Attributes typeset can give a parameter, from its option letters.
+struct TypesetAttrs {
+  char          type   = 0;   // 'a', 'A', 'i' or 'F'; 0 for scalar
+  bool          global = false;
+  std::uint32_t on     = 0;   // PM_EXPORTED, PM_READONLY, PM_UPPER, PM_LOWER
+  std::uint32_t off    = 0;
+};
+
+static bool is_identifier(std::string_view s) noexcept {
+  if (s.empty() or std::isdigit(static_cast<unsigned char>(s[0]))) return false;
+  for (char c : s)
+    if (not std::isalnum(static_cast<unsigned char>(c)) and c != '_') return false;
+  return true;
+}
+
+// Declares or updates one `name` / `name=value` argument of typeset.
+static int typeset_one(std::string_view cmd, const std::string& arg,
+                       const TypesetAttrs& attrs, ExecContext& ctx) {
+  std::size_t eq = arg.find('=');
+  bool        has_value = eq != std::string::npos;
+  bool        append    = has_value and eq > 0 and arg[eq - 1] == '+';
+  std::string name  = arg.substr(0, has_value ? eq - (append ? 1 : 0) : arg.size());
+  std::string value = has_value ? arg.substr(eq + 1) : std::string{};
+  if (not is_identifier(name)) {
+    std::fprintf(stderr, "jfsh: %.*s: not valid in this context: %s\n",
+                 static_cast<int>(cmd.size()), cmd.data(), name.c_str());
+    return 1;
+  }
+  auto existing = attrs.global ? ctx.params.lookup(name)
+                               : ctx.params.lookup_local(name);
+  if (existing and existing->get().is_readonly()
+      and (has_value or attrs.type or attrs.off)) {
+    std::fprintf(stderr, "jfsh: read-only variable: %s\n", name.c_str());
+    return 1;
+  }
+  Param* p = existing ? &existing->get() : nullptr;
+  if (not p) {
+    // A new local keeps the export attribute of the parameter it hides.
+    auto outer = ctx.params.lookup(name);
+    bool exported = outer and outer->get().is_exported();
+    if (attrs.global) {
+      (void)ctx.params.set_scalar(name, "");
+      p = &ctx.params.lookup(name)->get();
+    } else {
+      p = &ctx.params.declare_local(name, PM_SCALAR);
+      p->set(std::string{});
+    }
+    if (exported) p->flags |= PM_EXPORTED;
+    if (attrs.type == 'i' and not has_value) p->set(0LL);
+    if (attrs.type == 'F' and not has_value) p->set(0.0);
+  }
+  if (append and has_value) {
+    value = (p->is_integer() ? std::to_string(p->integer()) : p->scalar()) + value;
+  }
+  std::uint32_t case_flags = (p->flags | attrs.on) & ~attrs.off;
+  if (case_flags & PM_UPPER)
+    for (char& c : value) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  if (case_flags & PM_LOWER)
+    for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  switch (attrs.type) {
+    case 'a':
+      if (has_value) p->set(std::vector<std::string>{value});
+      else if (not p->is_array()) p->set(std::vector<std::string>{});
+      break;
+    case 'A':
+      if (not p->is_hash()) p->set(std::unordered_map<std::string, std::string>{});
+      break;
+    case 'i':
+      if (has_value or not p->is_integer()) {
+        std::string text = has_value ? value : p->scalar();
+        auto v = text.empty() ? Result<long long>{0} : arith_eval(text, ctx.params);
+        if (not v) {
+          std::fprintf(stderr, "jfsh: %.*s: %s\n", static_cast<int>(cmd.size()),
+                       cmd.data(), v.error().message.c_str());
+          return 1;
+        }
+        p->set(*v);
+      }
+      break;
+    case 'F':
+      if (has_value or not p->is_float())
+        p->set(std::strtod((has_value ? value : p->scalar()).c_str(), nullptr));
+      break;
+    default:
+      if (has_value) {
+        if (p->is_integer()) {
+          auto v = arith_eval(value, ctx.params);
+          if (v) p->set(*v);
+          else   p->set(std::move(value));
+        } else {
+          p->set(std::move(value));
+        }
+      }
+  }
+  p->flags = (p->flags | attrs.on) & ~attrs.off;
+  return 0;
+}
+
+// typeset [±aAFgilrux] [name[=value] …].  Without -g a name is declared in
+// the innermost scope, which inside a function is local to it.  A new
+// parameter is set and empty (0 for -i/-F, () for -a/-A).  `implied` holds
+// the options the variant stands for (export is `typeset -gx`).
+// TODO(builtin/typeset): listing (`typeset`, `-p`, `-m`), `-f`, `-h`,
+//   `-T`, `-U`, `-Z`/`-L`/`-R` padding, and keeping -u/-l/-i in force for
+//   later assignments (M7).
+static int typeset_common(std::vector<std::string>& args, ExecContext& ctx,
+                          std::string_view implied) {
+  std::string_view cmd = args[0];
+  TypesetAttrs attrs;
+  auto apply = [&](char c, bool on) {
+    switch (c) {
+      case 'a': case 'A': case 'i': attrs.type = on ? c : 0; return true;
+      case 'F': case 'E':           attrs.type = on ? 'F' : 0; return true;
+      case 'g': attrs.global = on; return true;
+      case 'x': (on ? attrs.on : attrs.off) |= PM_EXPORTED; return true;
+      case 'r': (on ? attrs.on : attrs.off) |= PM_READONLY; return true;
+      case 'u': (on ? attrs.on : attrs.off) |= PM_UPPER;    return true;
+      case 'l': (on ? attrs.on : attrs.off) |= PM_LOWER;    return true;
+      default:  return false;
+    }
+  };
+  for (char c : implied) apply(c, true);
+  std::size_t i = 1;
+  for (; i < args.size(); ++i) {
+    const std::string& a = args[i];
+    if (a == "--") { ++i; break; }
+    if (a.size() < 2 or (a[0] != '-' and a[0] != '+')) break;
+    for (std::size_t k = 1; k < a.size(); ++k) {
+      if (not apply(a[k], a[0] == '-')) {
+        std::fprintf(stderr, "jfsh: %.*s: bad option: %c%c\n",
+                     static_cast<int>(cmd.size()), cmd.data(), a[0], a[k]);
+        return 1;
+      }
+    }
+  }
+  if (cmd == "local") attrs.global = false;
+  int rc = 0;
+  for (; i < args.size(); ++i)
+    if (typeset_one(cmd, args[i], attrs, ctx) != 0) rc = 1;
+  return rc;
+}
+
 int builtin_typeset(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/typeset): The central variable-declaration builtin.
-  //   Flags: -i (integer), -f (float), -a (array), -A (hash/assoc),
-  //          -l (lowercase), -u (uppercase), -r (readonly), -x (export),
-  //          -g (global, suppress local), -p (print), -m (pattern match),
-  //          -h (hide), -T (tie array/scalar), -U (unique array).
-  //   Without a value, declare (create if needed); with =value, assign.
-  //   `typeset -p` / `typeset` with no args → print all vars.
-  (void)args; (void)ctx; return 0;
+  return typeset_common(args, ctx, "");
 }
 int builtin_local(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/local): Alias for typeset in a function scope.
-  //   Calls params_.declare_local() for each name.
-  (void)args; (void)ctx; return 0;
+  return typeset_common(args, ctx, "");
 }
 int builtin_declare(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/declare): Bash-compat alias for typeset (subset of flags).
-  (void)args; (void)ctx; return 0;
+  return typeset_common(args, ctx, "");
 }
 int builtin_integer(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/integer): Shorthand for `typeset -i`.
-  (void)args; (void)ctx; return 0;
+  return typeset_common(args, ctx, "i");
 }
 int builtin_float(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/float): Shorthand for `typeset -F` (float with decimal).
-  (void)args; (void)ctx; return 0;
+  return typeset_common(args, ctx, "F");
 }
 int builtin_fc(std::vector<std::string>& args, ExecContext& ctx) {
   // TODO(builtin/fc): History editor and re-execution.
@@ -332,17 +492,111 @@ int builtin_print(std::vector<std::string>& args, ExecContext& ctx) {
   return builtin_echo(args, ctx);
 }
 int builtin_printf    (std::vector<std::string>&, ExecContext&) { return 0; }
+// `read [-rA] [name …]`: reads one line from fd 0, a byte at a time so
+// nothing past it is consumed.  The line is split on $IFS: each name but
+// the last takes a field and the last takes the rest; with no name the
+// whole line goes to $REPLY, and with -A the fields fill the array.
+// Without -r a backslash quotes the next character, and before a newline
+// joins the next line.  Status 1 at end of input.
+// TODO(builtin/read): -s, -t, -n/-k, -p, -u, -d, -q, -e/-E, -z (M7).
 int builtin_read(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/read): Read one line from stdin (or -u fd) into named vars.
-  //   Split the line by IFS; assign fields to var1 var2 …; last var gets remainder.
-  //   -r: raw mode (no backslash processing).
-  //   -A/-a: read into array (all words).
-  //   -s: silent (no echo, for passwords).
-  //   -t N: timeout after N seconds.
-  //   -n N: read at most N characters.
-  //   -p prompt: display prompt without newline.
-  //   -k: read a single keypress.
-  (void)args; (void)ctx; return 0;
+  bool raw = false;
+  bool array = false;
+  std::size_t i = 1;
+  for (; i < args.size() and args[i].size() > 1 and args[i][0] == '-'; ++i) {
+    for (char c : std::string_view(args[i]).substr(1)) {
+      if      (c == 'r') raw = true;
+      else if (c == 'A') array = true;
+      else {
+        std::fprintf(stderr, "jfsh: read: bad option: -%c\n", c);
+        return 1;
+      }
+    }
+  }
+  std::vector<std::string> names(args.begin() + static_cast<long>(i), args.end());
+
+  // Characters quoted by a backslash are marked so they don't split.
+  std::string line;
+  std::vector<bool> quoted;
+  bool eof = false;
+  for (;;) {
+    char c;
+    ssize_t n = ::read(STDIN_FILENO, &c, 1);
+    if (n < 0 and errno == EINTR) continue;
+    if (n <= 0) { eof = true; break; }
+    if (c == '\n') break;
+    if (c == '\\' and not raw) {
+      n = ::read(STDIN_FILENO, &c, 1);
+      if (n <= 0) { eof = true; break; }
+      if (c == '\n') continue;
+      line += c;
+      quoted.push_back(true);
+      continue;
+    }
+    line += c;
+    quoted.push_back(false);
+  }
+  if (eof and line.empty()) return 1;
+
+  std::string ifs = " \t\n";
+  if (auto p = ctx.params.lookup("IFS"); p and p->get().is_set())
+    ifs = p->get().scalar();
+  auto is_sep = [&](std::size_t k) {
+    return not quoted[k] and ifs.find(line[k]) != std::string::npos;
+  };
+  auto is_white = [&](std::size_t k) {
+    return is_sep(k) and (line[k] == ' ' or line[k] == '\t' or line[k] == '\n');
+  };
+  // Fields, plus where each starts so the last name can take the rest.
+  std::vector<std::string> fields;
+  std::vector<std::size_t> starts;
+  std::size_t k = 0;
+  while (k < line.size() and is_white(k)) ++k;
+  while (k < line.size()) {
+    starts.push_back(k);
+    std::string field;
+    while (k < line.size() and not is_sep(k)) field += line[k++];
+    fields.push_back(std::move(field));
+    while (k < line.size() and is_white(k)) ++k;
+    if (k < line.size() and is_sep(k)) {
+      ++k;
+      while (k < line.size() and is_white(k)) ++k;
+    }
+  }
+
+  auto set = [&](const std::string& name, std::string value) {
+    if (auto r = ctx.params.set_scalar(name, std::move(value)); not r) {
+      std::fprintf(stderr, "jfsh: read: %s\n", r.error().message.c_str());
+      return false;
+    }
+    return true;
+  };
+  if (array) {
+    std::string name = names.empty() ? "reply" : names[0];
+    if (auto r = ctx.params.set_array(name, fields); not r) {
+      std::fprintf(stderr, "jfsh: read: %s\n", r.error().message.c_str());
+      return 1;
+    }
+    return eof ? 1 : 0;
+  }
+  if (names.empty()) names.push_back("REPLY");
+  if (names.size() == 1 and names[0] == "REPLY" and i == args.size()) {
+    if (not set("REPLY", line)) return 1;
+    return eof ? 1 : 0;
+  }
+  for (std::size_t n = 0; n < names.size(); ++n) {
+    std::string value;
+    if (n + 1 == names.size() and n < fields.size()) {
+      // The rest of the line, without trailing IFS whitespace.
+      std::size_t end = line.size();
+      while (end > starts[n] and is_white(end - 1)) --end;
+      value = line.substr(starts[n], end - starts[n]);
+    } else if (n < fields.size()) {
+      value = fields[n];
+    }
+    if (not set(names[n], std::move(value))) return 1;
+  }
+  return eof ? 1 : 0;
 }
 int builtin_source(std::vector<std::string>& args, ExecContext& ctx) {
   // TODO(builtin/source): Same as builtin_dot.  Source the file; pass any

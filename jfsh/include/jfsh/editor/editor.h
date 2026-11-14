@@ -58,7 +58,9 @@ struct Editor {
   Editor(const OptionState& opts, HistoryManager& hist, PromptRenderer& prompt);
   ~Editor();
 
-  std::optional<std::string> read_line();
+  // Reads one line after PS1, or after PS2 for a `continuation` line of an
+  // unfinished command.
+  std::optional<std::string> read_line(bool continuation = false);
 
   void suspend();
   void resume();
@@ -110,6 +112,7 @@ private:
   int                      mHistPos     = -1;  // -1 = not navigating
   std::string              mSavedLine;
   bool                     mRawModeActive = false;
+  bool                     mContinuation  = false;  // prompting with PS2
 };
 
 }  // namespace jfsh

@@ -1,15 +1,18 @@
 # jfsh — remaining work
 
-Status as of 2026-11-12: M1 (simple commands), M2 (pipelines, redirections, lists,
-background jobs) and M3 (word expansion) are done, along with the part of M0 they needed.
+Status as of 2026-11-13: M1 (simple commands), M2 (pipelines, redirections, lists,
+background jobs), M3 (word expansion) and M4 (compound commands and functions) are done,
+along with the part of M0 they needed.
 
 jfsh builds on macOS and Linux and has gtest coverage for the pieces that work. It runs
 **simple commands**, pipelines and background jobs joined by `;`, newlines, `&&`, `||` and
 `!`, with redirections, here-documents, `NAME=value` and `NAME=(…)` assignments, and the
 full word expansion pipeline (parameters, command and arithmetic substitution, splitting,
-braces, tilde, globbing). Compound commands (`if`, loops, functions, subshells, `[[ ]]`,
-`(( ))`) are reported as "not supported yet". The System 1 router and the LLM agent layer
-work end to end.
+braces, tilde, globbing), and compound commands: `if`, `while`/`until`, `for` (all three
+forms), `case`, `select`, `repeat`, subshells, brace groups, `always` blocks, `(( ))` and
+shell functions with `local`. Commands that span lines work in scripts, on stdin and at the
+prompt (with `PS2`). `[[ ]]` and most builtins beyond those M4 needed are still missing
+(M5, M7). The System 1 router and the LLM agent layer work end to end.
 
 This file has two parts:
 
@@ -61,9 +64,9 @@ parse errors print `jfsh:LINE: parse error near `X'` with status 1, and leftover
 are an error (B9). `disassemble()` (`src/parser/text.cpp`) backs `tests/parser_test.cpp`.
 
 **Remaining**
-- Each construct that lands later (redirections in M2, compound commands in M4, `[[ ]]` and
-  `(( ))` in M5) adds its layout to the comment in `wordcode.h`, its own
-  `disassemble()` formatting, and parser tests asserting the exact bytecode.
+- Each construct that lands later (`[[ ]]` in M5) adds its layout to the comment in
+  `wordcode.h`, its own `disassemble()` formatting, and parser tests asserting the exact
+  bytecode, as redirections (M2) and compound commands (M4) did.
 - The source-text decompiler for `functions`/`which` [text/decompile] is still to do.
 
 ### M1. Simple commands
@@ -91,7 +94,8 @@ are an error (B9). `disassemble()` (`src/parser/text.cpp`) backs `tests/parser_t
   **before** running it.
 
 **Left to other milestones**
-- Function lookup ahead of builtins (M4); aliases are expanded by the lexer (M7).
+- Aliases are expanded by the lexer (M7). (Function lookup ahead of builtins landed
+  with M4.)
 - `PS4` is printed raw; prompt escapes such as zsh's default `+%N:%i> ` need M9.
 - Assigning to an integer parameter stores text; zsh evaluates it arithmetically (M5).
 - Array assignments `a=(x y)` landed with M3; subscripted assignments `a[i]=x` are still
@@ -191,32 +195,76 @@ assignments, words and redirection targets. Tests: `tests/subst_test.cpp`.
 - A failed `${x?}` should make a non-interactive shell exit; jfsh only fails the
   command [subst/errexit].
 - In `${x:-word}`, unquoted pattern characters in `word` should still glob.
-- Floating-point arithmetic and `OCTAL_ZEROES` [math/float], [math/octal]; `(( … ))` as a
-  command needs the M5 parser.
+- Floating-point arithmetic and `OCTAL_ZEROES` [math/float], [math/octal]. (`(( … ))` as a
+  command landed with M4.)
 - `NO_GLOB` (`set -f`) has no option slot yet; `CSH_NULL_GLOB` is not honoured.
 - History expansion still happens in the REPL before parsing (`HistoryManager::expand`).
 
 ### M4. Compound commands and functions [parser/*], [exec/*]
 
-**Requirements**
-- `if/elif/else/fi`, `while`/`until` loops, `for name in words`, `for name (words)`,
-  `for ((init; cond; step))`, `case … esac` with `;;`, `;&`, `;|`, and `select`
-  (menu on stderr, `PS3`, `$REPLY`).
-- zsh `repeat N`, `{ … } always { … }`, and short forms (`if [[ x ]] { … }`) can come
-  later.
-- `break N` and `continue N` across nested loops (bug B18: the levels are `bool`).
-- Subshells `( … )` fork and isolate state; brace groups `{ …; }` run in the current shell
-  (they are currently parsed as function definitions, bug B11).
-- Functions [parser/funcdef], [exec/funcdef]:
-  - both `name () { … }` and `function name { … }` forms;
-  - a function table that holds a `ProgRef`;
-  - `$1…`/`$#`/`$@` scoped per call;
-  - `return N`;
-  - `local`/`typeset` scope through `ParamTable::push_scope`;
-  - `LOCAL_TRAPS` / `LOCAL_OPTIONS`;
-  - recursion limit (`FUNCNEST`);
-  - anonymous functions `() { … } args`.
-- Keywords are only recognized in command position (bug B7).
+**Done.** Bytecode layouts are in `include/jfsh/core/wordcode.h`: each compound header
+carries a type and a skip length, bodies are nested `list* WC_END` programs, and two
+opcodes were added, `WC_CURSH` and `WC_WORDS`. The parser is in `src/parser/parser.cpp`,
+the executor in `src/exec/executor.cpp`. Tests: `tests/parser_test.cpp` (exact bytecode)
+and `tests/compound_test.cpp` (behaviour, with zsh's output as the expected value).
+- `if`/`elif`/`else`, `while`/`until`, `for name… in words`, `for name (words)`,
+  `for name` (over `"$@"`), `for ((init; cond; step))`, `case` with `;;`, `;&` and `;|`,
+  `select` (menu and `PS3` on stderr, `$REPLY`), `repeat N`, `{ … } always { … }`, and
+  `(( expr ))` as a command (status 2 on an arithmetic error). Loop bodies may be
+  `do … done`, `{ … }` or a single sublist (`for x (a b) echo $x`, `repeat 3 cmd`).
+- Several names per `for` (`for k v in …`). The value list goes through full expansion;
+  `case` patterns use `Expander::pattern`, so characters from quotes or `$v` are literal.
+- `break N` and `continue N` (bug B18): `ExecContext::break_level` counts the loops left
+  to unwind and `continuing` marks a `continue`; `loop_depth` gives the "not in while,
+  until, select, or repeat loop" error. As in zsh, `break` in a function leaves the
+  caller's loop.
+- Subshells `( … )` fork; brace groups `{ … }` run in the current shell (bug B11). `))`
+  is now two tokens, so `(a; (b))` closes both; `(( … ))` is read raw by
+  `Lexer::read_arith`.
+- Redirections after any compound command (`while …; done < f`, `{ … } 2>&1 | x`) are
+  moved in front of it in the bytecode and applied around it in-process.
+- Functions: `name () body`, `name1 name2 () body`, `function name [()] body`, with a
+  `{ … }` or single-command body, and anonymous `() { … } args`. `ExecContext::functions`
+  maps names to a `ProgRef` copied out of the defining program, so bodies outlive it.
+  Functions are looked up before builtins. Each call scopes `$1…`/`$#`/`$@`, sets `$0`
+  under `FUNCTION_ARGZERO`, pushes a parameter scope, and honours `return N`,
+  `LOCAL_OPTIONS`, `LOCAL_TRAPS` and `FUNCNEST` (default 700, as in zsh). Assignments in
+  front of a function call are exported to what it runs. `return` outside a function ends
+  the script or `-c` string, as in zsh.
+- `typeset`, `local`, `declare`, `integer`, `float`, `export` and `readonly` are parsed
+  as zsh's reserved-word typeset (`WC_TYPESET`), so `local x=$(cmd)` isn't split and
+  `local a=(1 2)` makes an array. The builtins handle `-a -A -i -F/-E -g -l -u -r -x` and
+  `+` to turn attributes off. A new local is set but empty, and keeps the export attribute
+  of the parameter it hides. A builtin with no prefix assignments no longer gets its
+  own parameter scope, so `local` lands in the function's scope.
+- `read [-rA] [name…]` (needed by `while read` loops): IFS splitting, with the rest of the
+  line in the last name, `$REPLY` with no name, backslash handling without `-r`, and
+  status 1 at end of input.
+- Keywords only act as keywords in command position (bug B7): wherever the parser
+  expects words (`for … in` lists, `case` patterns and subjects, `repeat` counts,
+  anonymous function arguments), it takes a reserved word as a word.
+- Multi-line input (bug B31, and the continuation item of M8): `is_incomplete()`
+  (`include/jfsh/parser/parser.h`) reports input cut off inside a construct, quote or
+  here-document. stdin mode collects lines until a command is complete, and the prompt
+  reads more lines after `PS2` (`Editor::read_line(true)`). The editor now switches raw
+  mode with `TCSADRAIN`, so pasted multi-line input isn't discarded.
+
+**Left**
+- zsh's other short forms: `if [[ x ]] { … }`, `while cond { … }`, `foreach … end`,
+  `for x in a b; cmd` [parser/short].
+- The source-text decompiler for `functions`/`which` [text/decompile], and `unset -f`,
+  `functions`, `autoload` (M7).
+- Redirections written after a function definition (`f() { … } > log`) should become part
+  of the function; they are a parse error.
+- `typeset` listing (`typeset`, `-p`, `-m`), `-f`, `-h`, `-T`, `-U`, padding flags, and
+  keeping `-u`/`-l`/`-i` in force for later assignments [builtin/typeset]; `read -s -t -n
+  -k -p -u -d -q` [builtin/read].
+- `EF_NOFORK` for a subshell that is already a forked pipeline stage [exec/subsh].
+- `LOCAL_TRAPS` saves the traps when the function is entered, not when it sets one
+  (`SignalTable::push_local_traps`); trap commands themselves still don't fire (B16).
+- The function call depth is bounded by the C++ stack: a Debug build reaches the default
+  `FUNCNEST=700` with about 2× headroom but crashes somewhere between 1500 and 3000; under
+  ASan, 700 already overflows.
 
 ### M5. Arithmetic, `[[ ]]`, `test`
 
@@ -274,7 +322,8 @@ assignments, words and redirection targets. Tests: `tests/subst_test.cpp`.
 ### M7. Builtins [builtin/*]
 
 Every stub currently returns 0, which is actively harmful: `[ -f /nonexistent ]` succeeds
-(bug B19). Until a builtin is implemented it should print
+(bug B19). (M4 made `typeset`, `local`, `declare`, `integer`, `float`, `export`, `readonly`,
+`read`, `break`, `continue` and `return` real; see M4.) Until a builtin is implemented it should print
 `jfsh: NAME: not implemented` and return 1.
 
 | Group | Builtins | Key requirements |
@@ -309,8 +358,9 @@ Every stub currently returns 0, which is actively harmful: `[ -f /nonexistent ]`
   - `-i`, `-s`, `-l`/`--login`, `-o option`, `+o option`, `--`;
   - unknown options are an error, not silently ignored (bug B32).
 - **Script and stdin mode:** parse incrementally from a `FileInputSource`, a complete
-  command at a time. Today stdin mode runs each physical line separately, so multi-line
-  constructs and lines over 4095 bytes break (bug B31).
+  command at a time. Since M4, stdin mode collects lines until `is_incomplete()` says the
+  command is whole (bug B31 fixed), but a script file is still read whole and parsed in
+  one go, so a syntax error at the end stops the whole script from running.
 - **Each REPL iteration**, in this order:
   1. drain pending signals and traps;
   2. reap jobs and print notifications;
@@ -320,8 +370,9 @@ Every stub currently returns 0, which is actively harmful: `[ -f /nonexistent ]`
   6. read a line, then add it to history;
   7. run `preexec`, then execute;
   8. after execution, set `$?` and run the `ZERR` trap on failure.
-- **Continuation:** lines that end inside an open construct (quote, `if` without `fi`,
-  trailing `|`/`&&`, `\` at end of line) prompt with `PS2` and keep reading.
+- **Continuation:** done with M4. Lines that end inside an open construct (quote, `if`
+  without `fi`, here-document, trailing `|`/`&&`, `\` at end of line) prompt with `PS2`
+  and keep reading. `PS2` is rendered raw (no `%_` construct names yet, M9).
 - **`ERR_EXIT`** should be applied by the executor with zsh's exemptions (conditions,
   `&&`/`||` lists, negated pipelines). The REPL hard-coding it in `main.cpp` is wrong
   (bug B33).
@@ -465,8 +516,10 @@ Every stub currently returns 0, which is actively harmful: `[ -f /nonexistent ]`
   output.
 - The two former `DISABLED_` tests (`GlobPatternMatch.BracketExpressions`,
   `Lexer.SubstitutionsStayOneWord`) are enabled since M3.
+- `tests/compound_test.cpp` covers M4 end to end; its expected outputs were checked
+  against zsh 5.9 (`zsh -f`).
 - `tests/shell_fixture.h` holds the in-process `Shell`/`TempDir` helpers shared by
-  `exec_test.cpp` and `subst_test.cpp`.
+  `exec_test.cpp`, `subst_test.cpp` and `compound_test.cpp`.
 - Run the suite under ASan/UBSan in CI. jfsh's Debug build has no sanitizer flags yet,
   although the top-level build does. (The suite passed under ASan + UBSan + LeakSanitizer
   when M1 landed, using a scratch build with `-fsanitize=address,undefined`.)
@@ -493,15 +546,13 @@ Severity:
 
 | ID | Location | Bug | Evidence |
 |---|---|---|---|
-| B7 | `src/lexer/lexer.cpp:185` | Reserved words are still lexed as keyword tokens in every position. `par_simple` now turns them back into words after the command word, so `echo done` works, but every later construct that takes words (`for x in …` lists, `case` patterns, `[[ ]]` operands) must do the same, or the lexer should only produce keywords in command position. | code reading |
 | B10 | `src/lexer/lexer.cpp:192` | Fd-number prefixes are not part of the redirection: `2>&1` lexes as word `2`, redir `>&`, word `1`, so `2` becomes a command argument. | code reading |
 | B13 | `src/core/params.cpp:83` | Shell assignments now go through `set_scalar`, which updates the right scope and enforces readonly. The lower-level `assign()` still writes into the innermost scope, ignores `PM_READONLY`, and with `flags` 0 makes the parameter `PM_SCALAR` even for an integer or array value; `typeset`/`local`/`export` (M7) must not use it for plain updates. | code reading |
 | B14 | `src/exec/executor.cpp` (`run_external`) | `waitpid` now retries on `EINTR`, but there is no `WUNTRACED`: a stopped child (Ctrl-Z) leaves the shell blocked in `waitpid`. Part of M6. | code reading |
 | B15 | `src/core/options.cpp:225` | `OptionState::find` strips a leading `no` **before** matching, so the real options `nomatch` and `notify` can never be found. The negation it detects is thrown away, so `noextendedglob` resolves to `extendedglob` and the caller can't tell. | **confirmed**: `find("nomatch")` = not found; `find("noextendedglob")` = `extendedglob` |
 | B16 | `src/core/signals.cpp:69` | `trap 'cmd' SIG` (`TrapAction::Command`) installs no handler at all, so command traps never fire. `set_trap` also calls `std::signal` on `SIGKILL`/`SIGSTOP` and ignores the failure. | code reading |
 | B17 | `src/core/signals.cpp:149` | `kill_job(pgid)` with the default `Job::pgid == -1` calls `kill(1, sig)`, which signals **init**; with pgid 0 it signals jfsh's own process group. It must reject `pgid <= 1`. | code reading |
-| B18 | `include/jfsh/exec/executor.h:40` | `break_level` and `cont_level` are `bool`, so `break 2` / `continue 3` can't be represented. `builtin_break` and `builtin_continue` ignore N (`src/builtins/builtins.cpp:103`). | code reading |
-| B19 | `src/builtins/builtins.cpp:340` (and ~45 others) | Unimplemented builtins return 0. `test`/`[` always succeed (`[ -f /missing ] && rm …` takes the true branch), and `kill`, `wait`, `export`, `read` and `cd`-stack builtins all report success while doing nothing. | code reading |
+| B19 | `src/builtins/builtins.cpp` (~40 builtins) | Unimplemented builtins return 0. `test`/`[` always succeed (`[ -f /missing ] && rm …` takes the true branch), and `kill`, `set`, `shift`, `setopt`, `unset`, `eval` and the `cd`-stack builtins all report success while doing nothing. (`export`, `readonly`, `typeset`/`local` and `read` are real since M4.) | code reading |
 | B20 | `src/builtins/builtins.cpp:185` | `cd` returns `chdir()`'s `-1` directly as the exit status (255) with no error message, and never updates `PWD`/`OLDPWD`. | code reading |
 | B21 | `src/builtins/builtins.cpp:436`, `:11` | `builtin_zpty` is defined and declared in `builtins.h` but never registered in `BuiltinTable::register_all()`. | code reading |
 | B22 | `src/core/signals.cpp:119`, `include/jfsh/core/signals.h:68` | The SIGCHLD handler does a read-modify-write on plain `uint64_t` fields (`PendingSignals::mark`), which is not async-signal-safe. Use `volatile std::sig_atomic_t` flags or `std::atomic<uint64_t>` with lock-free ops, and install with `sigaction` + `SA_RESTART`. `dispatch_pending()` is only called from `SignalManager::unblock()`, and nothing calls `block()`/`unblock()`, so even the flag is never acted on. | code reading |
@@ -518,7 +569,6 @@ Severity:
 | B26 | `src/editor/editor.cpp:146` | `refresh_display` rewrites the whole prompt with a single `\r`, so prompts containing newlines are reprinted on every keystroke and lines wider than the terminal break. It also recomputes the prompt (`getpwuid`, `gethostname`, `getcwd`) on every key. | code reading |
 | B27 | `src/editor/editor.cpp` | No `SIGWINCH` handling; `Editor::terminal_width()` exists but is never called. | code reading |
 | B28 | `src/editor/editor.cpp:115` | Tab completion inserts `candidates[0].substr(mBuf.cursor)`, using the **line** cursor as an offset into a **word** candidate. That only works when the word starts at column 0. `main.cpp:184` installs a completer that returns nothing anyway. | code reading |
-| B31 | `src/main.cpp:232` | stdin mode runs each physical line separately: multi-line constructs can't work, and a line longer than 4095 bytes is split by `fgets` into **two commands**. | code reading |
 | B32 | `src/main.cpp:84` | Unknown options are ignored silently, as is `-c` with no argument (`main.cpp:58`). (Arguments after the script, or after `-c cmd`, now become `$0` and the positional parameters.) `--router` with an unknown value silently means heuristic, and `--provider` with an unknown value silently means Ollama (`main.cpp:143`). | code reading |
 | B33 | `src/main.cpp:220` | `errexit` is applied by the REPL to every interactive line (so one failed command exits the interactive shell), with none of zsh's exemptions. (The xtrace half of this bug is fixed: the executor traces before running.) | code reading |
 | B34 | `src/prompt/prompt.cpp:128` | Numeric prompt arguments aren't parsed: the default `PS1` `%n@%m %1~ %# ` renders as `user@host 1~ % `. | **confirmed** |
@@ -563,10 +613,13 @@ Severity:
 | B4 | M2: `JobTable::find_free_slot` reserves slot 0 so the first `alloc` returns id 1. |
 | B9 | `Parser::parse` fails on leftover tokens and on an empty error message. |
 | B10 | M2: the lexer bakes digit fd prefixes into the `TK_REDIR` token (`2>`, `12<`, `2>&1`). |
-| B11 | `{` no longer misparses as a function definition: brace groups and functions are a "not supported yet" error until M4. |
+| B11 | M4: `{ … }` is a brace group run in the current shell; function definitions are `name ()` / `function name`. |
 | B12 | External commands use `execve` with `make_envp()`, which now emits each name once with its innermost value. |
 | B22 | M2: SIGCHLD uses the self-pipe trick — the handler writes one byte, `dispatch_pending` drains the pipe and reaps via `waitpid` + `Jobs.update`. |
 | B8 | M3: the lexer keeps `$(…)`, `${…}`, `$((…))`, backquotes, `$'…'`, brace expansions, `(…)` glob groups, `<lo-hi>` and `name=(…)` inside one word. |
 | B30 | M3: `CompiledPattern` implements `[…]`, escapes and groups; `glob_expand` walks every `/`-separated segment. |
 | B62 | M3: `Lexer::read_heredoc` threw away the rest of the line after `<<EOF`, newline included, so `cat <<EOF \| x` lost `\| x` and the command after the body became extra arguments. Bodies are now read when the lexer reaches the newline. |
 | B60 | M2: `par_redir` consumes the target word and emits `WC_REDIR + WC_STRING`, so redirections no longer turn their target into an argument. |
+| B7 | M4: wherever the parser expects words (`for … in` lists, `case` patterns and subjects, `repeat` counts, anonymous function arguments, command arguments), it takes a reserved word as a word, so keywords only act in command position. |
+| B18 | M4: `break N` / `continue N` unwind N loops through `ExecContext::break_level` and `continuing`; `loop_depth` reports a `break` outside any loop. |
+| B31 | M4: stdin mode gathers lines until `is_incomplete()` says the command is whole, so constructs that span lines work and a line longer than the 4096-byte buffer is no longer split into two commands. |

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cctype>
 #include <memory>
 #include <vector>
@@ -14,6 +15,7 @@ Result<ProgRef> Parser::parse() {
   auto prog = std::make_shared<CompiledProgram>();
   mProg  = prog.get();
   mError = {};
+  mIncomplete = false;
   bool ok = par_list();
   if (ok and not at(TokType::TK_EOF)) ok = error_near(mLex.peek());
   if (not ok and mError.message.empty()) error_near(mLex.peek());
@@ -29,6 +31,15 @@ Result<ProgRef> Parser::parse() {
   emit(make_wc(WC_END, 0));
   mProg = nullptr;
   return prog;
+}
+
+bool is_incomplete(std::string_view src, bool comments) {
+  StringInputSource in{std::string(src)};
+  Lexer lex{in};
+  if (comments) lex.push_state(LEX_SKIPCOMMENTS);
+  Parser parser{lex};
+  auto prog = parser.parse();
+  return lex.incomplete() or (not prog and parser.incomplete());
 }
 
 Result<ProgRef> Parser::parse_string(std::string_view src) {
@@ -71,6 +82,30 @@ bool Parser::at(TokType t) const noexcept {
   return mLex.peek().type == t;
 }
 
+// Reserved words are only reserved in command position; anywhere else
+// (`echo done`, `git log --until …`) they are ordinary words.
+static bool is_reserved_word(TokType t) noexcept {
+  return (t >= TokType::TK_IF and t <= TokType::TK_ALWAYS)
+      or t == TokType::TK_BANG;
+}
+
+bool Parser::at_word() const noexcept {
+  return at(TokType::TK_WORD) or is_reserved_word(mLex.peek().type);
+}
+
+bool Parser::expect(TokType t) {
+  if (eat(t)) return true;
+  return error_near(mLex.peek());
+}
+
+// `<(…)`, `>(…)` or `=(…)`: process substitution, which the lexer returns
+// as a redirection token holding the whole command.
+static bool is_procsubst(std::string_view text) noexcept {
+  return text.size() >= 2 and text.back() == ')'
+     and (text.starts_with("<(") or text.starts_with(">(")
+          or text.starts_with("=("));
+}
+
 // Tokens that end a list: end of input, or the closing word of whatever
 // compound command the list is the body of.
 bool Parser::at_list_terminator() const noexcept {
@@ -97,6 +132,7 @@ void Parser::error(std::string msg) {
 }
 
 bool Parser::error_near(const LexToken& tok) {
+  mIncomplete = tok.is_eof();
   if (tok.is_eof())          error("parse error: unexpected end of input");
   else if (tok.is_newline()) error("parse error near `\\n'");
   else                       error("parse error near `" + tok.text + "'");
@@ -108,10 +144,23 @@ bool Parser::unsupported(std::string_view what) {
   return false;
 }
 
+// An empty list is allowed (`f() { }`); at the top level the token that
+// stopped it is then reported by parse().
 bool Parser::par_list() {
   skip_newlines();
-  if (at(TokType::TK_EOF)) return true;
+  if (at_list_terminator()) return true;
   return par_list1();
+}
+
+bool Parser::par_body() {
+  if (not par_list()) return false;
+  emit(make_wc(WC_END, 0));
+  return true;
+}
+
+void Parser::emit_words(std::vector<std::string> words) {
+  emit(make_wc(WC_WORDS, static_cast<WordCode>(words.size())));
+  for (auto& w : words) emit_str(std::move(w));
 }
 
 // list := WC_LIST(flags, skip) sublist, repeated for each `;`, `&` or
@@ -169,21 +218,36 @@ bool Parser::par_pline() {
 
 bool Parser::par_cmd() {
   skip_newlines();
-  const auto& tok = mLex.peek();
-  switch (tok.type) {
-    case TokType::TK_IF:       return par_if();
+  std::size_t start = mProg->prog.size();
+  bool ok = false;
+  switch (mLex.peek().type) {
+    case TokType::TK_IF:       ok = par_if();      break;
     case TokType::TK_WHILE:
-    case TokType::TK_UNTIL:    return par_while();
-    case TokType::TK_FOR:      return par_for();
-    case TokType::TK_CASE:     return par_case();
-    case TokType::TK_SELECT:   return par_select();
-    case TokType::TK_REPEAT:   return par_repeat();
-    case TokType::TK_LPAREN:   return par_subsh();
-    case TokType::TK_LBRACE:
-    case TokType::TK_FUNCTION: return par_funcdef();
-    case TokType::TK_DLPAREN:  return par_arith();
+    case TokType::TK_UNTIL:    ok = par_while();   break;
+    case TokType::TK_FOR:      ok = par_for();     break;
+    case TokType::TK_CASE:     ok = par_case();    break;
+    case TokType::TK_SELECT:   ok = par_select();  break;
+    case TokType::TK_REPEAT:   ok = par_repeat();  break;
+    case TokType::TK_LPAREN:   ok = par_subsh();   break;
+    case TokType::TK_LBRACE:   ok = par_cursh();   break;
+    case TokType::TK_FUNCTION: ok = par_funcdef(); break;
+    case TokType::TK_DLPAREN:  ok = par_arith();   break;
     default:                   return par_simple();
   }
+  return ok and par_trailing_redirs(start);
+}
+
+bool Parser::par_trailing_redirs(std::size_t start) {
+  std::size_t mid = mProg->prog.size();
+  while (at(TokType::TK_REDIR)) {
+    if (is_procsubst(mLex.peek().text)) return error_near(mLex.peek());
+    if (not par_redir()) return false;
+  }
+  auto& prog = mProg->prog;
+  auto& lines = mProg->line_map;
+  std::rotate(prog.begin() + start, prog.begin() + mid, prog.end());
+  std::rotate(lines.begin() + start, lines.begin() + mid, lines.end());
+  return true;
 }
 
 // `NAME=value` or `NAME+=value` with an unquoted identifier before the `=`.
@@ -206,18 +270,41 @@ static std::size_t assignment_name_len(std::string_view w, bool& append) {
   return (i < w.size() and w[i] == '=') ? i : 0;
 }
 
-// Reserved words are only reserved in command position; anywhere else
-// (`echo done`, `git log --until …`) they are ordinary words.
-static bool is_reserved_word(TokType t) noexcept {
-  return (t >= TokType::TK_IF and t <= TokType::TK_ALWAYS)
-      or t == TokType::TK_BANG;
+// Commands whose `name=value` arguments are assignments, expanded without
+// splitting (`local x=$(cmd)`), as zsh's reserved-word typeset does.
+static bool is_typeset_command(std::string_view w) noexcept {
+  return w == "typeset" or w == "local" or w == "declare" or w == "export"
+      or w == "readonly" or w == "integer" or w == "float";
+}
+
+// An assignment word after its NAME (of length len): sets the WC_ASSIGN
+// flags and the value, without the parentheses of an array.
+static std::string assignment_value(const std::string& word, std::size_t len,
+                                    bool append, WordCode& flags) {
+  std::string value = word.substr(len + (append ? 2 : 1));
+  flags = append ? WC_ASSIGN_APPEND : 0;
+  if (value.size() >= 2 and value.front() == '(' and value.back() == ')') {
+    flags |= WC_ASSIGN_ARRAY;
+    value = value.substr(1, value.size() - 2);
+  }
+  return value;
 }
 
 // simple := (assign | redir)* WC_SIMPLE(argc) WC_STRING{argc}
+//         | (assign | redir)* WC_TYPESET(n) item{n}
+// A word list followed by `()` is a function definition instead.
 bool Parser::par_simple() {
+  struct Item {
+    std::string word;      // the name, for an assignment
+    std::string value;
+    WordCode    flags  = 0;
+    bool        assign = false;
+  };
   std::vector<std::string> words;
-  int nassign = 0;
-  int nredir  = 0;
+  std::vector<Item>        items;   // typeset arguments, in order
+  bool typeset = false;
+  int  nassign = 0;
+  int  nredir  = 0;
   for (;;) {
     const auto& tok = mLex.peek();
     if (tok.type == TokType::TK_REDIR) {
@@ -225,12 +312,9 @@ bool Parser::par_simple() {
       // behaves like a WORD whose value is `/dev/fd/N` once the pipe is up.
       // Forward it through as an argument; the executor sets up the pipe
       // during word expansion and substitutes the path in-place.
-      if (tok.text.size() >= 2
-          and tok.text.back() == ')'
-          and (tok.text.substr(0, 2) == "<("
-               or tok.text.substr(0, 2) == ">("
-               or tok.text.substr(0, 2) == "=(")) {
+      if (is_procsubst(tok.text)) {
         words.push_back(tok.text);
+        if (typeset) items.push_back({tok.text});
         mLex.consume();
         continue;
       }
@@ -240,85 +324,327 @@ bool Parser::par_simple() {
     }
     if (tok.type == TokType::TK_WORD) {
       bool append = false;
-      std::size_t len = words.empty() ? assignment_name_len(tok.text, append) : 0;
+      std::size_t len = (words.empty() or typeset)
+                      ? assignment_name_len(tok.text, append) : 0;
       if (len) {
-        std::string value = tok.text.substr(len + (append ? 2 : 1));
-        WordCode flags = append ? WC_ASSIGN_APPEND : 0;
-        if (value.size() >= 2 and value.front() == '(' and value.back() == ')') {
-          flags |= WC_ASSIGN_ARRAY;
-          value = value.substr(1, value.size() - 2);
+        WordCode flags = 0;
+        std::string value = assignment_value(tok.text, len, append, flags);
+        if (typeset) {
+          items.push_back({tok.text.substr(0, len), std::move(value), flags, true});
+        } else {
+          emit(make_wc(WC_ASSIGN, flags));
+          emit_str(tok.text.substr(0, len));
+          emit_str(std::move(value));
+          ++nassign;
         }
-        emit(make_wc(WC_ASSIGN, flags));
-        emit_str(tok.text.substr(0, len));
-        emit_str(std::move(value));
-        ++nassign;
       } else {
+        if (words.empty() and is_typeset_command(tok.text)) typeset = true;
         words.push_back(tok.text);
+        if (typeset) items.push_back({tok.text});
       }
       mLex.consume();
       continue;
     }
     if (not words.empty() and is_reserved_word(tok.type)) {
       words.push_back(tok.text);
+      if (typeset) items.push_back({tok.text});
       mLex.consume();
       continue;
     }
     break;
   }
+  if (at(TokType::TK_LPAREN) and not words.empty() and not typeset
+      and nassign == 0 and nredir == 0) {
+    mLex.consume();
+    if (not expect(TokType::TK_RPAREN)) return false;
+    return par_funcdef_body(std::move(words));
+  }
   if (words.empty() and nassign == 0 and nredir == 0)
     return error_near(mLex.peek());
+  if (typeset) {
+    emit(make_wc(WC_TYPESET, static_cast<WordCode>(items.size())));
+    for (auto& item : items) {
+      if (item.assign) {
+        emit(make_wc(WC_ASSIGN, item.flags));
+        emit_str(std::move(item.word));
+        emit_str(std::move(item.value));
+      } else {
+        emit_str(std::move(item.word));
+      }
+    }
+    return true;
+  }
   emit(make_wc(WC_SIMPLE, static_cast<WordCode>(words.size())));
   for (auto& w : words) emit_str(std::move(w));
   return true;
 }
 
-// TODO(parser/if): consume TK_IF; par_list(); expect TK_THEN; par_list();
-//   repeat [TK_ELIF par_list() TK_THEN par_list()]*;
-//   optional [TK_ELSE par_list()]; expect TK_FI.
-//   Emit WC_IF with offsets to each branch.
-bool Parser::par_if() { return unsupported("`if'"); }
+// if := WC_IF(HEAD, skip) branch+, one branch for `if`, each `elif` and
+// the `else`.
+bool Parser::par_if() {
+  mLex.consume();  // if
+  std::size_t head = emit(make_wc_cmd(WC_IF, WC_IF_HEAD, 0));
+  for (;;) {
+    std::size_t branch = emit(make_wc_cmd(WC_IF, WC_IF_IF, 0));
+    if (not par_body()) return false;  // condition
+    if (not expect(TokType::TK_THEN)) return false;
+    if (not par_body()) return false;
+    patch(branch, make_wc_cmd(WC_IF, WC_IF_IF, words_after(*mProg, branch)));
+    if (eat(TokType::TK_ELIF)) continue;
+    if (eat(TokType::TK_ELSE)) {
+      std::size_t other = emit(make_wc_cmd(WC_IF, WC_IF_ELSE, 0));
+      if (not par_body()) return false;
+      patch(other, make_wc_cmd(WC_IF, WC_IF_ELSE, words_after(*mProg, other)));
+    }
+    if (not expect(TokType::TK_FI)) return false;
+    break;
+  }
+  patch(head, make_wc_cmd(WC_IF, WC_IF_HEAD, words_after(*mProg, head)));
+  return true;
+}
 
-// TODO(parser/while): consume TK_WHILE or TK_UNTIL; par_list() (cond);
-//   expect TK_DO; par_list() (body); expect TK_DONE.
-//   Emit WC_WHILE with until-flag and body offset.
-bool Parser::par_while() { return unsupported("`while'/`until'"); }
+bool Parser::par_loop_body() {
+  skip_newlines();
+  if (eat(TokType::TK_DO))
+    return par_body() and expect(TokType::TK_DONE);
+  if (eat(TokType::TK_LBRACE))
+    return par_body() and expect(TokType::TK_RBRACE);
+  return par_sublist_body();
+}
 
-// TODO(parser/for): Two forms:
-//   `for name in words; do body; done`  → WC_FOR
-//   `for ((init; cond; incr)); do body; done` → WC_FOR_COND
-bool Parser::par_for() { return unsupported("`for'"); }
+bool Parser::par_sublist_body() {
+  std::size_t list = emit(make_wc_list(0, 0));
+  if (not par_sublist()) return false;
+  patch(list, make_wc_list(WC_LIST_END, words_after(*mProg, list)));
+  emit(make_wc(WC_END, 0));
+  return true;
+}
 
-// TODO(parser/case): consume TK_CASE word TK_IN;
-//   parse pattern-list: pat [| pat]* ) par_list() (;;|;&|;|) until TK_ESAC.
-//   Emit WC_CASE with offset table.
-bool Parser::par_case() { return unsupported("`case'"); }
+// while := WC_WHILE(WHILE|UNTIL, skip) body(cond) body
+bool Parser::par_while() {
+  WordCode type = at(TokType::TK_UNTIL) ? WC_WHILE_UNTIL : WC_WHILE_WHILE;
+  mLex.consume();
+  std::size_t head = emit(make_wc_cmd(WC_WHILE, type, 0));
+  if (not par_body()) return false;
+  if (not par_loop_body()) return false;
+  patch(head, make_wc_cmd(WC_WHILE, type, words_after(*mProg, head)));
+  return true;
+}
 
-// TODO(parser/select): Like for — consume TK_SELECT name TK_IN words TK_DO body TK_DONE.
-bool Parser::par_select() { return unsupported("`select'"); }
+// The rest of `for`/`select` after the keyword (head already emitted):
+//   names in words ;    names ( words )    names [;]   (loops over "$@")
+bool Parser::par_for_words(std::size_t head, WordCode op) {
+  std::vector<std::string> names;
+  while (at(TokType::TK_WORD)) {
+    names.push_back(mLex.peek().text);
+    mLex.consume();
+  }
+  if (names.empty()) return error_near(mLex.peek());
+  skip_newlines();
+  WordCode type = WC_FOR_IN;
+  std::vector<std::string> values;
+  if (eat(TokType::TK_IN)) {
+    while (at_word()) {
+      values.push_back(mLex.peek().text);
+      mLex.consume();
+    }
+    if (not (eat(TokType::TK_SEMI) or eat(TokType::TK_NEWLINE)))
+      return error_near(mLex.peek());
+  } else if (eat(TokType::TK_LPAREN)) {
+    for (skip_newlines(); not eat(TokType::TK_RPAREN); skip_newlines()) {
+      if (not at_word()) return error_near(mLex.peek());
+      values.push_back(mLex.peek().text);
+      mLex.consume();
+    }
+  } else {
+    type = WC_FOR_ARGS;
+    eat(TokType::TK_SEMI);
+  }
+  emit_words(std::move(names));
+  if (type == WC_FOR_IN) emit_words(std::move(values));
+  if (not par_loop_body()) return false;
+  patch(head, make_wc_cmd(op, type, words_after(*mProg, head)));
+  return true;
+}
 
-// TODO(parser/repeat): consume TK_REPEAT word TK_NEWLINE|TK_LBRACE body TK_RBRACE.
-bool Parser::par_repeat() { return unsupported("`repeat'"); }
+// Splits the text of `for (( init; cond; step ))` at its top-level `;`s.
+static bool split_for_cond(std::string_view text, std::vector<std::string>& out) {
+  int depth = 0;
+  std::size_t start = 0;
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    if (text[i] == '(') ++depth;
+    else if (text[i] == ')') --depth;
+    else if (text[i] == ';' and depth == 0) {
+      out.emplace_back(text.substr(start, i - start));
+      start = i + 1;
+    }
+  }
+  out.emplace_back(text.substr(start));
+  return out.size() == 3;
+}
 
-// TODO(parser/subsh): consume TK_LPAREN; par_list(); consume TK_RPAREN.
-//   Emit WC_SUBSH with body offset.
-bool Parser::par_subsh() { return unsupported("subshell `( … )'"); }
+// for  := WC_FOR(IN|ARGS, skip) words(names) [words(values)] body
+// cfor := WC_FOR_COND(0, skip) WC_STRING{3} body
+bool Parser::par_for() {
+  mLex.consume();  // for
+  if (at(TokType::TK_DLPAREN)) {
+    mLex.consume();
+    auto text = mLex.read_arith();
+    if (not text) return error_near(mLex.peek());
+    std::vector<std::string> parts;
+    if (not split_for_cond(*text, parts)) {
+      error("parse error near `((" + *text + "))'");
+      return false;
+    }
+    std::size_t head = emit(make_wc_cmd(WC_FOR_COND, 0, 0));
+    for (auto& part : parts) emit_str(std::move(part));
+    eat(TokType::TK_SEMI);
+    if (not par_loop_body()) return false;
+    patch(head, make_wc_cmd(WC_FOR_COND, 0, words_after(*mProg, head)));
+    return true;
+  }
+  std::size_t head = emit(make_wc_cmd(WC_FOR, 0, 0));
+  return par_for_words(head, WC_FOR);
+}
 
-// TODO(parser/funcdef): Two forms:
-//   `function name [()] { body }`
-//   `name () { body }`
-//   Emit WC_FUNCDEF.
-bool Parser::par_funcdef() { return unsupported("brace group or function definition"); }
+// case := WC_CASE(HEAD, skip) WC_STRING(subject) arm*
+// arm  := WC_CASE(BREAK|FALL|TESTNEXT, skip) words(patterns) body
+bool Parser::par_case() {
+  mLex.consume();  // case
+  if (not at_word()) return error_near(mLex.peek());
+  std::string subject = mLex.peek().text;
+  mLex.consume();
+  skip_newlines();
+  if (not expect(TokType::TK_IN)) return false;
+  std::size_t head = emit(make_wc_cmd(WC_CASE, WC_CASE_HEAD, 0));
+  emit_str(std::move(subject));
+  for (;;) {
+    skip_newlines();
+    if (eat(TokType::TK_ESAC)) break;
+    std::size_t arm = emit(make_wc_cmd(WC_CASE, WC_CASE_BREAK, 0));
+    eat(TokType::TK_LPAREN);
+    std::vector<std::string> patterns;
+    for (;;) {
+      if (not at_word()) return error_near(mLex.peek());
+      patterns.push_back(mLex.peek().text);
+      mLex.consume();
+      if (not eat(TokType::TK_PIPE)) break;
+    }
+    if (not expect(TokType::TK_RPAREN)) return false;
+    emit_words(std::move(patterns));
+    if (not par_body()) return false;
+    WordCode type = WC_CASE_BREAK;
+    if      (eat(TokType::TK_SEMIAMP)) type = WC_CASE_FALL;
+    else if (eat(TokType::TK_SEMIBAR)) type = WC_CASE_TESTNEXT;
+    else if (not eat(TokType::TK_DSEMI) and not at(TokType::TK_ESAC))
+      return error_near(mLex.peek());
+    patch(arm, make_wc_cmd(WC_CASE, type, words_after(*mProg, arm)));
+  }
+  patch(head, make_wc_cmd(WC_CASE, WC_CASE_HEAD, words_after(*mProg, head)));
+  return true;
+}
 
-// TODO(parser/cond): consume TK_DLPAREN (for [[);
-//   parse binary/unary test operators (-f, -d, =, ==, =~, <, >, -eq, etc.)
-//   and logical operators (&& || !).
-//   Emit WC_COND with operand string refs.
+// select := WC_SELECT(IN|ARGS, skip), laid out like for.
+bool Parser::par_select() {
+  mLex.consume();  // select
+  std::size_t head = emit(make_wc_cmd(WC_SELECT, 0, 0));
+  return par_for_words(head, WC_SELECT);
+}
+
+// repeat := WC_REPEAT(0, skip) WC_STRING(count) body
+bool Parser::par_repeat() {
+  mLex.consume();  // repeat
+  if (not at_word()) return error_near(mLex.peek());
+  std::size_t head = emit(make_wc_cmd(WC_REPEAT, 0, 0));
+  emit_str(mLex.peek().text);
+  mLex.consume();
+  eat(TokType::TK_SEMI);
+  if (not par_loop_body()) return false;
+  patch(head, make_wc_cmd(WC_REPEAT, 0, words_after(*mProg, head)));
+  return true;
+}
+
+// subsh := WC_SUBSH(0, skip) body, or `() { … } args`, an anonymous
+// function called at once: WC_FUNCDEF(ANON, skip) body words(args).
+bool Parser::par_subsh() {
+  mLex.consume();  // (
+  if (eat(TokType::TK_RPAREN)) {
+    std::size_t head = emit(make_wc_cmd(WC_FUNCDEF, WC_FUNCDEF_ANON, 0));
+    if (not par_function_body()) return false;
+    std::vector<std::string> args;
+    while (at_word()) {
+      args.push_back(mLex.peek().text);
+      mLex.consume();
+    }
+    emit_words(std::move(args));
+    patch(head, make_wc_cmd(WC_FUNCDEF, WC_FUNCDEF_ANON, words_after(*mProg, head)));
+    return true;
+  }
+  std::size_t head = emit(make_wc_cmd(WC_SUBSH, 0, 0));
+  if (not par_body() or not expect(TokType::TK_RPAREN)) return false;
+  patch(head, make_wc_cmd(WC_SUBSH, 0, words_after(*mProg, head)));
+  return true;
+}
+
+// cursh := WC_CURSH(0, skip) body
+// try   := WC_TRY(0, skip) body body     `{ … } always { … }`
+bool Parser::par_cursh() {
+  mLex.consume();  // {
+  std::size_t head = emit(make_wc_cmd(WC_CURSH, 0, 0));
+  if (not par_body() or not expect(TokType::TK_RBRACE)) return false;
+  WordCode op = WC_CURSH;
+  if (eat(TokType::TK_ALWAYS)) {
+    op = WC_TRY;
+    if (not expect(TokType::TK_LBRACE)) return false;
+    if (not par_body() or not expect(TokType::TK_RBRACE)) return false;
+  }
+  patch(head, make_wc_cmd(op, 0, words_after(*mProg, head)));
+  return true;
+}
+
+// `function name… [()] body`; `name… () body` comes through par_simple.
+bool Parser::par_funcdef() {
+  mLex.consume();  // function
+  std::vector<std::string> names;
+  while (at(TokType::TK_WORD)) {
+    names.push_back(mLex.peek().text);
+    mLex.consume();
+  }
+  if (names.empty()) return error_near(mLex.peek());
+  if (eat(TokType::TK_LPAREN) and not expect(TokType::TK_RPAREN)) return false;
+  return par_funcdef_body(std::move(names));
+}
+
+// funcdef := WC_FUNCDEF(NAMED, skip) words(names) body
+bool Parser::par_funcdef_body(std::vector<std::string> names) {
+  std::size_t head = emit(make_wc_cmd(WC_FUNCDEF, WC_FUNCDEF_NAMED, 0));
+  emit_words(std::move(names));
+  if (not par_function_body()) return false;
+  patch(head, make_wc_cmd(WC_FUNCDEF, WC_FUNCDEF_NAMED, words_after(*mProg, head)));
+  return true;
+}
+
+bool Parser::par_function_body() {
+  skip_newlines();
+  if (eat(TokType::TK_LBRACE))
+    return par_body() and expect(TokType::TK_RBRACE);
+  return par_sublist_body();
+}
+
+// TODO(parser/cond): `[[ … ]]` (M5).  `[[` is still an ordinary word: parse
+//   unary/binary test operators (-f, -d, =, ==, =~, <, >, -eq, etc.) and
+//   && || ! ( ), and emit WC_COND with operand string refs.
 bool Parser::par_cond() { return unsupported("`[[ … ]]'"); }
 
-// TODO(parser/arith): consume TK_DLPAREN;
-//   collect arithmetic expression tokens until TK_DRPAREN.
-//   Emit WC_ARITH with expression string ref.
-bool Parser::par_arith() { return unsupported("`(( … ))'"); }
+// arith := WC_ARITH(0, 1) WC_STRING(expr)
+bool Parser::par_arith() {
+  mLex.consume();  // ((
+  auto text = mLex.read_arith();
+  if (not text) return error_near(mLex.peek());
+  emit(make_wc_cmd(WC_ARITH, 0, 1));
+  emit_str(std::move(*text));
+  return true;
+}
 
 // Split a redirection token `text` (produced by the lexer) into an optional
 // leading fd prefix (as an int, or -1 when absent) and the operator string.
@@ -372,10 +698,7 @@ bool Parser::par_redir() {
   // Process substitution tokens look like `<(cmd)` / `>(cmd)` / `=(cmd)` —
   // the lexer already slurped the balanced parens into text, so recognize
   // them by prefix before invoking the general operator table.
-  if (op_tok.text.size() >= 2 and op_tok.text.back() == ')'
-      and (op_tok.text.substr(0, 2) == "<("
-           or op_tok.text.substr(0, 2) == ">("
-           or op_tok.text.substr(0, 2) == "=(")) {
+  if (is_procsubst(op_tok.text)) {
     RedirType type =
         op_tok.text[0] == '<' ? REDIR_PROC_IN :
         op_tok.text[0] == '>' ? REDIR_PROC_OUT : REDIR_PROC_EQ;

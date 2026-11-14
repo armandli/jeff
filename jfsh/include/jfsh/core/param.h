@@ -93,6 +93,10 @@ struct ParamTable {
   std::optional<std::reference_wrapper<const Param>>
   lookup(std::string_view name) const noexcept;
 
+  // The parameter in the innermost scope only (for `local`).
+  std::optional<std::reference_wrapper<Param>>
+  lookup_local(std::string_view name) noexcept;
+
   // Create or overwrite in the current scope.
   Param& assign(
     std::string name,

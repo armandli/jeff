@@ -8,12 +8,14 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
 #include <jfsh/builtins/builtins.h>
 #include <jfsh/exec/executor.h>
 #include <jfsh/exec/subst.h>
+#include <jfsh/glob/glob.h>
 #include <jfsh/lexer/input.h>
 #include <jfsh/parser/parser.h>
 
@@ -52,7 +54,72 @@ int Executor::exec_string(std::string_view src) {
     mCtx.last_exit = 1;
     return 1;
   }
-  return exec(**prog);
+  int rc = exec(**prog);
+  // `return` outside a function ends the script or -c string, as in zsh.
+  if (mCtx.returning and mCtx.func_depth == 0) {
+    mCtx.returning = false;
+    rc = mCtx.last_exit = mCtx.return_val;
+  }
+  return rc;
+}
+
+// Copies the words of prog[begin, end) into a program of their own, with
+// the strings they use renumbered.  A function body outlives the program
+// that defined it.
+static ProgRef extract_body(const CompiledProgram& prog, std::size_t begin,
+                            std::size_t end) {
+  auto body = std::make_shared<CompiledProgram>();
+  for (std::size_t pc = begin; pc < end; ++pc) {
+    WordCode w = prog.prog[pc];
+    if (wc_code(w) == WC_STRING) {
+      body->strs.push_back(prog.strs[wc_data(w)]);
+      w = make_wc(WC_STRING, static_cast<WordCode>(body->strs.size() - 1));
+    }
+    body->prog.push_back(w);
+    body->line_map.push_back(pc < prog.line_map.size() ? prog.line_map[pc] : 0);
+  }
+  return body;
+}
+
+// The pc just past a body (list* WC_END) that starts at pc.
+static std::size_t body_end(const CompiledProgram& prog, std::size_t pc) {
+  while (pc < prog.prog.size() and wc_code(prog.prog[pc]) == WC_LIST)
+    pc += 1 + wc_list_skip(prog.prog[pc]);
+  return pc + 1;
+}
+
+// words := WC_WORDS(n) WC_STRING{n}
+static std::vector<std::string> fetch_words(ExecState& es) {
+  WordCode n = wc_data(es.fetch());
+  std::vector<std::string> words;
+  words.reserve(n);
+  for (WordCode i = 0; i < n; ++i) words.emplace_back(es.fetch_str());
+  return words;
+}
+
+static Redirection fetch_redir(ExecState& es) {
+  WordCode w = es.fetch();
+  Redirection r;
+  r.type    = wc_redir_type(w);
+  r.fd      = wc_redir_has_fd(w) ? wc_redir_fd(w) : -1;
+  r.literal = wc_redir_literal(w);
+  r.target  = std::string(es.fetch_str());
+  return r;
+}
+
+// Expands an assignment's value in place: a scalar without splitting, an
+// array like command arguments.
+static Result<void> expand_assignment(Expander& ex, Assignment& a) {
+  if (a.array) {
+    auto el = ex.array_elements(a.value);
+    if (not el) return std::unexpected(el.error());
+    a.elements = std::move(*el);
+  } else {
+    auto v = ex.scalar(a.value, /*assignment=*/true);
+    if (not v) return std::unexpected(v.error());
+    a.value = std::move(*v);
+  }
+  return {};
 }
 
 // Value an assignment in front of a command gives its name for that command
@@ -78,9 +145,29 @@ static Result<std::string> prefix_value(const ParamTable& params,
 int Executor::exec_simple(std::vector<std::string> args,
                           std::vector<Assignment>  assigns,
                           std::vector<Redirection> redirs,
-                          ExecFlags flags) {
+                          ExecFlags flags,
+                          std::vector<Assignment>  typeset_args) {
   std::optional<int> subst_status;
   if (not expand_command(args, assigns, redirs, subst_status)) return 1;
+  // typeset's `name=value` arguments: a scalar is passed as `name=value`; an
+  // array is passed as `name`, and given its elements once the builtin has
+  // declared it.
+  std::vector<Assignment> typeset_arrays;
+  if (not typeset_args.empty()) {
+    Expander ex{*this, mCtx};
+    for (auto& a : typeset_args) {
+      if (auto r = expand_assignment(ex, a); not r) {
+        std::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+        return 1;
+      }
+      if (a.array) {
+        args.push_back(a.name);
+        typeset_arrays.push_back(std::move(a));
+      } else {
+        args.push_back(a.name + (a.append ? "+=" : "=") + a.value);
+      }
+    }
+  }
   auto psubst = expand_procsubst(args);
   struct PSubstGuard {
     Executor* exec;
@@ -104,46 +191,70 @@ int Executor::exec_simple(std::vector<std::string> args,
     return rc;
   }
 
-  // Shell functions get looked up here, before builtins, when M4 lands.
-  // Aliases are already expanded by the lexer (M7).
-  if (auto def = Builtins.find(args[0])) {
-    SavedFds saved;
-    if (not redirs.empty()) {
-      // Push pending buffered output through the ORIGINAL fds before we
-      // rewire them; otherwise the builtin's output lands in the wrong
-      // place after SavedFds restores (bug: stdio buffers survive dup2).
-      std::fflush(nullptr);
-      if (not apply_redirects(redirs, saved)) return 1;
-    }
-    // zsh keeps assignments in front of a special builtin only under
-    // POSIX_BUILTINS; otherwise they last while the builtin runs.
-    if ((def->get().flags & BINF_SPECIAL) and mCtx.opts.get(OPT_POSIXBUILTINS)) {
-      int rc_special = apply_assigns(assigns);
-      if (rc_special == 0) rc_special = def->get().fn(args, mCtx);
-      std::fflush(nullptr);
-      return rc_special;
-    }
-    mCtx.params.push_scope();
-    int rc = 0;
-    for (const auto& a : assigns) {
-      auto value = prefix_value(mCtx.params, a);
-      if (not value) {
-        std::fprintf(stderr, "jfsh: %s\n", value.error().message.c_str());
-        rc = 1;
-        break;
-      }
-      auto outer = mCtx.params.lookup(a.name);
-      std::uint32_t attrs = a.array ? PM_ARRAY : PM_SCALAR;
-      if (outer and outer->get().is_exported()) attrs |= PM_EXPORTED;
-      if (a.array) mCtx.params.assign(a.name, a.elements, attrs);
-      else         mCtx.params.assign(a.name, std::move(*value), attrs);
-    }
-    if (rc == 0) rc = def->get().fn(args, mCtx);
-    mCtx.params.pop_scope();
+  // Functions come before builtins.  Aliases are already expanded by the
+  // lexer (M7).
+  auto fn  = mCtx.functions.find(args[0]);
+  auto def = fn == mCtx.functions.end() ? Builtins.find(args[0]) : std::nullopt;
+  if (fn == mCtx.functions.end() and not def)
+    return run_external(args, assigns, redirs, flags);
+
+  SavedFds saved;
+  if (not redirs.empty()) {
+    // Push pending buffered output through the ORIGINAL fds before we
+    // rewire them; otherwise the output lands in the wrong place after
+    // SavedFds restores (bug: stdio buffers survive dup2).
+    std::fflush(nullptr);
+    if (not apply_redirects(redirs, saved)) return 1;
+  }
+  int rc = 0;
+  if (fn != mCtx.functions.end()) {
+    ProgRef body = fn->second;  // the function may redefine itself
+    // Assignments in front of a function are exported to what it runs.
+    if (not assigns.empty()) rc = push_prefix_assigns(assigns, true);
+    if (rc == 0) rc = call_function(body, args);
+    if (not assigns.empty()) mCtx.params.pop_scope();
     std::fflush(nullptr);
     return rc;
   }
-  return run_external(args, assigns, redirs, flags);
+  // zsh keeps assignments in front of a special builtin only under
+  // POSIX_BUILTINS; otherwise they last while the builtin runs.  Without
+  // any, no scope is pushed, so `local` declares in the caller's scope.
+  bool scoped = not assigns.empty();
+  if ((def->get().flags & BINF_SPECIAL) and mCtx.opts.get(OPT_POSIXBUILTINS)) {
+    rc = apply_assigns(assigns);
+    scoped = false;
+  } else if (scoped) {
+    rc = push_prefix_assigns(assigns, false);
+  }
+  if (rc == 0) rc = def->get().fn(args, mCtx);
+  for (const auto& a : typeset_arrays) {
+    if (rc != 0) break;
+    if (auto r = mCtx.params.set_array(a.name, a.elements, a.append); not r) {
+      std::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+      rc = 1;
+    }
+  }
+  if (scoped) mCtx.params.pop_scope();
+  std::fflush(nullptr);
+  return rc;
+}
+
+int Executor::push_prefix_assigns(const std::vector<Assignment>& assigns,
+                                  bool exported) {
+  mCtx.params.push_scope();
+  for (const auto& a : assigns) {
+    auto value = prefix_value(mCtx.params, a);
+    if (not value) {
+      std::fprintf(stderr, "jfsh: %s\n", value.error().message.c_str());
+      return 1;
+    }
+    auto outer = mCtx.params.lookup(a.name);
+    std::uint32_t attrs = a.array ? PM_ARRAY : PM_SCALAR;
+    if (exported or (outer and outer->get().is_exported())) attrs |= PM_EXPORTED;
+    if (a.array) mCtx.params.assign(a.name, a.elements, attrs);
+    else         mCtx.params.assign(a.name, std::move(*value), attrs);
+  }
+  return 0;
 }
 
 int Executor::exec_list(ExecState& es, ExecFlags flags) {
@@ -179,8 +290,21 @@ int Executor::exec_list(ExecState& es, ExecFlags flags) {
     }
     es.pc = end;
     if (mCtx.exiting) return mCtx.exit_val;
+    if (interrupted()) return rc;
   }
   return rc;
+}
+
+bool Executor::interrupted() const noexcept {
+  return mCtx.exiting or mCtx.returning or mCtx.break_level > 0;
+}
+
+bool Executor::loop_done() noexcept {
+  if (mCtx.exiting or mCtx.returning) return true;
+  if (mCtx.break_level == 0) return false;
+  if (--mCtx.break_level > 0 or not mCtx.continuing) return true;
+  mCtx.continuing = false;
+  return false;
 }
 
 // Runs a chain of pipelines joined by && / ||.  A pipeline whose connector
@@ -199,7 +323,7 @@ int Executor::exec_sublist(ExecState& es, ExecFlags flags) {
       mCtx.last_exit = rc;
     }
     es.pc = end;
-    if (mCtx.exiting) return rc;
+    if (interrupted()) return rc;
     WordCode type = f & WC_SUBLIST_TYPE;
     if (type == WC_SUBLIST_END) return rc;
     skip = (type == WC_SUBLIST_AND) ? rc != 0 : rc == 0;
@@ -220,20 +344,25 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
   stages.reserve(n);
   for (unsigned i = 0; i < n; ++i) {
     std::size_t start = es.pc;
-    // Walk this stage: one WC_SIMPLE (plus assigns/redirs/strings) or one
-    // compound command.  The compound commands are not implemented yet in
-    // M2, so just walk WC_ASSIGN/WC_REDIR until WC_SIMPLE + its strings.
+    // Walk this stage: redirections and assignments, then WC_SIMPLE or
+    // WC_TYPESET and its words, or a compound command, which its header's
+    // skip jumps over.
     while (es.pc < es.prog->prog.size()) {
       WordCode op = wc_code(es.peek());
-      if (op == WC_ASSIGN) { es.fetch(); es.fetch(); es.fetch(); }
-      else if (op == WC_REDIR) { es.fetch(); es.fetch(); }
+      if (op == WC_ASSIGN) { es.pc += 3; }
+      else if (op == WC_REDIR) { es.pc += 2; }
       else if (op == WC_SIMPLE) {
         WordCode argc = wc_data(es.fetch());
-        for (WordCode a = 0; a < argc; ++a) es.fetch();
+        es.pc += argc;
+        break;
+      } else if (op == WC_TYPESET) {
+        WordCode n = wc_data(es.fetch());
+        for (WordCode a = 0; a < n; ++a)
+          es.pc += wc_code(es.peek()) == WC_ASSIGN ? 3 : 1;
         break;
       } else {
-        // Compound command: the enclosing WC_SUBLIST skip already covers
-        // us; without M4 we cannot walk inside, so just bail.
+        WordCode skip = wc_cmd_skip(es.fetch());
+        es.pc += skip;
         break;
       }
     }
@@ -303,111 +432,489 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
 
 int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
   if (es.at_end()) return 0;
-  WordCode w  = es.peek();
-  WordCode op = wc_code(w);
-  switch (op) {
-    case WC_ASSIGN:
-    case WC_REDIR:
-    case WC_SIMPLE:  return exec_simple_cmd(es, flags);
-    case WC_IF:      { es.fetch(); return exec_if(es);           }
-    case WC_WHILE:   { es.fetch(); return exec_while(es);        }
-    case WC_FOR:     { es.fetch(); return exec_for(es);          }
-    case WC_CASE:    { es.fetch(); return exec_case(es);         }
-    case WC_SELECT:  { es.fetch(); return exec_select(es);       }
-    case WC_REPEAT:  { es.fetch(); return exec_repeat(es);       }
-    case WC_SUBSH:   { es.fetch(); return exec_subsh(es, flags); }
-    case WC_FUNCDEF: { es.fetch(); return exec_funcdef(es);      }
-    case WC_COND:    { es.fetch(); return exec_cond(es);         }
-    case WC_ARITH:   { es.fetch(); return exec_arith(es);        }
-    case WC_ALWAYS:  { es.fetch(); return exec_always(es);       }
-    default:         return 0;
+  // Redirections in front of a compound command belong to it; a simple
+  // command goes on with an assignment or its words.
+  std::size_t pc = es.pc;
+  while (wc_code(es.prog->prog[pc]) == WC_REDIR) pc += 2;
+  switch (wc_code(es.prog->prog[pc])) {
+    case WC_ASSIGN: case WC_SIMPLE: case WC_TYPESET:
+      return exec_simple_cmd(es, flags);
+    default:
+      break;
+  }
+  if (pc == es.pc) return exec_compound(es, flags);
+
+  std::vector<Redirection> redirs;
+  while (wc_code(es.peek()) == WC_REDIR) redirs.push_back(fetch_redir(es));
+  std::vector<std::string> no_args;
+  std::vector<Assignment>  no_assigns;
+  std::optional<int>       subst_status;
+  if (not expand_command(no_args, no_assigns, redirs, subst_status)) return 1;
+  SavedFds saved;
+  std::fflush(nullptr);
+  if (not apply_redirects(redirs, saved)) return 1;
+  int rc = exec_compound(es, flags);
+  std::fflush(nullptr);
+  return rc;
+}
+
+int Executor::exec_compound(ExecState& es, ExecFlags flags) {
+  WordCode head = es.fetch();
+  switch (wc_code(head)) {
+    case WC_IF:       return exec_if(es, head);
+    case WC_WHILE:    return exec_while(es, head);
+    case WC_FOR:      return exec_for(es, head);
+    case WC_FOR_COND: return exec_for_cond(es, head);
+    case WC_CASE:     return exec_case(es, head);
+    case WC_SELECT:   return exec_select(es, head);
+    case WC_REPEAT:   return exec_repeat(es, head);
+    case WC_SUBSH:    return exec_subsh(es, head, flags);
+    case WC_FUNCDEF:  return exec_funcdef(es, head);
+    case WC_COND:     return exec_cond(es, head);
+    case WC_ARITH:    return exec_arith(es, head);
+    case WC_TRY:      return exec_always(es, head);
+    case WC_CURSH: {
+      std::size_t end = es.pc + wc_cmd_skip(head);
+      int rc = exec_list(es, EF_NONE);
+      es.pc = end;
+      return rc;
+    }
+    default:          return 0;
   }
 }
 
 // simple := (assign | redir)* WC_SIMPLE(argc) WC_STRING{argc}
+//         | (assign | redir)* WC_TYPESET(n) item{n}
 int Executor::exec_simple_cmd(ExecState& es, ExecFlags flags) {
+  auto fetch_assign = [&] {
+    WordCode f = wc_data(es.fetch());
+    Assignment a;
+    a.name   = std::string(es.fetch_str());
+    a.value  = std::string(es.fetch_str());
+    a.append = f & WC_ASSIGN_APPEND;
+    a.array  = f & WC_ASSIGN_ARRAY;
+    return a;
+  };
   std::vector<Assignment> assigns;
   std::vector<Redirection> redirs;
   for (;;) {
     WordCode op = wc_code(es.peek());
-    if (op == WC_ASSIGN) {
-      WordCode f = wc_data(es.fetch());
-      Assignment a;
-      a.name   = std::string(es.fetch_str());
-      a.value  = std::string(es.fetch_str());
-      a.append = f & WC_ASSIGN_APPEND;
-      a.array  = f & WC_ASSIGN_ARRAY;
-      assigns.push_back(std::move(a));
-    } else if (op == WC_REDIR) {
-      WordCode w = es.fetch();
-      Redirection r;
-      r.type   = wc_redir_type(w);
-      r.fd      = wc_redir_has_fd(w) ? wc_redir_fd(w) : -1;
-      r.literal = wc_redir_literal(w);
-      r.target  = std::string(es.fetch_str());
-      redirs.push_back(std::move(r));
-    } else {
+    if      (op == WC_ASSIGN) assigns.push_back(fetch_assign());
+    else if (op == WC_REDIR)  redirs.push_back(fetch_redir(es));
+    else break;
+  }
+  WordCode head = es.fetch();  // WC_SIMPLE or WC_TYPESET
+  WordCode argc = wc_data(head);
+  std::vector<std::string> words;
+  std::vector<Assignment>  typeset_args;
+  words.reserve(argc);
+  for (WordCode i = 0; i < argc; ++i) {
+    if (wc_code(es.peek()) == WC_ASSIGN) typeset_args.push_back(fetch_assign());
+    else                                 words.emplace_back(es.fetch_str());
+  }
+  return exec_simple(std::move(words), std::move(assigns), std::move(redirs),
+                     flags, std::move(typeset_args));
+}
+
+// if := WC_IF(HEAD, skip) branch+; the first branch whose condition
+// succeeds runs.  With none, the status is 0.
+int Executor::exec_if(ExecState& es, WordCode head) {
+  std::size_t end = es.pc + wc_cmd_skip(head);
+  int rc = 0;
+  while (es.pc < end) {
+    WordCode branch = es.fetch();
+    std::size_t next = es.pc + wc_cmd_skip(branch);
+    if (wc_cmd_type(branch) == WC_IF_ELSE) {
+      rc = exec_list(es, EF_NONE);
+      break;
+    }
+    int status = exec_list(es, EF_NONE);
+    if (interrupted()) {
+      rc = status;
+      break;
+    }
+    if (status == 0) {
+      rc = exec_list(es, EF_NONE);
+      break;
+    }
+    es.pc = next;
+  }
+  es.pc = end;
+  return rc;
+}
+
+// while := WC_WHILE(WHILE|UNTIL, skip) body(cond) body.  The status is the
+// last body's, or 0 when the body never ran.
+int Executor::exec_while(ExecState& es, WordCode head) {
+  std::size_t end   = es.pc + wc_cmd_skip(head);
+  std::size_t cond  = es.pc;
+  bool        until = wc_cmd_type(head) == WC_WHILE_UNTIL;
+  int rc = 0;
+  ++mCtx.loop_depth;
+  for (;;) {
+    es.pc = cond;
+    int status = exec_list(es, EF_NONE);
+    if (interrupted()) {
+      if (loop_done()) break;
+      continue;
+    }
+    if ((status == 0) == until) break;
+    rc = exec_list(es, EF_NONE);
+    if (loop_done()) break;
+  }
+  --mCtx.loop_depth;
+  es.pc = end;
+  return rc;
+}
+
+bool Executor::loop_values(ExecState& es, WordCode head,
+                           std::vector<std::string>& names,
+                           std::vector<std::string>& values) {
+  names = fetch_words(es);
+  if (wc_cmd_type(head) == WC_FOR_ARGS) {
+    values = mCtx.positional;
+    return true;
+  }
+  auto raw = fetch_words(es);
+  Expander ex{*this, mCtx};
+  auto expanded = ex.words(raw);
+  if (not expanded) {
+    std::fprintf(stderr, "jfsh: %s\n", expanded.error().message.c_str());
+    return false;
+  }
+  values = std::move(*expanded);
+  return true;
+}
+
+// for := WC_FOR(IN|ARGS, skip) words(names) [words(values)] body.  With
+// several names each pass takes that many values; missing ones are empty.
+int Executor::exec_for(ExecState& es, WordCode head) {
+  std::size_t end = es.pc + wc_cmd_skip(head);
+  std::vector<std::string> names, values;
+  if (not loop_values(es, head, names, values)) {
+    es.pc = end;
+    return 1;
+  }
+  std::size_t body = es.pc;
+  int rc = 0;
+  ++mCtx.loop_depth;
+  for (std::size_t i = 0; i < values.size(); i += names.size()) {
+    bool ok = true;
+    for (std::size_t k = 0; k < names.size() and ok; ++k) {
+      std::string v = i + k < values.size() ? values[i + k] : std::string{};
+      if (auto r = mCtx.params.set_scalar(names[k], std::move(v)); not r) {
+        std::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+        ok = false;
+      }
+    }
+    if (not ok) {
+      rc = 1;
+      break;
+    }
+    es.pc = body;
+    rc = exec_list(es, EF_NONE);
+    if (loop_done()) break;
+  }
+  --mCtx.loop_depth;
+  es.pc = end;
+  return rc;
+}
+
+static bool is_blank(std::string_view s) noexcept {
+  return s.find_first_not_of(" \t\n") == std::string_view::npos;
+}
+
+// cfor := WC_FOR_COND(0, skip) WC_STRING(init) WC_STRING(cond)
+// WC_STRING(step) body.  An empty condition is true.
+int Executor::exec_for_cond(ExecState& es, WordCode head) {
+  std::size_t end = es.pc + wc_cmd_skip(head);
+  std::string init(es.fetch_str());
+  std::string cond(es.fetch_str());
+  std::string step(es.fetch_str());
+  std::size_t body = es.pc;
+  Expander ex{*this, mCtx};
+  auto eval = [&](const std::string& expr, long long& value) {
+    value = 1;
+    if (is_blank(expr)) return true;
+    auto v = ex.arith(expr);
+    if (not v) {
+      std::fprintf(stderr, "jfsh: %s\n", v.error().message.c_str());
+      return false;
+    }
+    value = *v;
+    return true;
+  };
+  int rc = 0;
+  long long value = 0;
+  if (not eval(init, value)) {
+    es.pc = end;
+    return 1;
+  }
+  ++mCtx.loop_depth;
+  for (;;) {
+    if (not eval(cond, value)) {
+      rc = 1;
+      break;
+    }
+    if (value == 0) break;
+    es.pc = body;
+    rc = exec_list(es, EF_NONE);
+    if (loop_done()) break;
+    if (not eval(step, value)) {
+      rc = 1;
       break;
     }
   }
-  WordCode argc = wc_data(es.fetch());  // WC_SIMPLE
-  std::vector<std::string> words;
-  words.reserve(argc);
-  for (WordCode i = 0; i < argc; ++i) words.emplace_back(es.fetch_str());
-  return exec_simple(std::move(words), std::move(assigns), std::move(redirs),
-                     flags);
+  --mCtx.loop_depth;
+  es.pc = end;
+  return rc;
 }
 
-// TODO(exec/if): Read WC_IF bytecode layout:
-//   WC_IF cond_len then_len [elif_cond_len elif_then_len]* [else_len] WC_END
-//   Execute cond_list; if exit==0 execute then_list, else try elif chain / else.
-int Executor::exec_if(ExecState&) { return 0; }
+// case := WC_CASE(HEAD, skip) WC_STRING(subject) arm*.  After a matching
+// arm, `;;` ends the case, `;&` runs the next arm's body unconditionally
+// and `;|` goes on testing the arms after it.
+int Executor::exec_case(ExecState& es, WordCode head) {
+  std::size_t end = es.pc + wc_cmd_skip(head);
+  Expander ex{*this, mCtx};
+  auto fail = [&](const ShellError& e) {
+    std::fprintf(stderr, "jfsh: %s\n", e.message.c_str());
+    es.pc = end;
+    return 1;
+  };
+  auto subject = ex.scalar(es.fetch_str());
+  if (not subject) return fail(subject.error());
+  int  rc   = 0;
+  bool fall = false;
+  while (es.pc < end) {
+    WordCode arm = es.fetch();
+    std::size_t next = es.pc + wc_cmd_skip(arm);
+    bool match = fall;
+    for (const auto& word : fetch_words(es)) {
+      if (match) break;
+      auto pat = ex.pattern(word);
+      if (not pat) return fail(pat.error());
+      match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob())
+                  .matches(*subject);
+    }
+    if (not match) {
+      es.pc = next;
+      continue;
+    }
+    rc = exec_list(es, EF_NONE);
+    if (interrupted() or wc_cmd_type(arm) == WC_CASE_BREAK) break;
+    fall  = wc_cmd_type(arm) == WC_CASE_FALL;
+    es.pc = next;
+  }
+  es.pc = end;
+  return rc;
+}
 
-// TODO(exec/while): WC_WHILE has a cond_prog and a body_prog offset.
-//   Loop: exec cond; if exit!=0 (or ==0 for `until`) break; exec body;
-//   Respect ctx_.break_level / ctx_.cont_level.
-int Executor::exec_while(ExecState&) { return 0; }
+// One line from fd 0, read a byte at a time so nothing past it is
+// consumed.  nullopt at end of input.
+static std::optional<std::string> read_line_fd0() {
+  std::string line;
+  for (;;) {
+    char c;
+    ssize_t n = ::read(STDIN_FILENO, &c, 1);
+    if (n < 0 and errno == EINTR) continue;
+    if (n <= 0) {
+      if (line.empty()) return std::nullopt;
+      return line;
+    }
+    if (c == '\n') return line;
+    line += c;
+  }
+}
 
-// TODO(exec/for): Two variants:
-//   WC_FOR word_list body — foreach word in list; exec body
-//   WC_FOR_COND init cond incr body — C-style arithmetic for
-int Executor::exec_for(ExecState&) { return 0; }
+// select := WC_SELECT(IN|ARGS, skip), laid out like for.  Prints the menu
+// and $PS3 on stderr, reads a line into $REPLY and sets the name to the
+// chosen value (empty for anything else); an empty line shows the menu
+// again.  Ends at end of input or on `break`.
+int Executor::exec_select(ExecState& es, WordCode head) {
+  std::size_t end = es.pc + wc_cmd_skip(head);
+  std::vector<std::string> names, values;
+  if (not loop_values(es, head, names, values)) {
+    es.pc = end;
+    return 1;
+  }
+  std::size_t body = es.pc;
+  int rc = 0;
+  if (values.empty()) {
+    es.pc = end;
+    return 0;
+  }
+  auto show_menu = [&] {
+    std::string menu;
+    std::size_t width = 0;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      std::string item = std::to_string(i + 1) + ") " + values[i] + "  ";
+      if (width > 0 and width + item.size() > 80) {
+        menu += '\n';
+        width = 0;
+      }
+      menu += item;
+      width += item.size();
+    }
+    std::fprintf(stderr, "%s\n", menu.c_str());
+  };
+  ++mCtx.loop_depth;
+  bool menu = true;
+  for (;;) {
+    if (menu) show_menu();
+    auto ps3 = mCtx.params.lookup("PS3");
+    std::string prompt = (ps3 and ps3->get().is_set()) ? ps3->get().scalar() : "?# ";
+    std::fprintf(stderr, "%s", prompt.c_str());
+    std::fflush(stderr);
+    auto line = read_line_fd0();
+    if (not line) {
+      std::fputc('\n', stderr);
+      break;
+    }
+    menu = line->empty();
+    if (menu) continue;
+    (void)mCtx.params.set_scalar("REPLY", *line);
+    char* rest = nullptr;
+    long n = std::strtol(line->c_str(), &rest, 10);
+    std::string choice = (*rest == '\0' and n >= 1
+                          and static_cast<std::size_t>(n) <= values.size())
+                       ? values[static_cast<std::size_t>(n) - 1] : std::string{};
+    if (auto r = mCtx.params.set_scalar(names[0], choice); not r) {
+      std::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+      rc = 1;
+      break;
+    }
+    es.pc = body;
+    rc = exec_list(es, EF_NONE);
+    if (loop_done()) break;
+  }
+  --mCtx.loop_depth;
+  es.pc = end;
+  return rc;
+}
 
-// TODO(exec/case): Pattern list is a series of (pattern, body) pairs terminated
-//   by WC_END. Glob-match each pattern against the subject word.
-int Executor::exec_case(ExecState&) { return 0; }
+// repeat := WC_REPEAT(0, skip) WC_STRING(count) body; the count is an
+// arithmetic expression.
+int Executor::exec_repeat(ExecState& es, WordCode head) {
+  std::size_t end = es.pc + wc_cmd_skip(head);
+  Expander ex{*this, mCtx};
+  auto count = ex.arith(es.fetch_str());
+  if (not count) {
+    std::fprintf(stderr, "jfsh: %s\n", count.error().message.c_str());
+    es.pc = end;
+    return 1;
+  }
+  std::size_t body = es.pc;
+  int rc = 0;
+  ++mCtx.loop_depth;
+  for (long long i = 0; i < *count; ++i) {
+    es.pc = body;
+    rc = exec_list(es, EF_NONE);
+    if (loop_done()) break;
+  }
+  --mCtx.loop_depth;
+  es.pc = end;
+  return rc;
+}
 
-// TODO(exec/select): Like for but prints a numbered menu, reads $REPLY,
-//   re-runs body until break.
-int Executor::exec_select(ExecState&) { return 0; }
+// subsh := WC_SUBSH(0, skip) body, run in a forked copy of the shell.
+// TODO(exec/subsh): with EF_NOFORK (already in a child, e.g. a pipeline
+//   stage) the body could run without another fork.
+int Executor::exec_subsh(ExecState& es, WordCode head, ExecFlags) {
+  std::size_t end = es.pc + wc_cmd_skip(head);
+  std::fflush(nullptr);
+  pid_t pid = ::fork();
+  if (pid < 0) {
+    std::fprintf(stderr, "jfsh: fork: %s\n", std::strerror(errno));
+    es.pc = end;
+    return 1;
+  }
+  if (pid == 0) {
+    int rc = exec_list(es, EF_NONE);
+    if (mCtx.exiting) rc = mCtx.exit_val;
+    else if (mCtx.returning) rc = mCtx.return_val;
+    std::fflush(nullptr);
+    _exit(rc);
+  }
+  es.pc = end;
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0) {
+    if (errno != EINTR) return 1;
+  }
+  if (WIFEXITED(status))   return WEXITSTATUS(status);
+  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+  return 1;
+}
 
-// TODO(exec/repeat): exec body N times (N is the word before the body).
-int Executor::exec_repeat(ExecState&) { return 0; }
+// funcdef := WC_FUNCDEF(NAMED, skip) words(names) body: copies the body
+// out and stores it under each name.  WC_FUNCDEF(ANON, skip) body
+// words(args) calls the body at once with the args.
+int Executor::exec_funcdef(ExecState& es, WordCode head) {
+  std::size_t end = es.pc + wc_cmd_skip(head);
+  if (wc_cmd_type(head) == WC_FUNCDEF_ANON) {
+    std::size_t begin = es.pc;
+    es.pc = body_end(*es.prog, begin);
+    ProgRef body = extract_body(*es.prog, begin, es.pc);
+    auto raw = fetch_words(es);
+    es.pc = end;
+    Expander ex{*this, mCtx};
+    auto args = ex.words(raw);
+    if (not args) {
+      std::fprintf(stderr, "jfsh: %s\n", args.error().message.c_str());
+      return 1;
+    }
+    args->insert(args->begin(), "(anon)");
+    return call_function(body, *args);
+  }
+  auto names = fetch_words(es);
+  ProgRef body = extract_body(*es.prog, es.pc, end);
+  for (auto& name : names) mCtx.functions[std::move(name)] = body;
+  es.pc = end;
+  return 0;
+}
 
-// TODO(exec/subsh): fork() a subshell, run the body in child, waitpid in parent.
-//   With EF_NOFORK, exec directly (last command optimisation).
-int Executor::exec_subsh(ExecState&, ExecFlags) { return 0; }
-
-// TODO(exec/funcdef): Register a named function in a function table.
-//   The body is a CompiledProgram offset stored in the bytecode.
-//   The function table lives on ParamTable or a separate HashTable<ProgRef>.
-int Executor::exec_funcdef(ExecState&) { return 0; }
-
-// TODO(exec/cond): Evaluate a [[ ]] expression tree.
+// TODO(exec/cond): Evaluate a [[ ]] expression tree (M5).
 //   Opcodes inside the cond block: WC_COND_STR, WC_COND_REGEX, WC_COND_AND/OR/NOT
 //   Delegate to builtins/cond.cpp evaluator.
-int Executor::exec_cond(ExecState&) { return 0; }
+int Executor::exec_cond(ExecState& es, WordCode head) {
+  es.pc += wc_cmd_skip(head);
+  return 0;
+}
 
-// TODO(exec/arith): Evaluate (( expr )).
-//   Fetch the expression string from the strs table, parse and compute
-//   with the arithmetic evaluator in builtins/math.cpp.
-//   Returns 0 if result != 0, 1 if result == 0 (like zsh).
-int Executor::exec_arith(ExecState&) { return 0; }
+// arith := WC_ARITH(0, 1) WC_STRING(expr).  Status 0 when the value is
+// non-zero, 1 when it is zero, 2 on an error.
+int Executor::exec_arith(ExecState& es, WordCode) {
+  Expander ex{*this, mCtx};
+  auto v = ex.arith(es.fetch_str());
+  if (not v) {
+    std::fprintf(stderr, "jfsh: %s\n", v.error().message.c_str());
+    return 2;
+  }
+  return *v != 0 ? 0 : 1;
+}
 
-// TODO(exec/always): { body } always { cleanup }
-//   Run body; whether it exits normally or via break/continue/return/exit,
-//   always run the cleanup block before propagating the control flow.
-int Executor::exec_always(ExecState&) { return 0; }
+// try := WC_TRY(0, skip) body body(always).  The always block runs however
+// the first one ended; a break, continue, return or exit pending from the
+// first block is held while it runs and then goes on, unless the always
+// block started one of its own.  The status is the first block's.
+int Executor::exec_always(ExecState& es, WordCode head) {
+  std::size_t end    = es.pc + wc_cmd_skip(head);
+  std::size_t always = body_end(*es.prog, es.pc);
+  int rc = exec_list(es, EF_NONE);
+  auto held = std::tuple{mCtx.break_level, mCtx.continuing, mCtx.returning,
+                         mCtx.return_val, mCtx.exiting, mCtx.exit_val};
+  mCtx.break_level = 0;
+  mCtx.continuing  = false;
+  mCtx.returning   = false;
+  mCtx.exiting     = false;
+  es.pc = always;
+  exec_list(es, EF_NONE);
+  if (not interrupted()) {
+    std::tie(mCtx.break_level, mCtx.continuing, mCtx.returning,
+             mCtx.return_val, mCtx.exiting, mCtx.exit_val) = held;
+  }
+  es.pc = end;
+  return rc;
+}
 
 // ---------------------------------------------------------------------------
 // SavedFds: RAII restore of fds overwritten by builtin redirections.
@@ -867,17 +1374,8 @@ bool Executor::expand_command(std::vector<std::string>& args,
   };
   // Assignment values are expanded first, then the arguments, then the
   // redirection targets.
-  for (auto& a : assigns) {
-    if (a.array) {
-      auto el = ex.array_elements(a.value);
-      if (not el) return fail(el.error());
-      a.elements = std::move(*el);
-    } else {
-      auto v = ex.scalar(a.value, /*assignment=*/true);
-      if (not v) return fail(v.error());
-      a.value = std::move(*v);
-    }
-  }
+  for (auto& a : assigns)
+    if (auto r = expand_assignment(ex, a); not r) return fail(r.error());
   auto words = ex.words(args);
   if (not words) return fail(words.error());
   args = std::move(*words);
@@ -988,9 +1486,51 @@ int Executor::call_builtin(std::string_view name,
   return 127;
 }
 
-int Executor::call_function(std::string_view /*name*/,
-                            std::vector<std::string>& /*args*/) {
-  return 127;
+// zsh's default limit on nested function calls, used when $FUNCNEST is
+// unset or not a number.
+static constexpr long kDefaultFuncNest = 700;
+
+int Executor::call_function(const ProgRef& body,
+                            std::vector<std::string>& args) {
+  long limit = kDefaultFuncNest;
+  if (auto p = mCtx.params.lookup("FUNCNEST"); p and p->get().is_set()) {
+    std::string text = p->get().is_integer() ? std::to_string(p->get().integer())
+                                             : p->get().scalar();
+    char* rest = nullptr;
+    long n = std::strtol(text.c_str(), &rest, 10);
+    if (not text.empty() and *rest == '\0') limit = n;
+  }
+  if (limit >= 0 and mCtx.func_depth >= limit) {
+    std::fprintf(stderr,
+                 "jfsh: %s: maximum nested function level reached; increase FUNCNEST?\n",
+                 args[0].c_str());
+    return 1;
+  }
+
+  auto saved_positional = std::exchange(
+      mCtx.positional, std::vector<std::string>(args.begin() + 1, args.end()));
+  std::string saved_arg0 = mCtx.arg0;
+  if (mCtx.opts.get(OPT_FUNCTIONARGZERO)) mCtx.arg0 = args[0];
+  OptionState saved_opts  = mCtx.opts;
+  bool        local_traps = mCtx.opts.get(OPT_LOCALTRAPS);
+  if (local_traps) mCtx.signals.traps().push_local_traps();
+  ++mCtx.func_depth;
+  mCtx.params.push_scope();
+
+  int rc = exec(*body);
+  if (mCtx.returning) {
+    mCtx.returning = false;
+    rc = mCtx.return_val;
+  }
+
+  mCtx.params.pop_scope();
+  --mCtx.func_depth;
+  if (local_traps) mCtx.signals.traps().pop_local_traps();
+  // LOCAL_OPTIONS as it stands when the function returns decides.
+  if (mCtx.opts.get(OPT_LOCALOPTIONS)) mCtx.opts = saved_opts;
+  mCtx.arg0       = std::move(saved_arg0);
+  mCtx.positional = std::move(saved_positional);
+  return rc;
 }
 
 int Executor::do_fork(ExecState&, ExecFlags) { return 0; }

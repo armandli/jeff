@@ -5,6 +5,7 @@ include(${PROJECT_SOURCE_DIR}/../cmake/FetchGoogleTest.cmake)
 
 add_executable(jfsh_tests
   agent_test.cpp
+  compound_test.cpp
   exec_test.cpp
   glob_test.cpp
   history_test.cpp
