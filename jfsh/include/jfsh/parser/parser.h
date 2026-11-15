@@ -116,6 +116,13 @@ bool is_incomplete(std::string_view src, bool comments = true);
 // (src/parser/text.cpp).  Used by tests and for debugging.
 std::string disassemble(const CompiledProgram& prog);
 
+// One-line source text, as job listings show it (src/parser/text.cpp):
+// the pipeline (WC_PIPE) or sublist chain (WC_SUBLIST) at `pc`, words as
+// written and compound commands on one line.
+std::string              pipeline_text(const CompiledProgram& prog, std::size_t pc);
+std::vector<std::string> pipeline_stage_texts(const CompiledProgram& prog, std::size_t pc);
+std::string              sublist_text(const CompiledProgram& prog, std::size_t pc);
+
 }  // namespace jfsh
 
 #endif  // JFSH_PARSER_PARSER_H

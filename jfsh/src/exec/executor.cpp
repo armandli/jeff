@@ -1,8 +1,11 @@
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -33,6 +36,8 @@ Executor::Executor(ExecContext& ctx) : mCtx(ctx) {
   }
 }
 
+Executor::~Executor() = default;
+
 int Executor::exec(const CompiledProgram& prog) {
   if (prog.empty()) return 0;
   ExecState es;
@@ -42,6 +47,11 @@ int Executor::exec(const CompiledProgram& prog) {
 }
 
 int Executor::exec_string(std::string_view src) {
+  struct Depth {
+    int& d;
+    explicit Depth(int& x) : d(x) { ++d; }
+    ~Depth() { --d; }
+  } depth{mStringDepth};
   StringInputSource in{std::string(src)};
   Lexer lex{in};
   // Comments are always recognized in scripts and -c strings, but
@@ -61,6 +71,14 @@ int Executor::exec_string(std::string_view src) {
   if (mCtx.returning and mCtx.func_depth == 0) {
     mCtx.returning = false;
     rc = mCtx.last_exit = mCtx.return_val;
+  }
+  // An aborted command line ends here: a non-interactive shell exits.  (An
+  // interactive one goes back to the prompt; the REPL clears the flag.)
+  if (mCtx.aborting and mStringDepth == 1 and mCtx.func_depth == 0
+      and not mCtx.opts.interactive()) {
+    mCtx.aborting = false;
+    mCtx.exiting  = true;
+    mCtx.exit_val = mCtx.last_exit;
   }
   return rc;
 }
@@ -229,6 +247,9 @@ int Executor::exec_simple(std::vector<std::string> args,
     rc = push_prefix_assigns(assigns, false);
   }
   if (rc == 0) rc = def->get().fn(args, mCtx);
+  // A signal the builtin brought on (`kill -USR1 $$`) is handled before
+  // its status replaces $?, as in zsh.
+  if (mCtx.signals.has_pending()) handle_signals();
   for (const auto& a : typeset_arrays) {
     if (rc != 0) break;
     if (auto r = mCtx.params.set_array(a.name, a.elements, a.append); not r) {
@@ -265,27 +286,47 @@ int Executor::exec_list(ExecState& es, ExecFlags flags) {
     WordCode w = es.fetch();
     if (wc_code(w) != WC_LIST) break;  // WC_END
     std::size_t end = es.pc + wc_list_skip(w);
+    if (mTrapDepth == 0 and mCtx.signals.traps().trapped(SIGDEBUG))
+      run_trap(SIGDEBUG);
+    if (interrupted()) return mCtx.exiting ? mCtx.exit_val : rc;
     if (wc_list_flags(w) & WC_LIST_ASYNC) {
-      pid_t pid = ::fork();
+      bool        jc   = job_control();
+      // A lone pipeline (no && || !) is exec'd by the child itself, so the
+      // job's pid is the command's own.
+      WordCode    sl   = es.peek();
+      bool        lone = (wc_sublist_flags(sl) & (WC_SUBLIST_TYPE | WC_SUBLIST_NOT))
+                         == WC_SUBLIST_END;
+      std::string text = sublist_text(*es.prog, es.pc);
+      pid_t pid = fork_child(0, false, ChildKind::Other);
       if (pid < 0) {
-        std::fprintf(stderr, "jfsh: fork: %s\n", std::strerror(errno));
         rc = mCtx.last_exit = 1;
       } else if (pid == 0) {
-        ::setpgid(0, 0);
+        if (jc and mCtx.opts.get(OPT_BGNICE)) {
+          errno = 0;
+          (void)::nice(5);
+        }
+        if (not jc) {
+          // Without job control a background job must not see Ctrl-C.
+          ::signal(SIGINT,  SIG_IGN);
+          ::signal(SIGQUIT, SIG_IGN);
+        }
         ExecState se{es.prog, es.pc};
-        int child_rc = exec_sublist(se, flags);
+        int child_rc = exec_sublist(se, lone ? EF_NOFORK : EF_NONE);
+        if (mCtx.exiting) child_rc = mCtx.exit_val;
+        std::fflush(nullptr);
         _exit(child_rc);
       } else {
-        ::setpgid(pid, pid);
-        int jid = mCtx.jobs.alloc(pid, JOB_ASYNC | JOB_NOTIFY, "");
+        int jid = mCtx.jobs.alloc(pid, JOB_ASYNC | JOB_NOTIFY | (jc ? JOB_PGRP : 0),
+                                  text);
         Process p;
         p.pid    = pid;
+        p.text   = text;
         p.status = ProcStatus::Running;
         mCtx.jobs.add_process(jid, std::move(p));
         mCtx.last_bg_pid = pid;
         if (mCtx.opts.interactive())
           std::fprintf(stderr, "[%d] %d\n", jid, static_cast<int>(pid));
-        rc = 0;
+        rc = mCtx.last_exit = 0;
       }
     } else {
       rc = exec_sublist(es, flags);
@@ -298,11 +339,11 @@ int Executor::exec_list(ExecState& es, ExecFlags flags) {
 }
 
 bool Executor::interrupted() const noexcept {
-  return mCtx.exiting or mCtx.returning or mCtx.break_level > 0;
+  return mCtx.exiting or mCtx.returning or mCtx.aborting or mCtx.break_level > 0;
 }
 
 bool Executor::loop_done() noexcept {
-  if (mCtx.exiting or mCtx.returning) return true;
+  if (mCtx.exiting or mCtx.returning or mCtx.aborting) return true;
   if (mCtx.break_level == 0) return false;
   if (--mCtx.break_level > 0 or not mCtx.continuing) return true;
   mCtx.continuing = false;
@@ -312,31 +353,84 @@ bool Executor::loop_done() noexcept {
 // Runs a chain of pipelines joined by && / ||.  A pipeline whose connector
 // rules it out is skipped, but the chain goes on: in `false && a || b`, `a`
 // is skipped and `b` runs.
+// Whether a failure of the pipeline at `pc` (a WC_PIPE) is one ZERR and
+// ERR_EXIT act on.  As in zsh: simple commands (function calls included),
+// pipelines, `( … )`, `[[ … ]]` and `(( … ))` are; `{ … }`, if, loops and
+// case are not, since the failing command inside them already was.
+static bool failure_counts(const CompiledProgram& prog, std::size_t pc) {
+  WordCode pipe = prog.prog[pc];
+  if (wc_pipe_count(pipe) != 1) return true;
+  std::size_t i = pc + 1;
+  while (i < prog.prog.size() and wc_code(prog.prog[i]) == WC_REDIR) i += 2;
+  if (i >= prog.prog.size()) return true;
+  switch (wc_code(prog.prog[i])) {
+    case WC_IF: case WC_WHILE: case WC_FOR: case WC_FOR_COND: case WC_CASE:
+    case WC_SELECT: case WC_REPEAT: case WC_CURSH: case WC_TRY:
+      return false;
+    default:
+      return true;
+  }
+}
+
+void Executor::on_command_error(int rc) {
+  // ZERR and ERR_EXIT are off anywhere inside a condition or a && / ||
+  // chain, and act once per failure (a function whose last command failed
+  // already set them off).  ERR_RETURN only minds the command's own place
+  // and acts at every level, so a failure returns through each caller.
+  bool exempt = mCtx.noerrexit > 0 or mCtx.err_reported;
+  mCtx.err_reported = true;
+  // Neither ZERR nor DEBUG runs inside another trap.
+  if (not exempt and mTrapDepth == 0 and mCtx.signals.traps().trapped(SIGZERR))
+    run_trap(SIGZERR);
+  if (mCtx.exiting) return;
+  if (not exempt and mCtx.opts.errexit()) {
+    mCtx.exiting  = true;
+    mCtx.exit_val = rc;
+  } else if (mCtx.opts.get(OPT_ERRRETURN) and mCtx.noerrreturn == 0) {
+    mCtx.returning  = true;
+    mCtx.return_val = rc;
+  }
+}
+
 int Executor::exec_sublist(ExecState& es, ExecFlags flags) {
   int  rc   = 0;
   bool skip = false;
   for (;;) {
-    WordCode    w   = es.fetch();  // WC_SUBLIST
-    WordCode    f   = wc_sublist_flags(w);
-    std::size_t end = es.pc + wc_sublist_skip(w);
+    WordCode    w    = es.fetch();  // WC_SUBLIST
+    WordCode    f    = wc_sublist_flags(w);
+    std::size_t end  = es.pc + wc_sublist_skip(w);
+    WordCode    type = f & WC_SUBLIST_TYPE;
     if (not skip) {
+      // Only the last pipeline of a && / || chain, not negated, can set
+      // off ZERR and ERR_EXIT; everything the others run is exempt.
+      bool exempt = type != WC_SUBLIST_END or (f & WC_SUBLIST_NOT);
+      bool counts = failure_counts(*es.prog, es.pc);
+      mCtx.err_reported = false;
+      if (exempt) { ++mCtx.noerrexit; ++mCtx.noerrreturn; }
       rc = exec_pline(es, flags);
+      if (exempt) { --mCtx.noerrexit; --mCtx.noerrreturn; }
       if (f & WC_SUBLIST_NOT) rc = (rc == 0) ? 1 : 0;
       mCtx.last_exit = rc;
+      if (rc != 0 and not exempt and counts and not interrupted())
+        on_command_error(rc);
     }
     es.pc = end;
+    if (mCtx.signals.has_pending()) handle_signals();
     if (interrupted()) return rc;
-    WordCode type = f & WC_SUBLIST_TYPE;
     if (type == WC_SUBLIST_END) return rc;
     skip = (type == WC_SUBLIST_AND) ? rc != 0 : rc == 0;
   }
 }
 
 int Executor::exec_pline(ExecState& es, ExecFlags flags) {
+  std::size_t pipe_pc = es.pc;
   WordCode w     = es.fetch();  // WC_PIPE
   WordCode n     = wc_pipe_count(w);
   if (n == 0) return 0;
+  mPipeProg = es.prog;
+  mPipePc   = pipe_pc;
   if (n == 1) return exec_cmd(es, flags);
+  bool jc = job_control();
 
   // Pre-decode every stage's bytecode slice so we can fork them from the
   // parent without re-entering the parser.  Each stage knows its own
@@ -388,15 +482,18 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
   std::vector<pid_t> pids(n, -1);
   pid_t pgid = 0;
   for (unsigned i = 0; i < n; ++i) {
-    pid_t pid = ::fork();
+    pid_t pid = fork_child(pgid, true, ChildKind::Other);
     if (pid < 0) {
-      std::fprintf(stderr, "jfsh: fork: %s\n", std::strerror(errno));
       for (int fd : rfds) if (fd >= 0) ::close(fd);
       for (int fd : wfds) if (fd >= 0) ::close(fd);
+      // The stages already started still have to be waited for.
+      for (unsigned j = 0; j < i; ++j) {
+        int st;
+        while (::waitpid(pids[j], &st, 0) < 0 and errno == EINTR) {}
+      }
       return 1;
     }
     if (pid == 0) {
-      ::setpgid(0, pgid ? pgid : getpid());
       if (rfds[i] >= 0) { ::dup2(rfds[i], 0); }
       if (wfds[i] >= 0) {
         ::dup2(wfds[i], 1);
@@ -405,16 +502,33 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
       for (int fd : rfds) if (fd >= 0) ::close(fd);
       for (int fd : wfds) if (fd >= 0) ::close(fd);
       ExecState se{es.prog, stages[i].start};
-      int rc = exec_cmd(se, flags);
+      int rc = exec_cmd(se, static_cast<ExecFlags>(flags | EF_NOFORK));
+      if (mCtx.exiting) rc = mCtx.exit_val;
       std::fflush(nullptr);
       _exit(rc);
     }
     if (i == 0) pgid = pid;
-    ::setpgid(pid, pgid);
     pids[i] = pid;
   }
   for (int fd : rfds) if (fd >= 0) ::close(fd);
   for (int fd : wfds) if (fd >= 0) ::close(fd);
+
+  if (jc) {
+    auto texts = pipeline_stage_texts(*es.prog, pipe_pc);
+    std::string text;
+    for (std::size_t i = 0; i < texts.size(); ++i) {
+      if (i) text += wc_pipe_stderr(w, static_cast<unsigned>(i - 1)) ? " |& " : " | ";
+      text += texts[i];
+    }
+    int jid = mCtx.jobs.alloc(pgid, JOB_PGRP, std::move(text), false);
+    for (unsigned i = 0; i < n; ++i) {
+      Process p;
+      p.pid  = pids[i];
+      p.text = i < texts.size() ? texts[i] : std::string{};
+      mCtx.jobs.add_process(jid, std::move(p));
+    }
+    return wait_foreground_job(mCtx, jid);
+  }
 
   int last_rc = 0;
   int worst   = 0;
@@ -530,7 +644,11 @@ int Executor::exec_if(ExecState& es, WordCode head) {
       rc = exec_list(es, EF_NONE);
       break;
     }
+    ++mCtx.noerrexit;
+    ++mCtx.noerrreturn;
     int status = exec_list(es, EF_NONE);
+    --mCtx.noerrexit;
+    --mCtx.noerrreturn;
     if (interrupted()) {
       rc = status;
       break;
@@ -555,7 +673,11 @@ int Executor::exec_while(ExecState& es, WordCode head) {
   ++mCtx.loop_depth;
   for (;;) {
     es.pc = cond;
+    ++mCtx.noerrexit;
+    ++mCtx.noerrreturn;
     int status = exec_list(es, EF_NONE);
+    --mCtx.noerrexit;
+    --mCtx.noerrreturn;
     if (interrupted()) {
       if (loop_done()) break;
       continue;
@@ -823,21 +945,29 @@ int Executor::exec_repeat(ExecState& es, WordCode head) {
 //   stage) the body could run without another fork.
 int Executor::exec_subsh(ExecState& es, WordCode head, ExecFlags) {
   std::size_t end = es.pc + wc_cmd_skip(head);
-  std::fflush(nullptr);
-  pid_t pid = ::fork();
+  bool jc = job_control();
+  pid_t pid = fork_child(0, true, ChildKind::Subshell);
   if (pid < 0) {
-    std::fprintf(stderr, "jfsh: fork: %s\n", std::strerror(errno));
     es.pc = end;
     return 1;
   }
   if (pid == 0) {
+    mExitTrapRan = false;
     int rc = exec_list(es, EF_NONE);
     if (mCtx.exiting) rc = mCtx.exit_val;
     else if (mCtx.returning) rc = mCtx.return_val;
+    rc = run_exit_trap(rc);
     std::fflush(nullptr);
     _exit(rc);
   }
   es.pc = end;
+  if (jc) {
+    int jid = mCtx.jobs.alloc(pid, JOB_PGRP, current_job_text(), false);
+    Process p;
+    p.pid = pid;
+    mCtx.jobs.add_process(jid, std::move(p));
+    return wait_foreground_job(mCtx, jid);
+  }
   int status = 0;
   while (::waitpid(pid, &status, 0) < 0) {
     if (errno != EINTR) return 1;
@@ -869,7 +999,14 @@ int Executor::exec_funcdef(ExecState& es, WordCode head) {
   }
   auto names = fetch_words(es);
   ProgRef body = extract_body(*es.prog, es.pc, end);
-  for (auto& name : names) mCtx.functions[std::move(name)] = body;
+  for (auto& name : names) {
+    // TRAPINT() { … } is the trap for SIGINT, and so on.
+    if (name.starts_with("TRAP"))
+      if (auto sig = SignalTable::name_to_sig(std::string_view(name).substr(4));
+          sig and not std::isdigit(static_cast<unsigned char>(name[4])))
+        mCtx.signals.set_trap(*sig, TrapAction::Function);
+    mCtx.functions[std::move(name)] = body;
+  }
   es.pc = end;
   return 0;
 }
@@ -1063,6 +1200,7 @@ static int heredoc_body_fd(std::string_view body) {
   pid_t pid = ::fork();
   if (pid < 0) { ::close(pfd[0]); ::close(pfd[1]); return -1; }
   if (pid == 0) {
+    Signals.child_reset(ChildKind::Other);
     ::close(pfd[0]);
     ::signal(SIGPIPE, SIG_DFL);
     const char* p   = body.data();
@@ -1088,6 +1226,8 @@ int Executor::procsubst_in(std::string_view src) {
   pid_t pid = ::fork();
   if (pid < 0) { ::close(pfd[0]); ::close(pfd[1]); return -1; }
   if (pid == 0) {
+    mCtx.signals.child_reset(ChildKind::Other);
+    mCtx.jobs.clear();
     ::close(pfd[0]);
     ::dup2(pfd[1], 1);
     if (pfd[1] != 1) ::close(pfd[1]);
@@ -1107,6 +1247,8 @@ int Executor::procsubst_out(std::string_view src) {
   pid_t pid = ::fork();
   if (pid < 0) { ::close(pfd[0]); ::close(pfd[1]); return -1; }
   if (pid == 0) {
+    mCtx.signals.child_reset(ChildKind::Other);
+    mCtx.jobs.clear();
     ::close(pfd[1]);
     ::dup2(pfd[0], 0);
     if (pfd[0] != 0) ::close(pfd[0]);
@@ -1127,6 +1269,8 @@ std::string Executor::procsubst_eq(std::string_view src) {
   pid_t pid = ::fork();
   if (pid < 0) { ::close(fd); ::unlink(tmpl); return {}; }
   if (pid == 0) {
+    mCtx.signals.child_reset(ChildKind::Other);
+    mCtx.jobs.clear();
     ::dup2(fd, 1);
     if (fd != 1) ::close(fd);
     int rc = exec_string(src);
@@ -1148,6 +1292,7 @@ static int spawn_tee(int read_fd, const std::vector<int>& out_fds,
   pid_t pid = ::fork();
   if (pid < 0) return -1;
   if (pid == 0) {
+    Signals.child_reset(ChildKind::Other);
     if (extra_close >= 0) ::close(extra_close);
     char buf[4096];
     for (;;) {
@@ -1601,8 +1746,8 @@ int Executor::call_function(const ProgRef& body,
   std::string saved_arg0 = mCtx.arg0;
   if (mCtx.opts.get(OPT_FUNCTIONARGZERO)) mCtx.arg0 = args[0];
   OptionState saved_opts  = mCtx.opts;
-  bool        local_traps = mCtx.opts.get(OPT_LOCALTRAPS);
-  if (local_traps) mCtx.signals.traps().push_local_traps();
+  mCtx.signals.push_trap_frame();
+  int saved_noerrreturn = std::exchange(mCtx.noerrreturn, 0);
   ++mCtx.func_depth;
   mCtx.params.push_scope();
 
@@ -1612,10 +1757,17 @@ int Executor::call_function(const ProgRef& body,
     rc = mCtx.return_val;
   }
 
+  // LOCAL_TRAPS as it stands when the function returns decides, as does
+  // LOCAL_OPTIONS.  An EXIT trap set in the function runs now.
+  auto exit_trap = mCtx.signals.pop_trap_frame(mCtx.opts.get(OPT_LOCALTRAPS));
+  if (exit_trap and exit_trap->action == TrapAction::Command and not mCtx.exiting) {
+    int saved = mCtx.last_exit;
+    exec_string(exit_trap->command);
+    if (not mCtx.exiting) mCtx.last_exit = saved;
+  }
   mCtx.params.pop_scope();
   --mCtx.func_depth;
-  if (local_traps) mCtx.signals.traps().pop_local_traps();
-  // LOCAL_OPTIONS as it stands when the function returns decides.
+  mCtx.noerrreturn = saved_noerrreturn;
   if (mCtx.opts.get(OPT_LOCALOPTIONS)) mCtx.opts = saved_opts;
   mCtx.arg0       = std::move(saved_arg0);
   mCtx.positional = std::move(saved_positional);
@@ -1725,11 +1877,9 @@ int Executor::run_external(const std::vector<std::string>& args,
     _exit(126);
   }
 
-  pid_t pid = fork();
-  if (pid < 0) {
-    std::fprintf(stderr, "jfsh: fork failed: %s\n", std::strerror(errno));
-    return 1;
-  }
+  bool jc = job_control();
+  pid_t pid = fork_child(0, true, ChildKind::Other);
+  if (pid < 0) return 1;
   if (pid == 0) {
     if (not redirs.empty() and not apply_redirects_child(redirs)) _exit(1);
     execve(path->c_str(), argv.data(), envp.data());
@@ -1754,6 +1904,13 @@ int Executor::run_external(const std::vector<std::string>& args,
     _exit(126);
   }
 
+  if (jc) {
+    int jid = mCtx.jobs.alloc(pid, JOB_PGRP, current_job_text(), false);
+    Process p;
+    p.pid = pid;
+    mCtx.jobs.add_process(jid, std::move(p));
+    return wait_foreground_job(mCtx, jid);
+  }
   int status = 0;
   while (waitpid(pid, &status, 0) < 0) {
     if (errno != EINTR) {
@@ -1764,6 +1921,139 @@ int Executor::run_external(const std::vector<std::string>& args,
   if (WIFEXITED(status))   return WEXITSTATUS(status);
   if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
   return 1;
+}
+
+// ---- Job control and signals -----------------------------------------------
+
+bool Executor::job_control() const noexcept {
+  return mCtx.signals.job_control() and mCtx.opts.monitor();
+}
+
+pid_t Executor::fork_child(Pid pgid, bool foreground, ChildKind kind) {
+  bool jc = job_control();
+  std::fflush(nullptr);
+  // Signals stay blocked until the child has its own dispositions: one sent
+  // to it right away (`cmd & kill %1`) must not meet the shell's handlers
+  // or ignored signals, and is delivered once the child unblocks.
+  sigset_t all, old;
+  sigfillset(&all);
+  ::sigprocmask(SIG_BLOCK, &all, &old);
+  pid_t pid = ::fork();
+  if (pid < 0) {
+    int err = errno;
+    ::sigprocmask(SIG_SETMASK, &old, nullptr);
+    std::fprintf(stderr, "jfsh: fork failed: %s\n", std::strerror(err));
+    return -1;
+  }
+  if (pid == 0) {
+    if (jc) {
+      // Both sides set the group, so neither can run ahead of the other.
+      ::setpgid(0, pgid);
+      if (foreground) mCtx.signals.give_terminal(pgid ? pgid : ::getpid());
+    }
+    mCtx.signals.child_reset(kind);
+    mCtx.jobs.clear();
+    ::sigprocmask(SIG_SETMASK, &old, nullptr);
+    return 0;
+  }
+  if (jc) ::setpgid(pid, pgid ? pgid : pid);
+  ::sigprocmask(SIG_SETMASK, &old, nullptr);
+  return pid;
+}
+
+std::string Executor::current_job_text() const {
+  if (not mPipeProg or mPipePc >= mPipeProg->prog.size()) return {};
+  return pipeline_text(*mPipeProg, mPipePc);
+}
+
+void Executor::update_window_size() {
+  struct winsize ws{};
+  int fd = mCtx.signals.tty_fd() >= 0 ? mCtx.signals.tty_fd() : STDOUT_FILENO;
+  if (::ioctl(fd, TIOCGWINSZ, &ws) != 0 or ws.ws_col == 0) return;
+  (void)mCtx.params.set_scalar("COLUMNS", std::to_string(ws.ws_col));
+  (void)mCtx.params.set_scalar("LINES", std::to_string(ws.ws_row));
+}
+
+void Executor::handle_signals() {
+  auto bits = mCtx.signals.take_pending();
+  auto has  = [&](int sig) {
+    return sig < 64 ? (bits[0] >> sig) & 1 : (bits[1] >> (sig - 64)) & 1;
+  };
+  if (has(SIGCHLD)) mCtx.signals.reap(mCtx.jobs);
+  if (has(SIGWINCH)) update_window_size();
+  for (int sig = 1; sig <= MAX_SIG; ++sig) {
+    if (not has(sig)) continue;
+    if (mCtx.signals.traps().trapped(sig)) {
+      run_trap(sig);
+    } else if (sig == SIGINT and mCtx.signals.job_control()) {
+      mCtx.aborting = true;
+    } else if (sig == SIGHUP and mCtx.signals.job_control()) {
+      mCtx.hangup   = true;
+      mCtx.exiting  = true;
+      mCtx.exit_val = 128 + SIGHUP;
+    }
+  }
+}
+
+void Executor::run_trap(int sig) {
+  if (sig < 0 or sig >= TRAP_TABLE_SIZE) return;
+  Trap trap = mCtx.signals.traps().get(sig);
+  if (trap.action != TrapAction::Command and trap.action != TrapAction::Function)
+    return;
+  if (mInTrap[static_cast<std::size_t>(sig)]) {
+    // Already running this trap: handle the signal once it is done.
+    if (is_real_signal(sig)) mCtx.signals.note(sig);
+    return;
+  }
+  mInTrap[static_cast<std::size_t>(sig)] = true;
+  ++mTrapDepth;
+  int  saved_status = mCtx.last_exit;
+  bool saved_err    = mCtx.err_reported;
+  if (trap.action == TrapAction::Function) {
+    std::string name = std::string("TRAP") + SignalTable::sig_to_name(sig);
+    auto fn = mCtx.functions.find(name);
+    if (fn != mCtx.functions.end()) {
+      ProgRef body = fn->second;
+      std::vector<std::string> args{name};
+      if (is_real_signal(sig))  args.push_back(std::to_string(sig));
+      else if (sig == SIGEXIT)  args.push_back("0");
+      int rc = call_function(body, args);
+      // A signal trap function that fails acts as if the signal had
+      // interrupted the shell.
+      if (rc != 0 and is_real_signal(sig) and not mCtx.exiting) mCtx.aborting = true;
+    }
+  } else {
+    exec_string(trap.command);
+  }
+  if (not mCtx.exiting) mCtx.last_exit = saved_status;
+  mCtx.err_reported = saved_err;
+  --mTrapDepth;
+  mInTrap[static_cast<std::size_t>(sig)] = false;
+}
+
+int Executor::run_exit_trap(int status) {
+  if (mExitTrapRan or not mCtx.signals.traps().trapped(SIGEXIT)) return status;
+  mExitTrapRan = true;
+  Trap trap = mCtx.signals.traps().get(SIGEXIT);
+  mCtx.signals.set_trap(SIGEXIT, TrapAction::Default);
+  bool was_exiting = mCtx.exiting;
+  int  was_val     = mCtx.exit_val;
+  mCtx.exiting = mCtx.returning = mCtx.aborting = false;
+  mCtx.break_level = 0;
+  mCtx.last_exit   = status;
+  ++mTrapDepth;
+  if (trap.action == TrapAction::Command) {
+    exec_string(trap.command);
+  } else if (auto fn = mCtx.functions.find("TRAPEXIT"); fn != mCtx.functions.end()) {
+    ProgRef body = fn->second;
+    std::vector<std::string> args{"TRAPEXIT", "0"};
+    call_function(body, args);
+  }
+  --mTrapDepth;
+  if (mCtx.exiting) return mCtx.exit_val;   // the trap called `exit`
+  mCtx.exiting  = was_exiting;
+  mCtx.exit_val = was_val;
+  return status;
 }
 
 }  // namespace jfsh

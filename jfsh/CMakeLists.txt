@@ -74,10 +74,15 @@ target_link_libraries(jfsh_glob PUBLIC jfsh_core jfsh_compiler_options)
 # jfsh_builtins — built-in commands, conditionals, arithmetic.
 #                 Mirrors zsh Src/{builtin,cond,math,loop}.c
 # ---------------------------------------------------------------------------
+# src/exec/jobctl.cpp (foreground waits, fg/bg, signalling jobs) is shared
+# by the executor and the job builtins and needs only ExecContext, so it
+# lives here, below jfsh_exec.
 add_library(jfsh_builtins STATIC
   src/builtins/builtins.cpp
   src/builtins/cond.cpp
+  src/builtins/jobctl.cpp
   src/builtins/math.cpp
+  src/exec/jobctl.cpp
 )
 target_include_directories(jfsh_builtins PUBLIC include)
 target_link_libraries(jfsh_builtins PUBLIC jfsh_core jfsh_compiler_options)

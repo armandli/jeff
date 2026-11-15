@@ -10,6 +10,7 @@
 
 #include <unistd.h>
 
+#include <array>
 #include <optional>
 #include <string>
 #include <vector>
@@ -48,6 +49,20 @@ struct ExecContext {
   int  return_val  = 0;
   bool exiting     = false;
   int  exit_val    = 0;
+  // Ctrl-C under job control, or a TRAPxxx function that failed: unwind
+  // the command line.  An interactive shell goes back to the prompt, any
+  // other shell exits.
+  bool aborting    = false;
+  bool hangup      = false; // SIGHUP reached an interactive shell
+  // ERR_EXIT, ERR_RETURN and ZERR are off while this is positive: in the
+  // conditions of if/while/until, after `!`, and in all but the last
+  // pipeline of a && / || chain.
+  int  noerrexit   = 0;
+  // The same for ERR_RETURN, but counted per function: a function called
+  // from a condition still returns on a failure inside it (zsh 5.9).
+  int  noerrreturn = 0;
+  bool err_reported = false; // ZERR already ran for the status in hand
+  bool ran_jobs    = false; // `jobs` ran (lets exit go on with stopped jobs)
 
   HashTable<ProgRef> functions{};  // shell functions: name → body
 
@@ -103,6 +118,7 @@ struct SavedFds {
 
 struct Executor {
   explicit Executor(ExecContext& ctx);
+  ~Executor();
 
   int exec(const CompiledProgram& prog);
   int exec_string(std::string_view src);
@@ -119,6 +135,21 @@ struct Executor {
   // otherwise a $PATH search (cached while HASH_CMDS is set).  Fails with
   // FileNotFound (exit 127) or PermissionDenied (exit 126).
   Result<std::string> find_command(std::string_view name);
+
+  // Acts on signals that arrived since the last call: reaps children into
+  // the job table, runs traps, turns an untrapped Ctrl-C into `aborting`
+  // and SIGHUP into an exit, and follows SIGWINCH into $COLUMNS/$LINES.
+  // Called between commands, and by the REPL at the prompt.
+  void handle_signals();
+  // Runs the trap for `sig` (a real or pseudo-signal), keeping $?.
+  void run_trap(int sig);
+  // Runs the EXIT trap once, as the shell exits with `status`; returns the
+  // status to exit with (the trap may call `exit`).
+  int  run_exit_trap(int status);
+  // Sets $COLUMNS and $LINES from the terminal.
+  void update_window_size();
+  // Job control is on: the shell owns a terminal and MONITOR is set.
+  bool job_control() const noexcept;
 
 protected:
   int exec_list   (ExecState& es, ExecFlags);
@@ -154,6 +185,15 @@ protected:
   bool loop_done() noexcept;
 
   int  do_fork(ExecState& es, ExecFlags);
+  // Forks.  With job control the child joins process group `pgid` (0: a
+  // new one of its own) and, when `foreground`, takes the terminal; then
+  // it resets signals and traps for `kind` and forgets the parent's jobs.
+  // Returns the pid, 0 in the child, -1 (after a message) on failure.
+  pid_t fork_child(Pid pgid, bool foreground, ChildKind kind);
+  // Command text of the pipeline being run, for job listings.
+  std::string current_job_text() const;
+  // The failing status `rc` of a command: ZERR, then ERR_EXIT/ERR_RETURN.
+  void on_command_error(int rc);
   int  run_external(
     const std::vector<std::string>& args,
     const std::vector<Assignment>&  assigns,
@@ -213,9 +253,44 @@ public:
 
 private:
   ExecContext& mCtx;
+  // The pipeline exec_pline is running, for current_job_text().
+  const CompiledProgram* mPipeProg = nullptr;
+  std::size_t            mPipePc   = 0;
+  std::array<bool, TRAP_TABLE_SIZE> mInTrap{};
+  int                    mTrapDepth  = 0;     // traps being run
+  int                    mStringDepth = 0;   // nested exec_string calls
+  bool                   mExitTrapRan = false;
   HashTable<std::string> mCmdHash;     // command name → resolved path
   std::string            mHashedPath;  // $PATH the hash was built against
 };
+
+// ---- Job control (src/exec/jobctl.cpp) ---------------------------------------
+
+// Waits for foreground job `jid` under job control: gives it the terminal,
+// waits until every process is done or stopped, and takes the terminal
+// back.  A stopped job stays in the table (reported as `jfsh: suspended
+// cmd`) and gives 128 + the signal; a finished one is removed and gives its
+// exit status.  Ctrl-C killing the job sets ctx.aborting.
+int wait_foreground_job(ExecContext& ctx, int jid);
+
+// Continues job `jid` (SIGCONT if stopped): in the foreground, `fg`, which
+// then waits for it, or in the background, `bg`.  Prints the job line
+// first, as zsh does.  Returns the status for $?.
+int resume_job(ExecContext& ctx, int jid, bool foreground);
+
+// Sends `sig` to every process of the job: to its process group when it
+// has one of its own, otherwise to each live process.
+Result<void> signal_job(const Job& job, int sig);
+
+// Waits for one process of background job `jid` (`wait`).  Returns its
+// status, or 128 + the signal when a trapped signal (or Ctrl-C under job
+// control) interrupts the wait.
+int wait_background_process(ExecContext& ctx, int jid, std::size_t proc_index);
+
+// Sends SIGHUP (and SIGCONT to stopped ones) to the jobs an exiting
+// interactive shell leaves behind, unless NO_HUP or disowned.  Returns
+// how many it signalled.
+int hangup_jobs(ExecContext& ctx);
 
 }  // namespace jfsh
 

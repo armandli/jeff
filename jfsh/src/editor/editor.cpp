@@ -1,5 +1,7 @@
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -69,6 +71,8 @@ std::optional<std::string> Editor::read_line(bool continuation) {
   mBuf.cursor    = 0;
   mHistPos       = -1;
   mContinuation  = continuation;
+  mInterrupted   = false;
+  mEof           = false;
 
   std::string ps1 = continuation ? mPrompt.continuation() : mPrompt.primary();
   std::fwrite(ps1.c_str(), 1, ps1.size(), stdout);
@@ -87,10 +91,21 @@ std::optional<std::string> Editor::read_line(bool continuation) {
   bool done = false;
   while (not done) {
     std::string key = read_key_sequence();
+    if (mEof) {                      // the terminal went away
+      exit_raw_mode();
+      return std::nullopt;
+    }
     if (key == "\x04" and mBuf.text.empty()) {  // Ctrl-D on empty line = EOF
       exit_raw_mode();
       std::putchar('\n');
       return std::nullopt;
+    }
+    if (key == "\x03") {            // Ctrl-C: drop the line
+      mInterrupted = true;
+      mBuf.text.clear();
+      mBuf.cursor = 0;
+      done = true;
+      break;
     }
     if (key == "\r" or key == "\n") {
       done = true;
@@ -131,8 +146,38 @@ std::optional<std::string> Editor::read_line(bool continuation) {
 
 std::string Editor::read_key_sequence() {
   char buf[8] = {};
+  for (;;) {
+    struct pollfd fds[2] = {{STDIN_FILENO, POLLIN, 0}, {mWakeFd, POLLIN, 0}};
+    nfds_t nfds = (mWakeFd >= 0 and mWake) ? 2 : 1;
+    int r = ::poll(fds, nfds, -1);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      mEof = true;
+      return {};
+    }
+    if (nfds == 2 and (fds[1].revents & POLLIN)) {
+      // A signal arrived: let the shell act on it with the terminal in
+      // its normal mode, then put the prompt and line back.
+      exit_raw_mode();
+      bool quit    = false;
+      bool printed = mWake(quit);
+      if (quit) {
+        mEof = true;
+        return {};
+      }
+      enter_raw_mode();
+      if (printed) refresh_display();
+      continue;
+    }
+    if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) break;
+  }
   int n = static_cast<int>(read(STDIN_FILENO, buf, 1));
-  if (n <= 0) return {};
+  if (n < 0 and errno == EINTR) return {};
+  if (n <= 0) {
+    // EOF or a hung-up terminal: without this the caller would spin.
+    mEof = true;
+    return {};
+  }
   if (buf[0] == '\x1b') {
     // Try to read more bytes (escape sequence)
     struct timeval tv{0, 50000};

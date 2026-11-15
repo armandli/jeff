@@ -27,7 +27,7 @@ const OptionInfo OPTION_INFO[OPT_COUNT] = {
   // B
   {"bareglobqual",        OPT_BAREGLOBQUAL,        true,  false, false, false},
   {"beep",                OPT_BEEP,                true,  false, false, false},
-  {"bgnice",              OPT_BGNICE,              false, false, false, false},
+  {"bgnice",              OPT_BGNICE,              true,  false, false, false},
   {"braceccl",            OPT_BRACECCL,            false, false, false, false},
   {"bsdecho",             OPT_BSDECHO,             false, false, false, false},
   // C
@@ -132,7 +132,7 @@ const OptionInfo OPTION_INFO[OPT_COUNT] = {
   {"multios",             OPT_MULTIOS,             true,  false, false, false},
   // N
   {"nomatch",             OPT_NOMATCH,             true,  true,  true,  false},
-  {"notify",              OPT_NOTIFY,              false, false, false, false},
+  {"notify",              OPT_NOTIFY,              true,  false, false, false},
   {"nullglob",            OPT_NULLGLOB,            false, false, false, false},
   {"numericglobsort",     OPT_NUMERICGLOBSORT,     false, false, false, false},
   // O

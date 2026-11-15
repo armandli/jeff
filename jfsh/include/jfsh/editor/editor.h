@@ -75,6 +75,18 @@ struct Editor {
   using CompleteFn = std::function<std::vector<std::string>(std::string_view)>;
   void set_completer(CompleteFn fn) { mCompleter = std::move(fn); }
 
+  // While a line is being read, `fd` (the shell's signal self-pipe) is
+  // watched too; when it becomes readable the editor leaves raw mode and
+  // calls `hook`, which handles the signals (traps, job notices).  The
+  // hook returns whether it printed anything, so the prompt and line are
+  // redrawn, and sets `quit` to end the read as at EOF (SIGHUP).
+  using WakeFn = std::function<bool(bool& quit)>;
+  void set_wake(int fd, WakeFn hook) { mWakeFd = fd; mWake = std::move(hook); }
+
+  // The last read_line ended with Ctrl-C: the line (and, for a PS2 line,
+  // the whole command) is to be dropped.
+  bool interrupted() const noexcept { return mInterrupted; }
+
 protected:
   void enter_raw_mode();
   void exit_raw_mode();
@@ -113,6 +125,10 @@ private:
   std::string              mSavedLine;
   bool                     mRawModeActive = false;
   bool                     mContinuation  = false;  // prompting with PS2
+  bool                     mInterrupted   = false;  // Ctrl-C ended the read
+  bool                     mEof           = false;  // input closed or hung up
+  int                      mWakeFd        = -1;
+  WakeFn                   mWake;
 };
 
 }  // namespace jfsh
