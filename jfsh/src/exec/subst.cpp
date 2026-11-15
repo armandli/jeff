@@ -507,16 +507,22 @@ struct Scan {
     return out;
   }
 
-  Result<long long> arith(std::string_view expr) {
+  Result<MathNum> math(std::string_view expr) {
     auto text = expand_scalar(expr);
     if (not text) return std::unexpected(text.error());
-    return arith_eval(*text, ctx().params);
+    return math_eval(*text, ctx().params, math_options(opts()));
+  }
+
+  Result<long long> arith(std::string_view expr) {
+    auto v = math(expr);
+    if (not v) return std::unexpected(v.error());
+    return v->as_int();
   }
 
   Result<void> arithmetic(std::string_view expr, bool dq) {
-    auto v = arith(expr);
+    auto v = math(expr);
     if (not v) return std::unexpected(v.error());
-    put(std::to_string(*v), true);
+    put(format_math(*v), true);
     (void)dq;
     return {};
   }
@@ -577,10 +583,6 @@ struct Scan {
       v.make_array(std::move(out));
     } else if (param.is_array()) {
       v.make_array(param.array());
-    } else if (param.is_integer()) {
-      v.make_scalar(std::to_string(param.integer()));
-    } else if (param.is_float()) {
-      v.make_scalar(std::to_string(param.floatv()));
     } else {
       v.make_scalar(param.scalar());
     }
@@ -875,15 +877,18 @@ struct Scan {
     if (not r) return std::unexpected(r.error());
     auto& [v, keep_separate, split, glob] = *r;
     if (mode != Mode::Word) {
+      // Only a pattern (`case`, `[[ = ]]`) looks at what is literal: there
+      // ${~x} and GLOB_SUBST make the value's characters active.
+      bool literal = dq or not glob;
       if (v.array) {
         std::string joined;
         for (std::size_t k = 0; k < v.arr.size(); ++k) {
           if (k) joined += ' ';
           joined += v.arr[k];
         }
-        put(joined, true);
+        put(joined, literal);
       } else {
-        put(v.str, true);
+        put(v.str, literal);
       }
       return {};
     }
@@ -1668,6 +1673,11 @@ Result<std::string> Expander::heredoc(std::string_view body) {
 Result<long long> Expander::arith(std::string_view expr) {
   Scan scan{*this, Mode::Heredoc};
   return scan.arith(expr);
+}
+
+Result<MathNum> Expander::math(std::string_view expr) {
+  Scan scan{*this, Mode::Heredoc};
+  return scan.math(expr);
 }
 
 Result<std::string> Expander::pattern(std::string_view word) {

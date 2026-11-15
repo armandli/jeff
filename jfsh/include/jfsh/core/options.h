@@ -230,8 +230,10 @@ struct OptionState {
   void unset(OptIndex opt)                  noexcept { mOpts[opt] = false; }
   void assign(OptIndex opt, bool val)       noexcept { mOpts[opt] = val; }
 
-  // Returns nullptr if not found.  Accepts "extendedglob", "EXTENDED_GLOB", etc.
-  static const OptionInfo* find(std::string_view name) noexcept;
+  // Returns nullptr if not found.  Accepts "extendedglob", "EXTENDED_GLOB",
+  // etc.  A name that is not an option but is one with `no` in front
+  // ("noextendedglob") finds that option and sets `negated`.
+  static const OptionInfo* find(std::string_view name, bool* negated = nullptr) noexcept;
 
   void apply_emulation(Emulation);
 

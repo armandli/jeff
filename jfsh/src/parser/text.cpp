@@ -70,6 +70,10 @@ static const char* cmd_type_name(WordCode op, WordCode type) noexcept {
     }
     case WC_FUNCDEF:
       return type == WC_FUNCDEF_ANON ? "anon" : "named";
+    case WC_COND: {
+      static const char* const kConds[] = {"not", "and", "or", "unary", "binary", "str"};
+      return type < std::size(kConds) ? kConds[type] : "?";
+    }
     default:
       return nullptr;
   }
@@ -125,7 +129,7 @@ std::string disassemble(const CompiledProgram& prog) {
       }
       break; case WC_IF: case WC_WHILE: case WC_FOR: case WC_CASE:
       case WC_SELECT: case WC_REPEAT: case WC_SUBSH: case WC_CURSH:
-      case WC_FUNCDEF: case WC_FOR_COND: case WC_TRY: case WC_ARITH:
+      case WC_FUNCDEF: case WC_FOR_COND: case WC_TRY: case WC_ARITH: case WC_COND:
         if (auto* type = cmd_type_name(op, wc_cmd_type(w))) out += ' ' + std::string(type);
         out += " skip=" + std::to_string(wc_cmd_skip(w));
       break; case WC_END:

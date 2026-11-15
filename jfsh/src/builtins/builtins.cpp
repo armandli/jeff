@@ -112,7 +112,7 @@ static int loop_control(std::vector<std::string>& args, ExecContext& ctx,
   const char* name = args[0].c_str();
   long n = 1;
   if (args.size() > 1) {
-    auto v = arith_eval(args[1], ctx.params);
+    auto v = arith_eval(args[1], ctx.params, math_options(ctx.opts));
     if (not v) {
       std::fprintf(stderr, "jfsh: %s: %s\n", name, v.error().message.c_str());
       return 1;
@@ -342,9 +342,7 @@ static int typeset_one(std::string_view cmd, const std::string& arg,
     if (attrs.type == 'i' and not has_value) p->set(0LL);
     if (attrs.type == 'F' and not has_value) p->set(0.0);
   }
-  if (append and has_value) {
-    value = (p->is_integer() ? std::to_string(p->integer()) : p->scalar()) + value;
-  }
+  if (append and has_value) value = p->scalar() + value;
   std::uint32_t case_flags = (p->flags | attrs.on) & ~attrs.off;
   if (case_flags & PM_UPPER)
     for (char& c : value) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -358,28 +356,29 @@ static int typeset_one(std::string_view cmd, const std::string& arg,
     case 'A':
       if (not p->is_hash()) p->set(std::unordered_map<std::string, std::string>{});
       break;
-    case 'i':
-      if (has_value or not p->is_integer()) {
-        std::string text = has_value ? value : p->scalar();
-        auto v = text.empty() ? Result<long long>{0} : arith_eval(text, ctx.params);
+    case 'i': case 'F':
+      if (has_value or (attrs.type == 'i' ? not p->is_integer() : not p->is_float())) {
+        auto v = math_eval(has_value ? value : p->scalar(), ctx.params, math_options(ctx.opts));
         if (not v) {
           std::fprintf(stderr, "jfsh: %.*s: %s\n", static_cast<int>(cmd.size()),
                        cmd.data(), v.error().message.c_str());
           return 1;
         }
-        p->set(*v);
+        if (attrs.type == 'i') p->set(v->as_int());
+        else                   p->set(v->as_float());
       }
-      break;
-    case 'F':
-      if (has_value or not p->is_float())
-        p->set(std::strtod((has_value ? value : p->scalar()).c_str(), nullptr));
       break;
     default:
       if (has_value) {
-        if (p->is_integer()) {
-          auto v = arith_eval(value, ctx.params);
-          if (v) p->set(*v);
-          else   p->set(std::move(value));
+        if (p->is_integer() or p->is_float()) {
+          auto v = math_eval(value, ctx.params, math_options(ctx.opts));
+          if (not v) {
+            std::fprintf(stderr, "jfsh: %.*s: %s\n", static_cast<int>(cmd.size()),
+                         cmd.data(), v.error().message.c_str());
+            return 1;
+          }
+          if (p->is_integer()) p->set(v->as_int());
+          else                 p->set(v->as_float());
         } else {
           p->set(std::move(value));
         }
@@ -403,7 +402,10 @@ static int typeset_common(std::vector<std::string>& args, ExecContext& ctx,
   auto apply = [&](char c, bool on) {
     switch (c) {
       case 'a': case 'A': case 'i': attrs.type = on ? c : 0; return true;
-      case 'F': case 'E':           attrs.type = on ? 'F' : 0; return true;
+      case 'F': case 'E':
+        attrs.type = on ? 'F' : 0;
+        if (on) (c == 'E' ? attrs.on : attrs.off) |= PM_EFLOAT;
+        return true;
       case 'g': attrs.global = on; return true;
       case 'x': (on ? attrs.on : attrs.off) |= PM_EXPORTED; return true;
       case 'r': (on ? attrs.on : attrs.off) |= PM_READONLY; return true;
@@ -616,14 +618,7 @@ int builtin_rehash(std::vector<std::string>& args, ExecContext& ctx) {
 }
 int builtin_true      (std::vector<std::string>&, ExecContext&) { return 0; }
 int builtin_false     (std::vector<std::string>&, ExecContext&) { return 1; }
-int builtin_test(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/test): Implement POSIX [ / test expression evaluator.
-  //   Unary: -f -d -e -s -r -w -x -z -n -L -b -c -p -S -t (fd).
-  //   Binary: = != < > -eq -ne -lt -le -gt -ge -nt -ot -ef.
-  //   Logical: -a -o ! ( ) (different precedence from [[ ]]).
-  //   For `[`, last arg must be `]`.
-  (void)args; (void)ctx; return 0;
-}
+// builtin_test (`test` / `[`) is in cond.cpp.
 int builtin_ulimit(std::vector<std::string>& args, ExecContext& ctx) {
   // TODO(builtin/ulimit): Wrapper around getrlimit/setrlimit.
   //   -a: print all; -c -d -f -n -s -t -u -v -x: individual resource limits.
@@ -729,16 +724,16 @@ int builtin_sched(std::vector<std::string>& args, ExecContext& ctx) {
 // `let expr…`: evaluates each expression; the status is 0 when the last
 // one is non-zero, 1 when it is zero, and 2 on an error.
 int builtin_let(std::vector<std::string>& args, ExecContext& ctx) {
-  long long last = 0;
+  MathNum last;
   for (std::size_t i = 1; i < args.size(); ++i) {
-    auto v = arith_eval(args[i], ctx.params);
+    auto v = math_eval(args[i], ctx.params, math_options(ctx.opts));
     if (not v) {
       std::fprintf(stderr, "jfsh: let: %s\n", v.error().message.c_str());
       return 2;
     }
     last = *v;
   }
-  return last != 0 ? 0 : 1;
+  return last.truthy() ? 0 : 1;
 }
 
 }  // namespace jfsh

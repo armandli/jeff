@@ -36,6 +36,7 @@ enum ParamFlags : std::uint32_t {
   PM_LOWER     = 0x0000'1000,
   PM_HIDE      = 0x0000'2000,
   PM_UNSET     = 0x0000'4000,
+  PM_EFLOAT    = 0x0000'8000,   // float shown in exponent form (typeset -E)
 };
 
 using ParamValue = std::variant<
@@ -72,6 +73,8 @@ struct Param {
   bool is_float()    const noexcept { return flags & PM_FLOAT; }
   bool is_scalar()   const noexcept { return flags & PM_SCALAR; }
 
+  // An integer or float renders as text: floats as `typeset -F` (10
+  // decimals) or, with PM_EFLOAT, `typeset -E` (10 significant digits).
   std::string                                   scalar()  const noexcept;
   long long                                     integer() const noexcept;
   double                                        floatv()  const noexcept;

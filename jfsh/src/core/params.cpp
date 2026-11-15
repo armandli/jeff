@@ -1,3 +1,5 @@
+#include <cstdio>
+
 #include <algorithm>
 #include <iterator>
 
@@ -7,6 +9,12 @@ namespace jfsh {
 
 std::string Param::scalar() const noexcept {
   if (auto* s = std::get_if<std::string>(&value)) return *s;
+  if (auto* i = std::get_if<long long>(&value)) return std::to_string(*i);
+  if (auto* f = std::get_if<double>(&value)) {
+    char buf[64];
+    std::snprintf(buf, sizeof buf, (flags & PM_EFLOAT) ? "%.9e" : "%.10f", *f);
+    return buf;
+  }
   return {};
 }
 

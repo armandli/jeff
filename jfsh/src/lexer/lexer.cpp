@@ -287,7 +287,13 @@ LexToken Lexer::read_token() {
         mSrc.unget(n);
         return {TokType::TK_PIPE, "|", mSrc.line()};
       }
-      case '!': return {TokType::TK_BANG,   "!",  mSrc.line()};
+      // `!` is a token only on its own; `!=` or `!x` is a word.
+      case '!': {
+        int n = mSrc.next_char();
+        mSrc.unget(n);
+        if (n == -1 or is_word_break(n)) return {TokType::TK_BANG, "!", mSrc.line()};
+        return read_word(c);
+      }
       // `{` and `}` are reserved only as words of their own; otherwise they
       // start a word (`{a,b}`, `{1..3}`, `{}`) for brace expansion.
       case '{':
@@ -301,7 +307,7 @@ LexToken Lexer::read_token() {
       }
       case '(': {
         int n = mSrc.next_char();
-        if (n == '(') return {TokType::TK_DLPAREN, "((", mSrc.line()};
+        if (n == '(' and not (mFlags & LEX_COND)) return {TokType::TK_DLPAREN, "((", mSrc.line()};
         mSrc.unget(n);
         return {TokType::TK_LPAREN, "(", mSrc.line()};
       }
@@ -309,7 +315,14 @@ LexToken Lexer::read_token() {
       // an arithmetic `(( … ))` is found by read_arith instead.
       case ')': return {TokType::TK_RPAREN, ")", mSrc.line()};
       case '<':
-      case '>': return read_redir(c);
+      case '>': {
+        // A lone `<` or `>` inside [[ ]] compares strings.
+        int n = mSrc.next_char();
+        mSrc.unget(n);
+        if ((mFlags & LEX_COND) and (n == -1 or n == ' ' or n == '\t' or n == '\n'))
+          return {TokType::TK_WORD, std::string(1, static_cast<char>(c)), mSrc.line()};
+        return read_redir(c);
+      }
       default:  return read_word(c);
     }
   }
@@ -339,6 +352,50 @@ std::optional<std::string> Lexer::read_arith() {
   return std::nullopt;
 }
 
+std::optional<std::string> Lexer::read_cond_pattern() {
+  int c = mSrc.next_char();
+  while (c == ' ' or c == '\t') c = mSrc.next_char();
+  if (c == -1) return std::nullopt;
+  std::string text;
+  int depth = 0;
+  for (; c != -1; c = mSrc.next_char()) {
+    if (depth == 0 and (c == ' ' or c == '\t' or c == '\n' or c == ')' or c == '|'
+                        or c == ';' or c == '&')) {
+      mSrc.unget(c);
+      break;
+    }
+    text += static_cast<char>(c);
+    if (c == '(') {
+      ++depth;
+    } else if (c == ')') {
+      --depth;
+    } else if (c == '\\') {
+      int n = mSrc.next_char();
+      if (n == -1) { mIncomplete = true; break; }
+      text += static_cast<char>(n);
+    } else if (c == '\'') {
+      int q;
+      while ((q = mSrc.next_char()) != -1 and q != '\'') text += static_cast<char>(q);
+      if (q == -1) { mIncomplete = true; break; }
+      text += '\'';
+    } else if (c == '"') {
+      slurp_dquote(mSrc, text);
+    } else if (c == '`') {
+      slurp_backquote(mSrc, text);
+    } else if (c == '$') {
+      int n = mSrc.next_char();
+      if (n == '(' or n == '{') {
+        text += static_cast<char>(n);
+        slurp_nested(mSrc, text, static_cast<char>(n), n == '(' ? ')' : '}');
+      } else {
+        mSrc.unget(n);
+      }
+    }
+  }
+  if (text.empty()) return std::nullopt;
+  return text;
+}
+
 LexToken Lexer::read_word(int first_char) {
   std::string text;
   int  c         = first_char;
@@ -353,7 +410,7 @@ LexToken Lexer::read_word(int first_char) {
       // Fd prefix: `2>`, `12<foo` etc.  When the word so far is all ASCII
       // digits and the next character is a redirection operator, hand the
       // whole lot over to read_redir and bake the fd into the token text.
-      if (all_digits_so_far and not text.empty()
+      if (all_digits_so_far and not text.empty() and not (mFlags & LEX_COND)
           and (c == '<' or c == '>')) {
         LexToken redir = read_redir(c);
         redir.text = text + redir.text;

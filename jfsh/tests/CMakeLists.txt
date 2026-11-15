@@ -6,10 +6,12 @@ include(${PROJECT_SOURCE_DIR}/../cmake/FetchGoogleTest.cmake)
 add_executable(jfsh_tests
   agent_test.cpp
   compound_test.cpp
+  cond_test.cpp
   exec_test.cpp
   glob_test.cpp
   history_test.cpp
   lexer_test.cpp
+  math_test.cpp
   params_test.cpp
   parser_test.cpp
   signals_test.cpp

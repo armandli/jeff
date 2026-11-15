@@ -115,6 +115,40 @@ TEST(Lexer, ReadArithStopsAtTheClosingParens) {
   EXPECT_EQ(lex2.read_arith(), std::nullopt);
 }
 
+TEST(Lexer, BangIsATokenOnlyOnItsOwn) {
+  using enum TokType;
+  auto toks = lex_all("! a != b !x");
+  EXPECT_EQ(types(toks), (std::vector<TokType>{TK_BANG, TK_WORD, TK_WORD, TK_WORD, TK_WORD}));
+  EXPECT_EQ(words(toks), (std::vector<std::string>{"!", "a", "!=", "b", "!x"}));
+}
+
+TEST(Lexer, CondStateMakesComparisonsWords) {
+  using enum TokType;
+  auto toks = lex_all("a < b > c ((x)) 2>d", LEX_COND);
+  EXPECT_EQ(types(toks),
+            (std::vector<TokType>{TK_WORD, TK_WORD, TK_WORD, TK_WORD, TK_WORD, TK_LPAREN,
+                                  TK_LPAREN, TK_WORD, TK_RPAREN, TK_RPAREN, TK_WORD,
+                                  TK_REDIR, TK_WORD}));
+  EXPECT_EQ(words(toks)[1], "<");
+  EXPECT_EQ(words(toks)[3], ">");
+  // Outside [[ ]] the same text is redirections.
+  EXPECT_EQ(lex_all("a < b")[1].type, TK_REDIR);
+}
+
+TEST(Lexer, ReadCondPatternKeepsGroupsWhole) {
+  StringInputSource in{"  *.(c|h)\"x y\"$(a b) ]] rest"};
+  Lexer lex{in};
+  EXPECT_EQ(lex.read_cond_pattern(), "*.(c|h)\"x y\"$(a b)");
+  EXPECT_EQ(lex.next_token().text, "]]");
+  StringInputSource stops{"a|b) c"};
+  Lexer lex2{stops};
+  EXPECT_EQ(lex2.read_cond_pattern(), "a");
+  EXPECT_EQ(lex2.next_token().type, TokType::TK_PIPE);
+  StringInputSource empty{"   "};
+  Lexer lex3{empty};
+  EXPECT_EQ(lex3.read_cond_pattern(), std::nullopt);
+}
+
 TEST(Lexer, ReportsInputCutOffInsideAQuote) {
   auto incomplete = [](std::string src) {
     StringInputSource in{std::move(src)};

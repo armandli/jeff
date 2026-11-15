@@ -67,6 +67,7 @@ enum LexFlags : std::uint32_t {
   LEX_CASEMOD      = 1 << 1,
   LEX_ACTIVE       = 1 << 2,
   LEX_DOCSTRING    = 1 << 3,
+  LEX_COND         = 1 << 4,   // inside [[ ]]: `<` `>` are words, `((` is two `(`
 };
 
 struct InputSource {
@@ -85,8 +86,13 @@ struct Lexer {
   void             consume();
   int              line() const noexcept;
 
-  void push_state(LexFlags flags);
-  void pop_state();
+  void     push_state(LexFlags flags);
+  void     pop_state();
+  LexFlags state() const noexcept { return mFlags; }
+
+  // Puts a token back so the next peek or next_token returns it; nothing
+  // may be peeked already.
+  void unread(LexToken tok) { mPeeked = std::move(tok); }
 
   void set_alias_expansion(bool on) noexcept { mAliasExpand = on; }
 
@@ -94,6 +100,13 @@ struct Lexer {
   // to the `))` that closes it, with nested parentheses kept.  nullopt when
   // the input ends first.
   std::optional<std::string> read_arith();
+
+  // Inside [[ ]], after a `=`, `==`, `!=` or `=~` token (and with nothing
+  // peeked past it): the pattern or regex operand as written.  Unlike a
+  // word, it keeps parentheses and `|` inside them (`(a|b)*`), and ends at
+  // a blank, or at a `)` or `|` outside parentheses.  nullopt at the end of
+  // the input.
+  std::optional<std::string> read_cond_pattern();
 
   // Here-documents: the parser registers each delimiter as it parses the
   // redirection; the lexer reads the bodies, in order, when it reaches the

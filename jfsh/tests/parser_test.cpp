@@ -275,6 +275,69 @@ TEST(Parser, ArithmeticCommandKeepsItsTextRaw) {
   EXPECT_EQ(listing("(( x > 1 ))"), program(2, "ARITH skip=1\nSTRING \" x > 1 \"\n"));
 }
 
+// ---- [[ ]] (M5) ---------------------------------------------------------------
+
+TEST(Parser, CondUnaryBinaryAndSingleWord) {
+  EXPECT_EQ(listing("[[ -f x ]]"),
+            program(3, "COND unary skip=2\nSTRING \"-f\"\nSTRING \"x\"\n"));
+  EXPECT_EQ(listing("[[ $a -lt 2 ]]"),
+            program(4, "COND binary skip=3\nSTRING \"-lt\"\nSTRING \"$a\"\nSTRING \"2\"\n"));
+  EXPECT_EQ(listing("[[ $x ]]"), program(2, "COND str skip=1\nSTRING \"$x\"\n"));
+  // `<` and `>` compare strings instead of redirecting.
+  EXPECT_EQ(listing("[[ b < c ]]"),
+            program(4, "COND binary skip=3\nSTRING \"<\"\nSTRING \"b\"\nSTRING \"c\"\n"));
+  // `-n = -n` compares two strings.
+  EXPECT_EQ(listing("[[ -n = -n ]]"),
+            program(4, "COND binary skip=3\nSTRING \"=\"\nSTRING \"-n\"\nSTRING \"-n\"\n"));
+}
+
+TEST(Parser, CondPatternOperandKeepsParenthesesAndBars) {
+  EXPECT_EQ(listing("[[ $f == *.(c|h) ]]"),
+            program(4, "COND binary skip=3\nSTRING \"==\"\nSTRING \"$f\"\n"
+                       "STRING \"*.(c|h)\"\n"));
+  EXPECT_EQ(listing("[[ $x =~ ^(a|b)+$ ]]"),
+            program(4, "COND binary skip=3\nSTRING \"=~\"\nSTRING \"$x\"\n"
+                       "STRING \"^(a|b)+$\"\n"));
+  EXPECT_EQ(listing("[[ a != \"x y\"* ]]"),
+            program(4, "COND binary skip=3\nSTRING \"!=\"\nSTRING \"a\"\n"
+                       "STRING \"\"x y\"*\"\n"));
+}
+
+TEST(Parser, CondLogicIsATreeWithSkips) {
+  // (a && !b) || c: && binds tighter, and each header precedes its operands.
+  EXPECT_EQ(listing("[[ a && ! b || c ]]"),
+            program(9, "COND or skip=8\nCOND and skip=5\n"
+                       "COND str skip=1\nSTRING \"a\"\n"
+                       "COND not skip=2\nCOND str skip=1\nSTRING \"b\"\n"
+                       "COND str skip=1\nSTRING \"c\"\n"));
+  EXPECT_EQ(listing("[[ ( a || b ) && c ]]"),
+            program(8, "COND and skip=7\nCOND or skip=4\n"
+                       "COND str skip=1\nSTRING \"a\"\nCOND str skip=1\nSTRING \"b\"\n"
+                       "COND str skip=1\nSTRING \"c\"\n"));
+  EXPECT_EQ(listing("[[ a ||\n  b ]]"),
+            program(5, "COND or skip=4\nCOND str skip=1\nSTRING \"a\"\n"
+                       "COND str skip=1\nSTRING \"b\"\n"));
+}
+
+TEST(Parser, CondIsACommandOnlyInCommandPosition) {
+  EXPECT_NE(listing("echo [[ a ]]").find("SIMPLE 4\n"), std::string::npos);
+  EXPECT_EQ(listing("[[ a ]] 2>/dev/null"),
+            program(4, "REDIR > fd=2\nSTRING \"/dev/null\"\n"
+                       "COND str skip=1\nSTRING \"a\"\n"));
+  EXPECT_NE(listing("! [[ a ]] && b").find("SUBLIST and|not"), std::string::npos);
+}
+
+TEST(Parser, CondErrors) {
+  EXPECT_EQ(listing("[[ ]]"), "error: parse error near `]]'");
+  EXPECT_EQ(listing("[[ a b ]]"), "error: parse error: condition expected: a");
+  EXPECT_EQ(listing("[[ a == a|b ]]"), "error: parse error near `|'");
+  EXPECT_EQ(listing("[[ ( a ]]"), "error: parse error near `]]'");
+  EXPECT_TRUE(is_incomplete("[[ a =="));
+  EXPECT_TRUE(is_incomplete("[[ a &&"));
+  EXPECT_TRUE(is_incomplete("[[ -n a"));
+  EXPECT_FALSE(is_incomplete("[[ -n a ]]"));
+}
+
 TEST(Parser, TypesetArgumentsAreAssignments) {
   EXPECT_EQ(listing("local -a x=$(a b) y z=(1 2)"),
             program(10, "TYPESET 5\nSTRING \"local\"\nSTRING \"-a\"\n"

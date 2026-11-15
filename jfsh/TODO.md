@@ -1,8 +1,8 @@
 # jfsh — remaining work
 
-Status as of 2026-11-13: M1 (simple commands), M2 (pipelines, redirections, lists,
-background jobs), M3 (word expansion) and M4 (compound commands and functions) are done,
-along with the part of M0 they needed.
+Status as of 2026-11-14: M1 (simple commands), M2 (pipelines, redirections, lists,
+background jobs), M3 (word expansion), M4 (compound commands and functions) and M5
+(arithmetic, `[[ ]]`, `test`) are done, along with the part of M0 they needed.
 
 jfsh builds on macOS and Linux and has gtest coverage for the pieces that work. It runs
 **simple commands**, pipelines and background jobs joined by `;`, newlines, `&&`, `||` and
@@ -10,9 +10,10 @@ jfsh builds on macOS and Linux and has gtest coverage for the pieces that work. 
 full word expansion pipeline (parameters, command and arithmetic substitution, splitting,
 braces, tilde, globbing), and compound commands: `if`, `while`/`until`, `for` (all three
 forms), `case`, `select`, `repeat`, subshells, brace groups, `always` blocks, `(( ))` and
-shell functions with `local`. Commands that span lines work in scripts, on stdin and at the
-prompt (with `PS2`). `[[ ]]` and most builtins beyond those M4 needed are still missing
-(M5, M7). The System 1 router and the LLM agent layer work end to end.
+shell functions with `local`, and conditions: `[[ … ]]`, `test`/`[` and integer and
+floating-point arithmetic. Commands that span lines work in scripts, on stdin and at the
+prompt (with `PS2`). Most builtins beyond those M4 and M5 needed are still missing (M7).
+The System 1 router and the LLM agent layer work end to end.
 
 This file has two parts:
 
@@ -64,9 +65,9 @@ parse errors print `jfsh:LINE: parse error near `X'` with status 1, and leftover
 are an error (B9). `disassemble()` (`src/parser/text.cpp`) backs `tests/parser_test.cpp`.
 
 **Remaining**
-- Each construct that lands later (`[[ ]]` in M5) adds its layout to the comment in
-  `wordcode.h`, its own `disassemble()` formatting, and parser tests asserting the exact
-  bytecode, as redirections (M2) and compound commands (M4) did.
+- Each construct that lands later adds its layout to the comment in `wordcode.h`, its
+  own `disassemble()` formatting, and parser tests asserting the exact bytecode, as
+  redirections (M2), compound commands (M4) and `[[ ]]` (M5) did.
 - The source-text decompiler for `functions`/`which` [text/decompile] is still to do.
 
 ### M1. Simple commands
@@ -97,7 +98,9 @@ are an error (B9). `disassemble()` (`src/parser/text.cpp`) backs `tests/parser_t
 - Aliases are expanded by the lexer (M7). (Function lookup ahead of builtins landed
   with M4.)
 - `PS4` is printed raw; prompt escapes such as zsh's default `+%N:%i> ` need M9.
-- Assigning to an integer parameter stores text; zsh evaluates it arithmetically (M5).
+- Assigning to an integer or float parameter evaluates the value arithmetically
+  (`i+=1` adds) since M5, for `name=value` words; `read`, `for` and `${x=v}` still
+  store text into such a parameter.
 - Array assignments `a=(x y)` landed with M3; subscripted assignments `a[i]=x` are still
   to do [parser/assign], [exec/assign].
 - There is still no way to turn on `xtrace` from the shell until `set -x`/`setopt` exist (M7).
@@ -195,8 +198,7 @@ assignments, words and redirection targets. Tests: `tests/subst_test.cpp`.
 - A failed `${x?}` should make a non-interactive shell exit; jfsh only fails the
   command [subst/errexit].
 - In `${x:-word}`, unquoted pattern characters in `word` should still glob.
-- Floating-point arithmetic and `OCTAL_ZEROES` [math/float], [math/octal]. (`(( … ))` as a
-  command landed with M4.)
+- Floating-point arithmetic and `OCTAL_ZEROES` landed with M5.
 - `NO_GLOB` (`set -f`) has no option slot yet; `CSH_NULL_GLOB` is not honoured.
 - History expansion still happens in the REPL before parsing (`HistoryManager::expand`).
 
@@ -268,24 +270,64 @@ and `tests/compound_test.cpp` (behaviour, with zsh's output as the expected valu
 
 ### M5. Arithmetic, `[[ ]]`, `test`
 
-**Arithmetic** [math/*], used by `(( ))`, `$(( ))`, `let`, array subscripts and
-`for (( ))`:
-- 64-bit integer and double arithmetic (`FORCE_FLOAT`, float literals) with C operator
-  precedence: `,`, assignment ops (`= += -= *= /= %= <<= >>= &= ^= |= **=`), `?:`,
-  `|| && | ^ &`, comparisons, shifts, `+ - * / %`, `**`, unary `! ~ + -`, and pre/post
-  `++`/`--`.
-- Bare variable names, with unset or empty values reading as 0; bases `16#ff`, `0x`,
-  `0b`, `0` octal (with `OCTAL_ZEROES`); `_` digit separators.
-- Errors: division by zero, bad syntax → status 1 plus a message, not a crash.
+**Done.** Arithmetic is `src/builtins/math.cpp` (`math_eval`, documented in
+`include/jfsh/builtins/math.h`); the conditions shared by `[[ ]]` and `test` are
+`src/builtins/cond.cpp` (`include/jfsh/builtins/cond.h`), which also holds the `test`
+builtin; `[[ ]]` is parsed by `Parser::par_cond` and run by `Executor::exec_cond`. Tests:
+`tests/math_test.cpp`, `tests/cond_test.cpp` (expected values from zsh 5.9), and bytecode
+and lexer tests in `tests/parser_test.cpp` and `tests/lexer_test.cpp`.
+- **Arithmetic** (`$(( ))`, `(( ))`, `let`, `for (( ))`, `[[ -eq ]]`, subscripts,
+  `typeset -i/-F/-E`): values are 64-bit integers or doubles (`MathNum`). Float literals
+  (`1.5`, `1.`, `.5`, `1e3`), `Inf`/`NaN`, float parameters, and an integer `**` a
+  negative exponent give floats; mixed operands promote; comparisons and bitwise operators
+  give integers. `$(( ))` prints floats as zsh does (`10.`, `0.30000000000000004`,
+  `1e+20`). Integers wrap on overflow; integer division by zero is an error, float
+  division gives `Inf`.
+- The evaluator is now precedence climbing over two tables: zsh's default (shifts and
+  bitwise operators bind tighter than `**`, `*` and `+`, which the old evaluator had
+  backwards) and C's under `C_PRECEDENCES`. All assignment operators, including `^^=`;
+  `&&`, `||`, `&&=`, `||=` and `?:` don't evaluate the un-taken side.
+- Literals: `0x`, `0b`, `base#digits`, `_` between digits, `0` octal under
+  `OCTAL_ZEROES`; `FORCE_FLOAT` makes integer constants floats. `name[i]` reads and
+  assigns array elements (negative indexes, growing the array) and `name[key]`
+  associative-array elements.
+- Assigning to a new name gives it the value's type (`(( n = 5 ))` is an integer,
+  `(( g = 2.5 ))` a float); an existing integer or float keeps its type, and a scalar stays
+  a scalar. `name=value` and `name+=value` on an integer or float parameter are evaluated
+  arithmetically. Float parameters print as `typeset -F` (`2.5000000000`) or, with the new
+  `PM_EFLOAT`, as `typeset -E` (`2.500000000e+00`); `Param::scalar()` renders integer and
+  float values.
+- Errors match zsh's messages (`operator expected at `…'`, `lvalue required`,
+  `invalid base`, `math recursion limit exceeded`) and set status 1, or 2 for `(( ))`.
+- **`[[ … ]]`:** `[[` is a command word that switches the lexer to `LEX_COND`, where `<`
+  and `>` are words and `((` is two `(`. Bytecode is a `WC_COND` tree (`wordcode.h`):
+  `!`, `&&`, `||` and `( )` with zsh's precedence, newlines allowed between parts.
+  Operands are expanded without splitting or globbing. The right side of `=`, `==`, `!=`
+  is a pattern read raw by `Lexer::read_cond_pattern`, so `(a|b)*` stays one operand;
+  quoted parts and parameter values are literal unless `${~x}`. `=~` is a POSIX extended
+  regex that sets `$MATCH`, `$MBEGIN`, `$MEND`, `$match`, `$mbegin`, `$mend` (character
+  offsets, -1 for a group that took no part). `<`/`>` compare strings; `-eq` … `-ge`
+  compare arithmetic expressions (`[[ n+1 -gt 2.5 ]]`).
+- Unary tests `-a -b -c -d -e -f -g -h -k -n -o -p -r -s -t -u -v -w -x -z -L -O -G -S -N`
+  and `-nt -ot -ef` (false unless both files exist). Status 2 and a message for an unknown
+  condition, 3 for `-o` with no such option, as in zsh.
+- **`test` / `[`** (bug B19 for these two): POSIX's rules for up to four arguments (so
+  `test = = =` and `test ! = !` compare strings), then `!`, `-a`, `-o` and `( )` by
+  precedence. Integers must be decimal (`integer expression expected`, status 2), and `[`
+  needs its `]`.
+- `OptionState::find` matches exact names before stripping `no` and reports the negation
+  (bug B15), so `[[ -o nomatch ]]` and `[[ -o nonomatch ]]` both work.
+- A `!` that isn't a word of its own (`!=`, `!x`) is now part of a word; it used to split
+  `test a != b` into `a ! = b`. `${~x}` and `GLOB_SUBST` now make a value active in `case`
+  and `[[ = ]]` patterns, as they already did in arguments.
 
-**Conditional expressions** [cond/*], [parser/cond], [exec/cond], [builtin/test]:
-- `[[ … ]]` needs its own lexer state: no word splitting or globbing of operands,
-  `&&`/`||`/`!`/`( )`, pattern match on the right of `==`/`!=`, `=~` regex with
-  `$MATCH`/`$match`, and `<`/`>` string comparison.
-- Unary tests `-a -b -c -d -e -f -g -h -k -n -o -p -r -s -t -u -w -x -z -L -O -G -S -N`;
-  binary tests `-nt -ot -ef -eq -ne -lt -le -gt -ge`.
-- `test` / `[`: POSIX argument-count rules, `-a`/`-o` with their lower precedence, and
-  `[` requires a closing `]`.
+**Left**
+- The zsh/mathfunc functions (`sqrt`, `int`, …) [math/mathfunc], which need `zmodload`;
+  output bases `$(( [#16] x ))` and `C_BASES` [math/output]; `##x` character codes.
+- `REMATCH_PCRE` and `BASH_REMATCH` for `=~`, and module conditions (`-pcre-match`, …).
+  zsh calls a lone `[[ -n ]]` an unknown condition; jfsh tests the string `-n`.
+- `test` accepts `<` and `>` (POSIX 2024) and `test -o option`, where zsh errors.
+- xtrace doesn't print `[[ … ]]` or `(( … ))` commands yet.
 
 ### M6. Job control, signals, traps [signals/*], [builtin/bg|fg|jobs|wait|disown|kill]
 
@@ -321,16 +363,17 @@ and `tests/compound_test.cpp` (behaviour, with zsh's output as the expected valu
 
 ### M7. Builtins [builtin/*]
 
-Every stub currently returns 0, which is actively harmful: `[ -f /nonexistent ]` succeeds
-(bug B19). (M4 made `typeset`, `local`, `declare`, `integer`, `float`, `export`, `readonly`,
-`read`, `break`, `continue` and `return` real; see M4.) Until a builtin is implemented it should print
+Every stub currently returns 0, which is actively harmful: `kill` or `set -e` report
+success while doing nothing (bug B19). (M5 made `test`/`[` and `let` real; M4 made
+`typeset`, `local`, `declare`, `integer`, `float`, `export`, `readonly`, `read`, `break`,
+`continue` and `return` real.) Until a builtin is implemented it should print
 `jfsh: NAME: not implemented` and return 1.
 
 | Group | Builtins | Key requirements |
 |---|---|---|
 | Sourcing / eval | `.`, `source`, `eval`, `exec` | `.` searches `PATH` for a bare name; positional args are scoped to the sourced file; `exec` with no command applies redirections permanently; `exec cmd` replaces the process |
 | Variables | `export`, `readonly`, `typeset`/`declare`/`local`/`integer`/`float`, `unset` | `-a -A -i -F -E -r -x -g -l -u -U -p` flags; `unset -f` / `-v`; readonly enforcement in `ParamTable::assign` |
-| Options | `set`, `setopt`, `unsetopt`, `emulate` | `set -e -u -x -o name +o`; `set -- args` sets positionals; `setopt` with no args lists non-default options; `no` prefix negates (bug B15) |
+| Options | `set`, `setopt`, `unsetopt`, `emulate` | `set -e -u -x -o name +o`; `set -- args` sets positionals; `setopt` with no args lists non-default options; `no` prefix negates (`OptionState::find` reports it) |
 | Positionals | `shift [N]` | errors when N exceeds `$#` |
 | Directories | `cd`, `pushd`, `popd`, `dirs`, `pwd` | `cd -`, `CDPATH`, update `PWD`/`OLDPWD`, `AUTO_PUSHD`, `PUSHD_SILENT`, `cd old new` substitution, `-L`/`-P`, and errors on stderr (bug B20) |
 | Output | `echo`, `print`, `printf` | `echo -n -e -E`, plus `BSD_ECHO`; `print -n -r -l -u N -P -z`; full `printf` with `%s %d %x %f %b %q` and argument reuse |
@@ -339,7 +382,7 @@ Every stub currently returns 0, which is actively harmful: `[ -f /nonexistent ]`
 | Aliases | `alias`, `unalias` | regular, global (`-g`) and suffix (`-s`) aliases, and alias expansion in the lexer (alias text re-lexed, recursion guard) |
 | Lookup | `whence`, `which`, `type`, `command`, `builtin`, `hash`, `rehash` | `-v -c -p -a`; `command -v`; `builtin name` bypasses functions; a command hash table that a `PATH` change invalidates |
 | Limits | `ulimit`, `umask`, `times` | real `getrlimit`/`setrlimit`; `umask -S`; `times` from `getrusage` (it currently prints zeros) |
-| Arithmetic | `let` | → M5 |
+| Arithmetic | `let` | done in M5 |
 | Functions | `functions`, `autoload` | print definitions via the decompiler; `autoload -U` lazy-loads from `$fpath` |
 | zsh extras | `zmodload`, `bindkey`, `vared`, `zle`, `sched`, `zpty`, `compinit` | `bindkey` and `zle` need M9; `zpty` is defined but **not registered** (bug B21); `sched` needs the REPL hook |
 | Control | `break`, `continue`, `return`, `exit` | N levels; `exit` validates numeric args and runs the EXIT trap; `return` outside a function behaves like `exit` in a sourced file |
@@ -516,13 +559,21 @@ Every stub currently returns 0, which is actively harmful: `[ -f /nonexistent ]`
   output.
 - The two former `DISABLED_` tests (`GlobPatternMatch.BracketExpressions`,
   `Lexer.SubstitutionsStayOneWord`) are enabled since M3.
-- `tests/compound_test.cpp` covers M4 end to end; its expected outputs were checked
-  against zsh 5.9 (`zsh -f`).
+- `tests/compound_test.cpp` covers M4 end to end, and `tests/cond_test.cpp` and
+  `tests/math_test.cpp` cover M5; their expected outputs were checked against zsh 5.9
+  (`zsh -f`).
 - `tests/shell_fixture.h` holds the in-process `Shell`/`TempDir` helpers shared by
   `exec_test.cpp`, `subst_test.cpp` and `compound_test.cpp`.
 - Run the suite under ASan/UBSan in CI. jfsh's Debug build has no sanitizer flags yet,
   although the top-level build does. (The suite passed under ASan + UBSan + LeakSanitizer
   when M1 landed, using a scratch build with `-fsanitize=address,undefined`.)
+- On macOS under ASan + UBSan (checked when M5 landed), every test passes except
+  `Subst.ProcessSubstitutionIsLeftToTheExecutor`, and that one only in a full run: alone,
+  or with any single other test left out, it passes, and it passes in the plain Debug
+  build. When it fails, the shell's forked children die with SIGKILL before they run
+  (`cat` exits 137, `<(…)` and `$(…)` produce nothing), with no sanitizer report. It is not
+  an fd leak, zombies, the working directory or ASan's quarantine size; the cause is still
+  unknown.
 
 ---
 
@@ -549,10 +600,9 @@ Severity:
 | B10 | `src/lexer/lexer.cpp:192` | Fd-number prefixes are not part of the redirection: `2>&1` lexes as word `2`, redir `>&`, word `1`, so `2` becomes a command argument. | code reading |
 | B13 | `src/core/params.cpp:83` | Shell assignments now go through `set_scalar`, which updates the right scope and enforces readonly. The lower-level `assign()` still writes into the innermost scope, ignores `PM_READONLY`, and with `flags` 0 makes the parameter `PM_SCALAR` even for an integer or array value; `typeset`/`local`/`export` (M7) must not use it for plain updates. | code reading |
 | B14 | `src/exec/executor.cpp` (`run_external`) | `waitpid` now retries on `EINTR`, but there is no `WUNTRACED`: a stopped child (Ctrl-Z) leaves the shell blocked in `waitpid`. Part of M6. | code reading |
-| B15 | `src/core/options.cpp:225` | `OptionState::find` strips a leading `no` **before** matching, so the real options `nomatch` and `notify` can never be found. The negation it detects is thrown away, so `noextendedglob` resolves to `extendedglob` and the caller can't tell. | **confirmed**: `find("nomatch")` = not found; `find("noextendedglob")` = `extendedglob` |
 | B16 | `src/core/signals.cpp:69` | `trap 'cmd' SIG` (`TrapAction::Command`) installs no handler at all, so command traps never fire. `set_trap` also calls `std::signal` on `SIGKILL`/`SIGSTOP` and ignores the failure. | code reading |
 | B17 | `src/core/signals.cpp:149` | `kill_job(pgid)` with the default `Job::pgid == -1` calls `kill(1, sig)`, which signals **init**; with pgid 0 it signals jfsh's own process group. It must reject `pgid <= 1`. | code reading |
-| B19 | `src/builtins/builtins.cpp` (~40 builtins) | Unimplemented builtins return 0. `test`/`[` always succeed (`[ -f /missing ] && rm …` takes the true branch), and `kill`, `set`, `shift`, `setopt`, `unset`, `eval` and the `cd`-stack builtins all report success while doing nothing. (`export`, `readonly`, `typeset`/`local` and `read` are real since M4.) | code reading |
+| B19 | `src/builtins/builtins.cpp` (~40 builtins) | Unimplemented builtins return 0: `kill`, `set`, `shift`, `setopt`, `unset`, `eval` and the `cd`-stack builtins all report success while doing nothing. (`export`, `readonly`, `typeset`/`local` and `read` are real since M4, `test`/`[` and `let` since M5.) | code reading |
 | B20 | `src/builtins/builtins.cpp:185` | `cd` returns `chdir()`'s `-1` directly as the exit status (255) with no error message, and never updates `PWD`/`OLDPWD`. | code reading |
 | B21 | `src/builtins/builtins.cpp:436`, `:11` | `builtin_zpty` is defined and declared in `builtins.h` but never registered in `BuiltinTable::register_all()`. | code reading |
 | B22 | `src/core/signals.cpp:119`, `include/jfsh/core/signals.h:68` | The SIGCHLD handler does a read-modify-write on plain `uint64_t` fields (`PendingSignals::mark`), which is not async-signal-safe. Use `volatile std::sig_atomic_t` flags or `std::atomic<uint64_t>` with lock-free ops, and install with `sigaction` + `SA_RESTART`. `dispatch_pending()` is only called from `SignalManager::unblock()`, and nothing calls `block()`/`unblock()`, so even the flag is never acted on. | code reading |
@@ -622,4 +672,5 @@ Severity:
 | B60 | M2: `par_redir` consumes the target word and emits `WC_REDIR + WC_STRING`, so redirections no longer turn their target into an argument. |
 | B7 | M4: wherever the parser expects words (`for … in` lists, `case` patterns and subjects, `repeat` counts, anonymous function arguments, command arguments), it takes a reserved word as a word, so keywords only act in command position. |
 | B18 | M4: `break N` / `continue N` unwind N loops through `ExecContext::break_level` and `continuing`; `loop_depth` reports a `break` outside any loop. |
+| B15 | M5: `OptionState::find` tries the exact name first and only then strips `no`, reporting the negation through an out-parameter. |
 | B31 | M4: stdin mode gathers lines until `is_incomplete()` says the command is whole, so constructs that span lines work and a line longer than the 4096-byte buffer is no longer split into two commands. |
