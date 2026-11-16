@@ -1,21 +1,22 @@
-#include <curl/curl.h>
+#include <jfsh/agent/anthropic.h>
 
+#include <curl/curl.h>
 #include <json.h>
 
-#include <jfsh/agent/anthropic.h>
+#include <jfsh/core/aliases.h>
 
 namespace jfsh {
 
-static std::size_t curl_write_anthropic(char* ptr, std::size_t, std::size_t nmemb,
-                                         void* ud) {
-  static_cast<std::string*>(ud)->append(ptr, nmemb);
+static s::size_t curl_write_anthropic(char* ptr, s::size_t, s::size_t nmemb,
+                                       void* ud) {
+  static_cast<str*>(ud)->append(ptr, nmemb);
   return nmemb;
 }
 
-AnthropicBackend::AnthropicBackend(ProviderConfig cfg) : mCfg(std::move(cfg)) {}
+AnthropicBackend::AnthropicBackend(ProviderConfig cfg) : mCfg(s::move(cfg)) {}
 
-std::string AnthropicBackend::build_body(const ChatRequest& req) const {
-  std::string_view system_text;
+str AnthropicBackend::build_body(const ChatRequest& req) const {
+  strv system_text;
   for (const auto& m : req.messages)
     if (m.role == Role::System) system_text = m.content;
 
@@ -35,21 +36,21 @@ std::string AnthropicBackend::build_body(const ChatRequest& req) const {
   return w.str();
 }
 
-Result<std::string> AnthropicBackend::http_post(std::string_view url,
-                                                 std::string_view body) const {
+Result<str> AnthropicBackend::http_post(strv url,
+                                         strv body) const {
   CURL* curl = curl_easy_init();
   if (not curl)
-    return std::unexpected(ShellError{ErrorKind::AgentError, "curl init failed"});
+    return s::unexpected(ShellError{ErrorKind::AgentError, "curl init failed"});
 
-  std::string resp;
+  str resp;
   struct curl_slist* hdrs = nullptr;
   hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-  std::string ak = "x-api-key: " + mCfg.api_key;
+  str ak = "x-api-key: " + mCfg.api_key;
   hdrs = curl_slist_append(hdrs, ak.c_str());
-  std::string av = std::string("anthropic-version: ") + std::string(kApiVersion);
+  str av = str("anthropic-version: ") + str(kApiVersion);
   hdrs = curl_slist_append(hdrs, av.c_str());
 
-  curl_easy_setopt(curl, CURLOPT_URL,           std::string(url).c_str());
+  curl_easy_setopt(curl, CURLOPT_URL,           str(url).c_str());
   // POSTFIELDS is not copied by curl; body outlives curl_easy_perform below.
   curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    body.data());
@@ -63,24 +64,24 @@ Result<std::string> AnthropicBackend::http_post(std::string_view url,
   curl_easy_cleanup(curl);
 
   if (rc != CURLE_OK)
-    return std::unexpected(ShellError{ErrorKind::AgentError,
-        std::string("curl: ") + curl_easy_strerror(rc)});
+    return s::unexpected(ShellError{ErrorKind::AgentError,
+        str("curl: ") + curl_easy_strerror(rc)});
   return resp;
 }
 
-Result<ChatResponse> AnthropicBackend::parse_response(std::string_view json) const {
+Result<ChatResponse> AnthropicBackend::parse_response(strv json) const {
   // {"content":[{"type":"text","text":"..."},...],"stop_reason":"end_turn",
   //  "usage":{"input_tokens":N,"output_tokens":M}}
   auto parsed = jeff::json::parse(json);
   if (not parsed)
-    return std::unexpected(ShellError{
+    return s::unexpected(ShellError{
         ErrorKind::AgentError, "invalid response: " + parsed.error});
   if (auto err = api_error_message(parsed.value))
-    return std::unexpected(ShellError{ErrorKind::AgentError, *err});
+    return s::unexpected(ShellError{ErrorKind::AgentError, *err});
 
   const jeff::json::Value* blocks = parsed.value.find("content");
   if (not blocks or not blocks->is_array())
-    return std::unexpected(ShellError{ErrorKind::AgentError, "no content in response"});
+    return s::unexpected(ShellError{ErrorKind::AgentError, "no content in response"});
 
   ChatResponse r;
   for (const auto& block : *blocks->as_array())
@@ -93,27 +94,26 @@ Result<ChatResponse> AnthropicBackend::parse_response(std::string_view json) con
   return r;
 }
 
-std::optional<std::string>
-AnthropicBackend::parse_sse_chunk(std::string_view line) const {
+opt<str> AnthropicBackend::parse_sse_chunk(strv line) const {
   // data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
   auto data = jeff::json::sse_data(line);
-  if (not data) return std::nullopt;
+  if (not data) return s::nullopt;
   auto parsed = jeff::json::parse(*data);
   if (not parsed or parsed.value.get_string("type") != "content_block_delta")
-    return std::nullopt;
+    return s::nullopt;
   const jeff::json::Value* delta = parsed.value.find("delta");
-  if (not delta or delta->get_string("type") != "text_delta") return std::nullopt;
+  if (not delta or delta->get_string("type") != "text_delta") return s::nullopt;
   return delta->get_string("text");
 }
 
 Result<ChatResponse> AnthropicBackend::chat(const ChatRequest& req) {
-  std::string url = (mCfg.base_url.empty()
+  str url = (mCfg.base_url.empty()
       ? "https://api.anthropic.com"
       : mCfg.base_url)
       + "/v1/messages";
   auto body = build_body(req);
   auto resp = http_post(url, body);
-  if (not resp) return std::unexpected(resp.error());
+  if (not resp) return s::unexpected(resp.error());
   return parse_response(*resp);
 }
 

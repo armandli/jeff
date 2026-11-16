@@ -4,44 +4,45 @@
 
 #include <gtest/gtest.h>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/param.h>
 
 namespace jfsh {
 namespace {
 
-long count_prefix(const std::vector<std::string>& env, std::string_view prefix) {
-  return std::count_if(env.begin(), env.end(),
-                       [&](const std::string& e) { return e.starts_with(prefix); });
+s::ptrdiff_t count_prefix(const vec<str>& env, strv prefix) {
+  return s::count_if(env.begin(), env.end(),
+                     [&](const str& e) { return e.starts_with(prefix); });
 }
 
 // make_envp emits each name once, with its innermost value (bug B12).
 TEST(ParamTable, EnvpUsesTheInnermostDefinitionOnce) {
   ParamTable params;
-  params.assign("X", std::string("outer"), PM_SCALAR | PM_EXPORTED);
+  params.assign("X", str("outer"), PM_SCALAR | PM_EXPORTED);
   params.push_scope();
-  params.assign("X", std::string("inner"), PM_SCALAR | PM_EXPORTED);
+  params.assign("X", str("inner"), PM_SCALAR | PM_EXPORTED);
   auto env = params.make_envp();
   EXPECT_EQ(count_prefix(env, "X="), 1);
-  EXPECT_NE(std::ranges::find(env, std::string("X=inner")), env.end());
+  EXPECT_NE(s::ranges::find(env, str("X=inner")), env.end());
 }
 
 TEST(ParamTable, UnexportedLocalHidesAnExportedGlobal) {
   ParamTable params;
-  params.assign("X", std::string("outer"), PM_SCALAR | PM_EXPORTED);
+  params.assign("X", str("outer"), PM_SCALAR | PM_EXPORTED);
   params.push_scope();
-  params.assign("X", std::string("inner"), PM_SCALAR);
+  params.assign("X", str("inner"), PM_SCALAR);
   EXPECT_EQ(count_prefix(params.make_envp(), "X="), 0);
 }
 
 TEST(ParamTable, IntegersAreExportedAsText) {
   ParamTable params;
-  params.assign("N", 42LL, PM_INTEGER | PM_EXPORTED);
-  EXPECT_EQ(params.make_envp(), std::vector<std::string>{"N=42"});
+  params.assign("N", s::int64_t{42}, PM_INTEGER | PM_EXPORTED);
+  EXPECT_EQ(params.make_envp(), vec<str>{"N=42"});
 }
 
 TEST(ParamTable, SetScalarKeepsAttributesAndCreatesGlobals) {
   ParamTable params;
-  params.assign("E", std::string("1"), PM_SCALAR | PM_EXPORTED);
+  params.assign("E", str("1"), PM_SCALAR | PM_EXPORTED);
   params.push_scope();
   ASSERT_TRUE(params.set_scalar("E", "2"));
   ASSERT_TRUE(params.set_scalar("NEW", "v"));
@@ -53,7 +54,7 @@ TEST(ParamTable, SetScalarKeepsAttributesAndCreatesGlobals) {
 
 TEST(ParamTable, SetScalarRefusesReadonly) {
   ParamTable params;
-  params.assign("R", std::string("x"), PM_SCALAR | PM_READONLY);
+  params.assign("R", str("x"), PM_SCALAR | PM_READONLY);
   auto r = params.set_scalar("R", "y");
   ASSERT_FALSE(r);
   EXPECT_EQ(r.error().message, "read-only variable: R");

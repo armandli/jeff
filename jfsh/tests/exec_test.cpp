@@ -1,23 +1,23 @@
 #include <cstdio>
 #include <cstdlib>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <string_view>
 
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include <gtest/gtest.h>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/jobs.h>
 #include <jfsh/core/options.h>
 #include <jfsh/core/param.h>
 #include <jfsh/core/signals.h>
 #include <jfsh/exec/executor.h>
-
-#include "shell_fixture.h"
+#include <shell_fixture.h>
 
 namespace jfsh {
 namespace {
@@ -25,10 +25,10 @@ namespace {
 using test::Run;
 using test::Shell;
 using test::TempDir;
-namespace fs = std::filesystem;
+namespace sf = s::filesystem;
 
-constexpr fs::perms kExec = fs::perms::owner_all;
-constexpr fs::perms kNoExec = fs::perms::owner_read | fs::perms::owner_write;
+constexpr sf::perms EXEC = sf::perms::owner_all;
+constexpr sf::perms NO_EXEC = sf::perms::owner_read | sf::perms::owner_write;
 
 // ---- lists, sublists, $? ---------------------------------------------------
 
@@ -110,7 +110,7 @@ TEST(Exec, AppendAssignment) {
 // of creating a shadowing local (bug B13).
 TEST(Exec, AssignmentUpdatesTheExistingParameter) {
   Shell sh;
-  sh.params.assign("G", std::string("old"), PM_SCALAR);
+  sh.params.assign("G", str("old"), PM_SCALAR);
   sh.params.push_scope();
   sh.run("G=new; L=created");
   sh.params.pop_scope();
@@ -120,10 +120,10 @@ TEST(Exec, AssignmentUpdatesTheExistingParameter) {
 
 TEST(Exec, ReadonlyParameterRejectsAssignment) {
   Shell sh;
-  sh.params.assign("R", std::string("fixed"), PM_SCALAR | PM_READONLY);
+  sh.params.assign("R", str("fixed"), PM_SCALAR | PM_READONLY);
   auto r = sh.run("R=changed");
   EXPECT_EQ(r.rc, 1);
-  EXPECT_NE(r.err.find("read-only variable: R"), std::string::npos);
+  EXPECT_NE(r.err.find("read-only variable: R"), str::npos);
   EXPECT_EQ(sh.get("R"), "fixed");
 
   r = sh.run("R=changed echo ran");
@@ -134,7 +134,7 @@ TEST(Exec, ReadonlyParameterRejectsAssignment) {
 TEST(Exec, PrefixAssignmentGoesOnlyToTheChildsEnvironment) {
   Shell sh;
   auto r = sh.run("V=tmp env");
-  EXPECT_NE(("\n" + r.out).find("\nV=tmp\n"), std::string::npos);
+  EXPECT_NE(("\n" + r.out).find("\nV=tmp\n"), str::npos);
   EXPECT_EQ(sh.get("V"), "<unset>");
 }
 
@@ -156,10 +156,10 @@ TEST(Exec, PrefixAssignmentBeforeASpecialBuiltinPersistsUnderPosixBuiltins) {
 // Children see the shell's parameters, not the process environment (B12).
 TEST(Exec, ExportedParametersReachChildren) {
   Shell sh;
-  sh.params.assign("E", std::string("1"), PM_SCALAR | PM_EXPORTED);
+  sh.params.assign("E", str("1"), PM_SCALAR | PM_EXPORTED);
   auto r = sh.run("E=2; U=unexported; env");
-  EXPECT_NE(("\n" + r.out).find("\nE=2\n"), std::string::npos);
-  EXPECT_EQ(("\n" + r.out).find("\nU="), std::string::npos);
+  EXPECT_NE(("\n" + r.out).find("\nE=2\n"), str::npos);
+  EXPECT_EQ(("\n" + r.out).find("\nU="), str::npos);
 }
 
 // ---- external commands -----------------------------------------------------
@@ -176,16 +176,16 @@ TEST(Exec, MissingPathIs127) {
   TempDir dir;
   auto r = sh.run((dir.path / "missing").string());
   EXPECT_EQ(r.rc, 127);
-  EXPECT_NE(r.err.find("no such file or directory"), std::string::npos);
+  EXPECT_NE(r.err.find("no such file or directory"), str::npos);
 }
 
 TEST(Exec, NotExecutableIs126) {
   Shell sh;
   TempDir dir;
-  auto file = dir.file("data", "x\n", kNoExec);
+  auto file = dir.file("data", "x\n", NO_EXEC);
   auto r = sh.run(file.string());
   EXPECT_EQ(r.rc, 126);
-  EXPECT_NE(r.err.find("permission denied"), std::string::npos);
+  EXPECT_NE(r.err.find("permission denied"), str::npos);
 
   // Found on $PATH but not executable.
   sh.params.set_scalar("PATH", dir.path.string());
@@ -207,7 +207,7 @@ TEST(Exec, ExitStatusOfExternalCommand) {
 TEST(Exec, ScriptWithoutShebangRunsWithSh) {
   Shell sh;
   TempDir dir;
-  auto script = dir.file("plain", "echo from-sh \"$1\"\n", kExec);
+  auto script = dir.file("plain", "echo from-sh \"$1\"\n", EXEC);
   EXPECT_EQ(sh.run(script.string() + " arg").out, "from-sh arg\n");
 }
 
@@ -220,8 +220,8 @@ TEST(Exec, BuiltinOutputComesBeforeTheNextChilds) {
 TEST(Exec, PathChangesInvalidateTheCommandHash) {
   Shell sh;
   TempDir one, two;
-  auto in_one = one.file("jfshcmd", "#!/bin/sh\n", kExec);
-  auto in_two = two.file("jfshcmd", "#!/bin/sh\n", kExec);
+  auto in_one = one.file("jfshcmd", "#!/bin/sh\n", EXEC);
+  auto in_two = two.file("jfshcmd", "#!/bin/sh\n", EXEC);
 
   sh.params.set_scalar("PATH", one.path.string());
   EXPECT_EQ(sh.exec.find_command("jfshcmd"), in_one.string());
@@ -234,12 +234,12 @@ TEST(Exec, PathChangesInvalidateTheCommandHash) {
 TEST(Exec, EmptyPathComponentMeansCurrentDirectory) {
   Shell sh;
   TempDir dir;
-  dir.file("jfshcmd", "#!/bin/sh\n", kExec);
-  auto cwd = fs::current_path();
-  fs::current_path(dir.path);
+  dir.file("jfshcmd", "#!/bin/sh\n", EXEC);
+  auto cwd = sf::current_path();
+  sf::current_path(dir.path);
   sh.params.set_scalar("PATH", "/nonexistent:");
   auto found = sh.exec.find_command("jfshcmd");
-  fs::current_path(cwd);
+  sf::current_path(cwd);
   EXPECT_EQ(found, "./jfshcmd");
 }
 
@@ -286,7 +286,7 @@ TEST(Exec, PipelineStderrMerge) {
   // sh -c 'echo out; echo err 1>&2' writes to both; |& should capture both.
   auto r = sh.run("sh -c 'echo xx 1>&2' |& cat");
   EXPECT_EQ(r.rc, 0);
-  EXPECT_NE(r.out.find("xx"), std::string::npos);
+  EXPECT_NE(r.out.find("xx"), str::npos);
 }
 
 TEST(Exec, BackgroundJobReturnsImmediately) {
@@ -306,9 +306,9 @@ TEST(Exec, RedirectWriteCreatesFile) {
   auto out = (dir.path / "o").string();
   auto r = sh.run("echo hi > " + out);
   EXPECT_EQ(r.rc, 0);
-  std::ifstream f{out};
-  std::string got((std::istreambuf_iterator<char>(f)),
-                  std::istreambuf_iterator<char>());
+  s::ifstream f{out};
+  str got((s::istreambuf_iterator<char>(f)),
+          s::istreambuf_iterator<char>());
   EXPECT_EQ(got, "hi\n");
 }
 
@@ -319,9 +319,9 @@ TEST(Exec, RedirectAppendPreservesFile) {
   sh.run("echo a > " + out);
   auto r = sh.run("echo b >> " + out);
   EXPECT_EQ(r.rc, 0);
-  std::ifstream f{out};
-  std::string got((std::istreambuf_iterator<char>(f)),
-                  std::istreambuf_iterator<char>());
+  s::ifstream f{out};
+  str got((s::istreambuf_iterator<char>(f)),
+          s::istreambuf_iterator<char>());
   EXPECT_EQ(got, "a\nb\n");
 }
 
@@ -329,7 +329,7 @@ TEST(Exec, RedirectReadDeliversFileAsStdin) {
   Shell sh;
   TempDir dir;
   auto in = (dir.path / "i").string();
-  std::ofstream{in} << "hello\n";
+  s::ofstream{in} << "hello\n";
   auto r = sh.run("cat < " + in);
   EXPECT_EQ(r.rc, 0);
   EXPECT_EQ(r.out, "hello\n");
@@ -362,9 +362,9 @@ TEST(Exec, StderrRedirectToFile) {
   auto errfile = (dir.path / "e").string();
   auto r = sh.run("sh -c 'echo err 1>&2' 2> " + errfile);
   EXPECT_EQ(r.rc, 0);
-  std::ifstream f{errfile};
-  std::string got((std::istreambuf_iterator<char>(f)),
-                  std::istreambuf_iterator<char>());
+  s::ifstream f{errfile};
+  str got((s::istreambuf_iterator<char>(f)),
+          s::istreambuf_iterator<char>());
   EXPECT_EQ(got, "err\n");
 }
 
@@ -373,21 +373,21 @@ TEST(Exec, MergeStderrIntoStdout) {
   auto r = sh.run("sh -c 'echo out; echo err 1>&2' 2>&1");
   EXPECT_EQ(r.rc, 0);
   // Both lines reach stdout; order is "out\nerr\n" for the sh above.
-  EXPECT_NE(r.out.find("out"), std::string::npos);
-  EXPECT_NE(r.out.find("err"), std::string::npos);
+  EXPECT_NE(r.out.find("out"), str::npos);
+  EXPECT_NE(r.out.find("err"), str::npos);
 }
 
 TEST(Exec, NoClobberRefusesExistingFile) {
   Shell sh;
   TempDir dir;
   auto path = (dir.path / "o").string();
-  std::ofstream{path} << "orig";
+  s::ofstream{path} << "orig";
   sh.opts.unset(OPT_CLOBBER);
   auto r = sh.run("echo new > " + path);
   EXPECT_NE(r.rc, 0);
-  std::ifstream f{path};
-  std::string got((std::istreambuf_iterator<char>(f)),
-                  std::istreambuf_iterator<char>());
+  s::ifstream f{path};
+  str got((s::istreambuf_iterator<char>(f)),
+          s::istreambuf_iterator<char>());
   EXPECT_EQ(got, "orig");
 }
 
@@ -395,13 +395,13 @@ TEST(Exec, ClobberOperatorOverridesNoClobber) {
   Shell sh;
   TempDir dir;
   auto path = (dir.path / "o").string();
-  std::ofstream{path} << "orig";
+  s::ofstream{path} << "orig";
   sh.opts.unset(OPT_CLOBBER);
   auto r = sh.run("echo new >| " + path);
   EXPECT_EQ(r.rc, 0);
-  std::ifstream f{path};
-  std::string got((std::istreambuf_iterator<char>(f)),
-                  std::istreambuf_iterator<char>());
+  s::ifstream f{path};
+  str got((s::istreambuf_iterator<char>(f)),
+          s::istreambuf_iterator<char>());
   EXPECT_EQ(got, "new\n");
 }
 
@@ -430,11 +430,11 @@ TEST(Exec, MultiosTeesToBothTargets) {
   // The tee helper runs asynchronously; give it a moment to flush and
   // exit so both target files have their data on disk.
   for (int i = 0; i < 50; ++i) {
-    std::ifstream fa{a}, fb{b};
-    std::string va((std::istreambuf_iterator<char>(fa)),
-                   std::istreambuf_iterator<char>());
-    std::string vb((std::istreambuf_iterator<char>(fb)),
-                   std::istreambuf_iterator<char>());
+    s::ifstream fa{a}, fb{b};
+    str va((s::istreambuf_iterator<char>(fa)),
+           s::istreambuf_iterator<char>());
+    str vb((s::istreambuf_iterator<char>(fb)),
+           s::istreambuf_iterator<char>());
     if (va == "x\n" and vb == "x\n") return;
     usleep(10'000);
   }

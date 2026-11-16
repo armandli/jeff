@@ -11,11 +11,12 @@
 
 #include <algorithm>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/exec/executor.h>
 
 namespace jfsh {
 
-static std::string pad9(std::string s) {
+static str pad9(str s) {
   if (s.size() < 9) s.append(9 - s.size(), ' ');
   return s;
 }
@@ -52,9 +53,9 @@ int wait_foreground_job(ExecContext& ctx, int jid) {
     for (const auto& p : j.procs)
       if (p.stopped()) { stop = p.stop_sig; break; }
     // The terminal echoed ^Z without a newline.
-    if (stop == SIGTSTP) std::fputc('\n', stderr);
-    std::fprintf(stderr, "jfsh: %s  %s\n", pad9(j.status_text()).c_str(), j.text.c_str());
-    std::fflush(stderr);
+    if (stop == SIGTSTP) s::fputc('\n', stderr);
+    s::fprintf(stderr, "jfsh: %s  %s\n", pad9(j.status_text()).c_str(), j.text.c_str());
+    s::fflush(stderr);
     ctx.jobs.set_current(jid);
     // Stopped inside a loop: give the prompt back rather than run the next
     // iteration in the foreground.  (zsh goes further and makes the rest
@@ -67,7 +68,7 @@ int wait_foreground_job(ExecContext& ctx, int jid) {
   // shell down with them.
   sig.restore_shell_modes();
   int rc = j.exit_status(ctx.opts.get(OPT_PIPEFAIL));
-  bool interrupted = std::any_of(j.procs.begin(), j.procs.end(), [](const Process& p) {
+  bool interrupted = s::any_of(j.procs.begin(), j.procs.end(), [](const Process& p) {
     return p.status == ProcStatus::Killed and p.stop_sig == SIGINT;
   });
   const Process& last = j.procs.back();
@@ -75,9 +76,9 @@ int wait_foreground_job(ExecContext& ctx, int jid) {
     // Ctrl-C ends the whole command line, not just this command.
     ctx.aborting = true;
   } else if (last.status == ProcStatus::Killed and last.stop_sig != SIGPIPE) {
-    std::fprintf(stderr, "jfsh: %s  %s\n", pad9(j.status_text()).c_str(), j.text.c_str());
+    s::fprintf(stderr, "jfsh: %s  %s\n", pad9(j.status_text()).c_str(), j.text.c_str());
   }
-  std::fflush(stderr);
+  s::fflush(stderr);
   ctx.jobs.remove(jid);
   return rc;
 }
@@ -87,7 +88,7 @@ Result<void> signal_job(const Job& job, int sig) {
   for (const auto& p : job.procs) {
     if (p.done() or p.pid <= 1) continue;
     if (::kill(p.pid, sig) != 0)
-      return std::unexpected(ShellError::from_errno(ErrorKind::ExecError, "kill"));
+      return s::unexpected(ShellError::from_errno(ErrorKind::ExecError, "kill"));
   }
   return {};
 }
@@ -98,13 +99,13 @@ int resume_job(ExecContext& ctx, int jid, bool foreground) {
   Job& j = found->get();
   bool was_stopped = j.is_stopped();
   ctx.jobs.set_current(jid);
-  std::string line = ctx.jobs.format_status(j, was_stopped ? "continued" : j.status_text());
-  std::fprintf(stderr, "%s\n", line.c_str());
-  std::fflush(stderr);
+  str line = ctx.jobs.format_status(j, was_stopped ? "continued" : j.status_text());
+  s::fprintf(stderr, "%s\n", line.c_str());
+  s::fflush(stderr);
 
   if (not foreground) {
     if (auto r = signal_job(j, SIGCONT); not r) {
-      std::fprintf(stderr, "jfsh: bg: %s\n", r.error().message.c_str());
+      s::fprintf(stderr, "jfsh: bg: %s\n", r.error().message.c_str());
       return 1;
     }
     j.continued();
@@ -118,7 +119,7 @@ int resume_job(ExecContext& ctx, int jid, bool foreground) {
   if (was_stopped) {
     if (auto r = signal_job(j, SIGCONT); not r) {
       ctx.signals.take_terminal();
-      std::fprintf(stderr, "jfsh: fg: %s\n", r.error().message.c_str());
+      s::fprintf(stderr, "jfsh: fg: %s\n", r.error().message.c_str());
       return 1;
     }
     j.continued();
@@ -126,7 +127,7 @@ int resume_job(ExecContext& ctx, int jid, bool foreground) {
   return wait_foreground_job(ctx, jid);
 }
 
-int wait_background_process(ExecContext& ctx, int jid, std::size_t proc_index) {
+int wait_background_process(ExecContext& ctx, int jid, s::size_t proc_index) {
   bool jc = ctx.signals.job_control();
   for (;;) {
     auto found = ctx.jobs.get(jid);

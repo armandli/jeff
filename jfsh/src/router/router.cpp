@@ -1,30 +1,30 @@
+#include <jfsh/router/router.h>
+
 #include <cstdio>
 #include <cstring>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/router/jeff.h>
 #include <jfsh/router/jev.h>
-#include <jfsh/router/router.h>
 
 namespace jfsh {
 
-RouterDecision HeuristicRouter::classify(std::string_view line) {
+RouterDecision HeuristicRouter::classify(strv line) {
   if (line.empty()) return {RouterVerdict::Run, 1.0f, "heuristic"};
 
-  std::string cmd = "zsh -n -c '";
+  str cmd = "zsh -n -c '";
   for (char c : line) {
     if (c == '\'') cmd += "'\\''";
     else           cmd += c;
   }
   cmd += "' 2>/dev/null";
 
-  int rc = std::system(cmd.c_str());
+  int rc = s::system(cmd.c_str());
   if (rc == 0) return {RouterVerdict::Run,   0.9f, "heuristic"};
   return          {RouterVerdict::Agent, 0.9f, "heuristic"};
 }
 
-Router::Router() : mModel(std::make_unique<HeuristicRouter>()) {}
-
-RouterDecision Router::classify(std::string_view line) {
+RouterDecision Router::classify(strv line) {
   if (mBypass or line.empty())
     return {RouterVerdict::Run, 1.0f, "bypass"};
   auto decision = mModel->classify(line);
@@ -34,11 +34,11 @@ RouterDecision Router::classify(std::string_view line) {
 }
 
 void Router::load_jeff(JeffConfig cfg) {
-  mModel = std::make_unique<JeffRouter>(std::move(cfg));
+  mModel = s::make_unique<JeffRouter>(s::move(cfg));
 }
 
 void Router::load_jev(JevConfig cfg) {
-  mModel = std::make_unique<JevRouter>(std::move(cfg));
+  mModel = s::make_unique<JevRouter>(s::move(cfg));
 }
 
 }  // namespace jfsh

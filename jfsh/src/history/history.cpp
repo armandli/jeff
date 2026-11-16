@@ -1,15 +1,16 @@
-#include <algorithm>
+#include <jfsh/history/history.h>
+
 #include <ctime>
+
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 
-#include <jfsh/history/history.h>
+#include <jfsh/core/aliases.h>
 
 namespace jfsh {
 
-HistoryManager::HistoryManager(HistOptions opts) : mOpts(std::move(opts)) {}
-
-bool HistoryManager::should_suppress(std::string_view text) const noexcept {
+bool HistoryManager::should_suppress(strv text) const noexcept {
   if (text.empty()) return true;
   if (mOpts.ignore_space and text[0] == ' ') return true;
   if (mOpts.no_store) return false;  // "history" suppressed by no_store flag
@@ -30,40 +31,40 @@ void HistoryManager::trim_to_limit() {
     mEntries.erase(mEntries.begin());
 }
 
-std::uint32_t HistoryManager::add(std::string text, std::uint32_t elapsed) {
+s::uint32_t HistoryManager::add(str text, s::uint32_t elapsed) {
   if (mOpts.reduce_blanks) {
-    std::string trimmed;
+    str trimmed;
     bool last_ws = false;
     for (char c : text) {
       bool ws = c == ' ' or c == '\t';
       if (not ws or not last_ws) trimmed += c;
       last_ws = ws;
     }
-    text = std::move(trimmed);
+    text = s::move(trimmed);
   }
   if (should_suppress(text)) return 0;
   HistEntry e;
   e.num       = mNextNum++;
-  e.text      = std::move(text);
-  e.timestamp = std::time(nullptr);
+  e.text      = s::move(text);
+  e.timestamp = s::time(nullptr);
   e.elapsed   = elapsed;
   // Remove duplicates if HIST_IGNORE_ALL_DUPS
   if (mOpts.ignore_all) {
     mEntries.erase(
-        std::remove_if(mEntries.begin(), mEntries.end(),
-                       [&](const HistEntry& x){ return x.text == e.text; }),
+        s::remove_if(mEntries.begin(), mEntries.end(),
+                     [&](const HistEntry& x){ return x.text == e.text; }),
         mEntries.end());
   }
-  mEntries.push_back(std::move(e));
+  mEntries.push_back(s::move(e));
   trim_to_limit();
   return mEntries.back().num;
 }
 
-Result<std::string> HistoryManager::expand(std::string_view line) {
-  if (line.empty() or line[0] != '!') return std::string(line);
+Result<str> HistoryManager::expand(strv line) {
+  if (line.empty() or line[0] != '!') return str(line);
   if (line == "!!") {
     if (mEntries.empty())
-      return std::unexpected(ShellError{ErrorKind::ExecError,
+      return s::unexpected(ShellError{ErrorKind::ExecError,
           "no previous command"});
     return mEntries.back().text;
   }
@@ -79,57 +80,51 @@ Result<std::string> HistoryManager::expand(std::string_view line) {
   //              :s/old/new/ (substitute), :gs/old/new/ (global substitute),
   //              :& (repeat last s), :u (uppercase), :l (lowercase), :p (print, no exec)
   //   HIST_SUBST_PATTERN option: use pattern matching instead of literal for :s.
-  return std::string(line);
+  return str(line);
 }
 
-std::optional<std::reference_wrapper<const HistEntry>>
-HistoryManager::lookup(int num) const noexcept {
+optref<const HistEntry> HistoryManager::lookup(int num) const noexcept {
   if (num > 0) {
     for (auto const& e : mEntries)
-      if (static_cast<int>(e.num) == num) return std::cref(e);
+      if (static_cast<int>(e.num) == num) return s::cref(e);
   } else {
     int idx = static_cast<int>(mEntries.size()) + num;
-    if (idx >= 0) return std::cref(mEntries[static_cast<std::size_t>(idx)]);
+    if (idx >= 0) return s::cref(mEntries[static_cast<s::size_t>(idx)]);
   }
-  return std::nullopt;
+  return s::nullopt;
 }
 
-std::optional<std::reference_wrapper<const HistEntry>>
-HistoryManager::search(std::string_view substr) const noexcept {
+optref<const HistEntry> HistoryManager::search(strv substr) const noexcept {
   for (auto it = mEntries.rbegin(); it != mEntries.rend(); ++it)
-    if (it->text.find(substr) != std::string::npos) return std::cref(*it);
-  return std::nullopt;
+    if (it->text.find(substr) != str::npos) return s::cref(*it);
+  return s::nullopt;
 }
 
-Result<void> HistoryManager::load(std::string_view path) {
-  std::ifstream f{std::string(path)};
+Result<void> HistoryManager::load(strv path) {
+  s::ifstream f{str(path)};
   if (not f) return {};  // file not found is not an error on first run
-  std::string line;
-  while (std::getline(f, line)) {
+  str line;
+  while (s::getline(f, line)) {
     if (not line.empty()) {
       HistEntry e;
       e.num  = mNextNum++;
-      e.text = std::move(line);
-      mEntries.push_back(std::move(e));
+      e.text = s::move(line);
+      mEntries.push_back(s::move(e));
     }
   }
   trim_to_limit();
   return {};
 }
 
-Result<void> HistoryManager::save(std::string_view path) {
-  std::ofstream f{std::string(path),
-      mOpts.append ? std::ios::app : std::ios::trunc};
+Result<void> HistoryManager::save(strv path) {
+  s::ofstream f{str(path),
+      mOpts.append ? s::ios::app : s::ios::trunc};
   if (not f)
-    return std::unexpected(ShellError{ErrorKind::FileNotFound,
+    return s::unexpected(ShellError{ErrorKind::FileNotFound,
         "cannot open histfile"});
   for (auto const& e : mEntries)
     f << e.text << '\n';
   return {};
-}
-
-Result<void> HistoryManager::sync(std::string_view path) {
-  return load(path);
 }
 
 }  // namespace jfsh

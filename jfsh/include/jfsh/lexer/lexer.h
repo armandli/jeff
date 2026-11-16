@@ -8,13 +8,15 @@
 
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/types.h>
 
 namespace jfsh {
 
-enum class TokType : std::uint16_t {
+enum class TokType : s::uint16_t {
   TK_NULL = 0,
   TK_EOF,
   TK_NEWLINE,
@@ -52,16 +54,16 @@ enum class TokType : std::uint16_t {
 };
 
 struct LexToken {
-  TokType     type = TokType::TK_NULL;
-  std::string text;
-  int         line = 0;
+  TokType type = TokType::TK_NULL;
+  str     text;
+  int     line = 0;
 
   bool is_word()    const noexcept { return type == TokType::TK_WORD; }
   bool is_newline() const noexcept { return type == TokType::TK_NEWLINE; }
   bool is_eof()     const noexcept { return type == TokType::TK_EOF; }
 };
 
-enum LexFlags : std::uint32_t {
+enum LexFlags : s::uint32_t {
   LEX_NORMAL       = 0,
   LEX_SKIPCOMMENTS = 1 << 0,
   LEX_CASEMOD      = 1 << 1,
@@ -78,41 +80,51 @@ struct InputSource {
 };
 
 struct Lexer {
-  explicit Lexer(InputSource& src);
+  explicit Lexer(InputSource& src) : mSrc{src} {}
   ~Lexer();
 
   LexToken         next_token();
   const LexToken&  peek();
   void             consume();
-  int              line() const noexcept;
+  int              line() const noexcept { return mSrc.line(); }
 
-  void     push_state(LexFlags flags);
-  void     pop_state();
+  void     push_state(LexFlags flags) {
+    mStateStack.push_back(mFlags);
+    mFlags = flags;
+  }
+  void     pop_state() {
+    if (not mStateStack.empty()) {
+      mFlags = mStateStack.back();
+      mStateStack.pop_back();
+    }
+  }
   LexFlags state() const noexcept { return mFlags; }
 
   // Puts a token back so the next peek or next_token returns it; nothing
   // may be peeked already.
-  void unread(LexToken tok) { mPeeked = std::move(tok); }
+  void unread(LexToken tok) { mPeeked = s::move(tok); }
 
   void set_alias_expansion(bool on) noexcept { mAliasExpand = on; }
 
   // After a `((` token (and with nothing peeked past it): the raw text up
   // to the `))` that closes it, with nested parentheses kept.  nullopt when
   // the input ends first.
-  std::optional<std::string> read_arith();
+  opt<str> read_arith();
 
   // Inside [[ ]], after a `=`, `==`, `!=` or `=~` token (and with nothing
   // peeked past it): the pattern or regex operand as written.  Unlike a
   // word, it keeps parentheses and `|` inside them (`(a|b)*`), and ends at
   // a blank, or at a `)` or `|` outside parentheses.  nullopt at the end of
   // the input.
-  std::optional<std::string> read_cond_pattern();
+  opt<str> read_cond_pattern();
 
   // Here-documents: the parser registers each delimiter as it parses the
   // redirection; the lexer reads the bodies, in order, when it reaches the
   // end of that line, and take_heredocs() hands them over.
-  void                     register_heredoc(std::string delim, bool strip_tabs, bool expand);
-  std::vector<std::string> take_heredocs();
+  void register_heredoc(str delim, bool strip_tabs, bool expand) {
+    mHeredocQueue.push_back({s::move(delim), strip_tabs, expand});
+  }
+  vec<str> take_heredocs();
 
   // The input ended inside a quote, after a trailing backslash, or before
   // a here-document's delimiter line: more input would continue it.
@@ -125,23 +137,23 @@ protected:
   LexToken read_heredoc_delimiter();
   LexToken newline_token();
   void     read_heredoc_bodies();
-  bool     is_keyword(std::string_view s) const noexcept;
+  bool     is_keyword(strv s) const noexcept;
 
 private:
   struct HeredocSpec {
-    std::string delim;
-    bool        strip_tabs;
-    bool        expand;
+    str  delim;
+    bool strip_tabs;
+    bool expand;
   };
 
-  InputSource&              mSrc;
-  std::optional<LexToken>   mPeeked;
-  LexFlags                  mFlags       = LEX_NORMAL;
-  bool                      mAliasExpand = true;
-  bool                      mIncomplete  = false;
-  std::vector<LexFlags>     mStateStack;
-  std::vector<HeredocSpec>  mHeredocQueue;
-  std::vector<std::string>  mHeredocBodies;
+  InputSource&      mSrc;
+  opt<LexToken>     mPeeked;
+  LexFlags          mFlags       = LEX_NORMAL;
+  bool              mAliasExpand = true;
+  bool              mIncomplete  = false;
+  vec<LexFlags>     mStateStack;
+  vec<HeredocSpec>  mHeredocQueue;
+  vec<str>          mHeredocBodies;
 };
 
 }  // namespace jfsh

@@ -7,11 +7,15 @@
 
 #include <cstdint>
 
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/options.h>
 #include <jfsh/core/types.h>
 #include <jfsh/history/history.h>
@@ -19,39 +23,48 @@
 
 namespace jfsh {
 
-enum class EditorMode : std::uint8_t { Emacs, Vi };
+enum class EditorMode : s::uint8_t { Emacs, Vi };
 
 struct KeyBinding {
-  std::string key_seq;
-  std::string widget;
+  str key_seq;
+  str widget;
 };
 
 struct Keymap {
-  std::string             name;
-  std::vector<KeyBinding> bindings;
+  str             name;
+  vec<KeyBinding> bindings;
 
-  std::string_view lookup(std::string_view key_seq) const noexcept;
+  strv lookup(strv key_seq) const noexcept;
 };
 
-using ZleWidgetFn = std::function<bool(struct LineBuffer&)>;
+using ZleWidgetFn = func<bool(struct LineBuffer&)>;
 
 struct ZleWidget {
-  std::string   name;
-  ZleWidgetFn   fn;
-  std::uint32_t flags = 0;
+  str         name;
+  ZleWidgetFn fn;
+  s::uint32_t flags = 0;
 };
 
 struct LineBuffer {
-  std::string text;
-  std::size_t cursor    = 0;      // cursor position (byte offset)
-  int         mark      = -1;     // yank mark (-1 = unset)
-  bool        overwrite = false;
+  str       text;
+  s::size_t cursor    = 0;      // cursor position (byte offset)
+  int       mark      = -1;     // yank mark (-1 = unset)
+  bool      overwrite = false;
 
-  void             insert(std::string_view s);
-  void             delete_char_at(std::size_t pos);
-  void             move_to(std::size_t pos);
-  std::string_view before_cursor() const noexcept;
-  std::string_view after_cursor()  const noexcept;
+  void insert(strv s) {
+    text.insert(cursor, s);
+    cursor += s.size();
+  }
+  void delete_char_at(s::size_t pos) {
+    if (pos < text.size()) text.erase(pos, 1);
+  }
+  void move_to(s::size_t pos) { cursor = s::min(pos, text.size()); }
+  strv before_cursor() const noexcept {
+    return strv(text).substr(0, cursor);
+  }
+  strv after_cursor() const noexcept {
+    return strv(text).substr(cursor);
+  }
 };
 
 struct Editor {
@@ -60,28 +73,28 @@ struct Editor {
 
   // Reads one line after PS1, or after PS2 for a `continuation` line of an
   // unfinished command.
-  std::optional<std::string> read_line(bool continuation = false);
+  opt<str> read_line(bool continuation = false);
 
-  void suspend();
-  void resume();
+  void suspend() { if (mRawModeActive) exit_raw_mode(); }
+  void resume() {}
 
-  void bind_key(std::string keymap, std::string key_seq, std::string widget);
-  void register_widget(ZleWidget widget);
-  void set_mode(EditorMode mode);
-  void redraw();
+  void bind_key(strv keymap, strv key_seq, strv widget) {}
+  void register_widget(ZleWidget widget) {}
+  void set_mode(EditorMode mode) { mMode = mode; }
+  void redraw() { refresh_display(); }
 
   EditorMode mode() const noexcept { return mMode; }
 
-  using CompleteFn = std::function<std::vector<std::string>(std::string_view)>;
-  void set_completer(CompleteFn fn) { mCompleter = std::move(fn); }
+  using CompleteFn = func<vec<str>(strv)>;
+  void set_completer(CompleteFn fn) { mCompleter = s::move(fn); }
 
   // While a line is being read, `fd` (the shell's signal self-pipe) is
   // watched too; when it becomes readable the editor leaves raw mode and
   // calls `hook`, which handles the signals (traps, job notices).  The
   // hook returns whether it printed anything, so the prompt and line are
   // redrawn, and sets `quit` to end the read as at EOF (SIGHUP).
-  using WakeFn = std::function<bool(bool& quit)>;
-  void set_wake(int fd, WakeFn hook) { mWakeFd = fd; mWake = std::move(hook); }
+  using WakeFn = func<bool(bool& quit)>;
+  void set_wake(int fd, WakeFn hook) { mWakeFd = fd; mWake = s::move(hook); }
 
   // The last read_line ended with Ctrl-C: the line (and, for a PS2 line,
   // the whole command) is to be dropped.
@@ -91,22 +104,31 @@ protected:
   void enter_raw_mode();
   void exit_raw_mode();
 
-  std::string read_key_sequence();
-  bool        dispatch_widget(std::string_view name);
+  str read_key_sequence();
+  bool        dispatch_widget(strv name) { return false; }
 
-  bool widget_self_insert(LineBuffer&);
-  bool widget_backward_delete_char(LineBuffer&);
-  bool widget_beginning_of_line(LineBuffer&);
-  bool widget_end_of_line(LineBuffer&);
+  bool widget_self_insert(LineBuffer&) { return false; }
+  bool widget_backward_delete_char(LineBuffer&) { return false; }
+  bool widget_beginning_of_line(LineBuffer& buf) {
+    buf.cursor = 0;
+    return true;
+  }
+  bool widget_end_of_line(LineBuffer& buf) {
+    buf.cursor = buf.text.size();
+    return true;
+  }
   bool widget_up_line_or_history(LineBuffer&);
   bool widget_down_line_or_history(LineBuffer&);
-  bool widget_accept_line(LineBuffer&);
-  bool widget_complete_word(LineBuffer&);
-  bool widget_expand_or_complete(LineBuffer&);
+  bool widget_accept_line(LineBuffer&) { return true; }
+  bool widget_complete_word(LineBuffer&) { return false; }
+  bool widget_expand_or_complete(LineBuffer&) { return false; }
 
-  void install_default_bindings();
-  void install_vi_bindings();
-  void install_emacs_bindings();
+  void install_default_bindings() {
+    if (mMode == EditorMode::Vi) install_vi_bindings();
+    else                         install_emacs_bindings();
+  }
+  void install_vi_bindings() {}
+  void install_emacs_bindings() {}
 
   void refresh_display();
   int  terminal_width()  const noexcept;
@@ -119,10 +141,10 @@ private:
   EditorMode               mMode        = EditorMode::Emacs;
   LineBuffer               mBuf;
   CompleteFn               mCompleter;
-  std::vector<Keymap>      mKeymaps;
+  vec<Keymap>              mKeymaps;
   HashTable<ZleWidget>     mWidgets;
   int                      mHistPos     = -1;  // -1 = not navigating
-  std::string              mSavedLine;
+  str                      mSavedLine;
   bool                     mRawModeActive = false;
   bool                     mContinuation  = false;  // prompting with PS2
   bool                     mInterrupted   = false;  // Ctrl-C ended the read

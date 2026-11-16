@@ -1,14 +1,16 @@
 #include <cerrno>
 #include <cstring>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/types.h>
 
 namespace jfsh {
 
-Metastring Metastring::from_plain(std::string_view s) {
+Metastring Metastring::from_plain(strv s) {
   Metastring m;
   m.raw.reserve(s.size());
-  for (unsigned char c : s) {
+  for (char ch : s) {
+    auto c = static_cast<unsigned char>(ch);
     if (c == '\0' or c >= 0x80 or c == static_cast<unsigned char>(META)) {
       m.raw += META;
       m.raw += static_cast<char>(c ^ 0x20);
@@ -19,10 +21,10 @@ Metastring Metastring::from_plain(std::string_view s) {
   return m;
 }
 
-std::string Metastring::to_plain() const {
-  std::string out;
+str Metastring::to_plain() const {
+  str out;
   out.reserve(raw.size());
-  for (std::size_t i = 0; i < raw.size(); ++i) {
+  for (s::size_t i = 0; i < raw.size(); ++i) {
     if (raw[i] == META and i + 1 < raw.size()) {
       out += static_cast<char>(
         static_cast<unsigned char>(raw[++i]) ^ 0x20);
@@ -33,9 +35,9 @@ std::string Metastring::to_plain() const {
   return out;
 }
 
-std::size_t Metastring::plain_len() const {
-  std::size_t n = 0;
-  for (std::size_t i = 0; i < raw.size(); ++i) {
+s::size_t Metastring::plain_len() const {
+  s::size_t n = 0;
+  for (s::size_t i = 0; i < raw.size(); ++i) {
     if (raw[i] == META and i + 1 < raw.size()) ++i;
     ++n;
   }
@@ -46,7 +48,7 @@ ShellError ShellError::from_errno(ErrorKind k, const char* ctx) noexcept {
   ShellError e;
   e.kind    = k;
   e.code    = errno;
-  e.message = std::string(ctx) + ": " + std::strerror(errno);
+  e.message = str(ctx) + ": " + s::strerror(errno);
   return e;
 }
 

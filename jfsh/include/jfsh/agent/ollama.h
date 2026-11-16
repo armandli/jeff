@@ -7,6 +7,7 @@
 
 #include <jfsh/agent/agent.h>
 #include <jfsh/agent/provider.h>
+#include <jfsh/core/aliases.h>
 
 namespace jfsh {
 
@@ -20,14 +21,14 @@ struct OllamaBackend : AgentBackend {
   bool is_server_available() const noexcept;
 
 protected:
-  std::string         build_body(const ChatRequest& req, bool stream) const;
-  Result<ChatResponse> parse_response(std::string_view json) const;
+  str         build_body(const ChatRequest& req, bool stream) const;
+  Result<ChatResponse> parse_response(strv json) const;
   // Ollama streams NDJSON (one JSON object per line, not SSE).
-  std::optional<std::string> parse_ndjson_chunk(std::string_view line) const;
+  opt<str> parse_ndjson_chunk(strv line) const;
 
-  Result<std::string> http_post(
-    std::string_view url,
-    std::string_view body) const;
+  Result<str> http_post(
+    strv url,
+    strv body) const;
 
 private:
   ProviderConfig mCfg;

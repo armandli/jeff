@@ -13,8 +13,10 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/types.h>
 
 namespace jfsh {
@@ -23,7 +25,7 @@ struct BuiltinDef;   // forward — defined in builtins.h
 struct ExecContext;  // forward — defined in executor.h
 
 struct ModuleFeatures {
-  std::vector<BuiltinDef> builtins;
+  vec<BuiltinDef> builtins;
 };
 
 struct ModuleHandle {
@@ -32,10 +34,10 @@ struct ModuleHandle {
   using CleanupFn = int(*)(void*);
   using FinishFn  = int(*)(void*);
 
-  std::string name;
-  std::string path;
-  void*       dlhandle  = nullptr;
-  bool        auto_     = false;    // loaded via autoload
+  str   name;
+  str   path;
+  void* dlhandle  = nullptr;
+  bool  auto_     = false;    // loaded via autoload
 
   SetupFn     setup_fn   = nullptr;
   BootFn      boot_fn    = nullptr;
@@ -46,29 +48,33 @@ struct ModuleHandle {
 };
 
 struct ModuleManager {
-  Result<std::reference_wrapper<ModuleHandle>>
-  load(std::string_view name, bool autoload = false);
+  Result<s::reference_wrapper<ModuleHandle>>
+  load(strv name, bool autoload = false);
 
-  Result<void> unload(std::string_view name);
+  Result<void> unload(strv name);
 
-  bool is_loaded(std::string_view name) const noexcept;
+  bool is_loaded(strv name) const noexcept {
+    return mModules.count(str(name)) > 0;
+  }
 
-  void for_each(std::function<void(const ModuleHandle&)>) const;
+  void for_each(func<void(const ModuleHandle&)> fn) const {
+    for (const auto& [name, h] : mModules) fn(*h);
+  }
 
-  void add_search_path(std::string path);
+  void add_search_path(str path) { mPaths.push_back(s::move(path)); }
 
-  const std::vector<std::string>& search_paths() const noexcept {
+  const vec<str>& search_paths() const noexcept {
     return mPaths;
   }
 
-  std::vector<const BuiltinDef*> all_builtins() const;
+  vec<const BuiltinDef*> all_builtins() const;
 
 protected:
-  std::string resolve_path(std::string_view name) const;
+  str resolve_path(strv name) const;
 
 private:
-  HashTable<std::unique_ptr<ModuleHandle>> mModules;
-  std::vector<std::string>                 mPaths;
+  HashTable<uptr<ModuleHandle>> mModules;
+  vec<str>                      mPaths;
 };
 
 }  // namespace jfsh

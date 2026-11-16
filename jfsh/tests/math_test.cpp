@@ -8,9 +8,9 @@
 #include <gtest/gtest.h>
 
 #include <jfsh/builtins/math.h>
+#include <jfsh/core/aliases.h>
 #include <jfsh/exec/executor.h>
-
-#include "shell_fixture.h"
+#include <shell_fixture.h>
 
 namespace jfsh {
 namespace {
@@ -18,14 +18,14 @@ namespace {
 using test::Shell;
 
 // $((expr)) as zsh prints it, or "error: <message>".
-std::string eval(std::string_view expr, MathOptions opts = {}) {
+str eval(strv expr, MathOptions opts = {}) {
   ParamTable params;
   auto v = math_eval(expr, params, opts);
   if (not v) return "error: " + v.error().message;
   return format_math(*v);
 }
 
-std::string eval(ParamTable& params, std::string_view expr) {
+str eval(ParamTable& params, strv expr) {
   auto v = math_eval(expr, params);
   if (not v) return "error: " + v.error().message;
   return format_math(*v);

@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <jfsh/builtins/math.h>
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/types.h>
 
 namespace jfsh {
@@ -38,33 +39,33 @@ struct Expander {
     : mExec{exec}, mCtx{ctx} {}
 
   // Command arguments: every step, so one word may become several or none.
-  Result<std::vector<std::string>> words(const std::vector<std::string>& words);
+  Result<vec<str>> words(const vec<str>& words);
 
   // A word that stays one word: assignment values, here-strings, `>&N`
   // targets.  No splitting, braces or globbing; arrays are joined with
   // spaces.  With `assignment`, `~` also expands after `=` and `:`.
-  Result<std::string> scalar(std::string_view word, bool assignment = false);
+  Result<str> scalar(strv word, bool assignment = false);
 
   // The elements of `name=(…)`: `src` is the text between the parentheses,
   // split into shell words that are then expanded like arguments.
-  Result<std::vector<std::string>> array_elements(std::string_view src);
+  Result<vec<str>> array_elements(strv src);
 
   // A here-document body: substitutions and backslash before $ ` \ and
   // newline only; quotes are ordinary characters.
-  Result<std::string> heredoc(std::string_view body);
+  Result<str> heredoc(strv body);
 
   // A pattern for `case`, `[[ = ]]` and ${x#pat}: expansions done, and
   // characters that were quoted come back backslash-escaped.
-  Result<std::string> pattern(std::string_view word);
+  Result<str> pattern(strv word);
 
   // An arithmetic expression, as in `$((…))`: substitutions are expanded
   // first, then the text is evaluated.  Used by `(( ))`, `for ((;;))`,
   // `[[ -eq ]]`, and as an integer by `repeat` and subscripts.
-  Result<MathNum>   math(std::string_view expr);
-  Result<long long> arith(std::string_view expr);
+  Result<MathNum>    math(strv expr);
+  Result<s::int64_t> arith(strv expr);
 
   // Status of the last command substitution run, if any.
-  std::optional<int> subst_status() const noexcept { return mSubstStatus; }
+  opt<int> subst_status() const noexcept { return mSubstStatus; }
 
   // Internal: used by the scanner in subst.cpp.
   Executor&    exec() noexcept { return mExec; }
@@ -72,19 +73,19 @@ struct Expander {
   void         note_subst_status(int rc) noexcept { mSubstStatus = rc; }
 
 private:
-  Executor&          mExec;
-  ExecContext&       mCtx;
-  std::optional<int> mSubstStatus;
+  Executor&    mExec;
+  ExecContext& mCtx;
+  opt<int>     mSubstStatus;
 };
 
 // Removes one level of shell quoting ('…', "…", $'…', backslash) from `w`
 // without expanding anything; used by ${(Q)x}.
-std::string remove_quotes(std::string_view w);
+str remove_quotes(strv w);
 
 // Splits `s` on the characters of `ifs` the way the shell splits unquoted
 // expansions: runs of IFS whitespace are one separator, and leading and
 // trailing whitespace makes no empty word.
-std::vector<std::string> ifs_split(std::string_view s, std::string_view ifs);
+vec<str> ifs_split(strv s, strv ifs);
 
 }  // namespace jfsh
 

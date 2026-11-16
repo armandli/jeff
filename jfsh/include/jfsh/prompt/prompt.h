@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/options.h>
 #include <jfsh/core/param.h>
 #include <jfsh/core/types.h>
@@ -16,42 +17,45 @@
 namespace jfsh {
 
 struct PromptVars {
-  std::string PS1;
-  std::string PS2;
-  std::string PS3;
-  std::string PS4;
-  std::string RPS1;
-  std::string RPS2;
-  std::string SPROMPT;
+  str PS1;
+  str PS2;
+  str PS3;
+  str PS4;
+  str RPS1;
+  str RPS2;
+  str SPROMPT;
 };
 
 struct PromptRenderer {
-  PromptRenderer(const ParamTable& params, const OptionState& opts);
+  PromptRenderer(const ParamTable& params, const OptionState& opts)
+    : mParams(params), mOpts(opts) {
+    reload();
+  }
 
   // Returns the rendered string; with strip_escapes=true, ANSI sequences
   // are removed (for width calculation).
-  std::string render(std::string_view prompt_str,
-                     bool strip_escapes = false) const;
+  str render(strv prompt_str,
+             bool strip_escapes = false) const;
 
-  std::string primary()      const { return render(mVars.PS1); }
-  std::string continuation() const { return render(mVars.PS2); }
-  std::string right()        const { return render(mVars.RPS1); }
-  std::string xtrace()       const { return render(mVars.PS4); }
+  str primary()      const { return render(mVars.PS1); }
+  str continuation() const { return render(mVars.PS2); }
+  str right()        const { return render(mVars.RPS1); }
+  str xtrace()       const { return render(mVars.PS4); }
 
   void reload();
 
-  static int visual_width(std::string_view rendered) noexcept;
+  static int visual_width(strv rendered) noexcept;
 
 protected:
   // Returns (expanded_string, chars_consumed).
-  std::pair<std::string, int>
-  expand_percent(std::string_view src, int pos) const;
+  s::pair<str, int>
+  expand_percent(strv src, int pos) const;
 
-  std::string do_subst(std::string_view s) const;
+  str do_subst(strv s) const;
 
 private:
   const ParamTable& mParams;
-  const OptionState& mOpts;
+  [[maybe_unused]] const OptionState& mOpts;   // not used yet
   PromptVars         mVars;
 };
 

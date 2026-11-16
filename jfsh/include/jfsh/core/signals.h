@@ -22,8 +22,10 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/types.h>
 
 namespace jfsh {
@@ -41,7 +43,7 @@ inline constexpr int TRAP_TABLE_SIZE = MAX_SIG + 4;
 
 constexpr bool is_real_signal(int sig) noexcept { return sig >= 1 and sig <= MAX_SIG; }
 
-enum class TrapAction : std::uint8_t {
+enum class TrapAction : s::uint8_t {
   Default,   // no trap: the shell's default disposition
   Ignore,    // trap '' SIG
   Command,   // trap 'cmd' SIG: run a command string
@@ -49,66 +51,77 @@ enum class TrapAction : std::uint8_t {
 };
 
 struct Trap {
-  TrapAction  action  = TrapAction::Default;
-  std::string command;              // only valid when action == Command
+  TrapAction action  = TrapAction::Default;
+  str        command;              // only valid when action == Command
 };
 
 // The trap table.  Pure bookkeeping: SignalManager installs the OS
 // dispositions that go with it.
 struct SignalTable {
-  void        set(int sig, TrapAction action, std::string cmd = {});
+  void        set(int sig, TrapAction action, str cmd = {});
   const Trap& get(int sig) const noexcept;
-  bool        trapped(int sig) const noexcept;   // Command or Function
+  bool        trapped(int sig) const noexcept {
+    auto a = get(sig).action;
+    return a == TrapAction::Command or a == TrapAction::Function;
+  }
 
   // A function call opens a frame; set() remembers in the innermost frame
   // the first value each trap had before the function changed it.
-  void push_frame();
+  void push_frame() { mFrames.emplace_back(); }
   // Closes the frame.  When `restore` (LOCAL_TRAPS), every trap the
   // function changed gets its old value back; an EXIT trap set inside the
   // function is always function-local: it is handed back in `exit_trap`
   // for the caller to run, and the outer EXIT trap is restored.  Returns
   // the signals whose trap changed, so their dispositions can be redone.
-  std::vector<int> pop_frame(bool restore, std::optional<Trap>& exit_trap);
-  std::size_t      depth() const noexcept { return mFrames.size(); }
+  vec<int>  pop_frame(bool restore, opt<Trap>& exit_trap);
+  s::size_t depth() const noexcept { return mFrames.size(); }
 
   // In a forked child: drop every trap except ignored signals, which
   // children inherit.  `keep_pseudo` keeps ZERR and DEBUG (a `( … )`
   // subshell runs them, a command substitution does not).
   void reset_for_child(bool keep_pseudo);
-  void clear_all();
+  void clear_all() {
+    mTraps.fill(Trap{});
+    mFrames.clear();
+  }
 
   // "INT", "SIGINT", "int", "2" → SIGINT; "EXIT" or "0" → SIGEXIT.
-  static std::optional<int> name_to_sig(std::string_view name) noexcept;
+  static opt<int>    name_to_sig(strv name)  noexcept;
   // Real signals and pseudo-signals; "UNKNOWN" for anything else.
-  static const char*        sig_to_name(int sig_no)            noexcept;
+  static const char* sig_to_name(int sig_no) noexcept;
   // What a job status line says about a signal: "terminated",
   // "suspended (tty input)" …
-  static const char*        sig_message(int sig_no)            noexcept;
+  static const char* sig_message(int sig_no) noexcept;
 
 private:
   struct Frame {
-    std::vector<std::pair<int, Trap>> saved;   // first old value per signal
+    vec<s::pair<int, Trap>> saved;   // first old value per signal
   };
-  std::array<Trap, TRAP_TABLE_SIZE> mTraps{};
-  std::vector<Frame>                mFrames;
+  s::array<Trap, TRAP_TABLE_SIZE> mTraps{};
+  vec<Frame>                      mFrames;
 };
 
 // Signals that have arrived but not been handled yet.  Set from signal
 // handlers, so every operation is a lock-free atomic.
 struct PendingSignals {
-  std::atomic<std::uint64_t> lo{0};  // signals 0–63
-  std::atomic<std::uint64_t> hi{0};  // signals 64–127
+  s::atomic<s::uint64_t> lo{0};  // signals 0–63
+  s::atomic<s::uint64_t> hi{0};  // signals 64–127
 
   void mark(int sig)  noexcept;
   bool test(int sig)  const noexcept;
-  bool any()          const noexcept;
+  bool any()          const noexcept {
+    return (lo.load(s::memory_order_relaxed) | hi.load(s::memory_order_relaxed)) != 0;
+  }
   // Takes every pending bit, leaving the set empty.
-  std::array<std::uint64_t, 2> take() noexcept;
+  s::array<s::uint64_t, 2> take() noexcept {
+    return {lo.exchange(0, s::memory_order_relaxed),
+            hi.exchange(0, s::memory_order_relaxed)};
+  }
   void clear_all()          noexcept { lo = 0; hi = 0; }
 };
 
 // What kind of child a fork made, for SignalManager::child_reset.
-enum class ChildKind : std::uint8_t {
+enum class ChildKind : s::uint8_t {
   Subshell,   // `( … )`: keeps ZERR and DEBUG traps
   Other,      // pipeline stages, background jobs, external commands,
               // command and process substitution, here-doc writers
@@ -133,7 +146,9 @@ struct SignalManager {
   // The terminal modes the shell keeps between jobs.
   void save_shell_modes() noexcept;
   void restore_shell_modes() noexcept;
-  bool read_modes(struct termios& t) const noexcept;
+  bool read_modes(struct termios& t) const noexcept {
+    return mTtyFd >= 0 and ::tcgetattr(mTtyFd, &t) == 0;
+  }
   void write_modes(const struct termios& t) const noexcept;
 
   // In a freshly forked child: restore the dispositions the shell changed
@@ -143,19 +158,22 @@ struct SignalManager {
 
   // Sets a trap and installs the disposition that goes with it.  Fails
   // for an unknown signal number.
-  void set_trap(int sig, TrapAction action, std::string cmd = {});
+  void set_trap(int sig, TrapAction action, str cmd = {}) {
+    mTraps.set(sig, action, s::move(cmd));
+    install(sig);
+  }
   // Resets every trap to its default.
   void reset_traps();
   // See SignalTable::pop_frame; also redoes the dispositions.
   void push_trap_frame() { mTraps.push_frame(); }
-  std::optional<Trap> pop_trap_frame(bool restore);
+  opt<Trap> pop_trap_frame(bool restore);
 
   // The handler: marks `sig` pending and wakes the self-pipe.
   void note(int sig) noexcept;
   bool has_pending() const noexcept { return mPending.any(); }
   bool pending(int sig) const noexcept { return mPending.test(sig); }
   // Takes the pending set and drains the self-pipe.
-  std::array<std::uint64_t, 2> take_pending() noexcept;
+  s::array<s::uint64_t, 2> take_pending() noexcept;
   // The first pending signal that has a trap, or 0.
   int  pending_trapped() const noexcept;
 
@@ -179,10 +197,11 @@ struct SignalManager {
   SignalTable&       traps()       noexcept { return mTraps; }
   const SignalTable& traps() const noexcept { return mTraps; }
 
-private:
+protected:
   void install(int sig) noexcept;
   void open_self_pipe() noexcept;
 
+private:
   SignalTable    mTraps;
   PendingSignals mPending;
   int            mSelfPipe[2]  = {-1, -1};
@@ -194,7 +213,7 @@ private:
   bool           mHaveModes    = false;
   // Signals that were ignored when the shell started stay ignored when
   // their trap is reset, as POSIX requires.
-  std::array<bool, MAX_SIG + 1> mIgnoredAtStart{};
+  s::array<bool, MAX_SIG + 1> mIgnoredAtStart{};
   bool           mStartChecked = false;
 };
 

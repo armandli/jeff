@@ -3,14 +3,15 @@
 
 #include <gtest/gtest.h>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/lexer/input.h>
 #include <jfsh/parser/parser.h>
 
 namespace jfsh {
 namespace {
 
-Result<ProgRef> parse(std::string src) {
-  StringInputSource in{std::move(src)};
+Result<ProgRef> parse(str src) {
+  StringInputSource in{s::move(src)};
   Lexer lex{in};
   lex.push_state(LEX_SKIPCOMMENTS);
   Parser parser{lex};
@@ -18,8 +19,8 @@ Result<ProgRef> parse(std::string src) {
 }
 
 // Disassembly of src, or the parse error message prefixed with "error: ".
-std::string listing(std::string src) {
-  auto prog = parse(std::move(src));
+str listing(str src) {
+  auto prog = parse(s::move(src));
   if (not prog) return "error: " + prog.error().message;
   return disassemble(**prog);
 }
@@ -74,8 +75,8 @@ TEST(Parser, OnlyUnquotedLeadingIdentifiersAreAssignments) {
   // A quoted name, a name starting with a digit, and an assignment after the
   // command word are all ordinary words.
   for (const char* src : {"'X'=1", "1X=2", "=x"})
-    EXPECT_NE(listing(src).find("SIMPLE 1\n"), std::string::npos) << src;
-  EXPECT_NE(listing("cmd X=1").find("SIMPLE 2\n"), std::string::npos);
+    EXPECT_NE(listing(src).find("SIMPLE 1\n"), str::npos) << src;
+  EXPECT_NE(listing("cmd X=1").find("SIMPLE 2\n"), str::npos);
 }
 
 TEST(Parser, AndOrNotChain) {
@@ -105,19 +106,19 @@ TEST(Parser, ListElementsAndAsync) {
 TEST(Parser, PipelineCountsItsCommands) {
   // The PIPE line encodes both the stage count and a per-connector `|&` mask
   // using the character `&` for the second connector in `a | b |& c`.
-  EXPECT_NE(listing("a | b |& c").find("PIPE 3 |&"), std::string::npos);
-  EXPECT_NE(listing("a | b | c").find("PIPE 3 ||"),  std::string::npos);
+  EXPECT_NE(listing("a | b |& c").find("PIPE 3 |&"), str::npos);
+  EXPECT_NE(listing("a | b | c").find("PIPE 3 ||"),  str::npos);
 }
 
 TEST(Parser, RedirectionsAttachToSimpleCommands) {
   // A simple command with a `>` redirection: WC_REDIR + target string come
   // before WC_SIMPLE.
   EXPECT_NE(listing("echo hi > f").find("REDIR >\nSTRING \"f\"\nSIMPLE 2\n"),
-            std::string::npos);
+            str::npos);
   // Fd prefix is recorded on the WC_REDIR instruction itself.
-  EXPECT_NE(listing("a 2>err").find("REDIR > fd=2"), std::string::npos);
+  EXPECT_NE(listing("a 2>err").find("REDIR > fd=2"), str::npos);
   // `>&-` closes an fd — explicit target is empty.
-  EXPECT_NE(listing("a >&-").find("REDIR >&-"), std::string::npos);
+  EXPECT_NE(listing("a >&-").find("REDIR >&-"), str::npos);
 }
 
 TEST(Parser, HeredocBodyLandsInStringTable) {
@@ -125,26 +126,26 @@ TEST(Parser, HeredocBodyLandsInStringTable) {
   // line and the EOF marker.  The disassembler emits raw newlines inside the
   // STRING literal rather than escaped ones.
   auto out = listing("cat <<EOF\nhello\nEOF\n");
-  EXPECT_NE(out.find("REDIR <<\nSTRING \"hello\n\""), std::string::npos);
+  EXPECT_NE(out.find("REDIR <<\nSTRING \"hello\n\""), str::npos);
   // <<-EOF strips one leading tab per line.
   auto out2 = listing("cat <<-END\n\tx\n\ty\n\tEND\n");
-  EXPECT_NE(out2.find("STRING \"x\ny\n\""), std::string::npos);
+  EXPECT_NE(out2.find("STRING \"x\ny\n\""), str::npos);
 }
 
 TEST(Parser, QuotedHeredocDelimiterMarksTheBodyLiteral) {
   EXPECT_NE(listing("cat <<'EOF'\n$x\nEOF\n").find("REDIR << literal\nSTRING \"$x\n\""),
-            std::string::npos);
+            str::npos);
   EXPECT_NE(listing("cat <<EOF\n$x\nEOF\n").find("REDIR <<\nSTRING \"$x\n\""),
-            std::string::npos);
+            str::npos);
 }
 
 // The body is read at the end of the line, so the rest of that line and
 // the next lines still parse as commands (an M2 bug).
 TEST(Parser, HeredocLeavesTheRestOfTheLineAndTheNextCommand) {
   auto out = listing("cat <<A | tr a b\nbody\nA\necho next\n");
-  EXPECT_NE(out.find("PIPE 2"), std::string::npos) << out;
-  EXPECT_NE(out.find("STRING \"body\n\""), std::string::npos) << out;
-  EXPECT_NE(out.find("STRING \"next\""), std::string::npos) << out;
+  EXPECT_NE(out.find("PIPE 2"), str::npos) << out;
+  EXPECT_NE(out.find("STRING \"body\n\""), str::npos) << out;
+  EXPECT_NE(out.find("STRING \"next\""), str::npos) << out;
 }
 
 TEST(Parser, ArrayAssignment) {
@@ -164,7 +165,7 @@ TEST(Parser, ArrayAssignment) {
 
 // Reserved words are only special in command position (bug B7).
 TEST(Parser, ReservedWordsAreArgumentsAfterTheCommandWord) {
-  EXPECT_NE(listing("echo done in if !").find("SIMPLE 5\n"), std::string::npos);
+  EXPECT_NE(listing("echo done in if !").find("SIMPLE 5\n"), str::npos);
 }
 
 // Leftover tokens are a parse error rather than silently dropped (bug B9).
@@ -182,16 +183,16 @@ TEST(Parser, UnimplementedConstructsFailClearly) {
 // ---- compound commands (M4) ------------------------------------------------
 
 // The listing of a body holding one command of one word.
-std::string body(std::string_view word) {
+str body(strv word) {
   return "LIST end skip=4\nSUBLIST - skip=3\nPIPE 1\nSIMPLE 1\n"
-         "STRING \"" + std::string(word) + "\"\nEND\n";
+         "STRING \"" + str(word) + "\"\nEND\n";
 }
 
 // The listing of a program holding one command whose own words, after
 // the PIPE, are `cmd` (n words).
-std::string program(std::size_t n, const std::string& cmd) {
-  return "LIST end skip=" + std::to_string(n + 2) + "\n"
-         "SUBLIST - skip=" + std::to_string(n + 1) + "\n"
+str program(s::size_t n, const str& cmd) {
+  return "LIST end skip=" + s::to_string(n + 2) + "\n"
+         "SUBLIST - skip=" + s::to_string(n + 1) + "\n"
          "PIPE 1\n" + cmd + "END\n";
 }
 
@@ -226,7 +227,7 @@ TEST(Parser, ForForms) {
   // Reserved words in the value list are values (bug B7).
   EXPECT_NE(listing("for x in do done; do b; done")
                 .find("WORDS 2\nSTRING \"do\"\nSTRING \"done\"\n"),
-            std::string::npos);
+            str::npos);
 }
 
 TEST(Parser, CaseArmsCarryTheirTerminator) {
@@ -249,7 +250,7 @@ TEST(Parser, GroupsAndSubshells) {
             program(13, "TRY skip=12\n" + body("a") + body("b")));
   // `))` closes two subshells.
   EXPECT_EQ(listing("((a))").substr(0, 5), "LIST ");
-  EXPECT_EQ(listing("(a; (b))").find("error"), std::string::npos);
+  EXPECT_EQ(listing("(a; (b))").find("error"), str::npos);
 }
 
 TEST(Parser, RedirectionsAfterACompoundCommandGoInFront) {
@@ -259,7 +260,7 @@ TEST(Parser, RedirectionsAfterACompoundCommandGoInFront) {
 }
 
 TEST(Parser, FunctionDefinitions) {
-  std::string named = "FUNCDEF named skip=9\nWORDS 2\nSTRING \"f\"\nSTRING \"g\"\n" + body("a");
+  str named = "FUNCDEF named skip=9\nWORDS 2\nSTRING \"f\"\nSTRING \"g\"\n" + body("a");
   EXPECT_EQ(listing("f g () { a; }"), program(10, named));
   EXPECT_EQ(listing("function f g { a }"), program(10, named));
   EXPECT_EQ(listing("f() a"),
@@ -320,11 +321,11 @@ TEST(Parser, CondLogicIsATreeWithSkips) {
 }
 
 TEST(Parser, CondIsACommandOnlyInCommandPosition) {
-  EXPECT_NE(listing("echo [[ a ]]").find("SIMPLE 4\n"), std::string::npos);
+  EXPECT_NE(listing("echo [[ a ]]").find("SIMPLE 4\n"), str::npos);
   EXPECT_EQ(listing("[[ a ]] 2>/dev/null"),
             program(4, "REDIR > fd=2\nSTRING \"/dev/null\"\n"
                        "COND str skip=1\nSTRING \"a\"\n"));
-  EXPECT_NE(listing("! [[ a ]] && b").find("SUBLIST and|not"), std::string::npos);
+  EXPECT_NE(listing("! [[ a ]] && b").find("SUBLIST and|not"), str::npos);
 }
 
 TEST(Parser, CondErrors) {
@@ -344,7 +345,7 @@ TEST(Parser, TypesetArgumentsAreAssignments) {
                         "ASSIGN -\nSTRING \"x\"\nSTRING \"$(a b)\"\nSTRING \"y\"\n"
                         "ASSIGN array\nSTRING \"z\"\nSTRING \"1 2\"\n"));
   // Only the unquoted command word counts.
-  EXPECT_NE(listing("echo local x=1").find("SIMPLE 3\n"), std::string::npos);
+  EXPECT_NE(listing("echo local x=1").find("SIMPLE 3\n"), str::npos);
 }
 
 TEST(Parser, CompoundCommandErrors) {

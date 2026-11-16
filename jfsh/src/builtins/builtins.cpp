@@ -1,5 +1,8 @@
+#include <jfsh/builtins/builtins.h>
+
 #include <cctype>
 #include <cerrno>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -8,8 +11,8 @@
 
 #include <algorithm>
 
-#include <jfsh/builtins/builtins.h>
 #include <jfsh/builtins/math.h>
+#include <jfsh/core/aliases.h>
 #include <jfsh/exec/executor.h>
 
 namespace jfsh {
@@ -89,98 +92,93 @@ void BuiltinTable::register_all() {
   add({"sched",    builtin_sched,      BINF_NONE});
 }
 
-void BuiltinTable::add(BuiltinDef def) {
-  mTable.emplace(def.name, std::move(def));
+optref<const BuiltinDef> BuiltinTable::find(strv name) const noexcept {
+  auto it = mTable.find(str(name));
+  if (it == mTable.end()) return s::nullopt;
+  return s::cref(it->second);
 }
 
-std::optional<std::reference_wrapper<const BuiltinDef>>
-BuiltinTable::find(std::string_view name) const noexcept {
-  auto it = mTable.find(std::string(name));
-  if (it == mTable.end()) return std::nullopt;
-  return std::cref(it->second);
-}
-
-void BuiltinTable::for_each(std::function<void(const BuiltinDef&)> fn) const {
+void BuiltinTable::for_each(func<void(const BuiltinDef&)> fn) const {
   for (const auto& [name, def] : mTable) fn(def);
 }
 
-int builtin_colon     (std::vector<std::string>&, ExecContext&) { return 0; }
+int builtin_colon     (vec<str>&, ExecContext&) { return 0; }
 // `break [N]` / `continue [N]`: leave, or start the next pass of, the Nth
 // enclosing loop.  N past the outermost loop means the outermost.
-static int loop_control(std::vector<std::string>& args, ExecContext& ctx,
+static int loop_control(vec<str>& args, ExecContext& ctx,
                         bool cont) {
   const char* name = args[0].c_str();
-  long n = 1;
+  s::int64_t n = 1;
   if (args.size() > 1) {
     auto v = arith_eval(args[1], ctx.params, math_options(ctx.opts));
     if (not v) {
-      std::fprintf(stderr, "jfsh: %s: %s\n", name, v.error().message.c_str());
+      s::fprintf(stderr, "jfsh: %s: %s\n", name, v.error().message.c_str());
       return 1;
     }
     if (*v < 1) {
-      std::fprintf(stderr, "jfsh: %s: argument is not positive: %lld\n", name, *v);
+      s::fprintf(stderr, "jfsh: %s: argument is not positive: %" PRId64 "\n", name, *v);
       return 1;
     }
-    n = static_cast<long>(std::min<long long>(*v, ctx.loop_depth));
+    n = s::min<s::int64_t>(*v, ctx.loop_depth);
   }
   if (ctx.loop_depth == 0) {
-    std::fprintf(stderr, "jfsh: %s: not in while, until, select, or repeat loop\n", name);
+    s::fprintf(stderr, "jfsh: %s: not in while, until, select, or repeat loop\n", name);
     return 1;
   }
-  ctx.break_level = static_cast<int>(std::min<long>(n, ctx.loop_depth));
+  ctx.break_level = static_cast<int>(s::min<s::int64_t>(n, ctx.loop_depth));
   ctx.continuing  = cont;
   return 0;
 }
-int builtin_break(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_break(vec<str>& args, ExecContext& ctx) {
   return loop_control(args, ctx, false);
 }
-int builtin_continue(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_continue(vec<str>& args, ExecContext& ctx) {
   return loop_control(args, ctx, true);
 }
-int builtin_dot(std::vector<std::string>& args, ExecContext&) {
+int builtin_dot(vec<str>& args, ExecContext&) {
   // TODO(builtin/dot): Source args[1] into the current shell environment.
   //   Open the file, read it line by line (or as a CompiledProgram), execute
   //   with executor.exec_string() in the current scope (no fork).
   //   Search $PATH if the filename has no slash (POSIX requirement).
   (void)args; return 0;
 }
-int builtin_eval(std::vector<std::string>& args, ExecContext&) {
+int builtin_eval(vec<str>& args, ExecContext&) {
   // TODO(builtin/eval): Join args[1..] with spaces, re-lex and re-parse,
   //   then execute in the current scope via executor.exec_string().
   //   EVAL_LINENO option: line number attributed to eval'd code.
   (void)args; return 0;
 }
-int builtin_exec(std::vector<std::string>& args, ExecContext&) {
+int builtin_exec(vec<str>& args, ExecContext&) {
   // TODO(builtin/exec): With args, replace the current process via execvp().
   //   Flags: -a name (set argv[0]), -c (clear environment), -l (login shell).
   //   Without args, just apply any redirections to the shell itself.
   (void)args; return 0;
 }
-int builtin_exit(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_exit(vec<str>& args, ExecContext& ctx) {
   ctx.exiting  = true;
-  ctx.exit_val = args.size() > 1 ? std::atoi(args[1].c_str()) : ctx.last_exit;
+  ctx.exit_val = args.size() > 1 ? s::atoi(args[1].c_str()) : ctx.last_exit;
   return ctx.exit_val;
 }
-static int typeset_common(std::vector<std::string>& args, ExecContext& ctx,
-                          std::string_view implied);
+static int typeset_common(vec<str>& args, ExecContext& ctx,
+                          strv implied);
 
 // `export` is `typeset -gx`; `-n` takes the export attribute away.
 // TODO(builtin/export): `-p` and the bare `export` listing (M7).
-int builtin_export(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_export(vec<str>& args, ExecContext& ctx) {
   for (auto& a : args)
     if (a == "-n") a = "+x";
   return typeset_common(args, ctx, "gx");
 }
 // `readonly` is `typeset -gr`.
-int builtin_readonly(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_readonly(vec<str>& args, ExecContext& ctx) {
   return typeset_common(args, ctx, "gr");
 }
-int builtin_return(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_return(vec<str>& args, ExecContext& ctx) {
   ctx.returning  = true;
-  ctx.return_val = args.size() > 1 ? std::atoi(args[1].c_str()) : ctx.last_exit;
+  ctx.return_val = args.size() > 1 ? s::atoi(args[1].c_str()) : ctx.last_exit;
   return ctx.return_val;
 }
-int builtin_set(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_set(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/set): Handle two roles:
   //   `set [±o option] …` — same as setopt/unsetopt; also single-letter flags
   //     (-e = errexit, -x = xtrace, -n = noexec, -u = nounset, etc.)
@@ -188,27 +186,27 @@ int builtin_set(std::vector<std::string>& args, ExecContext& ctx) {
   //   `set` with no args — print all shell variables (like typeset -p).
   (void)args; (void)ctx; return 0;
 }
-int builtin_shift(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_shift(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/shift): Remove the first N positional parameters (default 1).
   //   $1 becomes the old $2, etc.  Error if N > $#.
   //   Also supports named array: `shift arrayname N`.
   (void)args; (void)ctx; return 0;
 }
-int builtin_times(std::vector<std::string>&, ExecContext&) {
-  std::printf("0m0.000s 0m0.000s\n0m0.000s 0m0.000s\n"); return 0;
+int builtin_times(vec<str>&, ExecContext&) {
+  s::printf("0m0.000s 0m0.000s\n0m0.000s 0m0.000s\n"); return 0;
 }
-int builtin_unset(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_unset(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/unset): Remove named variables and/or functions.
   //   -v → unset variable (default); -f → unset function.
   //   Error if the variable is readonly.
   //   For PM_SPECIAL params, call the unset handler rather than removing.
   (void)args; (void)ctx; return 0;
 }
-int builtin_cd(std::vector<std::string>& args, ExecContext&) {
+int builtin_cd(vec<str>& args, ExecContext&) {
   const char* dir = args.size() > 1 ? args[1].c_str() : getenv("HOME");
   return dir ? chdir(dir) : 1;
 }
-int builtin_pushd(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_pushd(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/pushd): Push directory onto the stack (stored in $dirstack).
   //   `pushd dir` → chdir(dir) and push old PWD.
   //   `pushd +N/-N` → rotate the stack.
@@ -216,51 +214,51 @@ int builtin_pushd(std::vector<std::string>& args, ExecContext& ctx) {
   //   PUSHD_MINUS, PUSHD_SILENT, PUSHD_TO_HOME options.
   (void)args; (void)ctx; return 0;
 }
-int builtin_popd(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_popd(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/popd): Pop the top directory and chdir to it.
   (void)args; (void)ctx; return 0;
 }
-int builtin_dirs(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_dirs(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/dirs): Print the directory stack.
   //   -v: numbered, one per line; -l: expand ~ to full path; -p: one per line.
   (void)args; (void)ctx; return 0;
 }
-int builtin_pwd(std::vector<std::string>&, ExecContext&) {
-  char buf[4096]; if (getcwd(buf, sizeof buf)) std::printf("%s\n", buf); return 0;
+int builtin_pwd(vec<str>&, ExecContext&) {
+  char buf[4096]; if (getcwd(buf, sizeof buf)) s::printf("%s\n", buf); return 0;
 }
 // Attributes typeset can give a parameter, from its option letters.
 struct TypesetAttrs {
-  char          type   = 0;   // 'a', 'A', 'i' or 'F'; 0 for scalar
-  bool          global = false;
-  std::uint32_t on     = 0;   // PM_EXPORTED, PM_READONLY, PM_UPPER, PM_LOWER
-  std::uint32_t off    = 0;
+  char        type   = 0;   // 'a', 'A', 'i' or 'F'; 0 for scalar
+  bool        global = false;
+  s::uint32_t on     = 0;   // PM_EXPORTED, PM_READONLY, PM_UPPER, PM_LOWER
+  s::uint32_t off    = 0;
 };
 
-static bool is_identifier(std::string_view s) noexcept {
-  if (s.empty() or std::isdigit(static_cast<unsigned char>(s[0]))) return false;
+static bool is_identifier(strv s) noexcept {
+  if (s.empty() or s::isdigit(static_cast<unsigned char>(s[0]))) return false;
   for (char c : s)
-    if (not std::isalnum(static_cast<unsigned char>(c)) and c != '_') return false;
+    if (not s::isalnum(static_cast<unsigned char>(c)) and c != '_') return false;
   return true;
 }
 
 // Declares or updates one `name` / `name=value` argument of typeset.
-static int typeset_one(std::string_view cmd, const std::string& arg,
+static int typeset_one(strv cmd, strv arg,
                        const TypesetAttrs& attrs, ExecContext& ctx) {
-  std::size_t eq = arg.find('=');
-  bool        has_value = eq != std::string::npos;
+  s::size_t eq = arg.find('=');
+  bool        has_value = eq != strv::npos;
   bool        append    = has_value and eq > 0 and arg[eq - 1] == '+';
-  std::string name  = arg.substr(0, has_value ? eq - (append ? 1 : 0) : arg.size());
-  std::string value = has_value ? arg.substr(eq + 1) : std::string{};
+  str name(arg.substr(0, has_value ? eq - (append ? 1 : 0) : arg.size()));
+  str value = has_value ? str(arg.substr(eq + 1)) : str{};
   if (not is_identifier(name)) {
-    std::fprintf(stderr, "jfsh: %.*s: not valid in this context: %s\n",
-                 static_cast<int>(cmd.size()), cmd.data(), name.c_str());
+    s::fprintf(stderr, "jfsh: %.*s: not valid in this context: %s\n",
+               static_cast<int>(cmd.size()), cmd.data(), name.c_str());
     return 1;
   }
   auto existing = attrs.global ? ctx.params.lookup(name)
                                : ctx.params.lookup_local(name);
   if (existing and existing->get().is_readonly()
       and (has_value or attrs.type or attrs.off)) {
-    std::fprintf(stderr, "jfsh: read-only variable: %s\n", name.c_str());
+    s::fprintf(stderr, "jfsh: read-only variable: %s\n", name.c_str());
     return 1;
   }
   Param* p = existing ? &existing->get() : nullptr;
@@ -273,51 +271,48 @@ static int typeset_one(std::string_view cmd, const std::string& arg,
       p = &ctx.params.lookup(name)->get();
     } else {
       p = &ctx.params.declare_local(name, PM_SCALAR);
-      p->set(std::string{});
+      p->set(str{});
     }
     if (exported) p->flags |= PM_EXPORTED;
-    if (attrs.type == 'i' and not has_value) p->set(0LL);
+    if (attrs.type == 'i' and not has_value) p->set(s::int64_t{0});
     if (attrs.type == 'F' and not has_value) p->set(0.0);
   }
   if (append and has_value) value = p->scalar() + value;
-  std::uint32_t case_flags = (p->flags | attrs.on) & ~attrs.off;
+  s::uint32_t case_flags = (p->flags | attrs.on) & ~attrs.off;
   if (case_flags & PM_UPPER)
-    for (char& c : value) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    for (char& c : value) c = static_cast<char>(s::toupper(static_cast<unsigned char>(c)));
   if (case_flags & PM_LOWER)
-    for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : value) c = static_cast<char>(s::tolower(static_cast<unsigned char>(c)));
   switch (attrs.type) {
     case 'a':
-      if (has_value) p->set(std::vector<std::string>{value});
-      else if (not p->is_array()) p->set(std::vector<std::string>{});
-      break;
-    case 'A':
-      if (not p->is_hash()) p->set(std::unordered_map<std::string, std::string>{});
-      break;
-    case 'i': case 'F':
+      if (has_value) p->set(vec<str>{value});
+      else if (not p->is_array()) p->set(vec<str>{});
+      break; case 'A':
+      if (not p->is_hash()) p->set(umap<str, str>{});
+      break; case 'i': case 'F':
       if (has_value or (attrs.type == 'i' ? not p->is_integer() : not p->is_float())) {
         auto v = math_eval(has_value ? value : p->scalar(), ctx.params, math_options(ctx.opts));
         if (not v) {
-          std::fprintf(stderr, "jfsh: %.*s: %s\n", static_cast<int>(cmd.size()),
-                       cmd.data(), v.error().message.c_str());
+          s::fprintf(stderr, "jfsh: %.*s: %s\n", static_cast<int>(cmd.size()),
+                     cmd.data(), v.error().message.c_str());
           return 1;
         }
         if (attrs.type == 'i') p->set(v->as_int());
         else                   p->set(v->as_float());
       }
-      break;
-    default:
+      break; default:
       if (has_value) {
         if (p->is_integer() or p->is_float()) {
           auto v = math_eval(value, ctx.params, math_options(ctx.opts));
           if (not v) {
-            std::fprintf(stderr, "jfsh: %.*s: %s\n", static_cast<int>(cmd.size()),
-                         cmd.data(), v.error().message.c_str());
+            s::fprintf(stderr, "jfsh: %.*s: %s\n", static_cast<int>(cmd.size()),
+                       cmd.data(), v.error().message.c_str());
             return 1;
           }
           if (p->is_integer()) p->set(v->as_int());
           else                 p->set(v->as_float());
         } else {
-          p->set(std::move(value));
+          p->set(s::move(value));
         }
       }
   }
@@ -332,9 +327,9 @@ static int typeset_one(std::string_view cmd, const std::string& arg,
 // TODO(builtin/typeset): listing (`typeset`, `-p`, `-m`), `-f`, `-h`,
 //   `-T`, `-U`, `-Z`/`-L`/`-R` padding, and keeping -u/-l/-i in force for
 //   later assignments (M7).
-static int typeset_common(std::vector<std::string>& args, ExecContext& ctx,
-                          std::string_view implied) {
-  std::string_view cmd = args[0];
+static int typeset_common(vec<str>& args, ExecContext& ctx,
+                          strv implied) {
+  strv cmd = args[0];
   TypesetAttrs attrs;
   auto apply = [&](char c, bool on) {
     switch (c) {
@@ -352,15 +347,15 @@ static int typeset_common(std::vector<std::string>& args, ExecContext& ctx,
     }
   };
   for (char c : implied) apply(c, true);
-  std::size_t i = 1;
+  s::size_t i = 1;
   for (; i < args.size(); ++i) {
-    const std::string& a = args[i];
+    const str& a = args[i];
     if (a == "--") { ++i; break; }
     if (a.size() < 2 or (a[0] != '-' and a[0] != '+')) break;
-    for (std::size_t k = 1; k < a.size(); ++k) {
+    for (s::size_t k = 1; k < a.size(); ++k) {
       if (not apply(a[k], a[0] == '-')) {
-        std::fprintf(stderr, "jfsh: %.*s: bad option: %c%c\n",
-                     static_cast<int>(cmd.size()), cmd.data(), a[0], a[k]);
+        s::fprintf(stderr, "jfsh: %.*s: bad option: %c%c\n",
+                   static_cast<int>(cmd.size()), cmd.data(), a[0], a[k]);
         return 1;
       }
     }
@@ -372,22 +367,22 @@ static int typeset_common(std::vector<std::string>& args, ExecContext& ctx,
   return rc;
 }
 
-int builtin_typeset(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_typeset(vec<str>& args, ExecContext& ctx) {
   return typeset_common(args, ctx, "");
 }
-int builtin_local(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_local(vec<str>& args, ExecContext& ctx) {
   return typeset_common(args, ctx, "");
 }
-int builtin_declare(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_declare(vec<str>& args, ExecContext& ctx) {
   return typeset_common(args, ctx, "");
 }
-int builtin_integer(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_integer(vec<str>& args, ExecContext& ctx) {
   return typeset_common(args, ctx, "i");
 }
-int builtin_float(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_float(vec<str>& args, ExecContext& ctx) {
   return typeset_common(args, ctx, "F");
 }
-int builtin_fc(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_fc(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/fc): History editor and re-execution.
   //   `fc -l [first [last]]` → list history entries.
   //   `fc -e editor [first [last]]` → open entries in $editor and re-execute.
@@ -396,15 +391,15 @@ int builtin_fc(std::vector<std::string>& args, ExecContext& ctx) {
   //   `fc -P` → pop pushed history.
   (void)args; (void)ctx; return 0;
 }
-int builtin_history(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_history(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/history): Alias for `fc -l`; prints numbered history list.
   (void)args; (void)ctx; return 0;
 }
-int builtin_r(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_r(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/r): Alias for `fc -s`; re-execute the last command.
   (void)args; (void)ctx; return 0;
 }
-int builtin_alias(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_alias(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/alias): Manage the alias table (a HashTable<std::string>
   //   that needs to be added to ExecContext or a global AliasTable).
   //   `alias name=value` → register; `alias name` → print; `alias` → print all.
@@ -413,24 +408,24 @@ int builtin_alias(std::vector<std::string>& args, ExecContext& ctx) {
   //   The lexer must expand aliases at token-read time (alias_expand_ flag).
   (void)args; (void)ctx; return 0;
 }
-int builtin_unalias(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_unalias(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/unalias): Remove named entries from the alias table.
   //   -a: remove all aliases; -m pattern: remove matching aliases.
   (void)args; (void)ctx; return 0;
 }
-int builtin_builtin   (std::vector<std::string>&, ExecContext&) { return 0; }
-int builtin_command   (std::vector<std::string>&, ExecContext&) { return 0; }
-int builtin_echo(std::vector<std::string>& args, ExecContext&) {
-  for (std::size_t i = 1; i < args.size(); ++i) {
-    if (i > 1) std::putchar(' ');
-    std::fputs(args[i].c_str(), stdout);
+int builtin_builtin   (vec<str>&, ExecContext&) { return 0; }
+int builtin_command   (vec<str>&, ExecContext&) { return 0; }
+int builtin_echo(vec<str>& args, ExecContext&) {
+  for (s::size_t i = 1; i < args.size(); ++i) {
+    if (i > 1) s::putchar(' ');
+    s::fputs(args[i].c_str(), stdout);
   }
-  std::putchar('\n'); return 0;
+  s::putchar('\n'); return 0;
 }
-int builtin_print(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_print(vec<str>& args, ExecContext& ctx) {
   return builtin_echo(args, ctx);
 }
-int builtin_printf    (std::vector<std::string>&, ExecContext&) { return 0; }
+int builtin_printf    (vec<str>&, ExecContext&) { return 0; }
 // `read [-rA] [name …]`: reads one line from fd 0, a byte at a time so
 // nothing past it is consumed.  The line is split on $IFS: each name but
 // the last takes a field and the last takes the rest; with no name the
@@ -438,25 +433,25 @@ int builtin_printf    (std::vector<std::string>&, ExecContext&) { return 0; }
 // Without -r a backslash quotes the next character, and before a newline
 // joins the next line.  Status 1 at end of input.
 // TODO(builtin/read): -s, -t, -n/-k, -p, -u, -d, -q, -e/-E, -z (M7).
-int builtin_read(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_read(vec<str>& args, ExecContext& ctx) {
   bool raw = false;
   bool array = false;
-  std::size_t i = 1;
+  s::size_t i = 1;
   for (; i < args.size() and args[i].size() > 1 and args[i][0] == '-'; ++i) {
-    for (char c : std::string_view(args[i]).substr(1)) {
+    for (char c : strv(args[i]).substr(1)) {
       if      (c == 'r') raw = true;
       else if (c == 'A') array = true;
       else {
-        std::fprintf(stderr, "jfsh: read: bad option: -%c\n", c);
+        s::fprintf(stderr, "jfsh: read: bad option: -%c\n", c);
         return 1;
       }
     }
   }
-  std::vector<std::string> names(args.begin() + static_cast<long>(i), args.end());
+  vec<str> names(args.begin() + static_cast<s::ptrdiff_t>(i), args.end());
 
   // Characters quoted by a backslash are marked so they don't split.
-  std::string line;
-  std::vector<bool> quoted;
+  str line;
+  vec<bool> quoted;
   bool eof = false;
   for (;;) {
     char c;
@@ -477,25 +472,25 @@ int builtin_read(std::vector<std::string>& args, ExecContext& ctx) {
   }
   if (eof and line.empty()) return 1;
 
-  std::string ifs = " \t\n";
+  str ifs = " \t\n";
   if (auto p = ctx.params.lookup("IFS"); p and p->get().is_set())
     ifs = p->get().scalar();
-  auto is_sep = [&](std::size_t k) {
-    return not quoted[k] and ifs.find(line[k]) != std::string::npos;
+  auto is_sep = [&](s::size_t k) {
+    return not quoted[k] and ifs.find(line[k]) != str::npos;
   };
-  auto is_white = [&](std::size_t k) {
+  auto is_white = [&](s::size_t k) {
     return is_sep(k) and (line[k] == ' ' or line[k] == '\t' or line[k] == '\n');
   };
   // Fields, plus where each starts so the last name can take the rest.
-  std::vector<std::string> fields;
-  std::vector<std::size_t> starts;
-  std::size_t k = 0;
+  vec<str> fields;
+  vec<s::size_t> starts;
+  s::size_t k = 0;
   while (k < line.size() and is_white(k)) ++k;
   while (k < line.size()) {
     starts.push_back(k);
-    std::string field;
+    str field;
     while (k < line.size() and not is_sep(k)) field += line[k++];
-    fields.push_back(std::move(field));
+    fields.push_back(s::move(field));
     while (k < line.size() and is_white(k)) ++k;
     if (k < line.size() and is_sep(k)) {
       ++k;
@@ -503,17 +498,17 @@ int builtin_read(std::vector<std::string>& args, ExecContext& ctx) {
     }
   }
 
-  auto set = [&](const std::string& name, std::string value) {
-    if (auto r = ctx.params.set_scalar(name, std::move(value)); not r) {
-      std::fprintf(stderr, "jfsh: read: %s\n", r.error().message.c_str());
+  auto set = [&](const str& name, str value) {
+    if (auto r = ctx.params.set_scalar(name, s::move(value)); not r) {
+      s::fprintf(stderr, "jfsh: read: %s\n", r.error().message.c_str());
       return false;
     }
     return true;
   };
   if (array) {
-    std::string name = names.empty() ? "reply" : names[0];
+    str name = names.empty() ? "reply" : names[0];
     if (auto r = ctx.params.set_array(name, fields); not r) {
-      std::fprintf(stderr, "jfsh: read: %s\n", r.error().message.c_str());
+      s::fprintf(stderr, "jfsh: read: %s\n", r.error().message.c_str());
       return 1;
     }
     return eof ? 1 : 0;
@@ -523,93 +518,93 @@ int builtin_read(std::vector<std::string>& args, ExecContext& ctx) {
     if (not set("REPLY", line)) return 1;
     return eof ? 1 : 0;
   }
-  for (std::size_t n = 0; n < names.size(); ++n) {
-    std::string value;
+  for (s::size_t n = 0; n < names.size(); ++n) {
+    str value;
     if (n + 1 == names.size() and n < fields.size()) {
       // The rest of the line, without trailing IFS whitespace.
-      std::size_t end = line.size();
+      s::size_t end = line.size();
       while (end > starts[n] and is_white(end - 1)) --end;
       value = line.substr(starts[n], end - starts[n]);
     } else if (n < fields.size()) {
       value = fields[n];
     }
-    if (not set(names[n], std::move(value))) return 1;
+    if (not set(names[n], s::move(value))) return 1;
   }
   return eof ? 1 : 0;
 }
-int builtin_source(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_source(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/source): Same as builtin_dot.  Source the file; pass any
   //   extra arguments as $1 $2 … to the sourced script.
   (void)args; (void)ctx; return 0;
 }
-int builtin_hash(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_hash(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/hash): Manage the command hash table (PATH lookup cache).
   //   `hash` → print table; `hash cmd=path` → add entry; `hash -d` → dir hash.
   //   The hash table needs to be added to ExecContext as HashTable<std::string>.
   (void)args; (void)ctx; return 0;
 }
-int builtin_rehash(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_rehash(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/rehash): Rebuild the command hash table by walking $PATH.
   //   HASH_CMDS option: auto-hash on first use rather than on startup.
   (void)args; (void)ctx; return 0;
 }
-int builtin_true      (std::vector<std::string>&, ExecContext&) { return 0; }
-int builtin_false     (std::vector<std::string>&, ExecContext&) { return 1; }
+int builtin_true      (vec<str>&, ExecContext&) { return 0; }
+int builtin_false     (vec<str>&, ExecContext&) { return 1; }
 // builtin_test (`test` / `[`) is in cond.cpp.
-int builtin_ulimit(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_ulimit(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/ulimit): Wrapper around getrlimit/setrlimit.
   //   -a: print all; -c -d -f -n -s -t -u -v -x: individual resource limits.
   //   Values: N (set hard+soft), `unlimited`, or Nh/Ns for hard/soft only.
   (void)args; (void)ctx; return 0;
 }
-int builtin_umask(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_umask(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/umask): Get/set the file creation mask via umask(2).
   //   Accept octal or symbolic (u=rwx,g=rx,o=) notation.
   //   -S: print in symbolic form.
   (void)args; (void)ctx; return 0;
 }
-int builtin_zmodload(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_zmodload(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/zmodload): Load/unload a module via ModuleManager::load().
   //   -a: autoload (load on first use); -u: unload; -l: list loaded modules.
   //   Pass the module name, search ModuleManager::search_paths().
   (void)args; (void)ctx; return 0;
 }
-int builtin_autoload(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_autoload(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/autoload): Mark a function name for lazy loading from $fpath.
   //   When the function is first called, search $fpath for a file named after
   //   it, source it, then invoke the now-defined function.
   //   -U: suppress alias expansion; -z/-k: zsh/ksh autoload style.
   (void)args; (void)ctx; return 0;
 }
-int builtin_functions(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_functions(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/functions): Print function definitions using text.cpp decompiler.
   //   `functions name` → print one function; `functions` → print all.
   //   -u: print only undefined (autoload) functions; -m pattern: match.
   (void)args; (void)ctx; return 0;
 }
-int builtin_whence(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_whence(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/whence): Report where a name is defined:
   //   alias, function, builtin, hashed command, or PATH search result.
   //   -c: print like `type`; -f: print function body; -v: verbose; -a: all.
   (void)args; (void)ctx; return 0;
 }
-int builtin_which(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_which(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/which): Like whence -c (command path only).
   //   Search PATH for each arg; print full path or "not found".
   (void)args; (void)ctx; return 0;
 }
-int builtin_type(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_type(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/type): POSIX-compat alias for `whence -v`.
   (void)args; (void)ctx; return 0;
 }
-int builtin_compinit(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_compinit(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/compinit): Bootstrap the completion system.
   //   Walk $fpath for files named _command, source them to populate the
   //   compdef table in CompletionEngine.
   //   -d dumpfile: cache compiled completions; -C: use cache without check.
   (void)args; (void)ctx; return 0;
 }
-int builtin_setopt(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_setopt(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/setopt): Set shell options by name.
   //   `setopt extendedglob` → opts.set(OPT_EXTENDEDGLOB)
   //   `setopt no_extendedglob` → opts.unset(OPT_EXTENDEDGLOB)
@@ -617,12 +612,12 @@ int builtin_setopt(std::vector<std::string>& args, ExecContext& ctx) {
   //   Use OptionState::find() for name lookup.
   (void)args; (void)ctx; return 0;
 }
-int builtin_unsetopt(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_unsetopt(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/unsetopt): Unset a shell option by name (inverse of setopt).
   //   `unsetopt globdots` → opts.unset(OPT_GLOBDOTS)
   (void)args; (void)ctx; return 0;
 }
-int builtin_bindkey(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_bindkey(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/bindkey): Manage ZLE key bindings.
   //   `bindkey seq widget` → editor.bind_key(keymap, seq, widget)
   //   `bindkey -M keymap seq widget` → bind in named keymap
@@ -630,13 +625,13 @@ int builtin_bindkey(std::vector<std::string>& args, ExecContext& ctx) {
   //   Keymap names: main, emacs, viins, vicmd, viopp, visual, menuselect.
   (void)args; (void)ctx; return 0;
 }
-int builtin_vared(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_vared(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/vared): Edit a shell variable interactively with ZLE.
   //   Load the variable's current value into the line buffer, run the editor,
   //   then write the result back to the variable.
   (void)args; (void)ctx; return 0;
 }
-int builtin_zle(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_zle(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/zle): ZLE widget management from within a widget function.
   //   `zle -N name [function]` → register a user-defined widget.
   //   `zle widget-name` → call a widget from within another widget.
@@ -644,7 +639,7 @@ int builtin_zle(std::vector<std::string>& args, ExecContext& ctx) {
   //   `zle -M msg` → display a message below the prompt.
   (void)args; (void)ctx; return 0;
 }
-int builtin_zpty(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_zpty(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/zpty): Run a command in a pseudo-terminal.
   //   `zpty name cmd` → fork cmd in a pty, store name for later I/O.
   //   `zpty -w name data` → write to the pty.
@@ -652,7 +647,7 @@ int builtin_zpty(std::vector<std::string>& args, ExecContext& ctx) {
   //   `zpty -d name` → close the pty.
   (void)args; (void)ctx; return 0;
 }
-int builtin_sched(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_sched(vec<str>& args, ExecContext& ctx) {
   // TODO(builtin/sched): Schedule a command to run after a delay.
   //   `sched +N:M cmd` → run cmd after N minutes M seconds.
   //   Implemented via SIGALRM or a checked event queue in the REPL loop.
@@ -660,12 +655,12 @@ int builtin_sched(std::vector<std::string>& args, ExecContext& ctx) {
 }
 // `let expr…`: evaluates each expression; the status is 0 when the last
 // one is non-zero, 1 when it is zero, and 2 on an error.
-int builtin_let(std::vector<std::string>& args, ExecContext& ctx) {
+int builtin_let(vec<str>& args, ExecContext& ctx) {
   MathNum last;
-  for (std::size_t i = 1; i < args.size(); ++i) {
+  for (s::size_t i = 1; i < args.size(); ++i) {
     auto v = math_eval(args[i], ctx.params, math_options(ctx.opts));
     if (not v) {
-      std::fprintf(stderr, "jfsh: let: %s\n", v.error().message.c_str());
+      s::fprintf(stderr, "jfsh: let: %s\n", v.error().message.c_str());
       return 2;
     }
     last = *v;

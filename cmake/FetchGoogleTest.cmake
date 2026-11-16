@@ -17,12 +17,19 @@ if(NOT TARGET GTest::gtest_main)
   set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)
 
+  include(CheckCXXCompilerFlag)
+  check_cxx_compiler_flag(-Wno-character-conversion _gtest_no_char_conv)
+
   # System headers: keep strict consumer warnings (-Wconversion, -Wshadow) off gtest code.
   foreach(_gtest_target gtest gtest_main gmock gmock_main)
     if(TARGET ${_gtest_target})
       get_target_property(_gtest_inc ${_gtest_target} INTERFACE_INCLUDE_DIRECTORIES)
       set_target_properties(${_gtest_target} PROPERTIES
         INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_gtest_inc}")
+      # Clang 21 (Apple clang 21 on macOS) warns about gtest's own char8_t printer.
+      if(_gtest_no_char_conv)
+        target_compile_options(${_gtest_target} PRIVATE -Wno-character-conversion)
+      endif()
     endif()
   endforeach()
 endif()

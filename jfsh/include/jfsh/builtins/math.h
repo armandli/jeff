@@ -37,6 +37,7 @@
 #include <string>
 #include <string_view>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/options.h>
 #include <jfsh/core/param.h>
 #include <jfsh/core/types.h>
@@ -45,17 +46,17 @@ namespace jfsh {
 
 // zsh's mnumber.
 struct MathNum {
-  bool      is_float = false;
-  long long i        = 0;
-  double    d        = 0.0;
+  bool       is_float = false;
+  s::int64_t i        = 0;
+  double     d        = 0.0;
 
-  static MathNum of(long long v) noexcept { return {false, v, 0.0}; }
-  static MathNum of(double v)    noexcept { return {true, 0, v}; }
+  static MathNum of(s::int64_t v) noexcept { return {false, v, 0.0}; }
+  static MathNum of(double v)     noexcept { return {true, 0, v}; }
 
   // Floats truncate toward zero, saturating at the integer range.
-  long long as_int()   const noexcept;
-  double    as_float() const noexcept { return is_float ? d : static_cast<double>(i); }
-  bool      truthy()   const noexcept { return is_float ? d != 0.0 : i != 0; }
+  s::int64_t as_int()   const noexcept;
+  double     as_float() const noexcept { return is_float ? d : static_cast<double>(i); }
+  bool       truthy()   const noexcept { return is_float ? d != 0.0 : i != 0; }
 };
 
 struct MathOptions {
@@ -66,14 +67,14 @@ struct MathOptions {
 
 MathOptions math_options(const OptionState& opts) noexcept;
 
-Result<MathNum>   math_eval (std::string_view expr, ParamTable& params, MathOptions opts = {});
+Result<MathNum>    math_eval (strv expr, ParamTable& params, MathOptions opts = {});
 // math_eval converted to an integer, for counts, indexes and `typeset -i`.
-Result<long long> arith_eval(std::string_view expr, ParamTable& params, MathOptions opts = {});
+Result<s::int64_t> arith_eval(strv expr, ParamTable& params, MathOptions opts = {});
 
 // The text of a result as $((…)) prints it: an integer in decimal, a float
 // with 17 significant digits and always a `.` or exponent (`10.`, `1.5`,
 // `1e+20`), or `Inf`, `-Inf`, `NaN`.
-std::string format_math(const MathNum& n);
+str format_math(const MathNum& n);
 
 }  // namespace jfsh
 

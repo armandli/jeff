@@ -9,11 +9,15 @@
 #include <cstdint>
 
 #include <array>
+#include <functional>
+#include <optional>
 #include <string_view>
+
+#include <jfsh/core/aliases.h>
 
 namespace jfsh {
 
-enum OptIndex : std::uint16_t {
+enum OptIndex : s::uint16_t {
   // A
   OPT_ALIASES = 0,
   OPT_ALLEXPORT,
@@ -225,15 +229,16 @@ struct OptionState {
 
   enum class Emulation : int { ZSH, SH, KSH, CSH };
 
-  bool get(OptIndex opt)              const noexcept { return mOpts[opt]; }
-  void set(OptIndex opt)                    noexcept { mOpts[opt] = true; }
-  void unset(OptIndex opt)                  noexcept { mOpts[opt] = false; }
-  void assign(OptIndex opt, bool val)       noexcept { mOpts[opt] = val; }
+  bool get(OptIndex option)        const noexcept { return mOpts[option]; }
+  void set(OptIndex option)              noexcept { mOpts[option] = true; }
+  void unset(OptIndex option)            noexcept { mOpts[option] = false; }
+  void assign(OptIndex option, bool val) noexcept { mOpts[option] = val; }
 
-  // Returns nullptr if not found.  Accepts "extendedglob", "EXTENDED_GLOB",
-  // etc.  A name that is not an option but is one with `no` in front
-  // ("noextendedglob") finds that option and sets `negated`.
-  static const OptionInfo* find(std::string_view name, bool* negated = nullptr) noexcept;
+  // Accepts "extendedglob", "EXTENDED_GLOB", etc.  A name that is not an
+  // option but is one with `no` in front ("noextendedglob") finds that
+  // option and sets `negated`.
+  static optref<const OptionInfo>
+  find(strv name, bool* negated = nullptr) noexcept;
 
   void apply_emulation(Emulation);
 
@@ -248,7 +253,7 @@ struct OptionState {
   bool xtrace()        const noexcept { return mOpts[OPT_XTRACE]; }
 
 private:
-  std::array<bool, OPT_COUNT> mOpts{};
+  s::array<bool, OPT_COUNT> mOpts{};
 };
 
 extern const OptionInfo OPTION_INFO[OPT_COUNT];

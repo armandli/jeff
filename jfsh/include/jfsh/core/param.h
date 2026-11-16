@@ -13,14 +13,16 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/types.h>
 
 namespace jfsh {
 
-enum ParamFlags : std::uint32_t {
+enum ParamFlags : s::uint32_t {
   PM_SCALAR    = 0x0000'0001,
   PM_INTEGER   = 0x0000'0002,
   PM_FLOAT     = 0x0000'0004,
@@ -39,30 +41,30 @@ enum ParamFlags : std::uint32_t {
   PM_EFLOAT    = 0x0000'8000,   // float shown in exponent form (typeset -E)
 };
 
-using ParamValue = std::variant<
-  std::string,
-  long long,
+using ParamValue = s::variant<
+  str,
+  s::int64_t,
   double,
-  std::vector<std::string>,
-  std::unordered_map<std::string, std::string>
+  vec<str>,
+  umap<str, str>
 >;
 
 struct ParamHandlers {
-  std::function<std::string()>                  get_scalar;
-  std::function<void(std::string)>              set_scalar;
-  std::function<std::vector<std::string>()>     get_array;
-  std::function<void(std::vector<std::string>)> set_array;
-  std::function<void()>                         unset_fn;
+  func<str()>          get_scalar;
+  func<void(str)>      set_scalar;
+  func<vec<str>()>     get_array;
+  func<void(vec<str>)> set_array;
+  func<void()>         unset_fn;
 };
 
 struct Param {
-  std::string   name;
-  ParamValue    value;
-  std::uint32_t flags    = PM_SCALAR | PM_UNSET;
-  int           scope    = 0;
+  str         name;
+  ParamValue  value;
+  s::uint32_t flags    = PM_SCALAR | PM_UNSET;
+  int         scope    = 0;
 
   // nullptr for ordinary parameters
-  std::unique_ptr<ParamHandlers> handlers;
+  uptr<ParamHandlers> handlers;
 
   bool is_set()      const noexcept { return not (flags & PM_UNSET); }
   bool is_exported() const noexcept { return flags & PM_EXPORTED; }
@@ -75,64 +77,81 @@ struct Param {
 
   // An integer or float renders as text: floats as `typeset -F` (10
   // decimals) or, with PM_EFLOAT, `typeset -E` (10 significant digits).
-  std::string                                   scalar()  const noexcept;
-  long long                                     integer() const noexcept;
-  double                                        floatv()  const noexcept;
-  std::vector<std::string>                      array()   const noexcept;
-  std::unordered_map<std::string, std::string>  hash()    const noexcept;
+  str             scalar()  const noexcept;
+  s::int64_t      integer() const noexcept;
+  double          floatv()  const noexcept;
+  vec<str>        array()   const noexcept;
+  umap<str, str>  hash()    const noexcept;
 
-  void set(std::string s)                                     noexcept;
-  void set(long long   i)                                     noexcept;
-  void set(double      f)                                     noexcept;
-  void set(std::vector<std::string> a)                        noexcept;
-  void set(std::unordered_map<std::string, std::string> h)    noexcept;
+  void set(str s) noexcept {
+    value = s::move(s);
+    flags = (flags & ~(PM_UNSET | PM_INTEGER | PM_FLOAT | PM_ARRAY | PM_HASH))
+          | PM_SCALAR;
+  }
+  void set(s::int64_t i) noexcept {
+    value = i;
+    flags = (flags & ~(PM_UNSET | PM_SCALAR | PM_FLOAT | PM_ARRAY | PM_HASH))
+          | PM_INTEGER;
+  }
+  void set(double f) noexcept {
+    value = f;
+    flags = (flags & ~(PM_UNSET | PM_SCALAR | PM_INTEGER | PM_ARRAY | PM_HASH))
+          | PM_FLOAT;
+  }
+  void set(vec<str> a) noexcept {
+    value = s::move(a);
+    flags = (flags & ~(PM_UNSET | PM_SCALAR | PM_INTEGER | PM_FLOAT | PM_HASH))
+          | PM_ARRAY;
+  }
+  void set(umap<str, str> h) noexcept {
+    value = s::move(h);
+    flags = (flags & ~(PM_UNSET | PM_SCALAR | PM_INTEGER | PM_FLOAT | PM_ARRAY))
+          | PM_HASH;
+  }
 };
 
 struct ParamTable {
   // Look up by name, searching inner → outer scopes.
-  std::optional<std::reference_wrapper<Param>>
-  lookup(std::string_view name) noexcept;
+  optref<Param> lookup(strv name) noexcept;
 
-  std::optional<std::reference_wrapper<const Param>>
-  lookup(std::string_view name) const noexcept;
+  optref<const Param> lookup(strv name) const noexcept;
 
   // The parameter in the innermost scope only (for `local`).
-  std::optional<std::reference_wrapper<Param>>
-  lookup_local(std::string_view name) noexcept;
+  optref<Param> lookup_local(strv name) noexcept;
 
   // Create or overwrite in the current scope.
   Param& assign(
-    std::string name,
+    str name,
     ParamValue value,
-    std::uint32_t flags = 0);
+    s::uint32_t flags = 0);
 
   // Shell assignment (`name=value`, `name+=value`): updates the innermost
   // existing parameter in place, keeping its attributes (e.g. PM_EXPORTED),
   // or creates a new global.  Fails on a readonly parameter.
   Result<void> set_scalar(
-    std::string_view name,
-    std::string value,
+    strv name,
+    str value,
     bool append = false);
 
   // Array assignment (`name=(…)`, `name+=(…)`), with set_scalar's scoping
   // and readonly rules.  An existing associative array takes the words as
   // key/value pairs.
   Result<void> set_array(
-    std::string_view name,
-    std::vector<std::string> words,
+    strv name,
+    vec<str> words,
     bool append = false);
 
   // Declare local — creates in current scope without setting.
   Param& declare_local(
-    std::string name,
-    std::uint32_t flags = PM_SCALAR | PM_UNSET);
+    str name,
+    s::uint32_t flags = PM_SCALAR | PM_UNSET);
 
   void push_scope();
   void pop_scope();
 
-  std::vector<std::string> make_envp() const;
+  vec<str> make_envp() const;
 
-  void for_each(std::function<void(const Param&)>) const;
+  void for_each(func<void(const Param&)>) const;
 
   int current_scope() const noexcept {
     return static_cast<int>(mScopes.size()) - 1;
@@ -140,7 +159,7 @@ struct ParamTable {
 
 private:
   // mScopes[0] = global; mScopes.back() = innermost local
-  std::vector<HashTable<Param>> mScopes;
+  vec<HashTable<Param>> mScopes;
 };
 
 }  // namespace jfsh

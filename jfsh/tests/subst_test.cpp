@@ -2,38 +2,38 @@
 // splitting, braces, tilde, globbing and quote handling, run end to end
 // through Executor::exec_string.
 
+#include <pwd.h>
+#include <unistd.h>
+
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include <pwd.h>
-#include <unistd.h>
-
 #include <gtest/gtest.h>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/exec/subst.h>
-
-#include "shell_fixture.h"
+#include <shell_fixture.h>
 
 namespace jfsh {
 namespace {
 
 using test::Shell;
 using test::TempDir;
-namespace fs = std::filesystem;
+namespace sf = s::filesystem;
 
-constexpr fs::perms kFile = fs::perms::owner_read | fs::perms::owner_write;
+constexpr sf::perms kFile = sf::perms::owner_read | sf::perms::owner_write;
 
 // Runs `cmd` and returns its stdout.  `show` prints each argument in
 // brackets so word boundaries are visible: show a 'b c' → "[a][b c]".
-std::string out(Shell& sh, std::string_view cmd) {
+str out(Shell& sh, strv cmd) {
   auto r = sh.run(cmd);
   EXPECT_EQ(r.err, "") << cmd;
   return r.out;
 }
 
-std::string show(Shell& sh, std::string_view args) {
-  return out(sh, "env printf '[%s]' " + std::string(args));
+str show(Shell& sh, strv args) {
+  return out(sh, "env printf '[%s]' " + str(args));
 }
 
 // ---- parameters --------------------------------------------------------------
@@ -135,7 +135,7 @@ TEST(Subst, ArrayAssignmentExpandsItsElements) {
 
 TEST(Subst, AssociativeArrays) {
   Shell sh;
-  sh.params.assign("h", std::unordered_map<std::string, std::string>{{"k1", "v1"}, {"k2", "v2"}},
+  sh.params.assign("h", umap<str, str>{{"k1", "v1"}, {"k2", "v2"}},
                    PM_HASH);
   EXPECT_EQ(out(sh, "k=k2; echo ${h[k1]} ${h[$k]} ${(k)h} $h ${#h}"), "v1 v2 k1 k2 v1 v2 2\n");
   sh.run("h=(a 1 b 2)");
@@ -180,9 +180,9 @@ TEST(Subst, PositionalParameters) {
 TEST(Subst, SpecialParameters) {
   Shell sh;
   EXPECT_EQ(out(sh, "false; echo $?; echo $?"), "1\n0\n");
-  EXPECT_EQ(out(sh, "echo $$"), std::to_string(getpid()) + "\n");
+  EXPECT_EQ(out(sh, "echo $$"), s::to_string(getpid()) + "\n");
   EXPECT_EQ(out(sh, "echo $!"), "0\n");
-  EXPECT_EQ(out(sh, "echo $(echo $$)"), std::to_string(getpid()) + "\n");
+  EXPECT_EQ(out(sh, "echo $(echo $$)"), s::to_string(getpid()) + "\n");
 }
 
 // ---- word splitting ------------------------------------------------------------
@@ -201,9 +201,9 @@ TEST(Subst, IfsWithNonWhitespaceSeparators) {
   Shell sh;
   sh.run("IFS=:; x=a:b::c");
   EXPECT_EQ(show(sh, "${=x}"), "[a][b][c]");
-  EXPECT_EQ(ifs_split("a:b::c:", ":"), (std::vector<std::string>{"a", "b", "", "c"}));
-  EXPECT_EQ(ifs_split("  a  b ", " \t\n"), (std::vector<std::string>{"a", "b"}));
-  EXPECT_EQ(ifs_split("a : b", " :"), (std::vector<std::string>{"a", "b"}));
+  EXPECT_EQ(ifs_split("a:b::c:", ":"), (vec<str>{"a", "b", "", "c"}));
+  EXPECT_EQ(ifs_split("  a  b ", " \t\n"), (vec<str>{"a", "b"}));
+  EXPECT_EQ(ifs_split("a : b", " :"), (vec<str>{"a", "b"}));
 }
 
 // ---- command substitution ------------------------------------------------------
@@ -262,7 +262,7 @@ TEST(Subst, ArithmeticErrors) {
   auto r = sh.run("echo $((10/0))");
   EXPECT_EQ(r.rc, 1);
   EXPECT_EQ(r.err, "jfsh: division by zero\n");
-  EXPECT_NE(sh.run("echo $((1+))").err.find("bad math expression"), std::string::npos);
+  EXPECT_NE(sh.run("echo $((1+))").err.find("bad math expression"), str::npos);
 }
 
 TEST(Subst, LetBuiltin) {
@@ -293,15 +293,15 @@ TEST(Subst, BraceExpansion) {
 
 TEST(Subst, TildeExpansion) {
   Shell sh;
-  sh.params.assign("HOME", std::string("/home/t"), PM_SCALAR);
-  sh.params.assign("PWD", std::string("/w"), PM_SCALAR);
+  sh.params.assign("HOME", str("/home/t"), PM_SCALAR);
+  sh.params.assign("PWD", str("/w"), PM_SCALAR);
   EXPECT_EQ(out(sh, "echo ~ ~/x ~+ a~ '~' \\~ \"~\""), "/home/t /home/t/x /w a~ ~ ~ ~\n");
   sh.run("p=~/a:~/b; q=x~");
   EXPECT_EQ(sh.get("p"), "/home/t/a:/home/t/b");
   EXPECT_EQ(sh.get("q"), "x~");
   struct passwd* root = getpwnam("root");
   ASSERT_NE(root, nullptr);
-  EXPECT_EQ(out(sh, "echo ~root"), std::string(root->pw_dir) + "\n");  // /var/root on macOS
+  EXPECT_EQ(out(sh, "echo ~root"), str(root->pw_dir) + "\n");  // /var/root on macOS
   EXPECT_EQ(sh.run("echo ~no_such_user_xyz").err,
             "jfsh: no such user or named directory: no_such_user_xyz\n");
   EXPECT_EQ(out(sh, "echo --a=~/x"), "--a=~/x\n");
@@ -327,12 +327,12 @@ TEST(Subst, DollarSingleQuotes) {
 // ---- globbing ---------------------------------------------------------------------
 
 struct GlobTree {
-  TempDir     dir;
-  std::string d;
+  TempDir dir;
+  str     d;
   GlobTree() : d{dir.path.string()} {
     for (auto n : {"a1.txt", "a2.txt", "a10.txt", "b.txt", "c.log", ".hidden"})
       dir.file(n, "", kFile);
-    fs::create_directories(dir.path / "sub" / "deep");
+    sf::create_directories(dir.path / "sub" / "deep");
     dir.file("sub/x.txt", "", kFile);
     dir.file("sub/deep/y.txt", "", kFile);
   }
@@ -342,8 +342,8 @@ TEST(Subst, Globbing) {
   GlobTree t;
   Shell sh;
   sh.params.assign("d", t.d, PM_SCALAR);
-  auto rel = [&](std::string s) {
-    for (std::size_t p; (p = s.find(t.d + "/")) != std::string::npos;) s.erase(p, t.d.size() + 1);
+  auto rel = [&](str s) {
+    for (s::size_t p; (p = s.find(t.d + "/")) != str::npos;) s.erase(p, t.d.size() + 1);
     return s;
   };
   EXPECT_EQ(rel(out(sh, "echo $d/*.txt")), "a1.txt a10.txt a2.txt b.txt\n");

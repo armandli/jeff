@@ -1,3 +1,5 @@
+#include <jfsh/editor/editor.h>
+
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -6,31 +8,11 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/editor/completion.h>
-#include <jfsh/editor/editor.h>
 
 namespace jfsh {
 
-void LineBuffer::insert(std::string_view s) {
-  text.insert(cursor, s);
-  cursor += s.size();
-}
-
-void LineBuffer::delete_char_at(std::size_t pos) {
-  if (pos < text.size()) text.erase(pos, 1);
-}
-
-void LineBuffer::move_to(std::size_t pos) {
-  cursor = std::min(pos, text.size());
-}
-
-std::string_view LineBuffer::before_cursor() const noexcept {
-  return std::string_view(text).substr(0, cursor);
-}
-
-std::string_view LineBuffer::after_cursor() const noexcept {
-  return std::string_view(text).substr(cursor);
-}
 
 Editor::Editor(const OptionState& opts,
                HistoryManager&    hist,
@@ -61,12 +43,15 @@ void Editor::enter_raw_mode() {
   mRawModeActive = true;
 }
 
+// TCSANOW: on macOS TCSADRAIN on a pty waits until the other side has read
+// the echoed line, and a Ctrl-C typed meanwhile arrives with ISIG still off
+// and sits in the queue as a plain byte instead of interrupting the command.
 void Editor::exit_raw_mode() {
-  tcsetattr(STDIN_FILENO, TCSADRAIN, &OrigTermios);
+  tcsetattr(STDIN_FILENO, TCSANOW, &OrigTermios);
   mRawModeActive = false;
 }
 
-std::optional<std::string> Editor::read_line(bool continuation) {
+opt<str> Editor::read_line(bool continuation) {
   mBuf.text.clear();
   mBuf.cursor    = 0;
   mHistPos       = -1;
@@ -74,31 +59,31 @@ std::optional<std::string> Editor::read_line(bool continuation) {
   mInterrupted   = false;
   mEof           = false;
 
-  std::string ps1 = continuation ? mPrompt.continuation() : mPrompt.primary();
-  std::fwrite(ps1.c_str(), 1, ps1.size(), stdout);
-  std::fflush(stdout);
+  str ps1 = continuation ? mPrompt.continuation() : mPrompt.primary();
+  s::fwrite(ps1.c_str(), 1, ps1.size(), stdout);
+  s::fflush(stdout);
 
   if (not isatty(STDIN_FILENO)) {
-    std::string line;
+    str line;
     int c;
-    while ((c = std::fgetc(stdin)) != EOF and c != '\n')
+    while ((c = s::fgetc(stdin)) != EOF and c != '\n')
       line += static_cast<char>(c);
-    if (c == EOF and line.empty()) return std::nullopt;
+    if (c == EOF and line.empty()) return s::nullopt;
     return line;
   }
 
   enter_raw_mode();
   bool done = false;
   while (not done) {
-    std::string key = read_key_sequence();
+    str key = read_key_sequence();
     if (mEof) {                      // the terminal went away
       exit_raw_mode();
-      return std::nullopt;
+      return s::nullopt;
     }
     if (key == "\x04" and mBuf.text.empty()) {  // Ctrl-D on empty line = EOF
       exit_raw_mode();
-      std::putchar('\n');
-      return std::nullopt;
+      s::putchar('\n');
+      return s::nullopt;
     }
     if (key == "\x03") {            // Ctrl-C: drop the line
       mInterrupted = true;
@@ -139,12 +124,12 @@ std::optional<std::string> Editor::read_line(bool continuation) {
     refresh_display();
   }
   exit_raw_mode();
-  std::putchar('\n');
-  std::fflush(stdout);
+  s::putchar('\n');
+  s::fflush(stdout);
   return mBuf.text;
 }
 
-std::string Editor::read_key_sequence() {
+str Editor::read_key_sequence() {
   char buf[8] = {};
   for (;;) {
     struct pollfd fds[2] = {{STDIN_FILENO, POLLIN, 0}, {mWakeFd, POLLIN, 0}};
@@ -184,16 +169,16 @@ std::string Editor::read_key_sequence() {
     fd_set fds; FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
     if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0) {
       auto more = read(STDIN_FILENO, buf + n,
-                       sizeof(buf) - static_cast<std::size_t>(n));
+                       sizeof(buf) - static_cast<s::size_t>(n));
       n += static_cast<int>(more);
     }
   }
-  return std::string(buf, static_cast<std::size_t>(n));
+  return str(buf, static_cast<s::size_t>(n));
 }
 
 void Editor::refresh_display() {
-  std::string ps1    = mContinuation ? mPrompt.continuation() : mPrompt.primary();
-  int         ps1_width = PromptRenderer::visual_width(ps1);
+  str ps1    = mContinuation ? mPrompt.continuation() : mPrompt.primary();
+  int ps1_width = PromptRenderer::visual_width(ps1);
   // CR + erase line
   write(STDOUT_FILENO, "\r\x1b[K", 4);
   write(STDOUT_FILENO, ps1.c_str(), ps1.size());
@@ -201,8 +186,8 @@ void Editor::refresh_display() {
   int col = ps1_width + static_cast<int>(mBuf.cursor);
   if (col > 0) {
     char seq[32];
-    int len = std::snprintf(seq, sizeof seq, "\r\x1b[%dC", col);
-    if (len > 0) write(STDOUT_FILENO, seq, static_cast<std::size_t>(len));
+    int len = s::snprintf(seq, sizeof seq, "\r\x1b[%dC", col);
+    if (len > 0) write(STDOUT_FILENO, seq, static_cast<s::size_t>(len));
   }
 }
 
@@ -217,7 +202,7 @@ bool Editor::widget_up_line_or_history(LineBuffer& buf) {
   } else {
     return false;
   }
-  buf.text   = entries[static_cast<std::size_t>(mHistPos)].text;
+  buf.text   = entries[static_cast<s::size_t>(mHistPos)].text;
   buf.cursor = buf.text.size();
   return true;
 }
@@ -227,7 +212,7 @@ bool Editor::widget_down_line_or_history(LineBuffer& buf) {
   const auto& entries = mHist.entries();
   if (mHistPos < static_cast<int>(entries.size()) - 1) {
     ++mHistPos;
-    buf.text   = entries[static_cast<std::size_t>(mHistPos)].text;
+    buf.text   = entries[static_cast<s::size_t>(mHistPos)].text;
     buf.cursor = buf.text.size();
   } else {
     mHistPos   = -1;
@@ -236,22 +221,6 @@ bool Editor::widget_down_line_or_history(LineBuffer& buf) {
   }
   return true;
 }
-
-bool Editor::widget_self_insert(LineBuffer&)          { return false; }
-bool Editor::widget_backward_delete_char(LineBuffer&) { return false; }
-bool Editor::widget_beginning_of_line(LineBuffer& buf){ buf.cursor = 0; return true; }
-bool Editor::widget_end_of_line(LineBuffer& buf)      { buf.cursor = buf.text.size(); return true; }
-bool Editor::widget_accept_line(LineBuffer&)          { return true; }
-bool Editor::widget_complete_word(LineBuffer&)        { return false; }
-bool Editor::widget_expand_or_complete(LineBuffer&)   { return false; }
-
-void Editor::suspend() { if (mRawModeActive) exit_raw_mode(); }
-void Editor::resume()  {}
-
-void Editor::bind_key(std::string /*km*/, std::string /*seq*/, std::string /*widget*/) {}
-void Editor::register_widget(ZleWidget /*w*/) {}
-void Editor::set_mode(EditorMode mode) { mMode = mode; }
-void Editor::redraw() { refresh_display(); }
 
 int Editor::terminal_width() const noexcept {
   struct winsize ws{}; ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
@@ -262,15 +231,5 @@ int Editor::terminal_height() const noexcept {
   struct winsize ws{}; ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
   return ws.ws_row > 0 ? ws.ws_row : 24;
 }
-
-bool Editor::dispatch_widget(std::string_view /*name*/) { return false; }
-
-void Editor::install_default_bindings() {
-  if (mMode == EditorMode::Vi) install_vi_bindings();
-  else                         install_emacs_bindings();
-}
-
-void Editor::install_vi_bindings()    {}
-void Editor::install_emacs_bindings() {}
 
 }  // namespace jfsh

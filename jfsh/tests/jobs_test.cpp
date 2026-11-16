@@ -7,35 +7,37 @@
 
 #include <csignal>
 #include <cstdio>
-#include <string>
-#include <string_view>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <string>
+#include <string_view>
+
 #include <gtest/gtest.h>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/jobs.h>
 #include <jfsh/core/signals.h>
 #include <jfsh/exec/executor.h>
 #include <jfsh/lexer/input.h>
 #include <jfsh/lexer/lexer.h>
 #include <jfsh/parser/parser.h>
-
-#include "shell_fixture.h"
+#include <shell_fixture.h>
 
 namespace jfsh {
 namespace {
 
 using test::Shell;
 
-std::string out(Shell& sh, std::string_view src) { return sh.run(src).out; }
+str out(Shell& sh, strv src) { return sh.run(src).out; }
 
 // The wait status of a child that exits with `code`, or (code < 0) is
-// killed by signal -code, or (stop) stops with signal `code`.
+// killed by signal -code, or (stop) stops with signal `code`.  A stopping
+// child gets its own group: stop signals to an orphaned group are dropped.
 int child_status(int code, bool stop = false) {
   pid_t pid = ::fork();
   if (pid == 0) {
-    if (stop) { ::raise(code); _exit(0); }
+    if (stop) { ::setpgid(0, 0); ::raise(code); _exit(0); }
     if (code < 0) { ::signal(-code, SIG_DFL); ::raise(-code); }
     _exit(code < 0 ? 0 : code);
   }
@@ -49,8 +51,8 @@ int child_status(int code, bool stop = false) {
   return status;
 }
 
-ProgRef compile(std::string src) {
-  StringInputSource in{std::move(src)};
+ProgRef compile(str src) {
+  StringInputSource in{s::move(src)};
   Lexer lex{in};
   Parser parser{lex};
   auto prog = parser.parse();
@@ -146,7 +148,7 @@ TEST(JobTable, NotifyReportsOnceAndDropsFinishedJobs) {
   jobs.add_process(id, Process{.pid = 100});
   jobs.update(100, child_status(0));
   EXPECT_TRUE(jobs.has_changes());
-  std::FILE* f = std::tmpfile();
+  s::FILE* f = s::tmpfile();
   EXPECT_EQ(jobs.notify_changes(f), 1);
   EXPECT_EQ(test::slurp(f), "[1]  + done       sleep 0.3\n");
   EXPECT_FALSE(jobs.get(id).has_value());
@@ -164,8 +166,8 @@ TEST(JobTable, PipefailStatus) {
 
 // ---- Job text ----------------------------------------------------------------
 
-std::string text_of(std::string src) {
-  auto prog = compile(std::move(src));
+str text_of(str src) {
+  auto prog = compile(s::move(src));
   // list → sublist → pipe: the first pipeline is at 2.
   return prog ? pipeline_text(*prog, 2) : "";
 }
@@ -216,7 +218,7 @@ TEST(SignalTable, NumbersAndAliases) {
 
 TEST(SignalTable, FramesRestoreOnlyWhenAsked) {
   SignalTable t;
-  std::optional<Trap> exit_trap;
+  opt<Trap> exit_trap;
   t.push_frame();
   t.set(SIGUSR1, TrapAction::Command, "x");
   t.pop_frame(false, exit_trap);
@@ -226,12 +228,12 @@ TEST(SignalTable, FramesRestoreOnlyWhenAsked) {
   t.set(SIGUSR1, TrapAction::Ignore);
   auto changed = t.pop_frame(true, exit_trap);
   EXPECT_EQ(t.get(SIGUSR1).command, "x");          // restored
-  EXPECT_EQ(changed, std::vector<int>{SIGUSR1});
+  EXPECT_EQ(changed, vec<int>{SIGUSR1});
 }
 
 TEST(SignalTable, AnOuterLocalTrapsFrameRestoresWhatAnInnerOneKept) {
   SignalTable t;
-  std::optional<Trap> exit_trap;
+  opt<Trap> exit_trap;
   t.push_frame();                                  // outer, LOCAL_TRAPS
   t.push_frame();                                  // inner, not
   t.set(SIGUSR2, TrapAction::Command, "inner");
@@ -244,7 +246,7 @@ TEST(SignalTable, AnOuterLocalTrapsFrameRestoresWhatAnInnerOneKept) {
 TEST(SignalTable, AnExitTrapSetInAFunctionIsHandedBack) {
   SignalTable t;
   t.set(SIGEXIT, TrapAction::Command, "outer");
-  std::optional<Trap> exit_trap;
+  opt<Trap> exit_trap;
   t.push_frame();
   t.set(SIGEXIT, TrapAction::Command, "inner");
   t.pop_frame(false, exit_trap);
@@ -283,11 +285,12 @@ TEST(SignalManager, KillJobRefusesInitAndOurOwnGroup) {
 TEST(Trap, ListingIsInSignalOrderWithZshQuoting) {
   {
     Shell sh;
+    // USR1 is 10 on Linux but 30 on macOS, so it lists before or after TERM (15).
+    str usr1 = "trap -- 'echo t' USR1\n";
+    str term = "trap -- 'echo t' TERM\n";
     EXPECT_EQ(out(sh, "trap 'echo hi' INT; trap '' QUIT; trap 'echo t' TERM USR1; trap"),
               "trap -- 'echo hi' INT\n"
-              "trap -- '' QUIT\n"
-              "trap -- 'echo t' USR1\n"
-              "trap -- 'echo t' TERM\n");
+              "trap -- '' QUIT\n" + (SIGUSR1 < SIGTERM ? usr1 + term : term + usr1));
   }
   {
     Shell sh;
@@ -329,7 +332,7 @@ TEST(Trap, RunsAfterTheBuiltinThatRaisedItWithTheOldStatus) {
 TEST(Trap, TrapFunctions) {
   Shell sh;
   EXPECT_EQ(out(sh, "TRAPUSR1() { echo got $1; }; kill -USR1 $$; echo after"),
-            "got " + std::to_string(SIGUSR1) + "\nafter\n");
+            "got " + s::to_string(SIGUSR1) + "\nafter\n");
   // `trap` replaces the function, and the function the trap.
 }
 
@@ -374,7 +377,7 @@ TEST(Trap, SubshellsDropSignalTraps) {
   EXPECT_EQ(out(sh, "trap 'echo int' INT; (trap)"), "");
   // The subshell's USR1 is back to the default, so it dies of it.
   EXPECT_EQ(out(sh, "trap 'echo usr' USR1; (sh -c 'kill -USR1 $PPID'; echo survived); echo $?"),
-            std::to_string(128 + SIGUSR1) + "\n");
+            s::to_string(128 + SIGUSR1) + "\n");
 }
 
 TEST(Trap, DebugRunsBeforeEachCommandButNotInsideTraps) {
@@ -390,16 +393,16 @@ TEST(Trap, DebugRunsBeforeEachCommandButNotInsideTraps) {
 TEST(Trap, ATrappedSignalInterruptsWait) {
   Shell sh;
   EXPECT_EQ(out(sh, "trap 'echo usr' USR1; (sleep 0.2; kill -USR1 $$; sleep 1) & wait; echo $?"),
-            "usr\n" + std::to_string(128 + SIGUSR1) + "\n");
+            "usr\n" + s::to_string(128 + SIGUSR1) + "\n");
   sh.run("kill %1; wait");
 }
 
 // ---- ZERR, ERR_EXIT, ERR_RETURN ---------------------------------------------------
 
 TEST(Zerr, OnlyTheFailingCommandSetsItOff) {
-  auto zerr = [](std::string_view src) {
+  auto zerr = [](strv src) {
     Shell sh;
-    return sh.run("trap 'echo z' ZERR; " + std::string(src)).out;
+    return sh.run("trap 'echo z' ZERR; " + str(src)).out;
   };
   EXPECT_EQ(zerr("false; true; if false; then :; fi; false || true; ! true; echo x"), "z\nx\n");
   EXPECT_EQ(zerr("{ false; }; echo x"), "z\nx\n");
@@ -426,10 +429,10 @@ TEST(Zerr, TrapFunction) {
 
 // The output of src with ERR_EXIT or ERR_RETURN set, and whether the shell
 // is exiting afterwards.
-std::string with_option(OptIndex opt, std::string_view src, bool* exiting = nullptr) {
+str with_option(OptIndex option, strv src, bool* exiting = nullptr) {
   Shell sh;
-  sh.opts.assign(opt, true);
-  std::string o = sh.run(src).out;
+  sh.opts.assign(option, true);
+  str o = sh.run(src).out;
   if (exiting) *exiting = sh.ctx.exiting;
   return o;
 }
@@ -501,9 +504,9 @@ TEST(Kill, Errors) {
 TEST(Kill, JobsAndPids) {
   Shell sh;
   EXPECT_EQ(out(sh, "sleep 5 & kill %1; wait %1; echo $?"),
-            std::to_string(128 + SIGTERM) + "\n");
+            s::to_string(128 + SIGTERM) + "\n");
   EXPECT_EQ(out(sh, "sleep 5 & kill -9 $!; wait $!; echo $?"),
-            std::to_string(128 + SIGKILL) + "\n");
+            s::to_string(128 + SIGKILL) + "\n");
   // The background child execs the command itself: killing $! kills sleep.
   EXPECT_EQ(out(sh, "sleep 5 & kill -KILL $!; wait; echo done"), "done\n");
 }
@@ -516,7 +519,7 @@ TEST(Wait, Statuses) {
   EXPECT_EQ(out(sh, "(exit 7) & wait %1; echo $?"), "7\n");
   auto r = sh.run("(exit 7) & p=$!; sleep 0.2; wait $p; echo $?; wait $p; echo $?");
   EXPECT_EQ(r.out, "7\n127\n");
-  EXPECT_NE(r.err.find("is not a child of this shell"), std::string::npos);
+  EXPECT_NE(r.err.find("is not a child of this shell"), str::npos);
   r = sh.run("wait 999999; echo $?; wait %1; echo $?");
   EXPECT_EQ(r.out, "127\n127\n");
   EXPECT_EQ(r.err, "jfsh: wait: pid 999999 is not a child of this shell\n"

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/glob/glob.h>
 
 namespace jfsh {
@@ -68,7 +69,7 @@ TEST(GlobPatternMatch, PrefixMatches) {
   auto p = CompiledPattern::compile("*/");
   EXPECT_EQ(p.match_prefix("a/b/c", false), 2u);
   EXPECT_EQ(p.match_prefix("a/b/c", true), 4u);
-  EXPECT_EQ(p.match_prefix("abc", true), std::string::npos);
+  EXPECT_EQ(p.match_prefix("abc", true), str::npos);
 }
 
 TEST(GlobHasGlobChars, DetectsUnescapedMetacharacters) {

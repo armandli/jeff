@@ -26,9 +26,11 @@
 #include <variant>
 #include <vector>
 
+#include <jfsh/core/aliases.h>
+
 namespace jfsh {
 
-enum class ErrorKind : std::uint8_t {
+enum class ErrorKind : s::uint8_t {
   None = 0,
   ParseError,
   ExecError,
@@ -44,37 +46,37 @@ enum class ErrorKind : std::uint8_t {
 };
 
 struct ShellError {
-  ErrorKind   kind    = ErrorKind::None;
-  std::string message;
-  int         code    = 0;    // errno or exit code
+  ErrorKind kind    = ErrorKind::None;
+  str       message;
+  int       code    = 0;    // errno or exit code
 
   static ShellError from_errno(ErrorKind k, const char* ctx) noexcept;
 };
 
 template<typename T>
-using Result = std::expected<T, ShellError>;
+using Result = s::expected<T, ShellError>;
 
 // Meta-encoding: byte b >= 0x80 or b == 0x00 is stored as {META, b^0x20}.
 inline constexpr char META   = '\x83';
 inline constexpr char MARKER = '\xa0';
 
 struct Metastring {
-  std::string raw;    // bytes possibly containing Meta sequences
+  str raw;    // bytes possibly containing Meta sequences
 
-  static Metastring from_plain(std::string_view s);
-  std::string       to_plain() const;
-  std::size_t       plain_len() const;
+  static Metastring from_plain(strv s);
+  str               to_plain() const;
+  s::size_t         plain_len() const;
 };
 
 template<typename T>
-using LinkList = std::list<T>;
+using LinkList = s::list<T>;
 
-using StringList = LinkList<std::string>;
+using StringList = LinkList<str>;
 
 template<typename V>
-using HashTable = std::unordered_map<std::string, V>;
+using HashTable = umap<str, V>;
 
-enum class AllocKind : std::uint8_t {
+enum class AllocKind : s::uint8_t {
   Permanent,  // lives for the shell's lifetime
   Command,    // freed after the current top-level command finishes
   Function,   // freed when the enclosing shell function returns
@@ -83,12 +85,12 @@ enum class AllocKind : std::uint8_t {
 using Pid = int;
 using Fd  = int;
 
-using WidgetFn = std::function<int()>;
+using WidgetFn = func<int()>;
 
 struct Thingy {
-  std::string   name;
-  WidgetFn      handler;
-  std::uint32_t flags = 0;
+  str         name;
+  WidgetFn    handler;
+  s::uint32_t flags = 0;
 };
 
 }  // namespace jfsh
