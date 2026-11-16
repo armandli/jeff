@@ -1,12 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/history/history.h>
 
 namespace jfsh {
 namespace {
 
-std::vector<std::string> texts(const HistoryManager& h) {
-  std::vector<std::string> out;
+vec<str> texts(const HistoryManager& h) {
+  vec<str> out;
   for (const auto& e : h.entries()) out.push_back(e.text);
   return out;
 }
@@ -31,7 +32,7 @@ TEST(History, IgnoreSpaceDropsLeadingSpaceLines) {
   HistoryManager h{opts};
   EXPECT_EQ(h.add(" secret --token=x"), 0u);
   EXPECT_NE(h.add("ls"), 0u);
-  EXPECT_EQ(texts(h), std::vector<std::string>{"ls"});
+  EXPECT_EQ(texts(h), vec<str>{"ls"});
 }
 
 TEST(History, IgnoreDupsOnlyDropsConsecutiveRepeats) {
@@ -42,7 +43,7 @@ TEST(History, IgnoreDupsOnlyDropsConsecutiveRepeats) {
   h.add("ls");
   h.add("pwd");
   h.add("ls");
-  EXPECT_EQ(texts(h), (std::vector<std::string>{"ls", "pwd", "ls"}));
+  EXPECT_EQ(texts(h), (vec<str>{"ls", "pwd", "ls"}));
 }
 
 TEST(History, IgnoreAllDupsSuppressesAnyRepeat) {
@@ -52,7 +53,7 @@ TEST(History, IgnoreAllDupsSuppressesAnyRepeat) {
   h.add("ls");
   h.add("pwd");
   EXPECT_EQ(h.add("ls"), 0u);
-  EXPECT_EQ(texts(h), (std::vector<std::string>{"ls", "pwd"}));
+  EXPECT_EQ(texts(h), (vec<str>{"ls", "pwd"}));
 }
 
 TEST(History, ReduceBlanksCollapsesWhitespaceRuns) {
@@ -60,7 +61,7 @@ TEST(History, ReduceBlanksCollapsesWhitespaceRuns) {
   opts.reduce_blanks = true;
   HistoryManager h{opts};
   h.add("ls    -la\t\t/tmp");
-  EXPECT_EQ(texts(h), std::vector<std::string>{"ls -la\t/tmp"});
+  EXPECT_EQ(texts(h), vec<str>{"ls -la\t/tmp"});
 }
 
 TEST(History, HistsizeKeepsNewestEntries) {
@@ -70,7 +71,7 @@ TEST(History, HistsizeKeepsNewestEntries) {
   h.add("a");
   h.add("b");
   h.add("c");
-  EXPECT_EQ(texts(h), (std::vector<std::string>{"b", "c"}));
+  EXPECT_EQ(texts(h), (vec<str>{"b", "c"}));
   EXPECT_EQ(h.last_num(), 3u);
 }
 

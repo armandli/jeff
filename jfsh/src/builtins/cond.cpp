@@ -1,3 +1,5 @@
+#include <jfsh/builtins/cond.h>
+
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -6,10 +8,11 @@
 #include <unistd.h>
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <jfsh/builtins/builtins.h>
-#include <jfsh/builtins/cond.h>
+#include <jfsh/core/aliases.h>
 #include <jfsh/exec/executor.h>
 
 // The conditions of `[[ … ]]` and `test`.  The `[[ ]]` grammar is parsed by
@@ -18,21 +21,21 @@
 
 namespace jfsh {
 
-bool cond_is_unary(std::string_view op) noexcept {
+bool cond_is_unary(strv op) noexcept {
   return op.size() == 2 and op[0] == '-'
-     and std::string_view{"abcdefghknoprstuvwxzLOGSN"}.find(op[1]) != std::string_view::npos;
+     and strv{"abcdefghknoprstuvwxzLOGSN"}.find(op[1]) != strv::npos;
 }
 
-bool cond_is_numeric(std::string_view op) noexcept {
+bool cond_is_numeric(strv op) noexcept {
   return op == "-eq" or op == "-ne" or op == "-lt" or op == "-le" or op == "-gt" or op == "-ge";
 }
 
-bool cond_is_binary(std::string_view op) noexcept {
+bool cond_is_binary(strv op) noexcept {
   return op == "=" or op == "==" or op == "!=" or op == "<" or op == ">"
       or op == "-nt" or op == "-ot" or op == "-ef" or cond_is_numeric(op);
 }
 
-int cond_compare(std::string_view op, int cmp) noexcept {
+int cond_compare(strv op, int cmp) noexcept {
   bool r = op == "-eq" ? cmp == 0 : op == "-ne" ? cmp != 0
          : op == "-lt" ? cmp <  0 : op == "-le" ? cmp <= 0
          : op == "-gt" ? cmp >  0 : cmp >= 0;
@@ -41,24 +44,25 @@ int cond_compare(std::string_view op, int cmp) noexcept {
 
 static int status(bool b) noexcept { return b ? 0 : 1; }
 
-static void complain(std::string_view who, const std::string& msg) {
-  std::fprintf(stderr, "jfsh: %.*s%s\n", static_cast<int>(who.size()), who.data(), msg.c_str());
+static void complain(strv who, strv msg) {
+  s::fprintf(stderr, "jfsh: %.*s%.*s\n", static_cast<int>(who.size()), who.data(),
+             static_cast<int>(msg.size()), msg.data());
 }
 
-int cond_unary(std::string_view op, const std::string& arg, ExecContext& ctx,
-               std::string_view who) {
+int cond_unary(strv op, const str& arg, ExecContext& ctx,
+               strv who) {
   char c = op.size() == 2 and op[0] == '-' ? op[1] : 0;
   switch (c) {
     case 'n': return status(not arg.empty());
     case 'z': return status(arg.empty());
     case 'o': {
       bool negated = false;
-      const OptionInfo* info = OptionState::find(arg, &negated);
+      auto info = OptionState::find(arg, &negated);
       if (not info) {
         complain(who, "no such option: " + arg);
         return 3;
       }
-      return status(ctx.opts.get(info->index) != negated);
+      return status(ctx.opts.get(info->get().index) != negated);
     }
     case 'v': {
       auto p = ctx.params.lookup(arg);
@@ -67,7 +71,7 @@ int cond_unary(std::string_view op, const std::string& arg, ExecContext& ctx,
     case 't': {
       char* rest = nullptr;
       errno = 0;
-      long fd = std::strtol(arg.c_str(), &rest, 10);
+      long fd = s::strtol(arg.c_str(), &rest, 10);
       if (arg.empty() or *rest or errno or fd < 0 or fd > 1 << 20) return 1;
       return status(::isatty(static_cast<int>(fd)));
     }
@@ -79,8 +83,7 @@ int cond_unary(std::string_view op, const std::string& arg, ExecContext& ctx,
       return status(::lstat(arg.c_str(), &st) == 0 and S_ISLNK(st.st_mode));
     }
     case 0:
-      break;
-    default: {
+      break; default: {
       if (not cond_is_unary(op)) break;
       struct stat st;
       if (::stat(arg.c_str(), &st) != 0) return 1;
@@ -103,20 +106,20 @@ int cond_unary(std::string_view op, const std::string& arg, ExecContext& ctx,
       }
     }
   }
-  complain(who, "unknown condition: " + std::string(op));
+  complain(who, "unknown condition: " + str(op));
   return 2;
 }
 
 // Modification time in nanoseconds.
-static long long mtime_ns(const struct stat& st) noexcept {
+static s::int64_t mtime_ns(const struct stat& st) noexcept {
 #ifdef __APPLE__
-  return st.st_mtimespec.tv_sec * 1'000'000'000LL + st.st_mtimespec.tv_nsec;
+  return st.st_mtimespec.tv_sec * s::int64_t{1'000'000'000} + st.st_mtimespec.tv_nsec;
 #else
-  return st.st_mtim.tv_sec * 1'000'000'000LL + st.st_mtim.tv_nsec;
+  return st.st_mtim.tv_sec * s::int64_t{1'000'000'000} + st.st_mtim.tv_nsec;
 #endif
 }
 
-int cond_file_binary(std::string_view op, const std::string& l, const std::string& r) {
+int cond_file_binary(strv op, const str& l, const str& r) {
   struct stat a, b;
   if (::stat(l.c_str(), &a) != 0 or ::stat(r.c_str(), &b) != 0) return 1;
   if (op == "-nt") return status(mtime_ns(a) > mtime_ns(b));
@@ -125,46 +128,46 @@ int cond_file_binary(std::string_view op, const std::string& l, const std::strin
 }
 
 // Characters (UTF-8 sequences) in the first n bytes of s.
-static long long char_count(const std::string& s, regoff_t n) noexcept {
-  long long chars = 0;
+static s::int64_t char_count(strv s, regoff_t n) noexcept {
+  s::int64_t chars = 0;
   for (regoff_t i = 0; i < n; ++i)
-    if ((static_cast<unsigned char>(s[static_cast<std::size_t>(i)]) & 0xC0) != 0x80) ++chars;
+    if ((static_cast<unsigned char>(s[static_cast<s::size_t>(i)]) & 0xC0) != 0x80) ++chars;
   return chars;
 }
 
-int cond_regex(const std::string& l, const std::string& re, ExecContext& ctx,
-               std::string_view who) {
+int cond_regex(const str& l, const str& re, ExecContext& ctx,
+               strv who) {
   regex_t rx;
   if (int e = ::regcomp(&rx, re.c_str(), REG_EXTENDED); e != 0) {
     char buf[256];
     ::regerror(e, &rx, buf, sizeof buf);
-    complain(who, std::string("failed to compile regex: ") + buf);
+    complain(who, str("failed to compile regex: ") + buf);
     return 1;
   }
-  std::vector<regmatch_t> m(rx.re_nsub + 1);
+  vec<regmatch_t> m(rx.re_nsub + 1);
   int rc = ::regexec(&rx, l.c_str(), m.size(), m.data(), 0);
   ::regfree(&rx);
   if (rc != 0) return 1;
-  auto set_int = [&](const char* name, long long v) {
+  auto set_int = [&](const char* name, s::int64_t v) {
     (void)ctx.params.set_scalar(name, {});
     ctx.params.lookup(name)->get().set(v);
   };
   auto text = [&](const regmatch_t& r) {
-    return l.substr(static_cast<std::size_t>(r.rm_so), static_cast<std::size_t>(r.rm_eo - r.rm_so));
+    return l.substr(static_cast<s::size_t>(r.rm_so), static_cast<s::size_t>(r.rm_eo - r.rm_so));
   };
   (void)ctx.params.set_scalar("MATCH", text(m[0]));
   set_int("MBEGIN", char_count(l, m[0].rm_so) + 1);
   set_int("MEND", char_count(l, m[0].rm_eo));
-  std::vector<std::string> match, mbegin, mend;
-  for (std::size_t i = 1; i < m.size(); ++i) {
+  vec<str> match, mbegin, mend;
+  for (s::size_t i = 1; i < m.size(); ++i) {
     bool used = m[i].rm_so >= 0;
-    match.push_back(used ? text(m[i]) : std::string{});
-    mbegin.push_back(used ? std::to_string(char_count(l, m[i].rm_so) + 1) : "-1");
-    mend.push_back(used ? std::to_string(char_count(l, m[i].rm_eo)) : "-1");
+    match.push_back(used ? text(m[i]) : str{});
+    mbegin.push_back(used ? s::to_string(char_count(l, m[i].rm_so) + 1) : "-1");
+    mend.push_back(used ? s::to_string(char_count(l, m[i].rm_eo)) : "-1");
   }
-  (void)ctx.params.set_array("match", std::move(match));
-  (void)ctx.params.set_array("mbegin", std::move(mbegin));
-  (void)ctx.params.set_array("mend", std::move(mend));
+  (void)ctx.params.set_array("match", s::move(match));
+  (void)ctx.params.set_array("mbegin", s::move(mbegin));
+  (void)ctx.params.set_array("mend", s::move(mend));
   return 0;
 }
 
@@ -180,13 +183,13 @@ namespace {
 //   or := and (-o and)*    and := not (-a not)*    not := ! not | primary
 //   primary := ( or ) | arg binop arg | unop arg | arg
 struct Test {
-  const std::vector<std::string>& a;
-  ExecContext&                    ctx;
-  std::string                     who;
-  std::size_t                     pos = 0;
-  bool                            error = false;
+  const vec<str>& a;
+  ExecContext&    ctx;
+  str             who;
+  s::size_t       pos = 0;
+  bool            error = false;
 
-  int fail(const std::string& msg) {
+  int fail(strv msg) {
     if (not error) complain(who, msg);
     error = true;
     return 2;
@@ -195,10 +198,10 @@ struct Test {
   static int negate(int r) noexcept { return r < 2 ? 1 - r : r; }
 
   // A decimal integer, as test (unlike [[ ]]) requires.
-  bool integer(const std::string& s, long long& out) {
+  bool integer(const str& s, s::int64_t& out) {
     char* rest = nullptr;
     errno = 0;
-    out = std::strtoll(s.c_str(), &rest, 10);
+    out = s::strtoll(s.c_str(), &rest, 10);
     while (rest and (*rest == ' ' or *rest == '\t')) ++rest;
     if (s.empty() or *rest or errno) {
       fail("integer expression expected: " + s);
@@ -207,7 +210,7 @@ struct Test {
     return true;
   }
 
-  int binary(const std::string& l, std::string_view op, const std::string& r) {
+  int binary(const str& l, strv op, const str& r) {
     if (op == "=" or op == "==") return status(l == r);
     if (op == "!=") return status(l != r);
     if (op == "<")  return status(l < r);
@@ -215,14 +218,14 @@ struct Test {
     if (op == "-a") return status(not l.empty() and not r.empty());
     if (op == "-o") return status(not l.empty() or not r.empty());
     if (cond_is_numeric(op)) {
-      long long x = 0, y = 0;
+      s::int64_t x = 0, y = 0;
       if (not integer(l, x) or not integer(r, y)) return 2;
       return cond_compare(op, x < y ? -1 : x > y ? 1 : 0);
     }
     return cond_file_binary(op, l, r);
   }
 
-  int unary(std::string_view op, const std::string& arg) {
+  int unary(strv op, const str& arg) {
     int r = cond_unary(op, arg, ctx, who);
     if (r >= 2) error = true;
     return r;
@@ -230,7 +233,7 @@ struct Test {
 
   // The rules for n arguments starting at index i; -1 when they don't
   // apply.
-  int posix(std::size_t i, std::size_t n) {
+  int posix(s::size_t i, s::size_t n) {
     switch (n) {
       case 0: return 1;
       case 1: return status(not a[i].empty());
@@ -260,7 +263,7 @@ struct Test {
 
   int primary() {
     if (not more()) return fail("argument expected");
-    std::size_t left = a.size() - pos;
+    s::size_t left = a.size() - pos;
     if (a[pos] == "(" and left > 1) {
       ++pos;
       int r = parse_or();
@@ -318,8 +321,8 @@ struct Test {
 
 }  // namespace
 
-int builtin_test(std::vector<std::string>& args, ExecContext& ctx) {
-  std::vector<std::string> operands(args.begin() + 1, args.end());
+int builtin_test(vec<str>& args, ExecContext& ctx) {
+  vec<str> operands(args.begin() + 1, args.end());
   if (args[0] == "[") {
     if (operands.empty() or operands.back() != "]") {
       complain("[: ", "']' expected");

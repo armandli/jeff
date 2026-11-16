@@ -1,6 +1,6 @@
 # Convenience wrapper around CMake for the C++ part of jeff (src/).
 #
-#   make                 build Release into build/release
+#   make                 build Release into build/release, and jfsh into build/jfsh-release
 #   make debug           build Debug (with AddressSanitizer) into build/debug
 #   make routers         build only bash_router and zsh_router
 #   make test            build and run all C++ unit tests (tests/ and jfsh/tests/, GoogleTest)
@@ -68,7 +68,7 @@ JFSH_CMAKE_SOURCES := jfsh/CMakeLists.txt $(wildcard jfsh/cmake/*.cmake) \
         jfsh $(BINARIES) \
         compile-commands clean distclean rebuild info help
 
-all: build
+all: build jfsh
 
 # Configure only when the build tree is missing or a CMake file changed.
 $(CACHE): $(CMAKE_SOURCES)
@@ -139,7 +139,7 @@ distclean:
 	rm -rf build compile_commands.json
 
 rebuild: distclean
-	$(MAKE) --no-print-directory build
+	$(MAKE) --no-print-directory all
 
 info:
 	@echo "BUILD_TYPE = $(BUILD_TYPE)"
@@ -153,7 +153,8 @@ info:
 
 help:
 	@echo "Targets:"
-	@echo "  all / build       configure if needed, then build everything (default)"
+	@echo "  all               build jeff and jfsh (default)"
+	@echo "  build             configure if needed, then build jeff only"
 	@echo "  release / debug   build with that BUILD_TYPE into build/release or build/debug"
 	@echo "  configure         run the CMake configure step only"
 	@echo "  reconfigure       drop CMakeCache.txt and configure again"

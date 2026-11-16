@@ -10,19 +10,21 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <jfsh/agent/provider.h>
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/types.h>
 
 namespace jfsh {
 
 struct AgentTurn {
-  std::string user_text;
-  std::string assistant_text;
+  str user_text;
+  str assistant_text;
 };
 
-using StreamCallback = std::function<void(std::string_view chunk)>;
+using StreamCallback = func<void(strv chunk)>;
 
 struct AgentBackend {
   virtual ~AgentBackend() = default;
@@ -33,32 +35,37 @@ struct AgentBackend {
 };
 
 struct Agent {
-  static std::unique_ptr<Agent> create(ProviderConfig cfg);
+  static uptr<Agent> create(ProviderConfig cfg);
 
-  Agent(std::unique_ptr<AgentBackend> backend, ProviderConfig cfg);
+  Agent(uptr<AgentBackend> backend, ProviderConfig cfg)
+    : mBackend(s::move(backend))
+    , mCfg(s::move(cfg))
+    , mSystemPrompt("You are a helpful assistant integrated into jfsh, "
+                    "a zsh-compatible shell. Help the user with tasks, "
+                    "answer questions, and assist with shell scripting.") {}
 
-  Result<std::string> handle(
-    std::string_view user_input, StreamCallback cb = nullptr);
+  Result<str> handle(
+    strv user_input, StreamCallback cb = nullptr);
 
-  void reset();
-  void set_system_prompt(std::string prompt);
-  void set_config(ProviderConfig cfg) { mCfg = std::move(cfg); }
+  void reset() { mHistory.clear(); }
+  void set_system_prompt(str prompt) { mSystemPrompt = s::move(prompt); }
+  void set_config(ProviderConfig cfg) { mCfg = s::move(cfg); }
   void set_max_turns(int n) noexcept  { mMaxTurns = n; }
 
-  const std::vector<AgentTurn>& history() const noexcept { return mHistory; }
+  const vec<AgentTurn>& history() const noexcept { return mHistory; }
 
 protected:
-  std::vector<Message> build_messages(std::string_view user_input) const;
+  vec<Message> build_messages(strv user_input) const;
 
 private:
-  std::unique_ptr<AgentBackend> mBackend;
-  ProviderConfig                mCfg;
-  std::string                   mSystemPrompt;
-  std::vector<AgentTurn>        mHistory;
-  int                           mMaxTurns = 20;
+  uptr<AgentBackend> mBackend;
+  ProviderConfig     mCfg;
+  str                mSystemPrompt;
+  vec<AgentTurn>     mHistory;
+  int                mMaxTurns = 20;
 };
 
-std::unique_ptr<AgentBackend> make_backend(const ProviderConfig& cfg);
+uptr<AgentBackend> make_backend(const ProviderConfig& cfg);
 
 }  // namespace jfsh
 

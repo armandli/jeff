@@ -8,6 +8,7 @@
 
 #include <jfsh/agent/openai.h>
 #include <jfsh/agent/provider.h>
+#include <jfsh/core/aliases.h>
 
 namespace jfsh {
 
@@ -19,11 +20,11 @@ struct OpenRouterBackend : AgentBackend {
     const ChatRequest& req, StreamCallback cb) override;
 
 private:
-  static constexpr std::string_view kBaseUrl =
+  static constexpr strv kBaseUrl =
     "https://openrouter.ai/api/v1";
-  static constexpr std::string_view kReferer  =
+  static constexpr strv kReferer  =
     "https://github.com/jfsh-shell/jfsh";
-  static constexpr std::string_view kTitle = "jfsh";
+  static constexpr strv kTitle = "jfsh";
 
   OpenAIBackend  mDelegate;
   ProviderConfig mCfg;

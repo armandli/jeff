@@ -8,9 +8,9 @@
 
 #include <gtest/gtest.h>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/exec/executor.h>
-
-#include "shell_fixture.h"
+#include <shell_fixture.h>
 
 namespace jfsh {
 namespace {
@@ -18,7 +18,7 @@ namespace {
 using test::Shell;
 using test::TempDir;
 
-std::string out(Shell& sh, std::string_view src) { return sh.run(src).out; }
+str out(Shell& sh, strv src) { return sh.run(src).out; }
 
 // ---- if ---------------------------------------------------------------------
 
@@ -171,7 +171,7 @@ TEST(Compound, BraceGroupRunsInTheCurrentShell) {
 TEST(Compound, RedirectionsApplyToTheWholeCommand) {
   Shell sh;
   TempDir dir;
-  std::string f = (dir.path / "o").string();
+  str f = (dir.path / "o").string();
   EXPECT_EQ(out(sh, "{ echo one; echo two } > " + f + "; cat " + f), "one\ntwo\n");
   EXPECT_EQ(out(sh, "for i in 1 2; do echo $i; done > " + f + "; cat " + f), "1\n2\n");
   EXPECT_EQ(out(sh, "{ echo err >&2 } 2>&1 | tr a-z A-Z"), "ERR\n");
@@ -205,7 +205,7 @@ TEST(Compound, ArithmeticCommand) {
   EXPECT_EQ(out(sh, "((x = 5)); echo $x"), "5\n");
   auto r = sh.run("(( 1/0 ))");
   EXPECT_EQ(r.rc, 2);
-  EXPECT_NE(r.err.find("division by zero"), std::string::npos);
+  EXPECT_NE(r.err.find("division by zero"), str::npos);
 }
 
 // ---- functions ----------------------------------------------------------------
@@ -270,7 +270,7 @@ TEST(Function, AnonymousFunctionRunsAtOnce) {
 TEST(Function, RedirectionsAndPrefixAssignments) {
   Shell sh;
   TempDir dir;
-  std::string f = (dir.path / "o").string();
+  str f = (dir.path / "o").string();
   EXPECT_EQ(out(sh, "fr() { echo to-file; }; fr > " + f + "; cat " + f), "to-file\n");
   EXPECT_EQ(out(sh, "X=pre; px() { echo $X; }; X=tmp px; echo $X"), "tmp\npre\n");
   // …and they are exported to what the function runs.

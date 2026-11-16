@@ -13,30 +13,32 @@
 #include <string>
 #include <string_view>
 
+#include <jfsh/core/aliases.h>
+
 namespace jfsh {
 
 struct ExecContext;
 
 // -a -b -c -d -e -f -g -h -k -n -o -p -r -s -t -u -v -w -x -z -L -O -G -S -N
-bool cond_is_unary(std::string_view op) noexcept;
+bool cond_is_unary(strv op) noexcept;
 // = == != < > -nt -ot -ef -eq -ne -lt -le -gt -ge (=~ is [[ ]] only).
-bool cond_is_binary(std::string_view op) noexcept;
-bool cond_is_numeric(std::string_view op) noexcept;   // -eq … -ge
+bool cond_is_binary(strv op) noexcept;
+bool cond_is_numeric(strv op) noexcept;   // -eq … -ge
 
-int cond_unary(std::string_view op, const std::string& arg, ExecContext& ctx,
-               std::string_view who);
+int cond_unary(strv op, const str& arg, ExecContext& ctx,
+               strv who);
 
 // The file comparisons -nt -ot -ef; false unless both files exist.
-int cond_file_binary(std::string_view op, const std::string& l, const std::string& r);
+int cond_file_binary(strv op, const str& l, const str& r);
 
 // `l =~ re` with a POSIX extended regex.  On a match, sets $MATCH, $MBEGIN,
 // $MEND and the arrays $match, $mbegin, $mend (1-based character offsets;
 // -1 for a group that did not take part).
-int cond_regex(const std::string& l, const std::string& re, ExecContext& ctx,
-               std::string_view who);
+int cond_regex(const str& l, const str& re, ExecContext& ctx,
+               strv who);
 
 // -eq … -ge on already evaluated operands: `cmp` is <0, 0 or >0.
-int cond_compare(std::string_view op, int cmp) noexcept;
+int cond_compare(strv op, int cmp) noexcept;
 
 }  // namespace jfsh
 

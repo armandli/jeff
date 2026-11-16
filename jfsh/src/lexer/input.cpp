@@ -1,12 +1,12 @@
-#include <cstdio>
-#include <string>
-
 #include <jfsh/lexer/input.h>
 
-namespace jfsh {
+#include <cstdio>
 
-StringInputSource::StringInputSource(std::string src, int start_line)
-  : mSrc{std::move(src)}, mPos{0}, mLine{start_line} {}
+#include <string>
+
+#include <jfsh/core/aliases.h>
+
+namespace jfsh {
 
 int StringInputSource::next_char() {
   if (mPos >= mSrc.size()) return -1;
@@ -23,18 +23,15 @@ void StringInputSource::unget(int c) {
   if (c == '\n' and mLine > 1) --mLine;
 }
 
-FileInputSource::FileInputSource(std::FILE* f, int start_line)
-  : mFile{f}, mLine{start_line} {}
-
 int FileInputSource::next_char() {
-  int c = std::fgetc(mFile);
+  int c = s::fgetc(mFile);
   if (c == '\n') ++mLine;
   return c;
 }
 
 void FileInputSource::unget(int c) {
   if (c == EOF) return;
-  std::ungetc(c, mFile);
+  s::ungetc(c, mFile);
   if (c == '\n' and mLine > 1) --mLine;
 }
 

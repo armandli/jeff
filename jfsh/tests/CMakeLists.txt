@@ -20,13 +20,17 @@ add_executable(jfsh_tests
   subst_test.cpp
 )
 target_link_libraries(jfsh_tests PRIVATE
-  jfsh_core jfsh_lexer jfsh_parser jfsh_exec jfsh_glob jfsh_builtins jfsh_history jfsh_agent
+  # jfsh_exec brings jfsh_parser, jfsh_lexer, jfsh_core, jfsh_glob and jfsh_builtins; naming
+  # them here too put them on the link line twice, which Apple's ld warns about.
+  jfsh_exec jfsh_history jfsh_agent
   GTest::gtest_main
   jfsh_compiler_options
 )
 # The interactive tests drive the jfsh binary through a pseudo-terminal.
 add_dependencies(jfsh_tests jfsh)
 target_compile_definitions(jfsh_tests PRIVATE JFSH_BINARY="$<TARGET_FILE:jfsh>")
+# Lets the tests include the shared fixture as <shell_fixture.h>.
+target_include_directories(jfsh_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(jfsh_tests PRIVATE util)   # forkpty
 endif()

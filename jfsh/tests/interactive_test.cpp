@@ -45,13 +45,15 @@ struct Pty {
       _exit(127);
     }
   }
+  // The master is closed before the wait: on macOS a dying process blocks
+  // closing its tty until unread output drains, so it would never be reaped.
   ~Pty() {
+    if (pid > 0) ::kill(pid, SIGKILL);
+    if (fd >= 0) ::close(fd);
     if (pid > 0) {
-      ::kill(pid, SIGKILL);
       int st;
       ::waitpid(pid, &st, 0);
     }
-    if (fd >= 0) ::close(fd);
   }
 
   void send(std::string_view s) const {

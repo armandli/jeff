@@ -17,11 +17,12 @@
 #include <string>
 #include <string_view>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/types.h>
 
 namespace jfsh {
 
-enum class RouterVerdict : std::uint8_t {
+enum class RouterVerdict : s::uint8_t {
   Run,
   Agent,
 };
@@ -29,7 +30,7 @@ enum class RouterVerdict : std::uint8_t {
 struct RouterDecision {
   RouterVerdict verdict    = RouterVerdict::Run;
   float         confidence = 1.0f;
-  std::string   model_name;
+  str           model_name;
 
   bool is_agent() const noexcept { return verdict == RouterVerdict::Agent; }
   bool is_run()   const noexcept { return verdict == RouterVerdict::Run; }
@@ -37,35 +38,35 @@ struct RouterDecision {
 
 struct RouterModel {
   virtual ~RouterModel() = default;
-  virtual RouterDecision   classify(std::string_view line) = 0;
-  virtual std::string_view name() const noexcept = 0;
+  virtual RouterDecision   classify(strv line) = 0;
+  virtual strv             name() const noexcept = 0;
 };
 
 struct HeuristicRouter : RouterModel {
-  RouterDecision   classify(std::string_view line) override;
-  std::string_view name() const noexcept override { return "heuristic"; }
+  RouterDecision classify(strv line) override;
+  strv           name() const noexcept override { return "heuristic"; }
 };
 
 // Configuration for the local jeff HTTP service (jeff-server binary).
 struct JeffConfig {
-  std::string   base_url   = "http://127.0.0.1:8765";
-  std::uint32_t timeout_ms = 1000;  // local — fast timeout
+  str         base_url   = "http://127.0.0.1:8765";
+  s::uint32_t timeout_ms = 1000;  // local — fast timeout
 };
 
 // Configuration for the JEV cloud router (api.typesafe.ai).
 struct JevConfig {
-  std::string   api_key;
-  std::string   model      = "jev-latest";
-  std::string   base_url   = "https://api.typesafe.ai";
-  std::uint32_t timeout_ms = 10000;
+  str         api_key;
+  str         model      = "jev-latest";
+  str         base_url   = "https://api.typesafe.ai";
+  s::uint32_t timeout_ms = 10000;
 
   static JevConfig from_env();  // reads TYPESAFE_API_KEY
 };
 
 struct Router {
-  Router();
+  Router() : mModel(s::make_unique<HeuristicRouter>()) {}
 
-  RouterDecision classify(std::string_view line);
+  RouterDecision classify(strv line);
 
   void set_bypass(bool on)  noexcept { mBypass = on; }
   bool is_bypass()    const noexcept { return mBypass; }
@@ -76,7 +77,7 @@ struct Router {
   void set_threshold(float t) noexcept { mThreshold = t; }
 
 private:
-  std::unique_ptr<RouterModel> mModel;
+  uptr<RouterModel> mModel;
   bool  mBypass    = false;
   float mThreshold = 0.5f;
 };

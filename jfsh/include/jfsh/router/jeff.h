@@ -10,25 +10,28 @@
 
 #include <string>
 #include <string_view>
+#include <utility>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/types.h>
 #include <jfsh/router/router.h>
 
 namespace jfsh {
 
 struct JeffRouter : RouterModel {
-  explicit JeffRouter(JeffConfig cfg);
+  explicit JeffRouter(JeffConfig cfg) : mCfg(s::move(cfg)) {}
 
-  RouterDecision   classify(std::string_view line) override;
-  std::string_view name() const noexcept override { return "jeff"; }
+  RouterDecision classify(strv line) override;
+  strv           name() const noexcept override { return "jeff"; }
+
+protected:
+  str            build_body(strv line) const;
+  Result<str>    http_post(strv url,
+                           strv body) const;
+  Result<RouterDecision> parse_response(strv json) const;
 
 private:
   JeffConfig mCfg;
-
-  std::string            build_body(std::string_view line) const;
-  Result<std::string>    http_post(std::string_view url,
-                                   std::string_view body) const;
-  Result<RouterDecision> parse_response(std::string_view json) const;
 };
 
 }  // namespace jfsh

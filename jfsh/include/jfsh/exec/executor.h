@@ -7,14 +7,15 @@
 // plus subshell, function call, and async execution paths.
 
 #include <cstdint>
-
 #include <unistd.h>
 
 #include <array>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/jobs.h>
 #include <jfsh/core/options.h>
 #include <jfsh/core/param.h>
@@ -24,7 +25,7 @@
 
 namespace jfsh {
 
-enum ExecFlags : std::uint32_t {
+enum ExecFlags : s::uint32_t {
   EF_NONE    = 0,
   EF_ASYNC   = 1 << 0,  // run as background job
   EF_NOPRINT = 1 << 1,  // don't print job info (used internally)
@@ -66,30 +67,30 @@ struct ExecContext {
 
   HashTable<ProgRef> functions{};  // shell functions: name → body
 
-  std::vector<std::string> positional{};    // $1 … $N, also $@ $* $argv
-  std::string              arg0 = "jfsh";   // $0
-  Pid                      shell_pid = ::getpid();  // $$, unchanged in subshells
+  vec<str> positional{};    // $1 … $N, also $@ $* $argv
+  str      arg0 = "jfsh";   // $0
+  Pid      shell_pid = ::getpid();  // $$, unchanged in subshells
 };
 
 // A `name=value` (or `name+=value`, `name=(…)`) word in front of a simple
 // command.  For an array assignment `value` holds the source between the
 // parentheses until expansion fills `elements`.
 struct Assignment {
-  std::string              name;
-  std::string              value;
-  bool                     append = false;
-  bool                     array  = false;
-  std::vector<std::string> elements;
+  str      name;
+  str      value;
+  bool     append = false;
+  bool     array  = false;
+  vec<str> elements;
 };
 
 // A single redirection decoded from the bytecode.  `fd == -1` means the
 // user did not write an explicit fd prefix; the executor picks the default
 // for `type` (0 for reads, 1 for writes, 2 for stderr merges).
 struct Redirection {
-  RedirType   type    = REDIR_READ;
-  int         fd      = -1;
-  std::string target;
-  bool        literal = false;   // here-doc with a quoted delimiter
+  RedirType type    = REDIR_READ;
+  int       fd      = -1;
+  str       target;
+  bool      literal = false;   // here-doc with a quoted delimiter
 };
 
 // RAII guard that restores a set of fds when it goes out of scope.
@@ -100,9 +101,12 @@ struct SavedFds {
   SavedFds() = default;
   SavedFds(const SavedFds&)            = delete;
   SavedFds& operator=(const SavedFds&) = delete;
-  SavedFds(SavedFds&&) noexcept;
+  SavedFds(SavedFds&& other) noexcept
+    : entries(s::move(other.entries)), fail(other.fail) {
+    other.entries.clear();
+  }
   SavedFds& operator=(SavedFds&&) noexcept;
-  ~SavedFds();
+  ~SavedFds() { restore(); }
 
   // Duplicate `dst` into a new high fd (CLOEXEC) if not already saved, so
   // the destructor can restore it with dup2.  If `dst` was closed, records
@@ -112,7 +116,7 @@ struct SavedFds {
   void restore() noexcept;
 
   struct Entry { int dst; int backup; };
-  std::vector<Entry> entries;
+  vec<Entry> entries;
   bool fail = false;
 };
 
@@ -121,20 +125,20 @@ struct Executor {
   ~Executor();
 
   int exec(const CompiledProgram& prog);
-  int exec_string(std::string_view src);
+  int exec_string(strv src);
   // `typeset_args` are the `name=value` arguments of typeset and its
   // variants: expanded like assignments, then passed on as `name=value`.
   int exec_simple(
-    std::vector<std::string> args,
-    std::vector<Assignment>  assigns,
-    std::vector<Redirection> redirs,
+    vec<str>         args,
+    vec<Assignment>  assigns,
+    vec<Redirection> redirs,
     ExecFlags flags = EF_NONE,
-    std::vector<Assignment>  typeset_args = {});
+    vec<Assignment>  typeset_args = {});
 
   // Path to run for a command name: the name itself when it contains `/`,
   // otherwise a $PATH search (cached while HASH_CMDS is set).  Fails with
   // FileNotFound (exit 127) or PermissionDenied (exit 126).
-  Result<std::string> find_command(std::string_view name);
+  Result<str> find_command(strv name);
 
   // Acts on signals that arrived since the last call: reaps children into
   // the job table, runs traps, turns an untrapped Ctrl-C into `aborting`
@@ -149,7 +153,9 @@ struct Executor {
   // Sets $COLUMNS and $LINES from the terminal.
   void update_window_size();
   // Job control is on: the shell owns a terminal and MONITOR is set.
-  bool job_control() const noexcept;
+  bool job_control() const noexcept {
+    return mCtx.signals.job_control() and mCtx.opts.monitor();
+  }
 
 protected:
   int exec_list   (ExecState& es, ExecFlags);
@@ -176,77 +182,79 @@ protected:
 
   // The values a `for`/`select` loops over; false (after printing the
   // error) when their expansion fails.
-  bool loop_values(ExecState& es, WordCode head, std::vector<std::string>& names,
-                   std::vector<std::string>& values);
+  bool loop_values(ExecState& es, WordCode head, vec<str>& names,
+                   vec<str>& values);
   // True while a break, continue, return or exit is unwinding the lists.
-  bool interrupted() const noexcept;
+  bool interrupted() const noexcept {
+    return mCtx.exiting or mCtx.returning or mCtx.aborting or mCtx.break_level > 0;
+  }
   // After a loop's body: whether the loop stops.  Consumes one level of a
   // pending `break N`/`continue N`.
   bool loop_done() noexcept;
 
-  int  do_fork(ExecState& es, ExecFlags);
+  int  do_fork(ExecState& es, ExecFlags) { return 0; }
   // Forks.  With job control the child joins process group `pgid` (0: a
   // new one of its own) and, when `foreground`, takes the terminal; then
   // it resets signals and traps for `kind` and forgets the parent's jobs.
   // Returns the pid, 0 in the child, -1 (after a message) on failure.
   pid_t fork_child(Pid pgid, bool foreground, ChildKind kind);
   // Command text of the pipeline being run, for job listings.
-  std::string current_job_text() const;
+  str current_job_text() const;
   // The failing status `rc` of a command: ZERR, then ERR_EXIT/ERR_RETURN.
   void on_command_error(int rc);
   int  run_external(
-    const std::vector<std::string>& args,
-    const std::vector<Assignment>&  assigns,
-    const std::vector<Redirection>& redirs,
+    const vec<str>&         args,
+    const vec<Assignment>&  assigns,
+    const vec<Redirection>& redirs,
     ExecFlags flags);
   // Apply `redirs` in the current process, remembering originals in `saved`
   // so they can be restored.  Returns true on success.
-  bool apply_redirects(const std::vector<Redirection>& redirs,
+  bool apply_redirects(const vec<Redirection>& redirs,
                        SavedFds& saved);
   // Apply `redirs` in a freshly forked child (no fd save needed).
   // Returns true on success; false means the child should exit 1.
-  bool apply_redirects_child(const std::vector<Redirection>& redirs);
+  bool apply_redirects_child(const vec<Redirection>& redirs);
   // Process-substitution helpers.  <(cmd) → read-end fd; >(cmd) → write-end fd.
   // =(cmd) → path to a tmp file.  All fork a subshell internally.
-  int         procsubst_in (std::string_view src);
-  int         procsubst_out(std::string_view src);
-  std::string procsubst_eq (std::string_view src);
+  int procsubst_in (strv src);
+  int procsubst_out(strv src);
+  str procsubst_eq (strv src);
   // Resolve any `<(cmd)`, `>(cmd)`, `=(cmd)` tokens in `args` to actual paths
   // by forking the inner subshell and recording the parent fd that the child
   // will inherit.  Pipe-backed fds are kept open until the caller invokes
   // `procsubst_release` so the outer command can see /dev/fd/N; `=(cmd)`
   // creates a tmp file that must also be unlinked afterwards.
   struct ProcSubstResources {
-    std::vector<int>         open_fds;
-    std::vector<std::string> tmp_files;
+    vec<int> open_fds;
+    vec<str> tmp_files;
   };
-  ProcSubstResources expand_procsubst(std::vector<std::string>& args);
+  ProcSubstResources expand_procsubst(vec<str>& args);
   void               procsubst_release(ProcSubstResources& res) noexcept;
   // Expands the words, assignments and redirection targets of a simple
   // command in place (src/exec/subst.cpp does the work).  Prints the error
   // and returns false when an expansion fails.  `subst_status` receives
   // the status of the last command substitution, if any ran.
-  bool expand_command(std::vector<std::string>& args,
-                      std::vector<Assignment>&  assigns,
-                      std::vector<Redirection>& redirs,
-                      std::optional<int>&       subst_status);
-  int  apply_assigns(const std::vector<Assignment>& assigns);
+  bool expand_command(vec<str>& args,
+                      vec<Assignment>&  assigns,
+                      vec<Redirection>& redirs,
+                      opt<int>&         subst_status);
+  int  apply_assigns(const vec<Assignment>& assigns);
   void trace(
-    const std::vector<std::string>& args,
-    const std::vector<Assignment>&  assigns);
+    const vec<str>&        args,
+    const vec<Assignment>& assigns);
 
-  bool is_builtin(std::string_view name) const noexcept;
+  bool is_builtin(strv name) const noexcept;
   int  call_builtin(
-    std::string_view name,
-    std::vector<std::string>& args,
+    strv name,
+    vec<str>& args,
     ExecContext& ctx);
   // Runs a shell function: `args[0]` is its name, the rest become $1 …
   int  call_function(
     const ProgRef& body,
-    std::vector<std::string>& args);
+    vec<str>& args);
   // Puts the assignments in front of a builtin or function into a new
   // scope, which the caller pops.  Returns non-zero on a readonly name.
-  int  push_prefix_assigns(const std::vector<Assignment>& assigns, bool exported);
+  int  push_prefix_assigns(const vec<Assignment>& assigns, bool exported);
 
 public:
   ExecContext& context() noexcept { return mCtx; }
@@ -255,13 +263,13 @@ private:
   ExecContext& mCtx;
   // The pipeline exec_pline is running, for current_job_text().
   const CompiledProgram* mPipeProg = nullptr;
-  std::size_t            mPipePc   = 0;
-  std::array<bool, TRAP_TABLE_SIZE> mInTrap{};
-  int                    mTrapDepth  = 0;     // traps being run
-  int                    mStringDepth = 0;   // nested exec_string calls
-  bool                   mExitTrapRan = false;
-  HashTable<std::string> mCmdHash;     // command name → resolved path
-  std::string            mHashedPath;  // $PATH the hash was built against
+  s::size_t              mPipePc   = 0;
+  s::array<bool, TRAP_TABLE_SIZE> mInTrap{};
+  int            mTrapDepth  = 0;     // traps being run
+  int            mStringDepth = 0;   // nested exec_string calls
+  bool           mExitTrapRan = false;
+  HashTable<str> mCmdHash;     // command name → resolved path
+  str            mHashedPath;  // $PATH the hash was built against
 };
 
 // ---- Job control (src/exec/jobctl.cpp) ---------------------------------------
@@ -285,7 +293,7 @@ Result<void> signal_job(const Job& job, int sig);
 // Waits for one process of background job `jid` (`wait`).  Returns its
 // status, or 128 + the signal when a trapped signal (or Ctrl-C under job
 // control) interrupts the wait.
-int wait_background_process(ExecContext& ctx, int jid, std::size_t proc_index);
+int wait_background_process(ExecContext& ctx, int jid, s::size_t proc_index);
 
 // Sends SIGHUP (and SIGCONT to stopped ones) to the jobs an exiting
 // interactive shell leaves behind, unless NO_HUP or disowned.  Returns

@@ -1,9 +1,12 @@
-#include <algorithm>
+#include <jfsh/core/options.h>
+
 #include <cctype>
 #include <cstring>
+
+#include <algorithm>
 #include <string>
 
-#include <jfsh/core/options.h>
+#include <jfsh/core/aliases.h>
 
 namespace jfsh {
 
@@ -209,30 +212,30 @@ OptionState::OptionState() {
     mOpts[info.index] = info.default_val;
 }
 
-static std::string normalize_option_name(std::string_view name) {
-  std::string s;
+static str normalize_option_name(strv name) {
+  str s;
   s.reserve(name.size());
   for (char c : name) {
     if (c == '_') continue;
-    s += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    s += static_cast<char>(s::tolower(static_cast<unsigned char>(c)));
   }
   return s;
 }
 
-const OptionInfo* OptionState::find(std::string_view name, bool* negated) noexcept {
-  std::string norm = normalize_option_name(name);
+optref<const OptionInfo> OptionState::find(strv name, bool* negated) noexcept {
+  str norm = normalize_option_name(name);
   if (negated) *negated = false;
   for (const auto& info : OPTION_INFO)
-    if (normalize_option_name(info.name) == norm) return &info;
-  if (norm.size() <= 2 or not norm.starts_with("no")) return nullptr;
+    if (normalize_option_name(info.name) == norm) return info;
+  if (norm.size() <= 2 or not norm.starts_with("no")) return s::nullopt;
   norm = norm.substr(2);
   for (const auto& info : OPTION_INFO) {
     if (normalize_option_name(info.name) == norm) {
       if (negated) *negated = true;
-      return &info;
+      return info;
     }
   }
-  return nullptr;
+  return s::nullopt;
 }
 
 void OptionState::apply_emulation(Emulation mode) {

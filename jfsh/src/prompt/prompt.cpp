@@ -1,19 +1,16 @@
+#include <jfsh/prompt/prompt.h>
+
 #include <cstring>
 #include <ctime>
 #include <pwd.h>
 #include <unistd.h>
 
-#include <jfsh/prompt/prompt.h>
+#include <jfsh/core/aliases.h>
 
 namespace jfsh {
 
-PromptRenderer::PromptRenderer(const ParamTable& params, const OptionState& opts)
-  : mParams(params), mOpts(opts) {
-  reload();
-}
-
 void PromptRenderer::reload() {
-  auto get = [&](const char* name, std::string def) -> std::string {
+  auto get = [&](const char* name, str def) -> str {
     auto p = mParams.lookup(name);
     return (p and p->get().is_set()) ? p->get().scalar() : def;
   };
@@ -26,11 +23,11 @@ void PromptRenderer::reload() {
   mVars.SPROMPT= get("SPROMPT",  "zsh: correct '%R' to '%r' [nyae]? ");
 }
 
-std::string PromptRenderer::render(std::string_view prompt_str,
-                                   bool strip_escapes) const {
-  std::string out;
+str PromptRenderer::render(strv prompt_str,
+                           bool strip_escapes) const {
+  str out;
   out.reserve(prompt_str.size() * 2);
-  for (std::size_t i = 0; i < prompt_str.size(); ++i) {
+  for (s::size_t i = 0; i < prompt_str.size(); ++i) {
     if (prompt_str[i] != '%') {
       out += prompt_str[i];
       continue;
@@ -48,15 +45,15 @@ std::string PromptRenderer::render(std::string_view prompt_str,
     } else {
       out += expanded;
     }
-    i += static_cast<std::size_t>(consumed - 1);
+    i += static_cast<s::size_t>(consumed - 1);
   }
   return out;
 }
 
-std::pair<std::string, int>
-PromptRenderer::expand_percent(std::string_view src, int pos) const {
+s::pair<str, int>
+PromptRenderer::expand_percent(strv src, int pos) const {
   if (pos >= static_cast<int>(src.size())) return {{}, 0};
-  char c = src[static_cast<std::size_t>(pos)];
+  char c = src[static_cast<s::size_t>(pos)];
   switch (c) {
     case 'n': { // username
       struct passwd* pw = getpwuid(getuid());
@@ -77,7 +74,7 @@ PromptRenderer::expand_percent(std::string_view src, int pos) const {
       if (not cwd) return {"?", 1};
       const char* home = getenv("HOME");
       if (home and strncmp(cwd, home, strlen(home)) == 0)
-        return {"~" + std::string(cwd + strlen(home)), 1};
+        return {"~" + str(cwd + strlen(home)), 1};
       return {cwd, 1};
     }
     case '/': case '.': { // last dir component
@@ -115,21 +112,21 @@ PromptRenderer::expand_percent(std::string_view src, int pos) const {
       // Skip {color} argument
       int skip = 1;
       if (pos + 1 < static_cast<int>(src.size())
-          and src[static_cast<std::size_t>(pos+1)] == '{') {
-        auto end = src.find('}', static_cast<std::size_t>(pos + 2));
-        if (end != std::string_view::npos)
-          skip = static_cast<int>(end - static_cast<std::size_t>(pos)) + 1;
+          and src[static_cast<s::size_t>(pos+1)] == '{') {
+        auto end = src.find('}', static_cast<s::size_t>(pos + 2));
+        if (end != strv::npos)
+          skip = static_cast<int>(end - static_cast<s::size_t>(pos)) + 1;
       }
       return {"\x1b[39m", skip};
     }
     case 'f': return {"\x1b[39m", 1};  // %f reset foreground
     case '%': return {"%", 1};
     case ')': return {"", 1};
-    default:  return {std::string(1, c), 1};
+    default:  return {str(1, c), 1};
   }
 }
 
-std::string PromptRenderer::do_subst(std::string_view s) const {
+str PromptRenderer::do_subst(strv s) const {
   // TODO(prompt/subst): When PROMPT_SUBST option is set, run a full parameter
   //   and command substitution pass over the prompt string before percent
   //   expansion.  This allows prompts like:
@@ -137,10 +134,10 @@ std::string PromptRenderer::do_subst(std::string_view s) const {
   //   Implementation: create a StringInputSource, Lexer, and call the
   //   substitution expander from lexer/subst.cpp on the prompt string.
   //   The result replaces s before expand_percent is called.
-  return std::string(s);
+  return str(s);
 }
 
-int PromptRenderer::visual_width(std::string_view rendered) noexcept {
+int PromptRenderer::visual_width(strv rendered) noexcept {
   int width = 0;
   bool in_esc = false;
   for (char c : rendered) {

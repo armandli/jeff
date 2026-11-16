@@ -6,35 +6,40 @@
 // into memory and tests; FileInputSource reads a stream incrementally.
 
 #include <cstdio>
-#include <string>
 
+#include <string>
+#include <utility>
+
+#include <jfsh/core/aliases.h>
 #include <jfsh/lexer/lexer.h>
 
 namespace jfsh {
 
 struct StringInputSource : InputSource {
-  explicit StringInputSource(std::string src, int start_line = 1);
+  explicit StringInputSource(str src, int start_line = 1)
+    : mSrc{s::move(src)}, mPos{0}, mLine{start_line} {}
 
   int  next_char() override;
   void unget(int c) override;
   int  line() const noexcept override { return mLine; }
 
 private:
-  std::string mSrc;
-  std::size_t mPos;
-  int         mLine;
+  str       mSrc;
+  s::size_t mPos;
+  int       mLine;
 };
 
 struct FileInputSource : InputSource {
-  explicit FileInputSource(std::FILE* f, int start_line = 1);
+  explicit FileInputSource(s::FILE* f, int start_line = 1)
+    : mFile{f}, mLine{start_line} {}
 
   int  next_char() override;
   void unget(int c) override;
   int  line() const noexcept override { return mLine; }
 
 private:
-  std::FILE* mFile;
-  int        mLine;
+  s::FILE* mFile;
+  int      mLine;
 };
 
 }  // namespace jfsh

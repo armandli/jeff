@@ -9,58 +9,63 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/param.h>
 #include <jfsh/core/types.h>
 
 namespace jfsh {
 
 struct CompCandidate {
-  std::string display;
-  std::string insert;
-  std::string description;
-  int         priority = 0;
+  str display;
+  str insert;
+  str description;
+  int priority = 0;
 };
 
 struct CompContext {
-  std::string line;
-  std::size_t cursor = 0;
-  std::string word;
-  std::string prefix;
-  std::string suffix;
+  str line;
+  s::size_t cursor = 0;
+  str word;
+  str prefix;
+  str suffix;
 
-  std::vector<std::string> args;
-  int                      current_arg = 0;
+  vec<str> args;
+  int      current_arg = 0;
 
-  std::string command;
+  str command;
 };
 
-using CompletionFn = std::function<std::vector<CompCandidate>(const CompContext&)>;
+using CompletionFn = func<vec<CompCandidate>(const CompContext&)>;
 
 struct CompletionEngine {
-  explicit CompletionEngine(const ParamTable& params);
+  explicit CompletionEngine(const ParamTable& params)
+    : mParams(params), mDefaultFn(complete_files) {}
 
-  std::vector<CompCandidate> complete(std::string_view line, std::size_t cursor);
+  vec<CompCandidate> complete(strv line, s::size_t cursor);
 
-  void compdef(std::string command, CompletionFn fn);
-
-  void set_default_completer(CompletionFn fn) {
-    mDefaultFn = std::move(fn);
+  void compdef(str command, CompletionFn fn) {
+    mCompdefTable[s::move(command)] = s::move(fn);
   }
 
-  static std::vector<CompCandidate> complete_files(const CompContext&);
-  static std::vector<CompCandidate> complete_commands(const CompContext&);
-  static std::vector<CompCandidate> complete_variables(
+  void set_default_completer(CompletionFn fn) {
+    mDefaultFn = s::move(fn);
+  }
+
+  static vec<CompCandidate> complete_files(const CompContext&);
+  static vec<CompCandidate> complete_commands(const CompContext&);
+  static vec<CompCandidate> complete_variables(
     const CompContext&, const ParamTable&);
-  static std::vector<CompCandidate> complete_options(
-    const CompContext&, std::string_view optstring);
+  static vec<CompCandidate> complete_options(
+    const CompContext&, strv optstring) { return {}; }
 
 protected:
-  CompContext build_context(std::string_view line, std::size_t cursor) const;
+  CompContext build_context(strv line, s::size_t cursor) const;
 
 private:
-  const ParamTable&       mParams;
+  [[maybe_unused]] const ParamTable& mParams;   // not used yet
   HashTable<CompletionFn> mCompdefTable;
   CompletionFn            mDefaultFn;
 };

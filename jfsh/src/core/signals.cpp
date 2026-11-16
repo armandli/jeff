@@ -1,3 +1,5 @@
+#include <jfsh/core/signals.h>
+
 #include <cctype>
 #include <cerrno>
 #include <csignal>
@@ -8,8 +10,8 @@
 
 #include <algorithm>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/jobs.h>
-#include <jfsh/core/signals.h>
 
 namespace jfsh {
 
@@ -90,10 +92,10 @@ constexpr int JOB_CONTROL_SIGNALS[] = {
   SIGINT, SIGQUIT, SIGTERM, SIGTSTP, SIGTTIN, SIGTTOU, SIGWINCH, SIGHUP,
 };
 
-bool equal_upper(std::string_view a, std::string_view b) noexcept {
+bool equal_upper(strv a, strv b) noexcept {
   if (a.size() != b.size()) return false;
-  for (std::size_t i = 0; i < a.size(); ++i)
-    if (std::toupper(static_cast<unsigned char>(a[i])) != b[i]) return false;
+  for (s::size_t i = 0; i < a.size(); ++i)
+    if (s::toupper(static_cast<unsigned char>(a[i])) != b[i]) return false;
   return true;
 }
 
@@ -107,22 +109,22 @@ void on_signal(int sig) {
 
 // ---- SignalTable -------------------------------------------------------------
 
-std::optional<int> SignalTable::name_to_sig(std::string_view name) noexcept {
-  if (name.empty()) return std::nullopt;
-  if (std::all_of(name.begin(), name.end(),
-                  [](char c) { return std::isdigit(static_cast<unsigned char>(c)); })) {
-    if (name.size() > 3) return std::nullopt;
+opt<int> SignalTable::name_to_sig(strv name) noexcept {
+  if (name.empty()) return s::nullopt;
+  if (s::all_of(name.begin(), name.end(),
+                [](char c) { return s::isdigit(static_cast<unsigned char>(c)); })) {
+    if (name.size() > 3) return s::nullopt;
     int n = 0;
     for (char c : name) n = n * 10 + (c - '0');
     if (n == 0) return SIGEXIT;
-    if (n > MAX_SIG) return std::nullopt;
+    if (n > MAX_SIG) return s::nullopt;
     return n;
   }
-  std::string_view n = name;
+  strv n = name;
   if (n.size() > 3 and equal_upper(n.substr(0, 3), "SIG")) n = n.substr(3);
   for (const auto& e : SIG_NAMES)
     if (equal_upper(n, e.name)) return e.num;
-  return std::nullopt;
+  return s::nullopt;
 }
 
 const char* SignalTable::sig_to_name(int sig_no) noexcept {
@@ -137,55 +139,48 @@ const char* SignalTable::sig_message(int sig_no) noexcept {
   return "unknown signal";
 }
 
-void SignalTable::set(int sig, TrapAction action, std::string cmd) {
+void SignalTable::set(int sig, TrapAction action, str cmd) {
   if (sig < 0 or sig >= TRAP_TABLE_SIZE) return;
-  auto& t = mTraps[static_cast<std::size_t>(sig)];
+  auto& t = mTraps[static_cast<s::size_t>(sig)];
   if (not mFrames.empty()) {
     auto& saved = mFrames.back().saved;
-    bool known = std::any_of(saved.begin(), saved.end(),
-                             [&](const auto& e) { return e.first == sig; });
+    bool known = s::any_of(saved.begin(), saved.end(),
+                           [&](const auto& e) { return e.first == sig; });
     if (not known) saved.emplace_back(sig, t);
   }
   t.action  = action;
-  t.command = action == TrapAction::Command ? std::move(cmd) : std::string{};
+  t.command = action == TrapAction::Command ? s::move(cmd) : str{};
 }
 
 const Trap& SignalTable::get(int sig) const noexcept {
   static const Trap kDefault{};
   if (sig < 0 or sig >= TRAP_TABLE_SIZE) return kDefault;
-  return mTraps[static_cast<std::size_t>(sig)];
+  return mTraps[static_cast<s::size_t>(sig)];
 }
 
-bool SignalTable::trapped(int sig) const noexcept {
-  auto a = get(sig).action;
-  return a == TrapAction::Command or a == TrapAction::Function;
-}
-
-void SignalTable::push_frame() { mFrames.emplace_back(); }
-
-std::vector<int> SignalTable::pop_frame(bool restore, std::optional<Trap>& exit_trap) {
-  std::vector<int> changed;
+vec<int> SignalTable::pop_frame(bool restore, opt<Trap>& exit_trap) {
+  vec<int> changed;
   exit_trap.reset();
   if (mFrames.empty()) return changed;
-  Frame frame = std::move(mFrames.back());
+  Frame frame = s::move(mFrames.back());
   mFrames.pop_back();
   for (auto& [sig, old] : frame.saved) {
-    auto& t = mTraps[static_cast<std::size_t>(sig)];
+    auto& t = mTraps[static_cast<s::size_t>(sig)];
     if (sig == SIGEXIT) {
       if (t.action != TrapAction::Default) exit_trap = t;
-      t = std::move(old);
+      t = s::move(old);
       continue;
     }
     if (restore) {
-      t = std::move(old);
+      t = s::move(old);
       changed.push_back(sig);
     } else if (not mFrames.empty()) {
       // The change outlives this function; an outer LOCAL_TRAPS function
       // still needs the value from before it.
       auto& outer = mFrames.back().saved;
-      bool known = std::any_of(outer.begin(), outer.end(),
-                               [&](const auto& e) { return e.first == sig; });
-      if (not known) outer.emplace_back(sig, std::move(old));
+      bool known = s::any_of(outer.begin(), outer.end(),
+                             [&](const auto& e) { return e.first == sig; });
+      if (not known) outer.emplace_back(sig, s::move(old));
     }
   }
   return changed;
@@ -193,7 +188,7 @@ std::vector<int> SignalTable::pop_frame(bool restore, std::optional<Trap>& exit_
 
 void SignalTable::reset_for_child(bool keep_pseudo) {
   for (int sig = 0; sig < TRAP_TABLE_SIZE; ++sig) {
-    auto& t = mTraps[static_cast<std::size_t>(sig)];
+    auto& t = mTraps[static_cast<s::size_t>(sig)];
     if (keep_pseudo and (sig == SIGZERR or sig == SIGDEBUG)) continue;
     if (is_real_signal(sig) and t.action == TrapAction::Ignore) continue;
     t = Trap{};
@@ -201,35 +196,21 @@ void SignalTable::reset_for_child(bool keep_pseudo) {
   mFrames.clear();
 }
 
-void SignalTable::clear_all() {
-  mTraps.fill(Trap{});
-  mFrames.clear();
-}
-
 // ---- PendingSignals ----------------------------------------------------------
 
-static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
+static_assert(s::atomic<s::uint64_t>::is_always_lock_free,
               "the signal handler needs lock-free 64-bit atomics");
 
 void PendingSignals::mark(int sig) noexcept {
   if (sig < 0 or sig >= 128) return;
-  if (sig < 64) lo.fetch_or(1ULL << sig, std::memory_order_relaxed);
-  else          hi.fetch_or(1ULL << (sig - 64), std::memory_order_relaxed);
+  if (sig < 64) lo.fetch_or(1ULL << sig, s::memory_order_relaxed);
+  else          hi.fetch_or(1ULL << (sig - 64), s::memory_order_relaxed);
 }
 
 bool PendingSignals::test(int sig) const noexcept {
   if (sig < 0 or sig >= 128) return false;
-  if (sig < 64) return (lo.load(std::memory_order_relaxed) >> sig) & 1;
-  return (hi.load(std::memory_order_relaxed) >> (sig - 64)) & 1;
-}
-
-bool PendingSignals::any() const noexcept {
-  return (lo.load(std::memory_order_relaxed) | hi.load(std::memory_order_relaxed)) != 0;
-}
-
-std::array<std::uint64_t, 2> PendingSignals::take() noexcept {
-  return {lo.exchange(0, std::memory_order_relaxed),
-          hi.exchange(0, std::memory_order_relaxed)};
+  if (sig < 64) return (lo.load(s::memory_order_relaxed) >> sig) & 1;
+  return (hi.load(s::memory_order_relaxed) >> (sig - 64)) & 1;
 }
 
 // ---- SignalManager -----------------------------------------------------------
@@ -270,7 +251,7 @@ void SignalManager::install(int sig) noexcept {
     for (int s = 1; s <= MAX_SIG; ++s) {
       struct sigaction old{};
       if (::sigaction(s, nullptr, &old) == 0)
-        mIgnoredAtStart[static_cast<std::size_t>(s)] = old.sa_handler == SIG_IGN;
+        mIgnoredAtStart[static_cast<s::size_t>(s)] = old.sa_handler == SIG_IGN;
     }
     mStartChecked = true;
   }
@@ -305,7 +286,7 @@ void SignalManager::install(int sig) noexcept {
       break; default:
         ;
     }
-  } else if (mIgnoredAtStart[static_cast<std::size_t>(sig)]) {
+  } else if (mIgnoredAtStart[static_cast<s::size_t>(sig)]) {
     sa.sa_handler = SIG_IGN;
   }
   if (catch_it) {
@@ -373,21 +354,17 @@ void SignalManager::restore_shell_modes() noexcept {
   if (mTtyFd >= 0 and mHaveModes) ::tcsetattr(mTtyFd, TCSADRAIN, &mShellModes);
 }
 
-bool SignalManager::read_modes(struct termios& t) const noexcept {
-  return mTtyFd >= 0 and ::tcgetattr(mTtyFd, &t) == 0;
-}
-
 void SignalManager::write_modes(const struct termios& t) const noexcept {
   if (mTtyFd >= 0) ::tcsetattr(mTtyFd, TCSADRAIN, &t);
 }
 
 void SignalManager::child_reset(ChildKind kind) noexcept {
   // Dispositions to redo: whatever a trap or job control changed.
-  std::array<bool, MAX_SIG + 1> redo{};
+  s::array<bool, MAX_SIG + 1> redo{};
   for (int sig = 1; sig <= MAX_SIG; ++sig)
-    if (mTraps.trapped(sig)) redo[static_cast<std::size_t>(sig)] = true;
+    if (mTraps.trapped(sig)) redo[static_cast<s::size_t>(sig)] = true;
   if (mJobControl)
-    for (int sig : JOB_CONTROL_SIGNALS) redo[static_cast<std::size_t>(sig)] = true;
+    for (int sig : JOB_CONTROL_SIGNALS) redo[static_cast<s::size_t>(sig)] = true;
 
   mJobControl  = false;
   mInteractive = false;
@@ -402,31 +379,26 @@ void SignalManager::child_reset(ChildKind kind) noexcept {
     fd = -1;
   }
   for (int sig = 1; sig <= MAX_SIG; ++sig)
-    if (redo[static_cast<std::size_t>(sig)]) install(sig);
-}
-
-void SignalManager::set_trap(int sig, TrapAction action, std::string cmd) {
-  mTraps.set(sig, action, std::move(cmd));
-  install(sig);
+    if (redo[static_cast<s::size_t>(sig)]) install(sig);
 }
 
 void SignalManager::reset_traps() {
-  std::array<bool, MAX_SIG + 1> redo{};
+  s::array<bool, MAX_SIG + 1> redo{};
   for (int sig = 1; sig <= MAX_SIG; ++sig)
-    redo[static_cast<std::size_t>(sig)] = mTraps.get(sig).action != TrapAction::Default;
+    redo[static_cast<s::size_t>(sig)] = mTraps.get(sig).action != TrapAction::Default;
   mTraps.clear_all();
   for (int sig = 1; sig <= MAX_SIG; ++sig)
-    if (redo[static_cast<std::size_t>(sig)]) install(sig);
+    if (redo[static_cast<s::size_t>(sig)]) install(sig);
   mPending.clear_all();
 }
 
-std::optional<Trap> SignalManager::pop_trap_frame(bool restore) {
-  std::optional<Trap> exit_trap;
+opt<Trap> SignalManager::pop_trap_frame(bool restore) {
+  opt<Trap> exit_trap;
   for (int sig : mTraps.pop_frame(restore, exit_trap)) install(sig);
   return exit_trap;
 }
 
-std::array<std::uint64_t, 2> SignalManager::take_pending() noexcept {
+s::array<s::uint64_t, 2> SignalManager::take_pending() noexcept {
   if (mSelfPipe[0] >= 0) {
     char buf[64];
     while (::read(mSelfPipe[0], buf, sizeof buf) > 0) {}
@@ -463,10 +435,10 @@ void SignalManager::dispatch_pending(JobTable& jobs) {
 Result<void> SignalManager::kill_job(Pid pgid, int sig) noexcept {
   if (pgid <= 1) {
     errno = ESRCH;
-    return std::unexpected(ShellError::from_errno(ErrorKind::ExecError, "kill"));
+    return s::unexpected(ShellError::from_errno(ErrorKind::ExecError, "kill"));
   }
   if (::kill(-pgid, sig) != 0)
-    return std::unexpected(ShellError::from_errno(ErrorKind::ExecError, "kill"));
+    return s::unexpected(ShellError::from_errno(ErrorKind::ExecError, "kill"));
   return {};
 }
 

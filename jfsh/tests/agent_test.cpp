@@ -1,13 +1,13 @@
 #include <string>
 
 #include <gtest/gtest.h>
-
 #include <json.h>
 
 #include <jfsh/agent/anthropic.h>
 #include <jfsh/agent/ollama.h>
 #include <jfsh/agent/openai.h>
 #include <jfsh/agent/provider.h>
+#include <jfsh/core/aliases.h>
 
 namespace jfsh {
 namespace {
@@ -47,10 +47,10 @@ ChatRequest make_request(bool stream = false) {
   return r;
 }
 
-jeff::json::Value parse_body(const std::string& body) {
+jeff::json::Value parse_body(const str& body) {
   auto r = jeff::json::parse(body);
   EXPECT_TRUE(r) << r.error << "\n  body: " << body;
-  return std::move(r.value);
+  return s::move(r.value);
 }
 
 // ---- OpenAI -----------------------------------------------------------------
@@ -194,7 +194,7 @@ TEST(OllamaBackend, ParseNdjsonChunk) {
 // ---- api_error_message ----------------------------------------------------------
 
 TEST(ApiErrorMessage, Shapes) {
-  auto v = [](std::string_view s) { return jeff::json::parse(s).value; };
+  auto v = [](strv s) { return jeff::json::parse(s).value; };
   EXPECT_EQ(api_error_message(v(R"({"error":{"message":"m"}})")), "m");
   EXPECT_EQ(api_error_message(v(R"({"error":"plain"})")), "plain");
   EXPECT_EQ(api_error_message(v(R"({"error":{"code":42}})")), R"({"code":42})");

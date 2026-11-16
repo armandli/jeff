@@ -14,11 +14,12 @@
 #include <string>
 #include <vector>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/types.h>
 
 namespace jfsh {
 
-using WordCode = std::uint32_t;
+using WordCode = s::uint32_t;
 
 inline constexpr int      WC_BITS = 5;
 inline constexpr int      WC_DATA = 32 - WC_BITS;
@@ -231,7 +232,7 @@ constexpr WordCode make_wc_pipe(WordCode n, WordCode stderr_mask) noexcept {
 constexpr WordCode wc_pipe_count(WordCode w) noexcept {
   return wc_data(w) & ((1u << WC_PIPE_COUNT_BITS) - 1u);
 }
-constexpr bool wc_pipe_stderr(WordCode w, unsigned i) noexcept {
+constexpr bool wc_pipe_stderr(WordCode w, s::uint32_t i) noexcept {
   return ((wc_data(w) >> WC_PIPE_COUNT_BITS) >> i) & 1u;
 }
 
@@ -274,32 +275,32 @@ constexpr WordCode wc_cmd_skip(WordCode w) noexcept {
 }
 
 struct CompiledProgram {
-  std::vector<WordCode>    prog;      // bytecode stream
-  std::vector<std::string> strs;      // string literal table
+  vec<WordCode> prog;      // bytecode stream
+  vec<str>      strs;      // string literal table
   int    flags      = 0;
   int    shf_flags  = 0;              // set when this is a shell function body
   int    ref_count  = 0;
-  std::vector<std::uint32_t> line_map; // prog index → source line number
+  vec<s::uint32_t> line_map; // prog index → source line number
 
   bool empty() const noexcept { return prog.empty(); }
 };
 
-using ProgRef = std::shared_ptr<CompiledProgram>;
+using ProgRef = sptr<CompiledProgram>;
 
 struct ExecState {
   const CompiledProgram* prog = nullptr;
-  std::size_t            pc   = 0;    // program counter into prog->prog
+  s::size_t              pc   = 0;    // program counter into prog->prog
 
   WordCode peek()  const noexcept { return prog->prog[pc]; }
   WordCode fetch()       noexcept { return prog->prog[pc++]; }
   bool     at_end() const noexcept { return pc >= prog->prog.size(); }
 
-  std::string_view str(std::size_t offset) const noexcept {
+  strv str_at(s::size_t offset) const noexcept {
     return prog->strs[offset];
   }
 
   // Fetch a WC_STRING operand and return the string it refers to.
-  std::string_view fetch_str() noexcept { return str(wc_data(fetch())); }
+  strv fetch_str() noexcept { return str_at(wc_data(fetch())); }
 };
 
 }  // namespace jfsh

@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/core/jobs.h>
 #include <jfsh/core/signals.h>
 
@@ -48,7 +49,7 @@ TEST(SignalSelfPipe, SigchldReachesJobTable) {
 
   int jid = Jobs.alloc(pid, 0, "test-child");
   Process p; p.pid = pid; p.status = ProcStatus::Running;
-  Jobs.add_process(jid, std::move(p));
+  Jobs.add_process(jid, s::move(p));
 
   // Give the child a moment to actually exit so SIGCHLD queues.  Then
   // drain the self-pipe and reap.

@@ -1,30 +1,29 @@
+#include <jfsh/router/jev.h>
+
 #include <cstdio>
 #include <cstdlib>
 
 #include <curl/curl.h>
-
 #include <json.h>
 
-#include <jfsh/router/jev.h>
+#include <jfsh/core/aliases.h>
 
 namespace jfsh {
 
-static std::size_t curl_write_jev(char* ptr, std::size_t, std::size_t nmemb,
-                                   void* ud) {
-  static_cast<std::string*>(ud)->append(ptr, nmemb);
+static s::size_t curl_write_jev(char* ptr, s::size_t, s::size_t nmemb,
+                                 void* ud) {
+  static_cast<str*>(ud)->append(ptr, nmemb);
   return nmemb;
 }
 
 JevConfig JevConfig::from_env() {
   JevConfig cfg;
-  const char* key = std::getenv("TYPESAFE_API_KEY");
+  const char* key = s::getenv("TYPESAFE_API_KEY");
   if (key) cfg.api_key = key;
   return cfg;
 }
 
-JevRouter::JevRouter(JevConfig cfg) : mCfg(std::move(cfg)) {}
-
-std::string JevRouter::build_body(std::string_view line) const {
+str JevRouter::build_body(strv line) const {
   jeff::json::Writer w;
   w.begin_object()
       .field("model", mCfg.model)
@@ -43,19 +42,19 @@ std::string JevRouter::build_body(std::string_view line) const {
   return w.str();
 }
 
-Result<std::string> JevRouter::http_post(std::string_view url,
-                                          std::string_view body) const {
+Result<str> JevRouter::http_post(strv url,
+                                  strv body) const {
   CURL* curl = curl_easy_init();
   if (not curl)
-    return std::unexpected(ShellError{ErrorKind::RouterError, "curl init"});
+    return s::unexpected(ShellError{ErrorKind::RouterError, "curl init"});
 
-  std::string resp;
+  str resp;
   struct curl_slist* hdrs = nullptr;
   hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-  std::string auth = "Authorization: Bearer " + mCfg.api_key;
+  str auth = "Authorization: Bearer " + mCfg.api_key;
   hdrs = curl_slist_append(hdrs, auth.c_str());
 
-  curl_easy_setopt(curl, CURLOPT_URL,           std::string(url).c_str());
+  curl_easy_setopt(curl, CURLOPT_URL,           str(url).c_str());
   // POSTFIELDS is not copied by curl; body outlives curl_easy_perform below.
   curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    body.data());
@@ -70,22 +69,22 @@ Result<std::string> JevRouter::http_post(std::string_view url,
   curl_easy_cleanup(curl);
 
   if (rc != CURLE_OK)
-    return std::unexpected(ShellError{ErrorKind::RouterError,
-        std::string("curl: ") + curl_easy_strerror(rc)});
+    return s::unexpected(ShellError{ErrorKind::RouterError,
+        str("curl: ") + curl_easy_strerror(rc)});
   return resp;
 }
 
 Result<RouterDecision> JevRouter::parse_response(
-    std::string_view json) const {
+    strv json) const {
   // {"answers":{"routing":{"choice":"run"|"agent","confidence":<float>}}}
   auto parsed = jeff::json::parse(json);
   if (not parsed)
-    return std::unexpected(ShellError{ErrorKind::RouterError,
+    return s::unexpected(ShellError{ErrorKind::RouterError,
         "jev: invalid response: " + parsed.error});
   const jeff::json::Value* routing = parsed.value.at({"answers", "routing"});
   const jeff::json::Value* choice  = routing ? routing->find("choice") : nullptr;
   if (not choice or not choice->is_string())
-    return std::unexpected(
+    return s::unexpected(
         ShellError{ErrorKind::RouterError, "jev: no choice in response"});
 
   // Confidence may sit beside the choice or at the top level.
@@ -100,22 +99,22 @@ Result<RouterDecision> JevRouter::parse_response(
   return d;
 }
 
-RouterDecision JevRouter::classify(std::string_view line) {
-  std::string url  = mCfg.base_url + "/v1/systemone";
-  auto        body = build_body(line);
-  auto        resp = http_post(url, body);
+RouterDecision JevRouter::classify(strv line) {
+  str  url  = mCfg.base_url + "/v1/systemone";
+  auto body = build_body(line);
+  auto resp = http_post(url, body);
   if (not resp) {
-    std::fprintf(stderr,
-                 "jfsh: jev router: %s — falling back to heuristic\n",
-                 resp.error().message.c_str());
+    s::fprintf(stderr,
+               "jfsh: jev router: %s — falling back to heuristic\n",
+               resp.error().message.c_str());
     HeuristicRouter fallback;
     return fallback.classify(line);
   }
   auto decision = parse_response(*resp);
   if (not decision) {
-    std::fprintf(stderr,
-                 "jfsh: jev router: %s — falling back to heuristic\n",
-                 decision.error().message.c_str());
+    s::fprintf(stderr,
+               "jfsh: jev router: %s — falling back to heuristic\n",
+               decision.error().message.c_str());
     HeuristicRouter fallback;
     return fallback.classify(line);
   }

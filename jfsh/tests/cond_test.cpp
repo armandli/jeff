@@ -7,30 +7,30 @@
 
 #include <gtest/gtest.h>
 
+#include <jfsh/core/aliases.h>
 #include <jfsh/exec/executor.h>
-
-#include "shell_fixture.h"
+#include <shell_fixture.h>
 
 namespace jfsh {
 namespace {
 
 using test::Shell;
 using test::TempDir;
-namespace fs = std::filesystem;
+namespace sf = s::filesystem;
 
-std::string out(Shell& sh, std::string_view src) { return sh.run(src).out; }
+str out(Shell& sh, strv src) { return sh.run(src).out; }
 
 // The output of src with its newlines removed.
-std::string joined(Shell& sh, const std::string& src) {
-  std::string s = out(sh, src);
-  std::erase(s, '\n');
+str joined(Shell& sh, strv src) {
+  str s = out(sh, src);
+  s::erase(s, '\n');
   return s;
 }
 
 // "T" or "F" for each condition, run one after another.
-std::string truth(Shell& sh, std::initializer_list<std::string_view> conds) {
-  std::string src;
-  for (auto c : conds) src += std::string(c) + " && echo T || echo F; ";
+str truth(Shell& sh, s::initializer_list<strv> conds) {
+  str src;
+  for (auto c : conds) src += str(c) + " && echo T || echo F; ";
   return joined(sh, src);
 }
 
@@ -39,15 +39,15 @@ std::string truth(Shell& sh, std::initializer_list<std::string_view> conds) {
 struct Files {
   TempDir  dir;
   Shell    sh;
-  fs::path old = fs::current_path();
+  sf::path old = sf::current_path();
   Files() {
-    dir.file("f", "data", fs::perms::owner_read | fs::perms::owner_write);
-    dir.file("e", "", fs::perms::owner_all);
-    fs::create_directory(dir.path / "d");
-    fs::create_symlink(dir.path / "f", dir.path / "l");
-    fs::current_path(dir.path);
+    dir.file("f", "data", sf::perms::owner_read | sf::perms::owner_write);
+    dir.file("e", "", sf::perms::owner_all);
+    sf::create_directory(dir.path / "d");
+    sf::create_symlink(dir.path / "f", dir.path / "l");
+    sf::current_path(dir.path);
   }
-  ~Files() { fs::current_path(old); }
+  ~Files() { sf::current_path(old); }
 };
 
 // ---- [[ ]] strings and patterns ---------------------------------------------
@@ -93,7 +93,7 @@ TEST(Cond, RegexSetsMatchParameters) {
   EXPECT_EQ(out(sh, "[[ héllo =~ l+ ]]; echo $MBEGIN $MEND $MATCH"), "3 4 ll\n");
   auto r = sh.run("[[ foo =~ \"(\" ]]");
   EXPECT_EQ(r.rc, 1);
-  EXPECT_NE(r.err.find("failed to compile regex"), std::string::npos);
+  EXPECT_NE(r.err.find("failed to compile regex"), str::npos);
 }
 
 TEST(Cond, NumericComparisonsAreArithmetic) {
@@ -104,7 +104,7 @@ TEST(Cond, NumericComparisonsAreArithmetic) {
             "TTTFTTFT");
   auto r = sh.run("x='a b'; [[ x -eq 1 ]]");
   EXPECT_EQ(r.rc, 1);
-  EXPECT_NE(r.err.find("operator expected at `b'"), std::string::npos);
+  EXPECT_NE(r.err.find("operator expected at `b'"), str::npos);
 }
 
 TEST(Cond, LogicShortCircuitsAndGroups) {
@@ -171,9 +171,9 @@ TEST(Cond, FileTests) {
 // ---- test / [ -----------------------------------------------------------------
 
 // The status of each command, run one after another.
-std::string statuses(Shell& sh, std::initializer_list<std::string_view> cmds) {
-  std::string src;
-  for (auto c : cmds) src += std::string(c) + "; echo $?; ";
+str statuses(Shell& sh, s::initializer_list<strv> cmds) {
+  str src;
+  for (auto c : cmds) src += str(c) + "; echo $?; ";
   return joined(sh, src);
 }
 

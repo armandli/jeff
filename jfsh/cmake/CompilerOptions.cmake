@@ -11,7 +11,7 @@ target_compile_options(jfsh_compiler_options INTERFACE
       -Wlogical-op
       -fdiagnostics-color=always
   >
-  $<$<CXX_COMPILER_ID:Clang>:
+  $<$<CXX_COMPILER_ID:Clang,AppleClang>:
       -Wno-gnu-zero-variadic-macro-arguments
       -fcolor-diagnostics
   >

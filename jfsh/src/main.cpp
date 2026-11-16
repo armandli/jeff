@@ -8,8 +8,6 @@
 
 #include <jfsh/agent/agent.h>
 #include <jfsh/agent/provider.h>
-#include <jfsh/router/jeff.h>
-#include <jfsh/router/jev.h>
 #include <jfsh/core/jobs.h>
 #include <jfsh/core/options.h>
 #include <jfsh/core/param.h>
@@ -21,6 +19,8 @@
 #include <jfsh/lexer/lexer.h>
 #include <jfsh/parser/parser.h>
 #include <jfsh/prompt/prompt.h>
+#include <jfsh/router/jeff.h>
+#include <jfsh/router/jev.h>
 #include <jfsh/router/router.h>
 
 extern char** environ;
