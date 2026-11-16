@@ -241,6 +241,15 @@ void SignalManager::open_self_pipe() noexcept {
     pfd[0] = pfd[1] = -1;
   }
 #endif
+  // Kept on high fds, as zsh keeps its own: `exec 3<file` must not close
+  // the read end, or the handler's next write kills the shell (SIGPIPE).
+  for (int& fd : pfd) {
+    if (fd < 0 or fd >= 10) continue;
+    int high = ::fcntl(fd, F_DUPFD_CLOEXEC, 10);
+    if (high < 0) continue;
+    ::close(fd);
+    fd = high;
+  }
   mSelfPipe[0] = pfd[0];
   mSelfPipe[1] = pfd[1];
 }

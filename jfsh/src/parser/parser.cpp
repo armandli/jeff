@@ -13,6 +13,8 @@
 
 namespace jfsh {
 
+static bool is_reserved_word(TokType t) noexcept;
+
 Result<ProgRef> Parser::parse() {
   auto prog = s::make_shared<CompiledProgram>();
   mProg  = prog.get();
@@ -33,6 +35,77 @@ Result<ProgRef> Parser::parse() {
   emit(make_wc(WC_END, 0));
   mProg = nullptr;
   return prog;
+}
+
+Result<ProgRef> Parser::parse_line() {
+  auto prog = s::make_shared<CompiledProgram>();
+  mProg  = prog.get();
+  mError = {};
+  mIncomplete = false;
+  mLineMode = true;
+  skip_newlines();
+  bool ok = at(TokType::TK_EOF) or par_list1();
+  mLineMode = false;
+  if (ok and not at(TokType::TK_EOF) and not at(TokType::TK_NEWLINE))
+    ok = error_near(mLex.peek());
+  if (not ok and mError.message.empty()) error_near(mLex.peek());
+  if (not ok) {
+    mProg = nullptr;
+    mPendingHeredocs.clear();
+    return s::unexpected(mError);
+  }
+  // The newline that ended the line reads the here-document bodies.
+  if (at(TokType::TK_NEWLINE)) mLex.consume();
+  auto bodies = mLex.take_heredocs();
+  for (s::size_t i = 0; i < mPendingHeredocs.size() and i < bodies.size(); ++i)
+    prog->strs[mPendingHeredocs[i]] = s::move(bodies[i]);
+  mPendingHeredocs.clear();
+  emit(make_wc(WC_END, 0));
+  mProg = nullptr;
+  return prog;
+}
+
+bool Parser::expand_alias(bool cmdpos) {
+  if (not mAliases or not mLex.alias_expansion()) return false;
+  const LexToken& tok = mLex.peek();
+  if (not (tok.type == TokType::TK_WORD or is_reserved_word(tok.type)
+           or tok.type == TokType::TK_LBRACE or tok.type == TokType::TK_RBRACE))
+    return false;
+  const str& name = tok.text;
+  if (name.empty()) return false;
+  auto in_use = [&](const str& n) {
+    return tok.aliases and s::find(tok.aliases->begin(), tok.aliases->end(), n)
+                           != tok.aliases->end();
+  };
+  str key;
+  str text;
+  if (auto it = mAliases->regular.find(name);
+      it != mAliases->regular.end() and (cmdpos or it->second.global)
+      and not in_use(name)) {
+    key  = name;
+    text = it->second.text;
+  } else if (cmdpos and not mAliases->suffix.empty()) {
+    // `file.ext` runs as `text file.ext`.
+    s::size_t slash = name.rfind('/');
+    s::size_t dot   = name.rfind('.');
+    if (dot == str::npos or dot == 0 or (slash != str::npos and dot < slash + 2)
+        or dot + 1 == name.size())
+      return false;
+    auto sfx = mAliases->suffix.find(name.substr(dot + 1));
+    if (sfx == mAliases->suffix.end() or in_use("." + sfx->first)) return false;
+    key  = "." + sfx->first;
+    text = sfx->second + " " + name;
+  } else {
+    return false;
+  }
+  auto names = s::make_shared<vec<str>>(tok.aliases ? *tok.aliases : vec<str>{});
+  names->push_back(s::move(key));
+  // A space after the text keeps the alias's last word apart from what
+  // follows it, as zsh's input stack does.
+  bool blank_end = not text.empty() and (text.back() == ' ' or text.back() == '\t');
+  mLex.consume();
+  mLex.push_alias(blank_end ? text : text + " ", s::move(names));
+  return true;
 }
 
 bool is_incomplete(strv src, bool comments) {
@@ -142,14 +215,27 @@ void Parser::emit_words(vec<str> words) {
 // list := WC_LIST(flags, skip) sublist, repeated for each `;`, `&` or
 // newline-separated element.
 bool Parser::par_list1() {
+  // parse_line stops at a newline outside any construct.
+  bool top = mLineMode;
+  mLineMode = false;
   for (;;) {
     s::size_t head = emit(make_wc_list(0, 0));
     if (not par_sublist()) return false;
     WordCode flags = 0;
     bool     more  = false;
+    if (top and at(TokType::TK_NEWLINE)) {
+      patch(head, make_wc_list(flags | WC_LIST_END, words_after(*mProg, head)));
+      return true;
+    }
     if (at(TokType::TK_SEMI) or at(TokType::TK_AMP) or at(TokType::TK_NEWLINE)) {
       if (at(TokType::TK_AMP)) flags |= WC_LIST_ASYNC;
       mLex.consume();
+      // `cmd & ;` is allowed, as in zsh.
+      if ((flags & WC_LIST_ASYNC) and at(TokType::TK_SEMI)) mLex.consume();
+      if (top and at(TokType::TK_NEWLINE)) {
+        patch(head, make_wc_list(flags | WC_LIST_END, words_after(*mProg, head)));
+        return true;
+      }
       skip_newlines();
       more = not at_list_terminator();
     }
@@ -194,6 +280,7 @@ bool Parser::par_pline() {
 
 bool Parser::par_cmd() {
   skip_newlines();
+  while (expand_alias(true)) skip_newlines();
   s::size_t start = mProg->prog.size();
   bool ok = false;
   switch (mLex.peek().type) {
@@ -303,6 +390,10 @@ bool Parser::par_simple() {
       ++nredir;
       continue;
     }
+    // Aliases: the command word (after any assignments), a word after an
+    // alias ending in a blank, and global aliases anywhere.
+    bool cmdpos = words.empty() or (tok.after_alias_blank and not typeset);
+    if (expand_alias(cmdpos)) continue;
     if (tok.type == TokType::TK_WORD) {
       bool append = false;
       s::size_t len = (words.empty() or typeset)
@@ -826,7 +917,7 @@ bool Parser::par_redir() {
 
   // Normal redirs: expect a WORD target.
   const auto& tgt = mLex.peek();
-  if (tgt.type != TokType::TK_WORD) {
+  if (tgt.type != TokType::TK_WORD and not is_reserved_word(tgt.type)) {
     error("expected target after `" + op_tok.text + "'");
     return false;
   }

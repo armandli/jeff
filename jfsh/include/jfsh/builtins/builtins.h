@@ -132,6 +132,13 @@ int builtin_zle       (vec<str>&, ExecContext&);
 int builtin_zpty      (vec<str>&, ExecContext&);
 int builtin_sched     (vec<str>&, ExecContext&);
 int builtin_let       (vec<str>&, ExecContext&);
+int builtin_emulate   (vec<str>&, ExecContext&);
+int builtin_noglob    (vec<str>&, ExecContext&);
+int builtin_dash      (vec<str>&, ExecContext&);
+
+// typeset and its variants (src/builtins/vars.cpp); `implied` holds the
+// options the variant stands for ("gx" for export).
+int typeset_common(vec<str>& args, ExecContext& ctx, strv implied);
 
 }  // namespace jfsh
 

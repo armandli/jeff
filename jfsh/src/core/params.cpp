@@ -1,3 +1,4 @@
+#include <cctype>
 #include <cstdio>
 
 #include <algorithm>
@@ -85,6 +86,11 @@ Result<void> ParamTable::set_scalar(
       return s::unexpected(ShellError{ErrorKind::ExecError,
           "read-only variable: " + str(name)});
     if (append) value = p.scalar() + value;
+    // typeset -u / -l stay in force.
+    if (p.flags & PM_UPPER)
+      for (char& ch : value) ch = static_cast<char>(s::toupper(static_cast<unsigned char>(ch)));
+    if (p.flags & PM_LOWER)
+      for (char& ch : value) ch = static_cast<char>(s::tolower(static_cast<unsigned char>(ch)));
     p.set(s::move(value));
     return {};
   }
@@ -122,6 +128,13 @@ Result<void> ParamTable::set_array(
                  s::make_move_iterator(words.end()));
       words = s::move(old);
     }
+    // typeset -U: only the first of each value is kept.
+    if (p.flags & PM_UNIQUE) {
+      vec<str> kept;
+      for (auto& w : words)
+        if (s::find(kept.begin(), kept.end(), w) == kept.end()) kept.push_back(s::move(w));
+      words = s::move(kept);
+    }
     p.set(s::move(words));
     return {};
   }
@@ -144,6 +157,26 @@ Param& ParamTable::declare_local(str name, s::uint32_t flags) {
   return p;
 }
 
+Result<void> ParamTable::unset(strv name) {
+  for (int i = static_cast<int>(mScopes.size()) - 1; i >= 0; --i) {
+    auto& scope = mScopes[static_cast<s::size_t>(i)];
+    auto it = scope.find(str(name));
+    if (it == scope.end()) continue;
+    if (it->second.is_readonly())
+      return s::unexpected(ShellError{ErrorKind::ExecError,
+          "read-only variable: " + str(name)});
+    if (i == 0) {
+      scope.erase(it);
+    } else {
+      // A local stays local, so the outer parameter doesn't show through.
+      it->second.value = str{};
+      it->second.flags = PM_SCALAR | PM_UNSET | (it->second.flags & PM_LOCAL);
+    }
+    return {};
+  }
+  return {};
+}
+
 // mScopes[0] is the global scope and is never popped.
 void ParamTable::push_scope() {
   if (mScopes.empty()) mScopes.emplace_back();
@@ -162,6 +195,7 @@ vec<str> ParamTable::make_envp() const {
     if (not p.is_exported() or not p.is_set()) return;
     if (p.is_scalar())       env.push_back(p.name + "=" + p.scalar());
     else if (p.is_integer()) env.push_back(p.name + "=" + s::to_string(p.integer()));
+    else if (p.is_float())   env.push_back(p.name + "=" + p.scalar());
   });
   return env;
 }

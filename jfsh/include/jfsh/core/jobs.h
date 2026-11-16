@@ -31,7 +31,7 @@ enum class ProcStatus : s::uint8_t {
 
 struct Process {
   Pid        pid       = -1;
-  str        text;           // this stage's command text, for `jobs -l`
+  str        text{};         // this stage's command text, for `jobs -l`
   ProcStatus status    = ProcStatus::Running;
   int        exit_code = 0;  // WEXITSTATUS, or 128 + the signal
   int        stop_sig  = 0;  // signal that stopped or killed it

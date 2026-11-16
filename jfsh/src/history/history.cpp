@@ -88,8 +88,9 @@ optref<const HistEntry> HistoryManager::lookup(int num) const noexcept {
     for (auto const& e : mEntries)
       if (static_cast<int>(e.num) == num) return s::cref(e);
   } else {
+    // -1 is the last entry; 0 is none (B6).
     int idx = static_cast<int>(mEntries.size()) + num;
-    if (idx >= 0) return s::cref(mEntries[static_cast<s::size_t>(idx)]);
+    if (num < 0 and idx >= 0) return s::cref(mEntries[static_cast<s::size_t>(idx)]);
   }
   return s::nullopt;
 }

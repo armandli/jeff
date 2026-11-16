@@ -146,6 +146,11 @@ struct ParamTable {
     str name,
     s::uint32_t flags = PM_SCALAR | PM_UNSET);
 
+  // `unset name`: removes the innermost parameter of that name; a local
+  // one stays, unset, so the outer one doesn't show through.  Fails on a
+  // readonly parameter; a name that isn't set is fine.
+  Result<void> unset(strv name);
+
   void push_scope();
   void pop_scope();
 

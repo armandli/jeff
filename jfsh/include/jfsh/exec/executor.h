@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include <jfsh/core/alias_table.h>
 #include <jfsh/core/aliases.h>
 #include <jfsh/core/jobs.h>
 #include <jfsh/core/options.h>
@@ -33,6 +34,9 @@ enum ExecFlags : s::uint32_t {
   EF_NOFORK  = 1 << 3,  // exec instead of fork (last cmd in subshell)
   EF_COPROC  = 1 << 4,  // set up coprocess pipes
 };
+
+struct Executor;
+struct HistoryManager;
 
 struct ExecContext {
   ParamTable&    params;
@@ -66,6 +70,21 @@ struct ExecContext {
   bool ran_jobs    = false; // `jobs` ran (lets exit go on with stopped jobs)
 
   HashTable<ProgRef> functions{};  // shell functions: name → body
+  // Where each function was defined: the script or sourced file, or the
+  // shell's name ($0) for one typed in (`whence -v`).
+  HashTable<str>     function_files{};
+  // `autoload name`: loaded from $fpath when first called.
+  uset<str>          autoloads{};
+  AliasTable         aliases{};
+  vec<str>           dirstack{};   // pushd/popd, without $PWD ($dirstack)
+  int                source_depth = 0;   // `.`/`source` files being read
+  str                source_name{};      // the file being read, if any
+
+  // The executor running this context, set by its constructor, for the
+  // builtins that run code (eval, source, command, …).
+  Executor*       executor = nullptr;
+  // The interactive shell's history, for fc/history/r; null without one.
+  HistoryManager* history  = nullptr;
 
   vec<str> positional{};    // $1 … $N, also $@ $* $argv
   str      arg0 = "jfsh";   // $0
@@ -114,6 +133,9 @@ struct SavedFds {
   // close(2)s see a valid fd in the slot.
   void save(int dst);
   void restore() noexcept;
+  // Keeps the redirections: forgets the saved fds instead of restoring them
+  // (`exec >file`).
+  void commit() noexcept;
 
   struct Entry { int dst; int backup; };
   vec<Entry> entries;
@@ -125,7 +147,28 @@ struct Executor {
   ~Executor();
 
   int exec(const CompiledProgram& prog);
-  int exec_string(strv src);
+  // Parses and runs `src`.  By default the whole text is parsed first, as
+  // for `-c` and `eval`; `by_line` parses and runs one line at a time, as
+  // for scripts and sourced files, so an alias defined on one line is
+  // used on the next.
+  int exec_string(strv src, bool by_line = false);
+  // `.`/`source`: runs the file at `path` in this shell, with `args` (if
+  // any) as the positional parameters meanwhile.  `name` is what errors
+  // and $0 call it.
+  int source_file(const str& path, const vec<str>& args, const str& name);
+  // Defines autoloaded function `name` from the first file of that name
+  // in $fpath.  Prints why and returns false when it can't.
+  bool load_autoload(const str& name);
+  // Runs `args` as an external command, bypassing functions and builtins
+  // (`command`), in the shell's current fds.
+  int run_command(const vec<str>& args) {
+    return run_external(args, {}, {}, EF_NONE);
+  }
+  // The command hash table (`hash`, `rehash`), checked against $PATH.
+  HashTable<str>& command_hash();
+  // Fills the command hash with every executable in $PATH (`hash -r` is
+  // clear, `rehash` refills).
+  void fill_command_hash();
   // `typeset_args` are the `name=value` arguments of typeset and its
   // variants: expanded like assignments, then passed on as `name=value`.
   int exec_simple(
@@ -243,6 +286,7 @@ protected:
     const vec<str>&        args,
     const vec<Assignment>& assigns);
 
+public:
   bool is_builtin(strv name) const noexcept;
   int  call_builtin(
     strv name,
@@ -252,6 +296,14 @@ protected:
   int  call_function(
     const ProgRef& body,
     vec<str>& args);
+  // The builtins' names, sorted (whence -m, `builtin` listings).
+  vec<str> builtin_names() const;
+
+protected:
+  // `exec cmd`: replaces the shell with `args`.  Returns only on failure,
+  // with the status the shell then exits with.
+  int  exec_replace(const vec<str>& args, const vec<Assignment>& assigns,
+                    const str& argv0, bool clear_env);
   // Puts the assignments in front of a builtin or function into a new
   // scope, which the caller pops.  Returns non-zero on a readonly name.
   int  push_prefix_assigns(const vec<Assignment>& assigns, bool exported);

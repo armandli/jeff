@@ -5,11 +5,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -31,6 +33,7 @@ namespace jfsh {
 static BuiltinTable Builtins;
 
 Executor::Executor(ExecContext& ctx) : mCtx(ctx) {
+  mCtx.executor = this;
   static bool initialized = false;
   if (not initialized) {
     Builtins.register_all();
@@ -48,7 +51,7 @@ int Executor::exec(const CompiledProgram& prog) {
   return exec_list(es, EF_NONE);
 }
 
-int Executor::exec_string(strv src) {
+int Executor::exec_string(strv src, bool by_line) {
   struct Depth {
     int& d;
     explicit Depth(int& x) : d(x) { ++d; }
@@ -61,14 +64,27 @@ int Executor::exec_string(strv src) {
   if (not mCtx.opts.interactive() or mCtx.opts.get(OPT_INTERACTIVECOMMENTS))
     lex.push_state(LEX_SKIPCOMMENTS);
   Parser parser{lex};
-  auto prog = parser.parse();
-  if (not prog) {
-    s::fprintf(stderr, "jfsh:%d: %s\n",
-               prog.error().code, prog.error().message.c_str());
+  if (mCtx.opts.get(OPT_ALIASES)) parser.set_aliases(&mCtx.aliases);
+  auto parse_failed = [&](const ShellError& e) {
+    s::fprintf(stderr, "jfsh:%d: %s\n", e.code, e.message.c_str());
     mCtx.last_exit = 1;
     return 1;
+  };
+  int rc = 0;
+  if (not by_line) {
+    auto prog = parser.parse();
+    if (not prog) return parse_failed(prog.error());
+    rc = exec(**prog);
+  } else {
+    for (;;) {
+      // A line may have turned ALIASES on or off for the next.
+      parser.set_aliases(mCtx.opts.get(OPT_ALIASES) ? &mCtx.aliases : nullptr);
+      auto prog = parser.parse_line();
+      if (not prog) return parse_failed(prog.error());
+      if ((*prog)->prog.size() > 1) rc = exec(**prog);
+      if (parser.at_eof() or interrupted()) break;
+    }
   }
-  int rc = exec(**prog);
   // `return` outside a function ends the script or -c string, as in zsh.
   if (mCtx.returning and mCtx.func_depth == 0) {
     mCtx.returning = false;
@@ -170,7 +186,22 @@ int Executor::exec_simple(vec<str> args,
                           ExecFlags flags,
                           vec<Assignment>  typeset_args) {
   opt<int> subst_status;
-  if (not expand_command(args, assigns, redirs, subst_status)) return 1;
+  // `noglob cmd`: the words are not globbed.
+  bool noglob = false;
+  while (not args.empty() and args[0] == "noglob") {
+    args.erase(args.begin());
+    noglob = true;
+  }
+  bool globbing = mCtx.opts.get(OPT_GLOB);
+  if (noglob) mCtx.opts.unset(OPT_GLOB);
+  bool expanded = expand_command(args, assigns, redirs, subst_status);
+  if (noglob) mCtx.opts.assign(OPT_GLOB, globbing);
+  // A failed expansion (`${x?msg}`, NO_UNSET, `$((1/0))`) ends the command
+  // line, as zsh's errflag does: a non-interactive shell exits.
+  if (not expanded) {
+    mCtx.aborting = true;
+    return 1;
+  }
   // typeset's `name=value` arguments: a scalar is passed as `name=value`; an
   // array is passed as `name`, and given its elements once the builtin has
   // declared it.
@@ -198,6 +229,90 @@ int Executor::exec_simple(vec<str> args,
   } psubst_guard{this, &psubst};
   if (mCtx.opts.xtrace()) trace(args, assigns);
 
+  // Precommand modifiers: `builtin` and `command` pick what the name may
+  // be; `exec` replaces the shell (or, alone, makes the redirections
+  // permanent); `-` and `nocorrect` change nothing here.
+  enum class Only { Any, Builtin, External } only = Only::Any;
+  bool replace = false;
+  bool clear_env = false;
+  str  argv0;
+  while (not args.empty()) {
+    const str& w = args[0];
+    if (w == "builtin" and only == Only::Any) {
+      args.erase(args.begin());
+      if (args.empty()) return 0;
+      only = Only::Builtin;
+      break;
+    }
+    if (w == "command" and only == Only::Any) {
+      s::size_t i = 1;
+      bool lookup = false;
+      bool default_path = false;
+      for (; i < args.size() and args[i].size() > 1 and args[i][0] == '-'; ++i) {
+        if (args[i] == "--") { ++i; break; }
+        for (char f : strv(args[i]).substr(1)) {
+          if (f == 'v' or f == 'V') lookup = true;
+          else if (f == 'p') default_path = true;
+          else {
+            s::fprintf(stderr, "jfsh: command: bad option: -%c\n", f);
+            return 1;
+          }
+        }
+      }
+      // `command -v name`: describe it, as whence does.
+      if (lookup) break;
+      args.erase(args.begin(), args.begin() + static_cast<s::ptrdiff_t>(i));
+      if (args.empty()) return 0;
+      if (default_path) {
+        // -p: look the name up in the system's default $PATH.
+        mCtx.params.push_scope();
+        mCtx.params.assign("PATH", str("/usr/bin:/bin:/usr/sbin:/sbin"), PM_SCALAR);
+        auto path = find_command(args[0]);
+        mCtx.params.pop_scope();
+        if (path) args[0] = *path;
+      }
+      only = mCtx.opts.get(OPT_POSIXBUILTINS) ? Only::Any : Only::External;
+      continue;
+    }
+    if (w == "exec" and not replace) {
+      s::size_t i = 1;
+      for (; i < args.size() and args[i].size() > 1 and args[i][0] == '-'; ++i) {
+        if (args[i] == "--") { ++i; break; }
+        strv letters = strv(args[i]).substr(1);
+        for (s::size_t k = 0; k < letters.size(); ++k) {
+          char f = letters[k];
+          if (f == 'c') {
+            clear_env = true;
+          } else if (f == 'l') {
+            argv0 = "-";
+          } else if (f == 'a') {
+            if (k + 1 < letters.size()) {
+              argv0 = str(letters.substr(k + 1));
+            } else if (i + 1 < args.size()) {
+              argv0 = args[++i];
+            } else {
+              s::fprintf(stderr, "jfsh: exec: argument expected: -a\n");
+              return 1;
+            }
+            break;
+          } else {
+            s::fprintf(stderr, "jfsh: exec: bad option: -%c\n", f);
+            return 1;
+          }
+        }
+      }
+      args.erase(args.begin(), args.begin() + static_cast<s::ptrdiff_t>(i));
+      replace = true;
+      continue;
+    }
+    if (w == "-" or w == "nocorrect") {
+      if (w == "-") argv0 = "-";
+      args.erase(args.begin());
+      continue;
+    }
+    break;
+  }
+
   // With no command word the redirections apply to the current shell and
   // the assignments update shell parameters.  Both happen in-process.
   if (args.empty()) {
@@ -205,18 +320,43 @@ int Executor::exec_simple(vec<str> args,
     if (not redirs.empty()) {
       s::fflush(nullptr);
       if (not apply_redirects(redirs, saved)) return 1;
+      if (replace) saved.commit();
     }
     int rc = apply_assigns(assigns);
     s::fflush(nullptr);
+    // So does assigning to a readonly parameter.
+    if (rc != 0) mCtx.aborting = true;
     // `x=$(cmd)` has cmd's status.
     if (rc == 0 and subst_status) rc = *subst_status;
     return rc;
   }
 
-  // Functions come before builtins.  Aliases are already expanded by the
-  // lexer (M7).
-  auto fn  = mCtx.functions.find(args[0]);
+  if (replace) {
+    s::fflush(nullptr);
+    if (not redirs.empty()) {
+      SavedFds saved;
+      if (not apply_redirects(redirs, saved)) return 1;
+      saved.commit();
+    }
+    return exec_replace(args, assigns, argv0, clear_env);
+  }
+  if (only == Only::External) return run_external(args, assigns, redirs, flags);
+
+  // Functions come before builtins; an autoloaded one is loaded on its
+  // first call.  Aliases were expanded by the parser.
+  auto fn = mCtx.functions.end();
+  if (only == Only::Any) {
+    fn = mCtx.functions.find(args[0]);
+    if (fn == mCtx.functions.end() and mCtx.autoloads.contains(args[0])) {
+      if (not load_autoload(args[0])) return 1;
+      fn = mCtx.functions.find(args[0]);
+    }
+  }
   auto def = fn == mCtx.functions.end() ? Builtins.find(args[0]) : s::nullopt;
+  if (only == Only::Builtin and not def) {
+    s::fprintf(stderr, "jfsh: no such builtin: %s\n", args[0].c_str());
+    return 1;
+  }
   if (fn == mCtx.functions.end() and not def)
     return run_external(args, assigns, redirs, flags);
 
@@ -1002,6 +1142,8 @@ int Executor::exec_funcdef(ExecState& es, WordCode head) {
       if (auto sig = SignalTable::name_to_sig(strv(name).substr(4));
           sig and not s::isdigit(static_cast<unsigned char>(name[4])))
         mCtx.signals.set_trap(*sig, TrapAction::Function);
+    mCtx.autoloads.erase(name);
+    mCtx.function_files[name] = mCtx.source_name.empty() ? mCtx.arg0 : mCtx.source_name;
     mCtx.functions[s::move(name)] = body;
   }
   es.pc = end;
@@ -1137,6 +1279,12 @@ void SavedFds::save(int dst) {
   }
   if (backup < 0) { fail = true; return; }
   entries.push_back({dst, backup});
+}
+
+void SavedFds::commit() noexcept {
+  for (const auto& e : entries)
+    if (e.backup >= 0) ::close(e.backup);
+  entries.clear();
 }
 
 void SavedFds::restore() noexcept {
@@ -1395,6 +1543,17 @@ bool Executor::apply_redirects(const vec<Redirection>& redirs,
     int dst = r.fd >= 0 ? r.fd : default_fd(r.type);
 
     auto dup_into = [&](int src_fd) -> bool {
+      // A new fd that landed on dst itself (dst was closed: `3<<<x`) is
+      // moved off first, so dst is saved as closed, not as the new fd.
+      if (src_fd == dst) {
+        int moved = ::fcntl(src_fd, F_DUPFD_CLOEXEC, 10);
+        ::close(src_fd);
+        if (moved < 0) {
+          s::fprintf(stderr, "jfsh: dup: %s\n", s::strerror(errno));
+          return false;
+        }
+        src_fd = moved;
+      }
       saved.save(dst);
       if (::dup2(src_fd, dst) < 0) {
         s::fprintf(stderr, "jfsh: dup2: %s\n", s::strerror(errno));
@@ -1702,6 +1861,13 @@ void Executor::trace(const vec<str>& args,
   s::fprintf(stderr, "%s\n", line.c_str());
 }
 
+vec<str> Executor::builtin_names() const {
+  vec<str> names;
+  Builtins.for_each([&](const BuiltinDef& d) { names.emplace_back(d.name); });
+  s::sort(names.begin(), names.end());
+  return names;
+}
+
 bool Executor::is_builtin(strv name) const noexcept {
   return Builtins.find(name).has_value();
 }
@@ -1912,6 +2078,194 @@ int Executor::run_external(const vec<str>& args,
   if (WIFEXITED(status))   return WEXITSTATUS(status);
   if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
   return 1;
+}
+
+// ---- exec, source, autoload, the command hash --------------------------------
+
+int Executor::exec_replace(const vec<str>& args, const vec<Assignment>& assigns,
+                           const str& argv0, bool clear_env) {
+  auto fail = [&](int rc) {
+    // A shell that can't exec goes on only when interactive.
+    if (not mCtx.opts.interactive()) {
+      mCtx.exiting  = true;
+      mCtx.exit_val = rc;
+    }
+    return rc;
+  };
+  auto path = find_command(args[0]);
+  if (not path) {
+    s::fprintf(stderr, "jfsh: %s\n", path.error().message.c_str());
+    return fail(path.error().kind == ErrorKind::PermissionDenied ? 126 : 127);
+  }
+  vec<str> env = clear_env ? vec<str>{} : mCtx.params.make_envp();
+  for (const auto& a : assigns) {
+    auto value = prefix_value(mCtx.params, a);
+    if (not value) {
+      s::fprintf(stderr, "jfsh: %s\n", value.error().message.c_str());
+      return fail(1);
+    }
+    str prefix = a.name + "=";
+    s::erase_if(env, [&](const str& e) { return e.starts_with(prefix); });
+    env.push_back(prefix + *value);
+  }
+  vec<str> argv_s = args;
+  if (argv0 == "-")        argv_s[0] = "-" + argv_s[0];
+  else if (not argv0.empty()) argv_s[0] = argv0;
+  auto argv = c_strings(argv_s);
+  auto envp = c_strings(env);
+  s::fflush(nullptr);
+  // The new program starts with the shell's caught signals at their
+  // defaults (ignored ones stay ignored); put back if exec fails.
+  vec<s::pair<int, struct sigaction>> changed;
+  for (int sig = 1; sig < NSIG; ++sig) {
+    struct sigaction old{};
+    if (::sigaction(sig, nullptr, &old) != 0) continue;
+    if (old.sa_handler == SIG_IGN or old.sa_handler == SIG_DFL) continue;
+    struct sigaction dfl{};
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    if (::sigaction(sig, &dfl, nullptr) == 0) changed.emplace_back(sig, old);
+  }
+  execve(path->c_str(), argv.data(), envp.data());
+  int err = errno;
+  for (auto& [sig, old] : changed) ::sigaction(sig, &old, nullptr);
+  s::fprintf(stderr, "jfsh: %s: %s\n", args[0].c_str(), s::strerror(err));
+  return fail(err == ENOENT ? 127 : 126);
+}
+
+static opt<str> read_file(const str& path) {
+  s::FILE* f = s::fopen(path.c_str(), "r");
+  if (not f) return s::nullopt;
+  str text;
+  char buf[4096];
+  s::size_t n;
+  while ((n = s::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+  s::fclose(f);
+  return text;
+}
+
+int Executor::source_file(const str& path, const vec<str>& args, const str& name) {
+  auto text = read_file(path);
+  if (not text) {
+    s::fprintf(stderr, "jfsh: %s: %s\n", s::strerror(errno), name.c_str());
+    return 1;
+  }
+  vec<str> saved_positional;
+  bool     set_args = not args.empty();
+  if (set_args) saved_positional = s::exchange(mCtx.positional, args);
+  str saved_arg0   = mCtx.arg0;
+  str saved_source = s::exchange(mCtx.source_name, path);
+  if (mCtx.opts.get(OPT_FUNCTIONARGZERO)) mCtx.arg0 = name;
+  ++mCtx.source_depth;
+  int rc = exec_string(*text, /*by_line=*/true);
+  --mCtx.source_depth;
+  // `return` in the file ends the file.
+  if (mCtx.returning) {
+    mCtx.returning = false;
+    rc = mCtx.return_val;
+  }
+  mCtx.source_name = s::move(saved_source);
+  mCtx.arg0        = s::move(saved_arg0);
+  if (set_args) mCtx.positional = s::move(saved_positional);
+  return rc;
+}
+
+bool Executor::load_autoload(const str& name) {
+  vec<str> dirs;
+  if (auto p = mCtx.params.lookup("fpath"); p and p->get().is_set()) {
+    dirs = p->get().array();
+  } else if (auto q = mCtx.params.lookup("FPATH"); q and q->get().is_set()) {
+    str all = q->get().scalar();
+    s::size_t start = 0;
+    while (start <= all.size()) {
+      s::size_t end = all.find(':', start);
+      if (end == str::npos) end = all.size();
+      dirs.push_back(all.substr(start, end - start));
+      start = end + 1;
+    }
+  }
+  vec<str> candidates;
+  // `autoload /dir/name` named its file.
+  if (auto f = mCtx.function_files.find(name); f != mCtx.function_files.end())
+    candidates.push_back(f->second);
+  for (const auto& dir : dirs) candidates.push_back((dir.empty() ? str(".") : dir) + "/" + name);
+  for (const auto& path : candidates) {
+    struct stat st{};
+    if (stat(path.c_str(), &st) != 0 or not S_ISREG(st.st_mode)) continue;
+    auto text = read_file(path);
+    if (not text) continue;
+    StringInputSource in{*text};
+    Lexer lex{in};
+    lex.push_state(LEX_SKIPCOMMENTS);
+    Parser parser{lex};
+    auto prog = parser.parse();
+    if (not prog) {
+      s::fprintf(stderr, "jfsh: %s: %s\n", name.c_str(), prog.error().message.c_str());
+      return false;
+    }
+    mCtx.autoloads.erase(name);
+    // A file that is just `name() { … }` (ksh style) defines the function
+    // when run; any other file is the function's body.
+    const auto& code = (*prog)->prog;
+    bool ksh_style = mCtx.opts.get(OPT_KSH_AUTOLOAD);
+    if (not ksh_style and code.size() > 4 and wc_code(code[3]) == WC_FUNCDEF
+        and wc_cmd_type(code[3]) == WC_FUNCDEF_NAMED) {
+      s::size_t after = 4 + wc_cmd_skip(code[3]);
+      bool only = after + 1 == code.size() and wc_code(code[after]) == WC_END
+              and wc_data(code[4]) == 1
+              and (*prog)->strs[wc_data(code[5])] == name;
+      ksh_style = only;
+    }
+    str saved_source = s::exchange(mCtx.source_name, path);
+    if (ksh_style) {
+      exec(**prog);
+    } else {
+      mCtx.functions[name]      = *prog;
+      mCtx.function_files[name] = path;
+    }
+    mCtx.source_name = s::move(saved_source);
+    if (mCtx.functions.contains(name)) return true;
+    s::fprintf(stderr, "jfsh: %s: function not defined by file\n", name.c_str());
+    return false;
+  }
+  s::fprintf(stderr, "jfsh: %s: function definition file not found\n", name.c_str());
+  return false;
+}
+
+HashTable<str>& Executor::command_hash() {
+  str path_var;
+  if (auto p = mCtx.params.lookup("PATH"); p and p->get().is_set())
+    path_var = p->get().scalar();
+  if (path_var != mHashedPath) {
+    mCmdHash.clear();
+    mHashedPath = path_var;
+  }
+  return mCmdHash;
+}
+
+void Executor::fill_command_hash() {
+  auto& hash = command_hash();
+  hash.clear();
+  // The first directory in $PATH with a name wins, as for a search.
+  str path_var = mHashedPath;
+  s::size_t start = 0;
+  while (not path_var.empty() and start <= path_var.size()) {
+    s::size_t end = path_var.find(':', start);
+    if (end == str::npos) end = path_var.size();
+    str dir = path_var.substr(start, end - start);
+    start = end + 1;
+    if (dir.empty() or dir[0] != '/') continue;   // relative ones aren't hashed
+    DIR* d = ::opendir(dir.c_str());
+    if (not d) continue;
+    while (auto* e = ::readdir(d)) {
+      str entry = e->d_name;
+      if (entry == "." or entry == ".." or hash.contains(entry)) continue;
+      str full = dir + "/" + entry;
+      if (mCtx.opts.get(OPT_HASHEXECUTABLESONLY) and not is_executable_file(full)) continue;
+      hash.emplace(s::move(entry), s::move(full));
+    }
+    ::closedir(d);
+  }
 }
 
 // ---- Job control and signals -----------------------------------------------

@@ -1,9 +1,9 @@
 # jfsh — remaining work
 
-Status as of 2026-11-14: M1 (simple commands), M2 (pipelines, redirections, lists,
+Status as of 2026-11-15: M1 (simple commands), M2 (pipelines, redirections, lists,
 background jobs), M3 (word expansion), M4 (compound commands and functions), M5
-(arithmetic, `[[ ]]`, `test`) and M6 (job control, signals, traps) are done, along with
-the part of M0 they needed.
+(arithmetic, `[[ ]]`, `test`), M6 (job control, signals, traps) and M7 (builtins) are
+done, along with the part of M0 they needed.
 
 jfsh builds on macOS and Linux and has gtest coverage for the pieces that work. It runs
 **simple commands**, pipelines and background jobs joined by `;`, newlines, `&&`, `||` and
@@ -15,9 +15,10 @@ shell functions with `local`, and conditions: `[[ … ]]`, `test`/`[` and intege
 floating-point arithmetic. Commands that span lines work in scripts, on stdin and at the
 prompt (with `PS2`). Interactively it has job control (Ctrl-Z, `fg`, `bg`, `jobs`, job
 notices, Ctrl-C that ends the command line but not the shell), and `trap`, `kill` and
-`wait` work in every shell. Most builtins beyond those M4–M6 needed are still missing
-(M7); in particular `set` and `setopt` can't change options yet, so ERR_EXIT and
-ERR_RETURN, though implemented, can't be turned on from a script.
+`wait` work in every shell. The builtins are real (M7): options (`set`, `setopt`,
+`emulate`), sourcing, aliases, the directory stack, `print`/`printf`, history,
+`whence` and friends; only the ones that need the line editor or modules (`bindkey`,
+`zle`, `vared`, `zmodload`, `sched`, `zpty`, `compinit`) say `not implemented`.
 The System 1 router and the LLM agent layer work end to end.
 
 This file has two parts:
@@ -100,15 +101,12 @@ are an error (B9). `disassemble()` (`src/parser/text.cpp`) backs `tests/parser_t
   **before** running it.
 
 **Left to other milestones**
-- Aliases are expanded by the lexer (M7). (Function lookup ahead of builtins landed
-  with M4.)
 - `PS4` is printed raw; prompt escapes such as zsh's default `+%N:%i> ` need M9.
 - Assigning to an integer or float parameter evaluates the value arithmetically
   (`i+=1` adds) since M5, for `name=value` words; `read`, `for` and `${x=v}` still
   store text into such a parameter.
 - Array assignments `a=(x y)` landed with M3; subscripted assignments `a[i]=x` are still
   to do [parser/assign], [exec/assign].
-- There is still no way to turn on `xtrace` from the shell until `set -x`/`setopt` exist (M7).
 
 ### M2. Pipelines, redirections, lists, background
 
@@ -258,13 +256,8 @@ and `tests/compound_test.cpp` (behaviour, with zsh's output as the expected valu
 **Left**
 - zsh's other short forms: `if [[ x ]] { … }`, `while cond { … }`, `foreach … end`,
   `for x in a b; cmd` [parser/short].
-- The source-text decompiler for `functions`/`which` [text/decompile], and `unset -f`,
-  `functions`, `autoload` (M7).
 - Redirections written after a function definition (`f() { … } > log`) should become part
   of the function; they are a parse error.
-- `typeset` listing (`typeset`, `-p`, `-m`), `-f`, `-h`, `-T`, `-U`, padding flags, and
-  keeping `-u`/`-l`/`-i` in force for later assignments [builtin/typeset]; `read -s -t -n
-  -k -p -u -d -q` [builtin/read].
 - `EF_NOFORK` for a subshell that is already a forked pipeline stage [exec/subsh].
 - The function call depth is bounded by the C++ stack: a Debug build reaches the default
   `FUNCNEST=700` with about 2× headroom but crashes somewhere between 1500 and 3000; under
@@ -410,10 +403,6 @@ output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
   own; jfsh ends the command line instead.
 - A background pipeline is one process (the forked shell) in the job table, so
   `jobs -l` shows one pid where zsh lists each stage.
-- `trap` doesn't list TRAPxxx functions (that needs function printing, M7), and
-  `unset -f TRAPxxx` can't remove one yet (M7).
-- `set -e`, `setopt errexit` and friends still do nothing (B19, M7), so ERR_EXIT and
-  ERR_RETURN are only reachable from code that sets the option directly.
 - TRAPS_ASYNC, POSIX_TRAPS, POSIX_JOBS, AUTO_CONTINUE and AUTO_RESUME are not
   implemented; neither are `suspend`, `time` (JOB_TIMED) or `$ZSH_SUBSHELL`.
 - A non-interactive shell keeps finished background jobs in its table until `jobs` or
@@ -424,30 +413,84 @@ output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
 
 ### M7. Builtins [builtin/*]
 
-Every stub currently returns 0, which is actively harmful: `set -e` or `shift` report
-success while doing nothing (bug B19). (M6 made `trap`, `jobs`, `fg`, `bg`, `wait`,
-`disown` and `kill` real; M5 made `test`/`[` and `let` real; M4 made
-`typeset`, `local`, `declare`, `integer`, `float`, `export`, `readonly`, `read`, `break`,
-`continue` and `return` real.) Until a builtin is implemented it should print
-`jfsh: NAME: not implemented` and return 1.
+**Done.** The builtins are in `src/builtins/` by group: `vars.cpp` (typeset and its
+variants, unset), `setopt.cpp` (set, setopt, unsetopt, emulate, shift), `dirs.cpp`,
+`print.cpp` (echo, print, printf), `read.cpp`, `eval.cpp` (`.`, source, eval, exit,
+return, autoload, functions), `lookup.cpp` (whence, which, type, command -v, builtin,
+hash, rehash, alias, unalias), `limits.cpp` (ulimit, umask, times), `hist.cpp` (fc,
+history, r), with shared helpers (option parsing, zsh-style quoting) in `util.cpp`. The
+ones that call the executor are compiled into `jfsh_exec`. Tests: `tests/builtins_test.cpp`;
+expected output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
+- **Options:** the option table is regenerated from zsh 5.9 itself: every option zsh
+  has (185), with each emulation's defaults, which ones a plain `emulate` resets and
+  which are special. Single letters follow zsh (`set -e`, `$-` = `569X…`) or, with
+  SH_OPTION_LETTERS, ksh. `set` handles `-o`/`+o` (both listings), `--`, `-`, `-s`,
+  `-A`/`+A` and lists parameters; `setopt`/`unsetopt` take names with `no`, `_` and any
+  case, `-m` patterns and letters, and list what differs from the defaults (all options
+  under KSH_OPTION_PRINT). Invocation options (`interactive`, `shinstdin`, …) can't be
+  changed. `emulate [-LR] mode [-c cmd]`. ERR_EXIT, ERR_RETURN, NO_UNSET, XTRACE and the
+  rest are now reachable from scripts.
+- **Errors abort:** an expansion error (`${x?}`, NO_UNSET, `$((1/0))`) or an assignment
+  to a readonly parameter ends the command line, so a non-interactive shell exits, as
+  zsh's errflag does.
+- **Variables:** `typeset -p`/`-m`/`+`, the bare listings (`typeset -i`, `export`,
+  `export -p`, `readonly -p`), `-f`, `-U`, with `-u`/`-l`/`-U` kept in force by later
+  assignments; `float` is `typeset -E` as in zsh. `unset [-fmv]`, `name[i]`/`name[key]`,
+  locals that stay local when unset, `unset -f TRAPxxx` removing the trap.
+- **Sourcing:** `.` searches `$PATH`, `source` the current directory first; arguments
+  become the positional parameters meanwhile, `$0` is the file, `return` ends the file,
+  127 when it isn't found. Scripts and sourced files are parsed a line at a time
+  (`Parser::parse_line`), so aliases defined on one line apply on the next; `-c` and
+  `eval` parse the whole text first, as zsh does.
+- **Precommand modifiers** are handled by `exec_simple`: `builtin`, `command [-pvV]`
+  (bypasses functions and builtins), `exec [-cl] [-a name]` (replaces the shell;
+  alone, keeps its redirections), `noglob`, `-`, `nocorrect`.
+- **Aliases** (`include/jfsh/core/alias_table.h`): regular, global (`-g`) and suffix
+  (`-s`) aliases expanded by the parser in command position (after assignments, and
+  after an alias whose text ends in a blank), global ones anywhere; the alias text is
+  pushed onto the lexer's input (`LexInput`) and each token remembers the aliases it came
+  from, so `alias ls='ls -l'` and `a=b b=a` don't recurse. Reserved words can be aliased.
+  `alias` lists (`-L`, `-m`, `-g`, `-s`), `unalias [-ams]`.
+- **Directories:** `cd`/`chdir` with `-`, `±N`, `old new`, CDPATH, CDABLE_VARS, `-L`/`-P`
+  (logical `$PWD` by default), CHASE_LINKS/CHASE_DOTS, errors as zsh words them, and the
+  `chpwd` function; `pushd`/`popd` (`±N`, PUSHD_MINUS, PUSHD_SILENT, PUSHD_TO_HOME,
+  PUSHD_IGNORE_DUPS, AUTO_PUSHD), `dirs [-clpv]`, `$dirstack`, `~N`/`~+N`/`~-N`, `pwd
+  [-rLP]`. Like zsh, they print the stack or new directory only when interactive (B20).
+- **Output:** `echo` interprets escapes unless `-E` or BSD_ECHO; `print` has `-r -R -n
+  -l -N -c -C -a -o -O -i -m -u -v -f -x -X -D -P -s`; `printf` has every conversion
+  (`%b %q %c %s %d %i %o %u %x %X %e %f %g %a`), flags, `*` widths, `%N$`, arithmetic
+  arguments, `'c` character codes, `\c`, reuse of the format and `-v`.
+- **read:** `-r -A -k N -q -s -d delim -t secs -u fd -e -E` and `name?prompt`; `$REPLY`
+  is trimmed like any other name, as in zsh.
+- **Lookup:** `whence [-vcwpafmsS]`, `type`, `which`, `command -v/-V` with zsh's wording,
+  `hash [-dfLmrv] [name[=path]]` and `rehash` on the executor's command hash.
+- **Functions:** `functions [-mu+]` and `whence -f`/`which` print definitions as zsh does
+  (`function_text` in `src/parser/text.cpp`, the multi-line decompiler); `trap` lists
+  TRAPxxx functions; `autoload [-U] name|/path/name` loads zsh-style (the file is the
+  body) or ksh-style (the file defines the function) from `$fpath` on first call.
+- **History:** `fc -l [-nrdfiD]`, `fc -s`/`-e -`/`r` with `old=new`, `fc -e editor`,
+  `fc -W/-R/-A`; `history` is `fc -l`. Event numbers, `-N` offsets and prefixes.
+- **Limits:** `ulimit [-HSa] -tfdscmunlvxiqerN [value]` with zsh's labels, `umask [-S]`
+  octal or symbolic, `times` from `getrusage`.
+- **Control:** `exit`/`return` take arithmetic expressions and reject extra arguments.
+- **Stubs** that need later milestones print `jfsh: NAME: not implemented` and return 1:
+  `bindkey`, `zle`, `vared` (M9), `sched` (M8), `zpty` (now registered, B21),
+  `compinit`; `zmodload` alone lists nothing.
 
-| Group | Builtins | Key requirements |
-|---|---|---|
-| Sourcing / eval | `.`, `source`, `eval`, `exec` | `.` searches `PATH` for a bare name; positional args are scoped to the sourced file; `exec` with no command applies redirections permanently; `exec cmd` replaces the process |
-| Variables | `export`, `readonly`, `typeset`/`declare`/`local`/`integer`/`float`, `unset` | `-a -A -i -F -E -r -x -g -l -u -U -p` flags; `unset -f` / `-v`; readonly enforcement in `ParamTable::assign` |
-| Options | `set`, `setopt`, `unsetopt`, `emulate` | `set -e -u -x -o name +o`; `set -- args` sets positionals; `setopt` with no args lists non-default options; `no` prefix negates (`OptionState::find` reports it) |
-| Positionals | `shift [N]` | errors when N exceeds `$#` |
-| Directories | `cd`, `pushd`, `popd`, `dirs`, `pwd` | `cd -`, `CDPATH`, update `PWD`/`OLDPWD`, `AUTO_PUSHD`, `PUSHD_SILENT`, `cd old new` substitution, `-L`/`-P`, and errors on stderr (bug B20) |
-| Output | `echo`, `print`, `printf` | `echo -n -e -E`, plus `BSD_ECHO`; `print -n -r -l -u N -P -z`; full `printf` with `%s %d %x %f %b %q` and argument reuse |
-| Input | `read` | `-r -A -k N -q -s -t T -u fd -p prompt`; IFS splitting, with the remainder in the last variable |
-| History | `fc`, `history`, `r` | `fc -l`, `-n`, `-r`, `-e editor`, `-s old=new`; `history` = `fc -l`; `r` = `fc -e -` |
-| Aliases | `alias`, `unalias` | regular, global (`-g`) and suffix (`-s`) aliases, and alias expansion in the lexer (alias text re-lexed, recursion guard) |
-| Lookup | `whence`, `which`, `type`, `command`, `builtin`, `hash`, `rehash` | `-v -c -p -a`; `command -v`; `builtin name` bypasses functions; a command hash table that a `PATH` change invalidates |
-| Limits | `ulimit`, `umask`, `times` | real `getrlimit`/`setrlimit`; `umask -S`; `times` from `getrusage` (it currently prints zeros) |
-| Arithmetic | `let` | done in M5 |
-| Functions | `functions`, `autoload` | print definitions via the decompiler; `autoload -U` lazy-loads from `$fpath` |
-| zsh extras | `zmodload`, `bindkey`, `vared`, `zle`, `sched`, `zpty`, `compinit` | `bindkey` and `zle` need M9; `zpty` is defined but **not registered** (bug B21); `sched` needs the REPL hook |
-| Control | `break`, `continue`, `return`, `exit` | N levels; `exit` validates numeric args and runs the EXIT trap; `return` outside a function behaves like `exit` in a sourced file |
+**Left**
+- `typeset -T`, `-Z`/`-L`/`-R` padding, `-h`, `-t`; `emulate -l`; `autoload -X`;
+  `read -z -c -l -n -p`; `print -z` and `-p`; `fc -p/-P`; `hash -d` (named directories,
+  no table yet).
+- zsh adds a line to the history before running it, so `history` lists itself and `r`
+  is recorded as `r`; jfsh adds it afterwards.
+- A command that runs in a forked pipeline stage hashes its path in the child, so
+  HASH_CMDS doesn't remember it in the shell.
+- zsh errors in special builtins (`set -o nosuch`, `unset readonly`) exit a
+  non-interactive shell; jfsh's only return 1.
+- Messages name the shell as `jfsh:` and leave out zsh's line numbers and `(eval)`.
+- `f() {}` is parsed as a function whose body runs a command `{}`.
+- `< <(cmd)` (process substitution as a redirection target) is a parse error.
+- zsh's default aliases `run-help` and `which-command` are not defined.
 
 ### M8. Startup, REPL loop, invocation [loop/*]
 
@@ -657,7 +700,6 @@ Severity:
 |---|---|---|---|
 | B4 | `src/core/jobs.cpp:18` | On an empty table, `find_free_slot()` returns `mTable.size()` (0), so the first job gets id 0. Id 0 means "free slot", so that job is invisible to `get()`, `for_each()`, notifications and `reap()`. | **confirmed**: first `alloc` → id 0, `get(0)` = missing |
 | B5 | `src/history/history.cpp:122` | `save()` in append mode, the default, writes **all** entries, including those just loaded from the file, so `HISTFILE` doubles every session (1 → 3 → 7 → 15 …). | **confirmed**: 3 sessions × 1 command = 7 lines |
-| B6 | `src/history/history.cpp:91` | `lookup(0)` computes `idx = size()` and reads one past the end. | **confirmed**: ASan heap-buffer-overflow |
 
 ### High
 
@@ -665,9 +707,6 @@ Severity:
 |---|---|---|---|
 | B10 | `src/lexer/lexer.cpp:192` | Fd-number prefixes are not part of the redirection: `2>&1` lexes as word `2`, redir `>&`, word `1`, so `2` becomes a command argument. | code reading |
 | B13 | `src/core/params.cpp:83` | Shell assignments now go through `set_scalar`, which updates the right scope and enforces readonly. The lower-level `assign()` still writes into the innermost scope, ignores `PM_READONLY`, and with `flags` 0 makes the parameter `PM_SCALAR` even for an integer or array value; `typeset`/`local`/`export` (M7) must not use it for plain updates. | code reading |
-| B19 | `src/builtins/builtins.cpp` (~40 builtins) | Unimplemented builtins return 0: `set`, `shift`, `setopt`, `unset`, `eval` and the `cd`-stack builtins all report success while doing nothing. (`export`, `readonly`, `typeset`/`local` and `read` are real since M4, `test`/`[` and `let` since M5, `trap`, `jobs`, `fg`, `bg`, `wait`, `disown` and `kill` since M6.) | code reading |
-| B20 | `src/builtins/builtins.cpp:185` | `cd` returns `chdir()`'s `-1` directly as the exit status (255) with no error message, and never updates `PWD`/`OLDPWD`. | code reading |
-| B21 | `src/builtins/builtins.cpp:436`, `:11` | `builtin_zpty` is defined and declared in `builtins.h` but never registered in `BuiltinTable::register_all()`. | code reading |
 | B44 | `src/main.cpp:134`, `src/agent/provider.cpp:30` | `ProviderConfig::from_env()` picks the default model **before** `--provider` is applied, so `--provider anthropic` with no `--llm-model` sends `llama3` to Anthropic. An unknown `JFSH_PROVIDER` leaves the kind at its default silently. | code reading |
 
 ### Medium
@@ -700,7 +739,6 @@ Severity:
 | ID | Location | Bug |
 |---|---|---|
 | B49 | `src/agent/agent.cpp` | The non-streaming path of `Agent::handle` prints a newline even when the request failed. |
-| B50 | `src/core/options.cpp` | `kOptionInfo` is indexed by `info.index`, but nothing checks that the table order matches `OptIndex` or that it is complete. A `static_assert` or startup check would catch a missing row, which would otherwise zero-initialize and crash `find()` on a null name. |
 | B51 | `include/jfsh/core/param.h:63` | It uses `std::unique_ptr` without `#include <memory>` and only compiles through `types.h`. |
 | B52 | `src/editor/completion.cpp:83` | `complete_commands` doesn't check the executable bit, deduplicate across `PATH` or sort. It also lists `.` and `..`. `complete_files` lists dotfiles when the prefix is empty, and adds no `/` to directories. |
 | B53 | `src/modules/module.cpp` | `ModuleManager` is never instantiated. Its `resolve_path` maps `zsh/x` → `zsh_x.so` but has no default search path, so `zmodload` can't work even once implemented. |
@@ -714,6 +752,14 @@ Severity:
 
 | ID | Fixed by |
 |---|---|
+| B6 | M7: `HistoryManager::lookup(0)` finds nothing instead of reading past the end. |
+| B19 | M7: every builtin is real, or prints `not implemented` and returns 1. |
+| B20 | M7: `cd` reports errors as zsh does and keeps `$PWD`/`$OLDPWD`. |
+| B21 | M7: `zpty` is registered (as `not implemented`). |
+| B50 | M7: the option table is generated from zsh 5.9; `Options.TableIsInIndexOrder` checks every row sits at its index. |
+| B63 | M7: the signal self-pipe sat on fds 3/4, so `exec 3<file` closed its read end and the next SIGCHLD killed the shell with SIGPIPE; it now lives on fds ≥ 10. |
+| B64 | M7: a redirection whose new fd landed on the target number itself (`3<<<x` with fd 3 closed) closed it again; it is moved off first. |
+| B65 | M7: a reserved word as a redirection target (`< in`) and `cmd & ;` were parse errors. |
 | B1 | M0/M1: parser and executor share the prefix layout documented in `wordcode.h`. |
 | B2 | M0: `exec_string` lexes, parses and executes. |
 | B3 | `StringInputSource`/`FileInputSource::unget(-1)` are no-ops; regression test `Lexer.TrailingOperatorAtEofTerminates`. |

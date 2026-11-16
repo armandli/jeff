@@ -77,15 +77,18 @@ target_link_libraries(jfsh_glob PUBLIC jfsh_core jfsh_compiler_options)
 # src/exec/jobctl.cpp (foreground waits, fg/bg, signalling jobs) is shared
 # by the executor and the job builtins and needs only ExecContext, so it
 # lives here, below jfsh_exec.
+# The builtins that run code (eval, source, command, cd's chpwd, …) call
+# the Executor, so they are part of jfsh_exec below; these need only
+# ExecContext.
 add_library(jfsh_builtins STATIC
-  src/builtins/builtins.cpp
   src/builtins/cond.cpp
   src/builtins/jobctl.cpp
   src/builtins/math.cpp
+  src/builtins/util.cpp
   src/exec/jobctl.cpp
 )
 target_include_directories(jfsh_builtins PUBLIC include)
-target_link_libraries(jfsh_builtins PUBLIC jfsh_core jfsh_compiler_options)
+target_link_libraries(jfsh_builtins PUBLIC jfsh_parser jfsh_core jfsh_compiler_options)
 
 # ---------------------------------------------------------------------------
 # jfsh_exec — command executor: list → pipeline → command dispatch, context,
@@ -97,10 +100,20 @@ add_library(jfsh_exec STATIC
   src/exec/subst.cpp
   src/exec/loop.cpp
   src/exec/context.cpp
+  src/builtins/builtins.cpp
+  src/builtins/dirs.cpp
+  src/builtins/eval.cpp
+  src/builtins/hist.cpp
+  src/builtins/limits.cpp
+  src/builtins/lookup.cpp
+  src/builtins/print.cpp
+  src/builtins/read.cpp
+  src/builtins/setopt.cpp
+  src/builtins/vars.cpp
 )
 target_include_directories(jfsh_exec PUBLIC include)
 target_link_libraries(jfsh_exec PUBLIC
-  jfsh_parser jfsh_glob jfsh_builtins jfsh_compiler_options)
+  jfsh_parser jfsh_glob jfsh_builtins jfsh_history jfsh_compiler_options)
 
 # ---------------------------------------------------------------------------
 # jfsh_history — history file, search, deduplication.
