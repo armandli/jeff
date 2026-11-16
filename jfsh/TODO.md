@@ -1,8 +1,9 @@
 # jfsh — remaining work
 
 Status as of 2026-11-14: M1 (simple commands), M2 (pipelines, redirections, lists,
-background jobs), M3 (word expansion), M4 (compound commands and functions) and M5
-(arithmetic, `[[ ]]`, `test`) are done, along with the part of M0 they needed.
+background jobs), M3 (word expansion), M4 (compound commands and functions), M5
+(arithmetic, `[[ ]]`, `test`) and M6 (job control, signals, traps) are done, along with
+the part of M0 they needed.
 
 jfsh builds on macOS and Linux and has gtest coverage for the pieces that work. It runs
 **simple commands**, pipelines and background jobs joined by `;`, newlines, `&&`, `||` and
@@ -12,7 +13,11 @@ braces, tilde, globbing), and compound commands: `if`, `while`/`until`, `for` (a
 forms), `case`, `select`, `repeat`, subshells, brace groups, `always` blocks, `(( ))` and
 shell functions with `local`, and conditions: `[[ … ]]`, `test`/`[` and integer and
 floating-point arithmetic. Commands that span lines work in scripts, on stdin and at the
-prompt (with `PS2`). Most builtins beyond those M4 and M5 needed are still missing (M7).
+prompt (with `PS2`). Interactively it has job control (Ctrl-Z, `fg`, `bg`, `jobs`, job
+notices, Ctrl-C that ends the command line but not the shell), and `trap`, `kill` and
+`wait` work in every shell. Most builtins beyond those M4–M6 needed are still missing
+(M7); in particular `set` and `setopt` can't change options yet, so ERR_EXIT and
+ERR_RETURN, though implemented, can't be turned on from a script.
 The System 1 router and the LLM agent layer work end to end.
 
 This file has two parts:
@@ -136,10 +141,9 @@ are an error (B9). `disassemble()` (`src/parser/text.cpp`) backs `tests/parser_t
   subshells, exposes their pipe fds through `/dev/fd/N` (or a tmp path for
   `=(…)`), and releases the resources after the command finishes.
 - `EF_NOFORK`: `run_external` honours the flag by `execve`-ing in place.
-- Bug B22 fix: SIGCHLD is handled with a self-pipe.  `SignalManager::init`
-  opens `pipe2(..., O_CLOEXEC|O_NONBLOCK)`, the handler writes one byte,
-  and `dispatch_pending()` drains the pipe and calls `waitpid` + `Jobs.update`
-  from the REPL (`src/main.cpp`).
+- SIGCHLD is handled with a self-pipe.  `SignalManager::init` opens
+  `pipe2(..., O_CLOEXEC|O_NONBLOCK)` and the handler writes one byte; M6 made
+  the pending set atomic and has the executor reap between commands (B22).
 - Bug B4 fix: `JobTable::alloc` never returns `id=0` (slot 0 reserved).
 
 **Left to other milestones**
@@ -262,8 +266,6 @@ and `tests/compound_test.cpp` (behaviour, with zsh's output as the expected valu
   keeping `-u`/`-l`/`-i` in force for later assignments [builtin/typeset]; `read -s -t -n
   -k -p -u -d -q` [builtin/read].
 - `EF_NOFORK` for a subshell that is already a forked pipeline stage [exec/subsh].
-- `LOCAL_TRAPS` saves the traps when the function is entered, not when it sets one
-  (`SignalTable::push_local_traps`); trap commands themselves still don't fire (B16).
 - The function call depth is bounded by the C++ stack: a Debug build reaches the default
   `FUNCNEST=700` with about 2× headroom but crashes somewhere between 1500 and 3000; under
   ASan, 700 already overflows.
@@ -331,40 +333,100 @@ and lexer tests in `tests/parser_test.cpp` and `tests/lexer_test.cpp`.
 
 ### M6. Job control, signals, traps [signals/*], [builtin/bg|fg|jobs|wait|disown|kill]
 
-**Requirements**
-- **Interactive shell setup:**
-  - put jfsh in its own process group and take the terminal with `tcsetpgrp`;
-  - ignore `SIGINT`, `SIGQUIT`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU` in the shell itself;
-  - restore default dispositions in children before `exec`.
-  - Today Ctrl-C during a foreground command also kills jfsh (bug B23).
-- **Foreground jobs:**
-  - give the job the terminal; wait with `WUNTRACED`;
-  - on stop, record it as a stopped job, print `[N]  + suspended  cmd`, and take the
-    terminal back;
-  - save and restore terminal modes per job.
-- **SIGCHLD:**
-  - async-signal-safe flagging (bug B22);
-  - reap with `waitpid(-1, …, WNOHANG|WUNTRACED|WCONTINUED)` in the main loop;
-  - update `JobTable`, and print `[N]  + done  cmd` before the next prompt, or
-    immediately with `NOTIFY`.
-- **`%` job specs:** `%N`, `%%`, `%+`, `%-`, `%string`, `%?string`.
-- **Builtins:**
-  - `fg`, `bg` (`SIGCONT`), `jobs [-l -p -r -s]`, `wait [pid|%job]` (sets `$?`), `disown`;
-  - `kill [-s SIG|-SIG] pid|%job`, plus `kill -l`.
-- **On exit:** warn about stopped jobs; send `SIGHUP` to jobs on exit unless `NOHUP` is
-  set or the job is disowned.
-- **Traps:**
-  - `trap 'cmd' SIG…`, `trap - SIG`, `trap '' SIG`, and `trap` with no args to list them;
-  - handlers queue the command, and the REPL runs it between commands;
-  - pseudo-signals: `EXIT` (also on function exit when set inside a function), `ZERR`
-    (after a failing command; `ERR_EXIT` runs it before exiting) and `DEBUG`;
-  - zsh `TRAPINT()`-style trap functions.
-- `SIGWINCH` updates `$COLUMNS`/`$LINES` and tells the editor to re-layout.
+**Done.** Signals and traps are `src/core/signals.cpp` (`include/jfsh/core/signals.h`),
+the job table `src/core/jobs.cpp`, foreground waits and fg/bg `src/exec/jobctl.cpp`
+(declared at the end of `include/jfsh/exec/executor.h`), the builtins
+`src/builtins/jobctl.cpp`, and the one-line job text `pipeline_text`/`sublist_text` in
+`src/parser/text.cpp`. Tests: `tests/jobs_test.cpp` (in-process) and
+`tests/interactive_test.cpp`, which drives the `jfsh` binary through a pty; expected
+output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
+- **Signals:** one handler for every signal the shell catches sets a bit in a lock-free
+  atomic pending set and writes a byte to the self-pipe (B22). The executor acts on them
+  between commands (`Executor::handle_signals`): it reaps children, runs traps, turns an
+  untrapped Ctrl-C into "abort the command line" and SIGHUP into an exit, and follows
+  SIGWINCH into `$COLUMNS`/`$LINES`. Dispositions come from the trap table plus job
+  control (`SignalManager::install`); signals ignored when the shell started stay ignored.
+- **Interactive setup:** the shell takes `/dev/tty`, waits to be in the foreground,
+  puts itself in its own process group, takes the terminal and saves its modes. It
+  catches SIGINT, SIGHUP and SIGWINCH, catches and drops SIGQUIT, SIGTERM and SIGTSTP
+  (caught rather than ignored so a child forked a moment ago still gets them), and
+  ignores SIGTTIN and SIGTTOU (B23). Without a terminal job control stays off and
+  `fg`/`bg` say `no job control in this shell.`
+- **Children:** `Executor::fork_child` blocks every signal across `fork`; the child joins
+  the job's process group, takes the terminal if it's in the foreground, resets
+  dispositions and traps (`SignalManager::child_reset`: ignored signals stay ignored,
+  `( … )` keeps ZERR and DEBUG), forgets the parent's jobs, then unblocks. Command and
+  process substitution and here-doc writers reset too. A background job without job
+  control ignores SIGINT and SIGQUIT; with it and BG_NICE it runs at nice 5. A lone
+  background pipeline and every pipeline stage `exec` their command instead of forking
+  again, so `$!` and `kill %1` reach the command itself.
+- **Foreground jobs** (only under job control; otherwise the old pid waits): each
+  pipeline, external command and `( … )` is a job; `wait_foreground_job` gives it the
+  terminal, waits with WUNTRACED and takes the terminal back (B14). A stopped job keeps
+  its terminal modes for `fg`, becomes the current job and prints
+  `jfsh: suspended  cmd` (status 128 + signal); a stop inside a loop also ends the
+  command line. A job killed by Ctrl-C ends the whole command line, as in zsh; one killed
+  by another signal prints `jfsh: killed     cmd` (not for SIGPIPE).
+- **Job table:** ids start at 1, `%+`/`%-` follow zsh (a job that stops becomes
+  current; removing a job promotes the previous one; B41), statuses say `running`,
+  `done`, `exit 1`, `terminated`, `suspended (tty input)`, `segmentation fault (core
+  dumped)` …, padded as zsh does. `jobs -l` puts each process of a pipeline on its own
+  line. Finished background jobs are reported before the prompt and, with NOTIFY (now on
+  by default, as BG_NICE is), right away while a line is being typed. Exit statuses of
+  finished background processes are kept for `wait $!`.
+- **Job specs:** `%N`, `%%`, `%+`, `%`, `%-`, `%string`, `%?string`, with zsh's messages
+  (`%3: no such job`, `job not found: x`, `no current job`).
+- **Builtins:** `jobs [-lprs]`, `fg`, `bg` (`job already in background`), `wait [pid|job
+  …]` (127 and `pid N is not a child of this shell`; a trapped signal ends it with 128 +
+  the signal), `disown` (warns about a suspended job), `kill [-s SIG|-n N|-SIG] pid|job`
+  (a stopped job also gets SIGCONT) and `kill -l [sig|status …]` (B19 for these).
+- **Traps:** `trap`, `trap cmd SIG…`, `trap '' SIG`, `trap - SIG`, `trap SIG…`, `trap -`,
+  signal numbers, `0` for EXIT, `--`, `undefined signal: X`; the listing is zsh's
+  (`trap -- 'echo hi' INT`, in signal order). Traps run between commands, and right
+  after a builtin that raised the signal, with `$?` preserved (B16). `TRAPINT() { … }`
+  functions get the signal number as `$1`; one that returns non-zero aborts the command
+  line; `trap` and `TRAPxxx` replace each other. EXIT runs when the shell exits (all
+  of `-c`, scripts, stdin and the REPL), when a `( … )` subshell that set it exits, and
+  at the end of a function that set it. DEBUG runs before each command, ZERR after a
+  failing one; neither runs inside another trap. LOCAL_TRAPS is decided when the
+  function returns, and only the traps the function changed are put back.
+- **ZERR, ERR_EXIT, ERR_RETURN** are the executor's (B33): set off by a failing simple
+  command, function call, pipeline, `( … )`, `[[ ]]` or `(( ))` (not by `{ }`, if,
+  loops or case, whose failing command already did), except in if/while/until
+  conditions, `!`, and all but the last pipeline of a `&&`/`||` chain. ZERR and
+  ERR_EXIT act once per failure and are off anywhere under such a context; ERR_RETURN
+  minds only the command's own place (so a function called from a condition still
+  returns) and acts at every level.
+- **Exit:** CHECK_JOBS warns `you have suspended jobs.` (or, with
+  CHECK_RUNNING_JOBS, `running jobs`) once; exiting again, or after `jobs`, goes ahead.
+  With HUP, jobs left behind get SIGHUP (and SIGCONT if stopped):
+  `jfsh: warning: N jobs SIGHUPed`.
+- **Line editor:** Ctrl-C drops the line, or at PS2 the whole command (B24); EOF or a
+  hung-up terminal ends the read instead of spinning (B29); the editor polls the signal
+  self-pipe so traps run and job notices print while it waits, then redraws.
+
+**Left**
+- zsh turns the rest of a loop whose command was suspended into a suspended job of its
+  own; jfsh ends the command line instead.
+- A background pipeline is one process (the forked shell) in the job table, so
+  `jobs -l` shows one pid where zsh lists each stage.
+- `trap` doesn't list TRAPxxx functions (that needs function printing, M7), and
+  `unset -f TRAPxxx` can't remove one yet (M7).
+- `set -e`, `setopt errexit` and friends still do nothing (B19, M7), so ERR_EXIT and
+  ERR_RETURN are only reachable from code that sets the option directly.
+- TRAPS_ASYNC, POSIX_TRAPS, POSIX_JOBS, AUTO_CONTINUE and AUTO_RESUME are not
+  implemented; neither are `suspend`, `time` (JOB_TIMED) or `$ZSH_SUBSHELL`.
+- A non-interactive shell keeps finished background jobs in its table until `jobs` or
+  `wait` reports them.
+- Job text shows a here-document as `<<EOF` whatever its delimiter.
+- The editor doesn't re-layout on SIGWINCH yet: `$COLUMNS`/`$LINES` are updated, but
+  the editor doesn't use them (B26, B27).
 
 ### M7. Builtins [builtin/*]
 
-Every stub currently returns 0, which is actively harmful: `kill` or `set -e` report
-success while doing nothing (bug B19). (M5 made `test`/`[` and `let` real; M4 made
+Every stub currently returns 0, which is actively harmful: `set -e` or `shift` report
+success while doing nothing (bug B19). (M6 made `trap`, `jobs`, `fg`, `bg`, `wait`,
+`disown` and `kill` real; M5 made `test`/`[` and `let` real; M4 made
 `typeset`, `local`, `declare`, `integer`, `float`, `export`, `readonly`, `read`, `break`,
 `continue` and `return` real.) Until a builtin is implemented it should print
 `jfsh: NAME: not implemented` and return 1.
@@ -416,9 +478,7 @@ success while doing nothing (bug B19). (M5 made `test`/`[` and `let` real; M4 ma
 - **Continuation:** done with M4. Lines that end inside an open construct (quote, `if`
   without `fi`, here-document, trailing `|`/`&&`, `\` at end of line) prompt with `PS2`
   and keep reading. `PS2` is rendered raw (no `%_` construct names yet, M9).
-- **`ERR_EXIT`** should be applied by the executor with zsh's exemptions (conditions,
-  `&&`/`||` lists, negated pipelines). The REPL hard-coding it in `main.cpp` is wrong
-  (bug B33).
+- **`ERR_EXIT`** is applied by the executor with zsh's exemptions since M6 (B33).
 - **Special parameters:** `$$`, `$PPID`, `$SHLVL` (incremented), `$PWD`, `$OLDPWD`,
   `$RANDOM`, `$SECONDS`, `$EPOCHSECONDS`, `$LINENO`, `$HISTCMD`, `$status`,
   `$pipestatus`. They use `ParamHandlers`; nothing sets those yet.
@@ -434,7 +494,7 @@ success while doing nothing (bug B19). (M5 made `test`/`[` and `let` real; M4 ma
   - Ctrl-D (delete-char-or-list), Ctrl-H/DEL, Ctrl-W, Alt-D, Ctrl-K, Ctrl-U, Ctrl-Y (yank);
   - Ctrl-T, Ctrl-L (clear-screen), Ctrl-R/Ctrl-S (incremental history search), Alt-.
     (insert-last-word), Ctrl-X Ctrl-E (edit in `$EDITOR`);
-  - Ctrl-C aborts the line (bug B24);
+  - Ctrl-C aborts the line (done with M6, B24);
   - Home, End and Delete keys.
 - Vi mode: insert/normal/visual/replace, motions, operators, text objects, registers,
   counts, undo/redo, and history `k`/`j`, all per [vi/*].
@@ -562,6 +622,12 @@ success while doing nothing (bug B19). (M5 made `test`/`[` and `let` real; M4 ma
 - `tests/compound_test.cpp` covers M4 end to end, and `tests/cond_test.cpp` and
   `tests/math_test.cpp` cover M5; their expected outputs were checked against zsh 5.9
   (`zsh -f`).
+- `tests/jobs_test.cpp` covers M6 in-process; `tests/interactive_test.cpp` runs the
+  `jfsh` binary in a pty (`forkpty`) and drives Ctrl-Z, Ctrl-C, `fg`/`bg`, job notices,
+  traps at the prompt and the exit checks with keystrokes. Expected output is zsh 5.9's
+  (`zsh -f -i`). That is the start of the "interactive tests" item above.
+- The suite passed under ASan + UBSan + LeakSanitizer on Linux when M6 landed (scratch
+  build with `-fsanitize=address,undefined`, clang 20).
 - `tests/shell_fixture.h` holds the in-process `Shell`/`TempDir` helpers shared by
   `exec_test.cpp`, `subst_test.cpp` and `compound_test.cpp`.
 - Run the suite under ASan/UBSan in CI. jfsh's Debug build has no sanitizer flags yet,
@@ -599,16 +665,9 @@ Severity:
 |---|---|---|---|
 | B10 | `src/lexer/lexer.cpp:192` | Fd-number prefixes are not part of the redirection: `2>&1` lexes as word `2`, redir `>&`, word `1`, so `2` becomes a command argument. | code reading |
 | B13 | `src/core/params.cpp:83` | Shell assignments now go through `set_scalar`, which updates the right scope and enforces readonly. The lower-level `assign()` still writes into the innermost scope, ignores `PM_READONLY`, and with `flags` 0 makes the parameter `PM_SCALAR` even for an integer or array value; `typeset`/`local`/`export` (M7) must not use it for plain updates. | code reading |
-| B14 | `src/exec/executor.cpp` (`run_external`) | `waitpid` now retries on `EINTR`, but there is no `WUNTRACED`: a stopped child (Ctrl-Z) leaves the shell blocked in `waitpid`. Part of M6. | code reading |
-| B16 | `src/core/signals.cpp:69` | `trap 'cmd' SIG` (`TrapAction::Command`) installs no handler at all, so command traps never fire. `set_trap` also calls `std::signal` on `SIGKILL`/`SIGSTOP` and ignores the failure. | code reading |
-| B17 | `src/core/signals.cpp:149` | `kill_job(pgid)` with the default `Job::pgid == -1` calls `kill(1, sig)`, which signals **init**; with pgid 0 it signals jfsh's own process group. It must reject `pgid <= 1`. | code reading |
-| B19 | `src/builtins/builtins.cpp` (~40 builtins) | Unimplemented builtins return 0: `kill`, `set`, `shift`, `setopt`, `unset`, `eval` and the `cd`-stack builtins all report success while doing nothing. (`export`, `readonly`, `typeset`/`local` and `read` are real since M4, `test`/`[` and `let` since M5.) | code reading |
+| B19 | `src/builtins/builtins.cpp` (~40 builtins) | Unimplemented builtins return 0: `set`, `shift`, `setopt`, `unset`, `eval` and the `cd`-stack builtins all report success while doing nothing. (`export`, `readonly`, `typeset`/`local` and `read` are real since M4, `test`/`[` and `let` since M5, `trap`, `jobs`, `fg`, `bg`, `wait`, `disown` and `kill` since M6.) | code reading |
 | B20 | `src/builtins/builtins.cpp:185` | `cd` returns `chdir()`'s `-1` directly as the exit status (255) with no error message, and never updates `PWD`/`OLDPWD`. | code reading |
 | B21 | `src/builtins/builtins.cpp:436`, `:11` | `builtin_zpty` is defined and declared in `builtins.h` but never registered in `BuiltinTable::register_all()`. | code reading |
-| B22 | `src/core/signals.cpp:119`, `include/jfsh/core/signals.h:68` | The SIGCHLD handler does a read-modify-write on plain `uint64_t` fields (`PendingSignals::mark`), which is not async-signal-safe. Use `volatile std::sig_atomic_t` flags or `std::atomic<uint64_t>` with lock-free ops, and install with `sigaction` + `SA_RESTART`. `dispatch_pending()` is only called from `SignalManager::unblock()`, and nothing calls `block()`/`unblock()`, so even the flag is never acted on. | code reading |
-| B23 | `src/core/signals.cpp:119` (`SignalManager::init`) | Interactive mode is ignored: no process groups, no `tcsetpgrp`, `SIGINT`/`SIGTSTP`/`SIGTTOU` keep their default dispositions. While a foreground command runs (raw mode off), Ctrl-C reaches jfsh too and **kills the shell**. | code reading |
-| B24 | `src/editor/editor.cpp:50` | Raw mode clears `ISIG` but `read_line` has no case for Ctrl-C (`\x03`) or Ctrl-Z, so Ctrl-C at the prompt does nothing instead of discarding the line. | code reading |
-| B29 | `src/editor/editor.cpp:132` | `read_key_sequence` returns `{}` when `read()` returns 0 (EOF/hangup) or -1. The caller loops forever, so a closed terminal leaves jfsh spinning at 100% CPU. | code reading |
 | B44 | `src/main.cpp:134`, `src/agent/provider.cpp:30` | `ProviderConfig::from_env()` picks the default model **before** `--provider` is applied, so `--provider anthropic` with no `--llm-model` sends `llama3` to Anthropic. An unknown `JFSH_PROVIDER` leaves the kind at its default silently. | code reading |
 
 ### Medium
@@ -617,10 +676,9 @@ Severity:
 |---|---|---|---|
 | B25 | `src/editor/editor.cpp:96` | The cursor and backspace work on bytes, so editing any multi-byte UTF-8 character corrupts the line. `PromptRenderer::visual_width` (`src/prompt/prompt.cpp:143`) counts bytes too. | code reading |
 | B26 | `src/editor/editor.cpp:146` | `refresh_display` rewrites the whole prompt with a single `\r`, so prompts containing newlines are reprinted on every keystroke and lines wider than the terminal break. It also recomputes the prompt (`getpwuid`, `gethostname`, `getcwd`) on every key. | code reading |
-| B27 | `src/editor/editor.cpp` | No `SIGWINCH` handling; `Editor::terminal_width()` exists but is never called. | code reading |
+| B27 | `src/editor/editor.cpp` | The editor doesn't re-layout on `SIGWINCH`: since M6 the shell updates `$COLUMNS`/`$LINES` and redraws the line after a signal, but `Editor::terminal_width()` is never called. | code reading |
 | B28 | `src/editor/editor.cpp:115` | Tab completion inserts `candidates[0].substr(mBuf.cursor)`, using the **line** cursor as an offset into a **word** candidate. That only works when the word starts at column 0. `main.cpp:184` installs a completer that returns nothing anyway. | code reading |
 | B32 | `src/main.cpp:84` | Unknown options are ignored silently, as is `-c` with no argument (`main.cpp:58`). (Arguments after the script, or after `-c cmd`, now become `$0` and the positional parameters.) `--router` with an unknown value silently means heuristic, and `--provider` with an unknown value silently means Ollama (`main.cpp:143`). | code reading |
-| B33 | `src/main.cpp:220` | `errexit` is applied by the REPL to every interactive line (so one failed command exits the interactive shell), with none of zsh's exemptions. (The xtrace half of this bug is fixed: the executor traces before running.) | code reading |
 | B34 | `src/prompt/prompt.cpp:128` | Numeric prompt arguments aren't parsed: the default `PS1` `%n@%m %1~ %# ` renders as `user@host 1~ % `. | **confirmed** |
 | B35 | `src/prompt/prompt.cpp:123`, `:128` | `%F{color}` always emits "default colour" and ignores the colour. Unsupported escapes fall into `default:` and print the letter, so `%B…%b` renders as `B…b`. | **confirmed**: `%Bx%b` → `Bxb` |
 | B36 | `src/prompt/prompt.cpp:79` | `%~` uses a bare prefix compare: with `HOME=/Users/a` and cwd `/Users/ab`, it renders `~b`. | code reading |
@@ -628,7 +686,6 @@ Severity:
 | B38 | `src/prompt/prompt.cpp:10` | `PS1`/`PROMPT` are read once, in the constructor; later assignments never take effect. | code reading |
 | B39 | `src/history/history.cpp:104` | `load()` treats every line as one command: zsh `EXTENDED_HISTORY` lines keep their `: ts:0;` prefix, and multi-line commands come back as several entries. `sync()` (`:131`) just calls `load()` and duplicates everything. | code reading |
 | B40 | `src/history/history.cpp:15` | `should_suppress` returns early when `no_store` is set, which skips the `ignore_dups`/`ignore_all` checks. `no_store` is supposed to drop `history`/`fc -l` lines themselves. | code reading |
-| B41 | `src/core/jobs.cpp:106`, `:68`, `:9` | `reap()` frees slots without updating `mCurrent`/`mPrevious`, so `%+` can point to a dead job. Killed processes set `JobStatus::Done`, never `Signalled`. `Job::exit_status` ignores `PIPEFAIL`. `notify_changes` only prints for `JOB_NOTIFY`, which nothing sets. | code reading |
 | B42 | `src/router/router.cpp:20` | `HeuristicRouter` runs `system("zsh -n -c …")` for **every** line, which costs a fork plus exec of `/bin/sh` and `zsh`. If zsh isn't installed, `system` returns 127 and **every line is routed to the LLM**. `zsh -n` also accepts most natural language (`what is ls`), so only lines that happen to be invalid syntax, such as an unbalanced apostrophe in `what's ls`, reach the agent. | code reading |
 | B43 | `src/router/jeff.cpp:83`, `src/router/jev.cpp:111` | When the service is down, each line waits for the full timeout (1 s for jeff, 10 s for JEV), prints a warning and falls back. There's no backoff, so the shell becomes unusable. JEV also sends `Authorization: Bearer ` with an empty key. | code reading |
 | B45 | `src/agent/provider.cpp:35`, `include/jfsh/agent/provider.h:43` | The default Anthropic model `claude-opus-4-7` (in `from_env()` and the `default_anthropic` default argument) is outdated; it should probably be `claude-opus-5-5`. | code reading |
@@ -665,7 +722,15 @@ Severity:
 | B10 | M2: the lexer bakes digit fd prefixes into the `TK_REDIR` token (`2>`, `12<`, `2>&1`). |
 | B11 | M4: `{ … }` is a brace group run in the current shell; function definitions are `name ()` / `function name`. |
 | B12 | External commands use `execve` with `make_envp()`, which now emits each name once with its innermost value. |
-| B22 | M2: SIGCHLD uses the self-pipe trick — the handler writes one byte, `dispatch_pending` drains the pipe and reaps via `waitpid` + `Jobs.update`. |
+| B22 | M2/M6: one handler for every caught signal sets a bit in a lock-free atomic pending set and writes a byte to the self-pipe; the executor drains it, reaps and runs traps between commands (`Executor::handle_signals`). |
+| B14 | M6: foreground jobs under job control are waited for with `WUNTRACED`; a stopped one is recorded as a job and the shell takes the terminal back. |
+| B16 | M6: setting a trap installs the handler (`SignalManager::install`), and traps run between commands; SIGKILL/SIGSTOP are recorded but not installed. |
+| B17 | M6: `SignalManager::kill_job` refuses `pgid <= 1`; jobs without a process group of their own are signalled pid by pid. |
+| B23 | M6: an interactive shell has its own process group and the terminal, and catches or ignores the job-control signals, so Ctrl-C stops the command (and the command line), not jfsh. |
+| B24 | M6: Ctrl-C in the line editor drops the line (at PS2, the whole command). |
+| B29 | M6: the editor ends the read on EOF, a read error or a hung-up terminal instead of looping. |
+| B33 | M6: ERR_EXIT is applied by the executor, with zsh's exemptions; the REPL no longer exits on every failed line. |
+| B41 | M6: removing a job promotes the previous one, killed processes give `Signalled`, `exit_status` honours PIPEFAIL, and changed jobs are reported whatever their flags. |
 | B8 | M3: the lexer keeps `$(…)`, `${…}`, `$((…))`, backquotes, `$'…'`, brace expansions, `(…)` glob groups, `<lo-hi>` and `name=(…)` inside one word. |
 | B30 | M3: `CompiledPattern` implements `[…]`, escapes and groups; `glob_expand` walks every `/`-separated segment. |
 | B62 | M3: `Lexer::read_heredoc` threw away the rest of the line after `<<EOF`, newline included, so `cat <<EOF \| x` lost `\| x` and the command after the body became extra arguments. Bodies are now read when the lexer reaches the newline. |

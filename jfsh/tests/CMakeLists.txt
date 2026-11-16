@@ -10,6 +10,8 @@ add_executable(jfsh_tests
   exec_test.cpp
   glob_test.cpp
   history_test.cpp
+  interactive_test.cpp
+  jobs_test.cpp
   lexer_test.cpp
   math_test.cpp
   params_test.cpp
@@ -22,4 +24,11 @@ target_link_libraries(jfsh_tests PRIVATE
   GTest::gtest_main
   jfsh_compiler_options
 )
+# The interactive tests drive the jfsh binary through a pseudo-terminal.
+add_dependencies(jfsh_tests jfsh)
+target_compile_definitions(jfsh_tests PRIVATE JFSH_BINARY="$<TARGET_FILE:jfsh>")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(jfsh_tests PRIVATE util)   # forkpty
+endif()
+
 gtest_discover_tests(jfsh_tests)

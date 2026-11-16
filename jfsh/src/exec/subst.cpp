@@ -467,6 +467,8 @@ struct Scan {
       return std::unexpected(ShellError::from_errno(ErrorKind::ExecError, "fork"));
     }
     if (pid == 0) {
+      ctx().signals.child_reset(ChildKind::Other);
+      ctx().jobs.clear();
       ::close(pfd[0]);
       if (pfd[1] != 1) {
         ::dup2(pfd[1], 1);

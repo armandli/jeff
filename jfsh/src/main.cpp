@@ -167,9 +167,17 @@ int main(int argc, char* argv[]) {
     ctx.positional.assign(rest.begin() + 1, rest.end());
   }
   jfsh::Executor executor(ctx);
+  if (interactive) executor.update_window_size();
+
+  // The status the shell exits with, after the EXIT trap (which may change
+  // it with `exit`).
+  auto finish = [&](int rc) {
+    if (ctx.exiting) rc = ctx.exit_val;
+    return executor.run_exit_trap(rc);
+  };
 
   if (not eval_cmd.empty()) {
-    return executor.exec_string(eval_cmd);
+    return finish(executor.exec_string(eval_cmd));
   }
 
   if (not script_path.empty()) {
@@ -183,7 +191,7 @@ int main(int argc, char* argv[]) {
     char buf[4096];
     while (std::fgets(buf, sizeof buf, f)) source += buf;
     std::fclose(f);
-    return executor.exec_string(source);
+    return finish(executor.exec_string(source));
   }
 
   jfsh::HistOptions hist_opts;
@@ -201,22 +209,74 @@ int main(int argc, char* argv[]) {
     editor.set_completer([](std::string_view prefix) -> std::vector<std::string> {
       return {};  // completion engine wired in later
     });
+    // Signals that arrive while a line is being typed: traps run, and with
+    // NOTIFY finished or stopped jobs are reported at once.
+    editor.set_wake(jfsh::Signals.wake_fd(), [&](bool& quit) {
+      bool printed = jfsh::Signals.pending_trapped() != 0;
+      if (printed) std::fputc('\n', stderr);
+      executor.handle_signals();
+      if (opts.monitor() and opts.get(jfsh::OPT_NOTIFY) and ctx.jobs.has_changes()) {
+        if (not printed) std::fputc('\n', stderr);
+        ctx.jobs.notify_changes();
+        printed = true;
+      }
+      std::fflush(nullptr);
+      quit = ctx.exiting;
+      return printed;
+    });
+
+    // CHECK_JOBS: the first attempt to exit with stopped (or, with
+    // CHECK_RUNNING_JOBS, running) jobs only warns.  Exiting again right
+    // away, or after `jobs`, goes ahead.
+    bool warned        = false;
+    bool prev_ran_jobs = false;
+    auto exit_blocked = [&] {
+      if (ctx.hangup or warned or prev_ran_jobs) return false;
+      if (not opts.get(jfsh::OPT_CHECKJOBS) or not jfsh::Signals.job_control()) return false;
+      if (ctx.jobs.stopped_count() > 0) {
+        std::fprintf(stderr, "jfsh: you have suspended jobs.\n");
+      } else if (opts.get(jfsh::OPT_CHECKRUNNINGJOBS) and ctx.jobs.running_count() > 0) {
+        std::fprintf(stderr, "jfsh: you have running jobs.\n");
+      } else {
+        return false;
+      }
+      warned = true;
+      return true;
+    };
 
     for (;;) {
+      // Before each prompt: reap, run traps, report jobs that changed.
+      executor.handle_signals();
+      if (opts.monitor()) ctx.jobs.notify_changes();
+      ctx.aborting = false;
+      if (ctx.exiting) {   // SIGHUP, or an EXIT-ing trap
+        if (not exit_blocked()) break;
+        ctx.exiting = false;
+      }
+
       auto line_opt = editor.read_line();
-      if (not line_opt) break;  // EOF
+      if (not line_opt) {   // EOF or hangup
+        if (ctx.exiting or not exit_blocked()) break;
+        continue;
+      }
+      if (editor.interrupted()) continue;
 
       std::string line = std::move(*line_opt);
       if (line.empty()) continue;
       // An unfinished `if`, loop, quote or here-document goes on over the
-      // next lines, read after PS2.
+      // next lines, read after PS2.  Ctrl-C there drops the whole command.
       bool comments = opts.get(jfsh::OPT_INTERACTIVECOMMENTS);
       while (jfsh::is_incomplete(line, comments)) {
         auto more = editor.read_line(/*continuation=*/true);
         if (not more) break;
+        if (editor.interrupted()) {
+          line.clear();
+          break;
+        }
         line += '\n';
         line += *more;
       }
+      if (line.empty()) continue;
 
       auto expanded = history.expand(line);
       if (not expanded) {
@@ -243,18 +303,28 @@ int main(int argc, char* argv[]) {
           ctx.last_exit = 0;
         }
       } else {
+        ctx.ran_jobs  = false;
         ctx.last_exit = executor.exec_string(line);
-        if (opts.errexit() and ctx.last_exit != 0) break;
+        // Ctrl-C: the terminal echoed ^C; start the prompt on a new line.
+        if (ctx.aborting) std::fputc('\n', stderr);
       }
 
       history.add(line);
 
-      jfsh::Signals.dispatch_pending();
-      jfsh::Jobs.notify_changes();
-      jfsh::Jobs.reap();
-
-      if (ctx.exiting) break;
+      if (ctx.exiting) {
+        if (not exit_blocked()) break;
+        ctx.exiting   = false;
+        prev_ran_jobs = ctx.ran_jobs;
+        continue;
+      }
+      warned        = false;
+      prev_ran_jobs = ctx.ran_jobs;
     }
+
+    // HUP: jobs left running get SIGHUP (stopped ones SIGCONT too).
+    if (jfsh::Signals.job_control())
+      if (int n = jfsh::hangup_jobs(ctx); n > 0)
+        std::fprintf(stderr, "jfsh: warning: %d jobs SIGHUPed\n", n);
   } else {
     // Lines are gathered until they make a whole command, so constructs
     // spanning lines work, and so do lines longer than the buffer.
@@ -264,7 +334,7 @@ int main(int argc, char* argv[]) {
       bool blank = pending.find_first_not_of(" \t\n") == std::string::npos;
       if (not blank) ctx.last_exit = executor.exec_string(pending);
       pending.clear();
-      return not (ctx.exiting or (opts.errexit() and ctx.last_exit != 0));
+      return not ctx.exiting;
     };
     bool more = true;
     while (more and std::fgets(buf, sizeof buf, stdin)) {
@@ -276,7 +346,5 @@ int main(int argc, char* argv[]) {
   }
 
   if (not hist_opts.histfile.empty()) history.save(hist_opts.histfile);
-  jfsh::Signals.traps().run_exit_trap();
-
-  return ctx.exiting ? ctx.exit_val : ctx.last_exit;
+  return finish(ctx.last_exit);
 }

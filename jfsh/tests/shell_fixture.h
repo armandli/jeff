@@ -51,6 +51,9 @@ struct Shell {
     params.assign("PATH", std::string(path ? path : "/usr/bin:/bin"),
                   PM_SCALAR | PM_EXPORTED);
   }
+  // Traps live in the process-wide Signals: don't let one test's traps
+  // reach the next.
+  ~Shell() { Signals.reset_traps(); }
 
   // Runs src with fds 1 and 2 captured.  Child processes inherit the
   // redirected fds, so their output is captured too.

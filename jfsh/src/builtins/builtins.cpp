@@ -197,15 +197,6 @@ int builtin_shift(std::vector<std::string>& args, ExecContext& ctx) {
 int builtin_times(std::vector<std::string>&, ExecContext&) {
   std::printf("0m0.000s 0m0.000s\n0m0.000s 0m0.000s\n"); return 0;
 }
-int builtin_trap(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/trap): Parse `trap [action] [signal ...]`.
-  //   action = ''  → reset to default; '-' → ignore; command-string → Command
-  //   signal names via SignalTable::name_to_sig(); pseudo-signals EXIT/ZERR/DEBUG.
-  //   `trap` with no args → print all traps in `trap -- 'cmd' SIG` form.
-  //   Local traps: when LOCAL_TRAPS is set, traps set inside a function are
-  //   restored on function return.
-  (void)args; (void)ctx; return 0;
-}
 int builtin_unset(std::vector<std::string>& args, ExecContext& ctx) {
   // TODO(builtin/unset): Remove named variables and/or functions.
   //   -v → unset variable (default); -f → unset function.
@@ -236,60 +227,6 @@ int builtin_dirs(std::vector<std::string>& args, ExecContext& ctx) {
 }
 int builtin_pwd(std::vector<std::string>&, ExecContext&) {
   char buf[4096]; if (getcwd(buf, sizeof buf)) std::printf("%s\n", buf); return 0;
-}
-int builtin_bg(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/bg): Send SIGCONT to job's pgid; mark job ASYNC.
-  //   `bg %N` or `bg` (current stopped job).
-  (void)args; (void)ctx; return 0;
-}
-int builtin_fg(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/fg): tcsetpgrp() to give the job the terminal, send SIGCONT,
-  //   then waitpid() (interruptible) until the job stops or finishes.
-  (void)args; (void)ctx; return 0;
-}
-int builtin_jobs(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/jobs): Print live jobs from Jobs.for_each().
-  //   -l: include pid; -p: only pid; -r: running only; -s: stopped only.
-  //   LONG_LIST_JOBS option: always use long format.
-  (void)args; (void)ctx; return 0;
-}
-int builtin_wait(std::vector<std::string>& args, ExecContext& ctx) {
-  // Minimal: with no args, wait for every running job; with a pid, wait
-  // for that one.  Returns the last reaped exit status.  Does not yet
-  // support %jobid forms or -n.
-  int rc = 0;
-  if (args.size() <= 1) {
-    for (;;) {
-      int status = 0;
-      pid_t pid = waitpid(-1, &status, 0);
-      if (pid <= 0) break;
-      ctx.jobs.update(pid, status);
-      if (WIFEXITED(status))        rc = WEXITSTATUS(status);
-      else if (WIFSIGNALED(status)) rc = 128 + WTERMSIG(status);
-    }
-    return rc;
-  }
-  for (std::size_t i = 1; i < args.size(); ++i) {
-    pid_t pid = static_cast<pid_t>(std::atoi(args[i].c_str()));
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 and errno == EINTR) {}
-    if (errno == ECHILD) continue;
-    ctx.jobs.update(pid, status);
-    if (WIFEXITED(status))        rc = WEXITSTATUS(status);
-    else if (WIFSIGNALED(status)) rc = 128 + WTERMSIG(status);
-  }
-  return rc;
-}
-int builtin_disown(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/disown): Mark job JOB_DISOWNED so SIGHUP is not sent on exit.
-  //   Also remove from job table so `jobs` doesn't show it.
-  (void)args; (void)ctx; return 0;
-}
-int builtin_kill(std::vector<std::string>& args, ExecContext& ctx) {
-  // TODO(builtin/kill): Send a signal to pid(s) or job(s).
-  //   -s SIG / -SIG / -N; `kill -l` to list signal names.
-  //   Accept %jobid notation.
-  (void)args; (void)ctx; return 0;
 }
 // Attributes typeset can give a parameter, from its option letters.
 struct TypesetAttrs {
