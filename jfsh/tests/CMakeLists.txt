@@ -18,6 +18,7 @@ add_executable(jfsh_tests
   params_test.cpp
   parser_test.cpp
   signals_test.cpp
+  startup_test.cpp
   subst_test.cpp
 )
 target_link_libraries(jfsh_tests PRIVATE

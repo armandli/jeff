@@ -65,6 +65,12 @@ struct Shell {
   Run run_script(strv src) { return capture(src, true); }
 
   Run capture(strv src, bool by_line) {
+    return call([&] { return exec.exec_string(src, by_line); });
+  }
+
+  // Runs fn with fds 1 and 2 captured, as run() does with a command.
+  template <class Fn>
+  Run call(Fn fn) {
     ctx.exiting  = false;
     ctx.aborting = false;
     s::fflush(nullptr);
@@ -74,7 +80,7 @@ struct Shell {
     int saved_err = dup(STDERR_FILENO);
     dup2(fileno(out), STDOUT_FILENO);
     dup2(fileno(err), STDERR_FILENO);
-    int rc = exec.exec_string(src, by_line);
+    int rc = fn();
     s::fflush(nullptr);
     dup2(saved_out, STDOUT_FILENO);
     dup2(saved_err, STDERR_FILENO);

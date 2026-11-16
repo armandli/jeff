@@ -44,6 +44,11 @@ int wait_foreground_job(ExecContext& ctx, int jid) {
   }
   sig.take_terminal();
 
+  // $pipestatus: what each stage of the foreground pipeline ended with.
+  ctx.pipestatus.clear();
+  for (const auto& p : j.procs)
+    ctx.pipestatus.push_back(p.stopped() ? 128 + p.stop_sig : p.exit_code);
+
   if (j.is_stopped()) {
     // Keep the job's terminal modes for `fg`, and put the shell's back.
     j.has_tmodes = sig.read_modes(j.tmodes);

@@ -182,7 +182,9 @@ TEST(Typeset, PrintsDefinitions) {
   EXPECT_EQ(r.err, "jfsh: typeset: no such variable: nope\n");
   EXPECT_EQ(r.rc, 1);
   EXPECT_EQ(out(sh, "typeset -m '[xyz]'"), "x='a b'\ny='it'\\''s'\nz=plain\n");
-  EXPECT_EQ(out(sh, "typeset -i"), "i=3\n");
+  // The integer specials ($SECONDS, $LINENO, …) are listed too, as in zsh.
+  EXPECT_EQ(out(sh, "typeset -i | grep -v -e '^[A-Z]' -e '^status='"), "i=3\n");
+  EXPECT_EQ(out(sh, "typeset -i | grep -c -e '^SECONDS=' -e '^LINENO='"), "2\n");
   EXPECT_EQ(out(sh, "readonly -p | grep ro="), "typeset -r ro=1\n");
   EXPECT_EQ(out(sh, "export -p | grep ex="), "export ex=1\n");
 }
@@ -737,7 +739,7 @@ TEST(History, ListsAndReruns) {
 
 TEST(Unimplemented, SayNotImplemented) {
   Shell sh;
-  for (const char* name : {"bindkey", "vared", "zle", "zpty", "sched", "compinit"}) {
+  for (const char* name : {"bindkey", "vared", "zle", "zpty", "compinit"}) {
     auto r = sh.run(str(name) + " x");
     EXPECT_EQ(r.err, "jfsh: " + str(name) + ": not implemented\n") << name;
     EXPECT_EQ(r.rc, 1) << name;

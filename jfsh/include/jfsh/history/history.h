@@ -58,6 +58,12 @@ struct HistoryManager {
 
   const vec<HistEntry>& entries() const noexcept { return mEntries; }
 
+  // Changes the text of the newest entry: `r` and `fc -s` leave the
+  // command they ran in place of their own line, as zsh does.
+  void replace_last(str text) {
+    if (not mEntries.empty()) mEntries.back().text = s::move(text);
+  }
+
   Result<void> load(strv path);
   Result<void> save(strv path);
   Result<void> sync(strv path) { return load(path); }

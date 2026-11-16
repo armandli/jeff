@@ -34,6 +34,7 @@ static BuiltinTable Builtins;
 
 Executor::Executor(ExecContext& ctx) : mCtx(ctx) {
   mCtx.executor = this;
+  install_special_params(mCtx);
   static bool initialized = false;
   if (not initialized) {
     Builtins.register_all();
@@ -567,7 +568,11 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
   if (n == 0) return 0;
   mPipeProg = es.prog;
   mPipePc   = pipe_pc;
-  if (n == 1) return exec_cmd(es, flags);
+  if (n == 1) {
+    int rc = exec_cmd(es, flags);
+    mCtx.pipestatus.assign(1, rc);
+    return rc;
+  }
   bool jc = job_control();
 
   // Pre-decode every stage's bytecode slice so we can fork them from the
@@ -670,6 +675,7 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
 
   int last_rc = 0;
   int worst   = 0;
+  mCtx.pipestatus.clear();
   for (s::uint32_t i = 0; i < n; ++i) {
     int status = 0;
     while (::waitpid(pids[i], &status, 0) < 0) {
@@ -680,12 +686,25 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
     else if (WIFSIGNALED(status)) rc = 128 + WTERMSIG(status);
     if (rc != 0) worst = rc;
     last_rc = rc;
+    mCtx.pipestatus.push_back(rc);
   }
   return mCtx.opts.get(OPT_PIPEFAIL) ? worst : last_rc;
 }
 
+// $LINENO for the command at es.pc: its line in the script, -c string,
+// sourced file or eval text, or in a function counted from the line the
+// definition starts on.
+static s::uint32_t line_at(const ExecState& es) noexcept {
+  const auto& lines = es.prog->line_map;
+  if (es.pc >= lines.size()) return 0;
+  s::uint32_t l = lines[es.pc];
+  if (es.prog->line_base == 0) return l;
+  return l > es.prog->line_base ? l - es.prog->line_base : 1;
+}
+
 int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
   if (es.at_end()) return 0;
+  mCtx.lineno = line_at(es);
   // Redirections in front of a compound command belong to it; a simple
   // command goes on with an assignment or its words.
   s::size_t pc = es.pc;
@@ -1119,10 +1138,14 @@ int Executor::exec_subsh(ExecState& es, WordCode head, ExecFlags) {
 // words(args) calls the body at once with the args.
 int Executor::exec_funcdef(ExecState& es, WordCode head) {
   s::size_t end = es.pc + wc_cmd_skip(head);
+  // The line the definition starts on is line 0 of the body's $LINENO.
+  s::uint32_t def_line = es.pc > 0 and es.pc - 1 < es.prog->line_map.size()
+                       ? es.prog->line_map[es.pc - 1] : 0;
   if (wc_cmd_type(head) == WC_FUNCDEF_ANON) {
     s::size_t begin = es.pc;
     es.pc = body_end(*es.prog, begin);
     ProgRef body = extract_body(*es.prog, begin, es.pc);
+    body->line_base = def_line;
     auto raw = fetch_words(es);
     es.pc = end;
     Expander ex{*this, mCtx};
@@ -1136,6 +1159,7 @@ int Executor::exec_funcdef(ExecState& es, WordCode head) {
   }
   auto names = fetch_words(es);
   ProgRef body = extract_body(*es.prog, es.pc, end);
+  body->line_base = def_line;
   for (auto& name : names) {
     // TRAPINT() { … } is the trap for SIGINT, and so on.
     if (name.starts_with("TRAP"))
@@ -1799,6 +1823,8 @@ static Result<void> set_numeric(ParamTable& params, const OptionState& opts,
             ? MathNum::of(old.as_float() + n.as_float())
             : MathNum::of(static_cast<s::int64_t>(static_cast<U>(old.i) + static_cast<U>(n.i)));
   }
+  // $SECONDS, $RANDOM, …: their setter decides what the value means.
+  if (p.handlers) return params.set_scalar(a.name, s::to_string(n.as_int()));
   if (p.is_float()) p.set(n.as_float());
   else              p.set(n.as_int());
   return {};

@@ -170,7 +170,6 @@ int builtin_bindkey (vec<str>& args, ExecContext&) { return not_implemented(args
 int builtin_vared   (vec<str>& args, ExecContext&) { return not_implemented(args); }
 int builtin_zle     (vec<str>& args, ExecContext&) { return not_implemented(args); }
 int builtin_zpty    (vec<str>& args, ExecContext&) { return not_implemented(args); }
-int builtin_sched   (vec<str>& args, ExecContext&) { return not_implemented(args); }
 // zmodload with no arguments lists the loaded modules: there are none.
 int builtin_zmodload(vec<str>& args, ExecContext&) {
   return args.size() < 2 ? 0 : not_implemented(args);

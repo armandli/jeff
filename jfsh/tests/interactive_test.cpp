@@ -4,6 +4,7 @@
 // -i`), with "jfsh:" for "zsh:".
 
 #include <cerrno>
+#include <cstdio>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -35,11 +36,14 @@ struct Pty {
   std::string out;           // everything read so far
   std::size_t mark = 0;      // where the next expect() starts looking
 
-  Pty() {
+  // The startup files come from `zdotdir`: by default one that doesn't
+  // exist, so the user's own files stay out of the tests.
+  explicit Pty(const std::string& zdotdir = "/nonexistent/jfsh-test-zdotdir") {
     pid = ::forkpty(&fd, nullptr, nullptr, nullptr);
     if (pid == 0) {
       ::setenv("PS1", "%% ", 1);
       ::setenv("TERM", "dumb", 1);
+      ::setenv("ZDOTDIR", zdotdir.c_str(), 1);
       ::unsetenv("HISTFILE");
       ::execl(JFSH_BINARY, JFSH_BINARY, "--norouter", "-i", static_cast<char*>(nullptr));
       _exit(127);
@@ -269,3 +273,67 @@ TEST(Interactive, ExitTrapRunsWhenTheShellExits) {
 }
 
 }  // namespace
+
+// ---- M8: the interactive loop ---------------------------------------------------
+
+namespace {
+
+// A $ZDOTDIR holding a .jfshrc, removed afterwards.
+struct RcDir {
+  std::string path;
+  explicit RcDir(std::string_view rc) {
+    char tmpl[] = "/tmp/jfsh_rc_XXXXXX";
+    path = ::mkdtemp(tmpl);
+    std::string file = path + "/.jfshrc";
+    if (std::FILE* f = std::fopen(file.c_str(), "w")) {
+      std::fwrite(rc.data(), 1, rc.size(), f);
+      std::fclose(f);
+    }
+  }
+  ~RcDir() {
+    std::string file = path + "/.jfshrc";
+    ::unlink(file.c_str());
+    ::rmdir(path.c_str());
+  }
+};
+
+}  // namespace
+
+TEST(Interactive, JfshrcHooksAndPromptReload) {
+  RcDir rc("precmd() { print -n '<pre>' }\n"
+           "preexec() { print -r -- \"<exec $1>\" }\n");
+  Pty sh(rc.path);
+  ASSERT_TRUE(sh.expect("<pre>% ")) << sh.out;
+  sh.line("echo hi");
+  EXPECT_TRUE(sh.expect("<exec echo hi>")) << sh.out;
+  EXPECT_TRUE(sh.expect("hi")) << sh.out;
+  EXPECT_TRUE(sh.expect("<pre>% ")) << sh.out;
+  // A new $PS1 takes effect at the next prompt (B38).
+  sh.line("PS1='new> '");
+  EXPECT_TRUE(sh.expect("<pre>new> ")) << sh.out;
+  sh.line("exit");
+  int st;
+  EXPECT_TRUE(sh.exits(st)) << sh.out;
+}
+
+TEST(Interactive, LineIsInHistoryWhileItRuns) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("echo one");
+  ASSERT_TRUE(sh.expect("one"));
+  sh.line("echo $HISTCMD");
+  EXPECT_TRUE(sh.expect("2\r\n")) << sh.out;
+  sh.line("r");
+  EXPECT_TRUE(sh.expect("echo $HISTCMD\r\n3")) << sh.out;   // r reran line 2 as event 3
+  sh.line("fc -l");
+  EXPECT_TRUE(sh.expect("    1  echo one\r\n    2  echo $HISTCMD\r\n    3  echo $HISTCMD\r\n"))
+      << sh.out;
+}
+
+TEST(Interactive, SchedRunsBeforeThePrompt) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("sched +0 echo fired");
+  EXPECT_TRUE(sh.expect("fired")) << sh.out;
+  EXPECT_TRUE(sh.expect("% ")) << sh.out;
+}
