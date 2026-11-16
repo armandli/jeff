@@ -210,7 +210,7 @@ opt<mode_t> parse_symbolic(strv spec, mode_t mask) {
       if (op != '+' and op != '-' and op != '=') return s::nullopt;
       mode_t perms = 0;
       for (; k < clause.size() and strv("rwx").find(clause[k]) != strv::npos; ++k)
-        perms |= clause[k] == 'r' ? 0444 : clause[k] == 'w' ? 0222 : 0111;
+        perms |= clause[k] == 'r' ? 0444u : clause[k] == 'w' ? 0222u : 0111u;
       perms &= who;
       if (op == '+') allowed |= perms;
       else if (op == '-') allowed &= ~perms;

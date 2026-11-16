@@ -41,7 +41,7 @@ struct CwdGuard {
     char buf[PATH_MAX];
     dir = ::getcwd(buf, sizeof buf) ? buf : "/";
   }
-  ~CwdGuard() { (void)::chdir(dir.c_str()); }
+  ~CwdGuard() { [[maybe_unused]] int r = ::chdir(dir.c_str()); }
 };
 
 // mkdtemp under /tmp may be a symlink (macOS); compare real paths.

@@ -445,7 +445,7 @@ int Executor::exec_list(ExecState& es, ExecFlags flags) {
       } else if (pid == 0) {
         if (jc and mCtx.opts.get(OPT_BGNICE)) {
           errno = 0;
-          (void)::nice(5);
+          [[maybe_unused]] int r = ::nice(5);
         }
         if (not jc) {
           // Without job control a background job must not see Ctrl-C.
@@ -458,7 +458,7 @@ int Executor::exec_list(ExecState& es, ExecFlags flags) {
         s::fflush(nullptr);
         _exit(child_rc);
       } else {
-        int jid = mCtx.jobs.alloc(pid, JOB_ASYNC | JOB_NOTIFY | (jc ? JOB_PGRP : 0),
+        int jid = mCtx.jobs.alloc(pid, JOB_ASYNC | JOB_NOTIFY | (jc ? +JOB_PGRP : 0),
                                   text);
         Process p;
         p.pid    = pid;
@@ -592,7 +592,7 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
       } else if (op == WC_TYPESET) {
         WordCode nitems = wc_data(es.fetch());
         for (WordCode a = 0; a < nitems; ++a)
-          es.pc += wc_code(es.peek()) == WC_ASSIGN ? 3 : 1;
+          es.pc += wc_code(es.peek()) == WC_ASSIGN ? 3u : 1u;
         break;
       } else {
         WordCode skip = wc_cmd_skip(es.fetch());
@@ -693,7 +693,7 @@ int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
   switch (wc_code(es.prog->prog[pc])) {
     case WC_ASSIGN: case WC_SIMPLE: case WC_TYPESET:
       return exec_simple_cmd(es, flags);
-    default:
+    default: break;
   }
   if (pc == es.pc) return exec_compound(es, flags);
 
@@ -1187,7 +1187,7 @@ int Executor::exec_cond(ExecState& es, WordCode head) {
       if (not arg) return fail(arg.error());
       return finish(cond_unary(op, *arg, mCtx, ""));
     }
-    default:
+    default: break;
   }
   str op(es.fetch_str());
   strv lhs_word = es.fetch_str();

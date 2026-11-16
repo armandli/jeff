@@ -71,7 +71,7 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
       (void)ctx.params.set_scalar(name, "");
       p = &ctx.params.lookup(name)->get();
     } else {
-      p = &ctx.params.declare_local(name, PM_SCALAR | (ctx.func_depth ? PM_LOCAL : 0));
+      p = &ctx.params.declare_local(name, PM_SCALAR | (ctx.func_depth ? +PM_LOCAL : 0));
       p->set(str{});
     }
     if (exported) p->flags |= PM_EXPORTED;

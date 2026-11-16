@@ -28,6 +28,19 @@ Editor::~Editor() {
 
 static struct termios OrigTermios;
 
+// Writes all of `data` to the terminal, retrying after EINTR and partial
+// writes; a failed write leaves nothing to recover in a redraw.
+static void term_write(strv data) {
+  while (not data.empty()) {
+    ssize_t n = ::write(STDOUT_FILENO, data.data(), data.size());
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return;
+    }
+    data.remove_prefix(static_cast<s::size_t>(n));
+  }
+}
+
 void Editor::enter_raw_mode() {
   tcgetattr(STDIN_FILENO, &OrigTermios);
   struct termios raw = OrigTermios;
@@ -156,38 +169,38 @@ str Editor::read_key_sequence() {
     }
     if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) break;
   }
-  int n = static_cast<int>(read(STDIN_FILENO, buf, 1));
-  if (n < 0 and errno == EINTR) return {};
-  if (n <= 0) {
+  ssize_t r = read(STDIN_FILENO, buf, 1);
+  if (r < 0 and errno == EINTR) return {};
+  if (r <= 0) {
     // EOF or a hung-up terminal: without this the caller would spin.
     mEof = true;
     return {};
   }
+  s::size_t n = 1;
   if (buf[0] == '\x1b') {
     // Try to read more bytes (escape sequence)
     struct timeval tv{0, 50000};
     fd_set fds; FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
     if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0) {
-      auto more = read(STDIN_FILENO, buf + n,
-                       sizeof(buf) - static_cast<s::size_t>(n));
-      n += static_cast<int>(more);
+      ssize_t more = read(STDIN_FILENO, buf + n, sizeof(buf) - n);
+      if (more > 0) n += static_cast<s::size_t>(more);
     }
   }
-  return str(buf, static_cast<s::size_t>(n));
+  return str(buf, n);
 }
 
 void Editor::refresh_display() {
   str ps1    = mContinuation ? mPrompt.continuation() : mPrompt.primary();
   int ps1_width = PromptRenderer::visual_width(ps1);
   // CR + erase line
-  write(STDOUT_FILENO, "\r\x1b[K", 4);
-  write(STDOUT_FILENO, ps1.c_str(), ps1.size());
-  write(STDOUT_FILENO, mBuf.text.c_str(), mBuf.text.size());
+  term_write("\r\x1b[K");
+  term_write(ps1);
+  term_write(mBuf.text);
   int col = ps1_width + static_cast<int>(mBuf.cursor);
   if (col > 0) {
     char seq[32];
     int len = s::snprintf(seq, sizeof seq, "\r\x1b[%dC", col);
-    if (len > 0) write(STDOUT_FILENO, seq, static_cast<s::size_t>(len));
+    if (len > 0) term_write(strv(seq, static_cast<s::size_t>(len)));
   }
 }
 
