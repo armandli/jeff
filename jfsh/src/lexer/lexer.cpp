@@ -34,6 +34,52 @@ static const struct { const char* word; TokType type; } KEYWORDS[] = {
 
 Lexer::~Lexer() = default;
 
+// ---- Input with alias text --------------------------------------------------
+
+int LexInput::next_char() {
+  while (not mPushed.empty()) {
+    auto& top = mPushed.back();
+    if (top.pos < top.text.size()) {
+      mFromRaw.push_back(false);
+      if (mFromRaw.size() > 32) mFromRaw.erase(mFromRaw.begin());
+      return static_cast<unsigned char>(top.text[top.pos++]);
+    }
+    char last = top.text.empty() ? '\0' : top.text.back();
+    if (last == ' ' or last == '\t') mBlankDone = true;
+    mPushed.pop_back();
+  }
+  mFromRaw.push_back(true);
+  if (mFromRaw.size() > 32) mFromRaw.erase(mFromRaw.begin());
+  return mRaw.next_char();
+}
+
+void LexInput::unget(int c) {
+  bool raw = true;
+  if (not mFromRaw.empty()) {
+    raw = mFromRaw.back();
+    mFromRaw.pop_back();
+  }
+  if (c == -1) return;
+  if (not raw and not mPushed.empty() and mPushed.back().pos > 0) {
+    --mPushed.back().pos;
+    return;
+  }
+  if (not raw) {   // its text was dropped already: push the character back
+    mPushed.push_back({str(1, static_cast<char>(c)), 0, current_aliases()});
+    return;
+  }
+  mRaw.unget(c);
+}
+
+void LexInput::push(str text, sptr<const vec<str>> names) {
+  mPushed.push_back({s::move(text), 0, s::move(names)});
+}
+
+const sptr<const vec<str>>& LexInput::current_aliases() const noexcept {
+  static const sptr<const vec<str>> none;
+  return mPushed.empty() ? none : mPushed.back().names;
+}
+
 // Scoop balanced parentheses so `<(…)`, `>(…)` and `=(…)` become a single
 // TK_REDIR token whose text holds the entire substitution source.
 static void slurp_balanced_paren(InputSource& src, str& text) {
@@ -235,7 +281,17 @@ LexToken Lexer::newline_token() {
   return {TokType::TK_NEWLINE, "\n", ln};
 }
 
+// Records, as a token starts, the aliases it is read from.
 LexToken Lexer::read_token() {
+  mTokAliases.reset();
+  mTokAfterBlank = false;
+  LexToken tok = read_token_raw();
+  tok.aliases           = s::move(mTokAliases);
+  tok.after_alias_blank = mTokAfterBlank;
+  return tok;
+}
+
+LexToken Lexer::read_token_raw() {
   for (;;) {
     int c = mSrc.next_char();
     if (c == -1) return {TokType::TK_EOF, {}, mSrc.line()};
@@ -246,6 +302,8 @@ LexToken Lexer::read_token() {
     }
     if (c == '\n') return newline_token();
     if (c == ' ' or c == '\t') continue;
+    mTokAliases    = mSrc.current_aliases();
+    mTokAfterBlank = mSrc.take_blank_flag();
     switch (c) {
       case ';': {
         int n = mSrc.next_char();

@@ -535,18 +535,7 @@ struct Scan {
   // -------------------------------------------------------------------------
   // Parameters.
   // -------------------------------------------------------------------------
-  str option_letters() {
-    str s;
-    auto& o = opts();
-    if (o.get(OPT_ERREXIT))     s += 'e';
-    if (o.get(OPT_HASHCMDS))    s += 'h';
-    if (o.interactive())        s += 'i';
-    if (o.get(OPT_MONITOR))     s += 'm';
-    if (not o.get(OPT_UNSET))   s += 'u';
-    if (o.get(OPT_VERBOSE))     s += 'v';
-    if (o.get(OPT_XTRACE))      s += 'x';
-    return s;
-  }
+  str option_letters() { return opts().letters(); }
 
   Value get_param(strv name, const ParamFlags& fl) {
     Value v;
@@ -566,6 +555,11 @@ struct Scan {
     if (not name.empty() and s::isdigit(static_cast<unsigned char>(name[0]))) {
       s::size_t n = s::strtoul(str(name).c_str(), nullptr, 10);
       if (n >= 1 and n <= c.positional.size()) scalar(c.positional[n - 1]);
+      return v;
+    }
+    if (name == "dirstack") {
+      v.set = true;
+      v.make_array(c.dirstack);
       return v;
     }
     if (name == "PPID")   { scalar(s::to_string(::getppid())); return v; }
@@ -1554,6 +1548,17 @@ Result<void> tilde_at(Field& f, s::size_t p, s::size_t end, ExecContext& ctx) {
     dir = param("PWD");
   } else if (name == "-") {
     dir = param("OLDPWD");
+  } else if (auto digits = strv(name).substr(name[0] == '+' or name[0] == '-' ? 1 : 0);
+             not digits.empty() and s::all_of(digits.begin(), digits.end(), [](char d) {
+               return s::isdigit(static_cast<unsigned char>(d)); })) {
+    // ~N, ~+N, ~-N: entries of the directory stack, $PWD being entry 0.
+    vec<str> stack;
+    if (auto pwd = param("PWD")) stack.push_back(*pwd);
+    stack.insert(stack.end(), ctx.dirstack.begin(), ctx.dirstack.end());
+    s::size_t n = s::strtoul(str(digits).c_str(), nullptr, 10);
+    if (n >= stack.size())
+      return s::unexpected(subst_error("not enough directory stack entries."));
+    dir = name[0] == '-' ? stack[stack.size() - 1 - n] : stack[n];
   } else {
     for (char c : name)
       if (not is_name_char(c) and c != '-' and c != '.') return {};
@@ -1630,7 +1635,7 @@ Result<vec<str>> Expander::words(const vec<str>& words) {
         out.push_back(*path);
         continue;
       }
-      if (f.has_unlit_glob()) {
+      if (opts.get(OPT_GLOB) and f.has_unlit_glob()) {
         auto matches = glob_expand(GlobPattern::compile(f.as_pattern()), opts);
         if (not matches) return s::unexpected(matches.error());
         for (auto& m : *matches) out.push_back(s::move(m));

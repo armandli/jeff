@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include <jfsh/core/alias_table.h>
 #include <jfsh/core/aliases.h>
 #include <jfsh/core/wordcode.h>
 #include <jfsh/lexer/lexer.h>
@@ -35,6 +36,14 @@ struct Parser {
 
   Result<ProgRef> parse();
   Result<ProgRef> parse_string(strv src);
+  // One top-level line: the lists up to a newline (or the end of the
+  // input), so what it defines (aliases) is in force for the next line.
+  // An empty program at the end of the input; `at_eof()` then says so.
+  Result<ProgRef> parse_line();
+  bool at_eof() { return mLex.peek().is_eof(); }
+
+  // Aliases to expand while parsing; none when null.
+  void set_aliases(const AliasTable* aliases) noexcept { mAliases = aliases; }
 
   int  line()      const noexcept { return mLex.line(); }
   bool has_error() const noexcept { return not mError.message.empty(); }
@@ -104,6 +113,11 @@ protected:
   bool par_trailing_redirs(s::size_t start);
   void emit_words(vec<str> words);
 
+  // When the next token is an alias that applies here (any alias in
+  // command position, a global one anywhere, a suffix alias for a command
+  // word ending in .ext), replaces it with the alias text and returns true.
+  bool expand_alias(bool cmdpos);
+
   const LexToken& cur() { return mLex.peek(); }
   bool   eat(TokType t) {
     if (at(t)) { mLex.consume(); return true; }
@@ -132,6 +146,8 @@ private:
   ShellError       mError;
   bool             mIncomplete = false;
   CompiledProgram* mProg = nullptr;
+  const AliasTable* mAliases = nullptr;
+  bool             mLineMode = false;   // parse_line: stop at a newline
   vec<s::size_t> mPendingHeredocs;   // strs indices awaiting bodies
 };
 
@@ -150,6 +166,10 @@ str disassemble(const CompiledProgram& prog);
 str      pipeline_text(const CompiledProgram& prog, s::size_t pc);
 vec<str> pipeline_stage_texts(const CompiledProgram& prog, s::size_t pc);
 str      sublist_text(const CompiledProgram& prog, s::size_t pc);
+
+// A function definition as `functions` prints it (src/parser/text.cpp):
+// `names () {`, the body one command per line indented by tabs, `}`.
+str function_text(strv names, const CompiledProgram& body);
 
 }  // namespace jfsh
 

@@ -330,7 +330,7 @@ TEST(Typeset, GlobalFlagUpdatesTheOuterParameter) {
 TEST(Read, SplitsALineIntoNames) {
   Shell sh;
   EXPECT_EQ(out(sh, "read a b <<< 'x y  z '; echo \"[$a][$b]\""), "[x][y  z]\n");
-  EXPECT_EQ(out(sh, "read <<< '  whole line '; echo \"[$REPLY]\""), "[  whole line ]\n");
+  EXPECT_EQ(out(sh, "read <<< '  whole line '; echo \"[$REPLY]\""), "[whole line]\n");
   EXPECT_EQ(out(sh, "read -A arr <<< 'p q r'; echo $#arr $arr[3]"), "3 r\n");
   EXPECT_EQ(out(sh, "read a <<< 'x\\ y'; echo $a"), "x y\n");
   EXPECT_EQ(out(sh, "read -r a <<< 'x\\ y'; echo $a"), "x\\ y\n");

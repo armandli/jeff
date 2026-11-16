@@ -43,7 +43,8 @@ TEST(Subst, ScalarsAndQuotes) {
   EXPECT_EQ(out(sh, "x=hello; echo $x ${x} \"$x\" '$x' \\$x"),
             "hello hello hello $x $x\n");
   EXPECT_EQ(out(sh, "x=1; echo \"${x}x\" \"$x\"y $x'z' a$x$x"), "1x 1y 1z a11\n");
-  EXPECT_EQ(out(sh, "echo \"a\\$b\" \"a\\\\b\" 'a\\b' a\\ b"), "a$b a\\b a\\b a b\n");
+  // print -r: echo would take `\b` for a backspace, as zsh's does.
+  EXPECT_EQ(out(sh, "print -r -- \"a\\$b\" \"a\\\\b\" 'a\\b' a\\ b"), "a$b a\\b a\\b a b\n");
 }
 
 TEST(Subst, ScalarsAreNotSplitOrGlobbed) {

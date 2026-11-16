@@ -16,6 +16,7 @@
 #include <jfsh/builtins/builtins.h>
 #include <jfsh/core/aliases.h>
 #include <jfsh/exec/executor.h>
+#include <jfsh/parser/parser.h>
 
 namespace jfsh {
 
@@ -97,8 +98,12 @@ int builtin_trap(vec<str>& args, ExecContext& ctx) {
   if (i >= args.size()) {
     for (int sig : trap_listing_order()) {
       const Trap& t = traps.get(sig);
-      // TODO(builtin/trap): list TRAPxxx functions as their definitions
-      //   once function bodies can be printed (`functions`, M7).
+      if (t.action == TrapAction::Function) {
+        str name = trap_function_name(sig);
+        if (auto fn = ctx.functions.find(name); fn != ctx.functions.end())
+          s::printf("%s\n", function_text(name, *fn->second).c_str());
+        continue;
+      }
       if (t.action != TrapAction::Command and t.action != TrapAction::Ignore) continue;
       s::printf("trap -- %s %s\n", trap_quote(t.command).c_str(),
                 SignalTable::sig_to_name(sig));

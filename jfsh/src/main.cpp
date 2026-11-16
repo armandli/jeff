@@ -100,9 +100,11 @@ int main(int argc, char* argv[]) {
   jfsh::ParamTable  params;
   jfsh::OptionState opts;
 
-  opts.assign(jfsh::OPT_STDIN,   interactive);
-  opts.assign(jfsh::OPT_MONITOR, interactive);
-  opts.assign(jfsh::OPT_ALIASES, true);
+  opts.assign(jfsh::OPT_INTERACTIVE, interactive);
+  opts.assign(jfsh::OPT_SHINSTDIN,   eval_cmd.empty() and script_path.empty());
+  opts.assign(jfsh::OPT_MONITOR,     interactive);
+  opts.assign(jfsh::OPT_ZLE,         interactive);
+  opts.assign(jfsh::OPT_SINGLECOMMAND, false);
 
   for (char** ep = environ; ep and *ep; ++ep) {
     std::string env(*ep);
@@ -191,7 +193,7 @@ int main(int argc, char* argv[]) {
     char buf[4096];
     while (std::fgets(buf, sizeof buf, f)) source += buf;
     std::fclose(f);
-    return finish(executor.exec_string(source));
+    return finish(executor.exec_string(source, /*by_line=*/true));
   }
 
   jfsh::HistOptions hist_opts;
@@ -201,6 +203,7 @@ int main(int argc, char* argv[]) {
 
   jfsh::HistoryManager history(hist_opts);
   if (not hist_opts.histfile.empty()) history.load(hist_opts.histfile);
+  ctx.history = &history;   // fc, history, r
 
   jfsh::PromptRenderer prompt_renderer(params, opts);
 

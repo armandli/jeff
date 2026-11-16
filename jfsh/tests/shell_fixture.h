@@ -58,7 +58,15 @@ struct Shell {
 
   // Runs src with fds 1 and 2 captured.  Child processes inherit the
   // redirected fds, so their output is captured too.
-  Run run(strv src) {
+  // Each run is like a `jfsh -c`: one that exited or aborted (an
+  // expansion error ends a non-interactive shell) doesn't stop the next.
+  Run run(strv src) { return capture(src, false); }
+  // Runs src a line at a time, as a script file is.
+  Run run_script(strv src) { return capture(src, true); }
+
+  Run capture(strv src, bool by_line) {
+    ctx.exiting  = false;
+    ctx.aborting = false;
     s::fflush(nullptr);
     s::FILE* out = s::tmpfile();
     s::FILE* err = s::tmpfile();
@@ -66,7 +74,7 @@ struct Shell {
     int saved_err = dup(STDERR_FILENO);
     dup2(fileno(out), STDOUT_FILENO);
     dup2(fileno(err), STDERR_FILENO);
-    int rc = exec.exec_string(src);
+    int rc = exec.exec_string(src, by_line);
     s::fflush(nullptr);
     dup2(saved_out, STDOUT_FILENO);
     dup2(saved_err, STDERR_FILENO);

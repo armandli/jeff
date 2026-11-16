@@ -57,6 +57,11 @@ struct LexToken {
   TokType type = TokType::TK_NULL;
   str     text;
   int     line = 0;
+  // Aliases whose text the token was read from (so they don't expand
+  // again inside it), and whether it follows an alias whose text ends in a
+  // blank, which makes it eligible for alias expansion too.
+  sptr<const vec<str>> aliases = {};
+  bool                 after_alias_blank = false;
 
   bool is_word()    const noexcept { return type == TokType::TK_WORD; }
   bool is_newline() const noexcept { return type == TokType::TK_NEWLINE; }
@@ -77,6 +82,34 @@ struct InputSource {
   virtual int  next_char() = 0;
   virtual void unget(int c) = 0;
   virtual int  line() const noexcept { return 0; }
+};
+
+// The lexer's input: the source, with alias text pushed in front of it.
+// A pushed text is dropped once read past; characters put back go back
+// where they came from.
+struct LexInput : InputSource {
+  explicit LexInput(InputSource& raw) : mRaw{raw} {}
+
+  int  next_char() override;
+  void unget(int c) override;
+  int  line() const noexcept override { return mRaw.line(); }
+
+  void push(str text, sptr<const vec<str>> names);
+  // The aliases of the text being read now; null when reading the source.
+  const sptr<const vec<str>>& current_aliases() const noexcept;
+  // An alias text ending in a blank was read past since the last call.
+  bool take_blank_flag() noexcept { return s::exchange(mBlankDone, false); }
+
+private:
+  struct Pushed {
+    str                  text;
+    s::size_t            pos = 0;
+    sptr<const vec<str>> names;
+  };
+  InputSource&  mRaw;
+  vec<Pushed>   mPushed;
+  vec<bool>     mFromRaw;      // where recent characters came from
+  bool          mBlankDone = false;
 };
 
 struct Lexer {
@@ -105,6 +138,14 @@ struct Lexer {
   void unread(LexToken tok) { mPeeked = s::move(tok); }
 
   void set_alias_expansion(bool on) noexcept { mAliasExpand = on; }
+  bool alias_expansion() const noexcept { return mAliasExpand; }
+
+  // Reads `text` before the rest of the input: the expansion of alias
+  // `names.back()`, with `names` the aliases being expanded, which don't
+  // expand again inside it.  Nothing may be peeked.
+  void push_alias(str text, sptr<const vec<str>> names) {
+    mSrc.push(s::move(text), s::move(names));
+  }
 
   // After a `((` token (and with nothing peeked past it): the raw text up
   // to the `))` that closes it, with nested parentheses kept.  nullopt when
@@ -132,6 +173,7 @@ struct Lexer {
 
 protected:
   LexToken read_token();
+  LexToken read_token_raw();
   LexToken read_word(int first_char);
   LexToken read_redir(int first_char);
   LexToken read_heredoc_delimiter();
@@ -146,8 +188,11 @@ private:
     bool expand;
   };
 
-  InputSource&      mSrc;
+  LexInput          mSrc;
   opt<LexToken>     mPeeked;
+  // Captured as each token starts (see read_token).
+  sptr<const vec<str>> mTokAliases;
+  bool                 mTokAfterBlank = false;
   LexFlags          mFlags       = LEX_NORMAL;
   bool              mAliasExpand = true;
   bool              mIncomplete  = false;

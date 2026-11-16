@@ -6,29 +6,9 @@
 #include <jfsh/core/aliases.h>
 #include <jfsh/parser/parser.h>
 
-// Decompiler: convert a CompiledProgram back to source text.
-// Used by `functions` / `typeset -f` to print function bodies.
-//
-// TODO(text/decompile): Implement decompiletext() — walk the prog[] array and
-//   reconstruct human-readable shell source from each WCOpcode:
-//     WC_LIST     → join with ; or & or newline
-//     WC_SUBLIST  → join with && or ||; prefix with !
-//     WC_PIPE     → join with |
-//     WC_SIMPLE   → print words from strs[]
-//     WC_IF       → if cond; then body; [elif ...;] [else ...;] fi
-//     WC_WHILE    → while cond; do body; done
-//     WC_FOR      → for name in words; do body; done
-//     WC_CASE     → case word in pat) body ;; esac
-//     WC_SELECT   → select name in words; do body; done
-//     WC_REPEAT   → repeat N; body; done
-//     WC_SUBSH    → ( body )
-//     WC_FUNCDEF  → function name { body }
-//     WC_COND     → [[ ... ]]
-//     WC_ARITH    → (( ... ))
-//     WC_REDIR    → reconstruct < > >> << <<< <( etc.
-//     WC_ASSIGN   → name=value
-//   Indentation should increase inside compound commands.
-//   String literals come from the strs[] table via WC_STRING indices.
+// Text from bytecode: the disassembler (tests, debugging), one-line
+// command text (job listings) and multi-line function definitions
+// (`functions`, `whence -f`).
 
 namespace jfsh {
 
@@ -389,6 +369,293 @@ struct Decompiler {
   }
 };
 
+
+// ---- Multi-line source text ---------------------------------------------------
+//
+// Function definitions as `functions` and `whence -f` print them: one
+// command per line, bodies indented by a tab per level, as zsh's text.c.
+
+struct Pretty {
+  const CompiledProgram& p;
+  s::size_t              pc;
+  str                    out;
+  vec<str>               docs;   // here-document bodies waiting for a newline
+
+  bool     at_end() const noexcept { return pc >= p.prog.size(); }
+  WordCode peek()   const noexcept { return at_end() ? WC_END : p.prog[pc]; }
+  WordCode fetch()        noexcept { return at_end() ? WC_END : p.prog[pc++]; }
+  str next_str() {
+    WordCode w = fetch();
+    WordCode i = wc_data(w);
+    return i < p.strs.size() ? p.strs[i] : str{};
+  }
+  str words() {
+    WordCode n = wc_data(fetch());
+    str o;
+    for (WordCode i = 0; i < n; ++i) {
+      if (i) o += ' ';
+      o += next_str();
+    }
+    return o;
+  }
+  void flush_docs() {
+    for (auto& d : docs) out += "\n" + d + "EOF";
+    docs.clear();
+  }
+  void nl(int ind) {
+    flush_docs();
+    out += '\n';
+    out.append(static_cast<s::size_t>(ind), '\t');
+  }
+
+  // list* WC_END: the first command where we are, the rest on new lines.
+  void body(int ind) {
+    bool first = true;
+    while (not at_end() and wc_code(peek()) == WC_LIST) {
+      WordCode  w   = fetch();
+      s::size_t end = pc + wc_list_skip(w);
+      if (not first) nl(ind);
+      sublist(ind);
+      pc = end;
+      if (wc_list_flags(w) & WC_LIST_ASYNC) out += " &";
+      first = false;
+    }
+    if (wc_code(peek()) == WC_END) ++pc;
+  }
+
+  void sublist(int ind) {
+    for (;;) {
+      WordCode  w   = fetch();
+      WordCode  f   = wc_sublist_flags(w);
+      s::size_t end = pc + wc_sublist_skip(w);
+      if (f & WC_SUBLIST_NOT) out += "! ";
+      pipeline(ind);
+      pc = end;
+      WordCode type = f & WC_SUBLIST_TYPE;
+      if (type == WC_SUBLIST_END or at_end()) return;
+      out += type == WC_SUBLIST_AND ? " && " : " || ";
+    }
+  }
+
+  void pipeline(int ind) {
+    WordCode w = fetch();
+    WordCode n = wc_pipe_count(w);
+    for (WordCode i = 0; i < n and not at_end(); ++i) {
+      if (i) out += wc_pipe_stderr(w, i - 1) ? " |& " : " | ";
+      command(ind);
+    }
+  }
+
+  str redir() {
+    WordCode  w      = fetch();
+    str       target = next_str();
+    RedirType t      = wc_redir_type(w);
+    str       fd     = wc_redir_has_fd(w) ? s::to_string(wc_redir_fd(w)) : "";
+    switch (t) {
+      case REDIR_READ:       return fd + "< " + target;
+      case REDIR_WRITE:      return fd + "> " + target;
+      case REDIR_APPEND:     return fd + ">> " + target;
+      case REDIR_HEREDOC:
+      case REDIR_HEREDOCD:   docs.push_back(target); return fd + "<<EOF";
+      case REDIR_HERESTR:    return fd + "<<< " + target;
+      case REDIR_READWRITE:  return fd + "<> " + target;
+      case REDIR_CLOBBER:    return fd + ">| " + target;
+      case REDIR_MERGE:      return fd + ">&" + target;
+      case REDIR_MERGEOUT:   return "&> " + target;
+      case REDIR_PROC_IN:    return "<(" + target + ")";
+      case REDIR_PROC_OUT:   return ">(" + target + ")";
+      case REDIR_PROC_EQ:    return "=(" + target + ")";
+      case REDIR_CLOSE:      return fd + ">&-";
+      case REDIR_IN_DUP:     return fd + "<&" + target;
+      case REDIR_APPEND_ERR: return "&>> " + target;
+      default:               return target;
+    }
+  }
+
+  str assign() {
+    WordCode f     = wc_data(fetch());
+    str      name  = next_str();
+    str      value = next_str();
+    str      op    = (f & WC_ASSIGN_APPEND) ? "+=" : "=";
+    if (f & WC_ASSIGN_ARRAY) return name + op + "(" + value + ")";
+    return name + op + value;
+  }
+
+  void command(int ind) {
+    vec<str> redirs;
+    while (wc_code(peek()) == WC_REDIR) redirs.push_back(redir());
+    WordCode op = wc_code(peek());
+    if (op == WC_ASSIGN or op == WC_SIMPLE or op == WC_TYPESET) {
+      str line;
+      for (;;) {
+        op = wc_code(peek());
+        if      (op == WC_ASSIGN) line += assign() + " ";
+        else if (op == WC_REDIR)  redirs.push_back(redir());
+        else break;
+      }
+      WordCode head = fetch();
+      WordCode n    = wc_data(head);
+      bool any_assign = false;
+      for (WordCode i = 0; i < n; ++i) {
+        if (i) line += ' ';
+        if (wc_code(peek()) == WC_ASSIGN) {
+          line += assign();
+          any_assign = true;
+        } else {
+          line += next_str();
+        }
+      }
+      // zsh leaves a blank after typeset's assignments.
+      if (wc_code(head) == WC_TYPESET and any_assign) line += ' ';
+      out += line;
+    } else {
+      compound(ind);
+    }
+    for (auto& r : redirs) out += " " + r;
+  }
+
+  str cond() {
+    WordCode w = fetch();
+    switch (wc_cmd_type(w)) {
+      case WC_COND_NOT: return "! " + cond();
+      case WC_COND_AND: { auto a = cond(); return a + " && " + cond(); }
+      case WC_COND_OR:  { auto a = cond(); return a + " || " + cond(); }
+      case WC_COND_UNARY: { auto o = next_str(); return o + " " + next_str(); }
+      case WC_COND_BINARY: {
+        auto o = next_str(); auto l = next_str(); auto r = next_str();
+        return l + " " + o + " " + r;
+      }
+      default: return "-n " + next_str();
+    }
+  }
+
+  // `do` on a line of its own, then the body, then `done`.
+  void do_done(int ind, bool indent_body = true) {
+    nl(ind);
+    out += "do";
+    nl(indent_body ? ind + 1 : ind);
+    body(indent_body ? ind + 1 : ind);
+    nl(ind);
+    out += "done";
+  }
+
+  void compound(int ind) {
+    WordCode  head = fetch();
+    s::size_t end  = pc + wc_cmd_skip(head);
+    WordCode  type = wc_cmd_type(head);
+    switch (wc_code(head)) {
+      case WC_IF: {
+        bool first = true;
+        while (pc < end) {
+          WordCode  b    = fetch();
+          s::size_t bend = pc + wc_cmd_skip(b);
+          if (wc_cmd_type(b) == WC_IF_IF) {
+            if (not first) nl(ind);
+            out += first ? "if " : "elif ";
+            body(ind + 1);
+            nl(ind);
+            out += "then";
+            nl(ind + 1);
+            body(ind + 1);
+          } else {
+            nl(ind);
+            out += "else";
+            nl(ind + 1);
+            body(ind + 1);
+          }
+          first = false;
+          pc = bend;
+        }
+        nl(ind);
+        out += "fi";
+      }
+      break; case WC_WHILE:
+        out += type == WC_WHILE_UNTIL ? "until " : "while ";
+        body(ind + 1);
+        do_done(ind);
+      break; case WC_FOR: case WC_SELECT: {
+        bool select = wc_code(head) == WC_SELECT;
+        out += select ? "select " : "for ";
+        out += words();
+        if (type == WC_FOR_IN) out += " in " + words();
+        // zsh 5.9 prints a select body without the extra indent.
+        do_done(ind, not select);
+      }
+      break; case WC_FOR_COND: {
+        auto a = next_str(); auto b = next_str(); auto c = next_str();
+        out += "for ((" + a + "; " + b + "; " + c + ")) do";
+        nl(ind + 1);
+        body(ind + 1);
+        nl(ind);
+        out += "done";
+      }
+      break; case WC_REPEAT:
+        out += "repeat " + next_str();
+        do_done(ind);
+      break; case WC_CASE: {
+        out += "case " + next_str() + " in";
+        while (pc < end) {
+          WordCode  a    = fetch();
+          s::size_t aend = pc + wc_cmd_skip(a);
+          str       pats = words();
+          for (char& ch : pats) if (ch == ' ') ch = '|';
+          nl(ind + 1);
+          out += "(" + pats + ") ";
+          body(ind + 2);
+          WordCode t = wc_cmd_type(a);
+          out += t == WC_CASE_FALL ? " ;&" : t == WC_CASE_TESTNEXT ? " ;|" : " ;;";
+          pc = aend;
+        }
+        nl(ind);
+        out += "esac";
+      }
+      break; case WC_SUBSH: case WC_CURSH: {
+        bool sub = wc_code(head) == WC_SUBSH;
+        out += sub ? "(" : "{";
+        nl(ind + 1);
+        body(ind + 1);
+        nl(ind);
+        out += sub ? ")" : "}";
+      }
+      break; case WC_TRY:
+        out += "{";
+        nl(ind + 1);
+        body(ind + 1);
+        nl(ind);
+        out += "} always {";
+        nl(ind + 1);
+        body(ind + 1);
+        nl(ind);
+        out += "}";
+      break; case WC_FUNCDEF:
+        if (type == WC_FUNCDEF_ANON) {
+          out += "() {";
+          nl(ind + 1);
+          body(ind + 1);
+          nl(ind);
+          out += "}";
+          str args = words();
+          if (not args.empty()) out += " " + args;
+        } else {
+          out += words() + " () {";
+          nl(ind + 1);
+          body(ind + 1);
+          nl(ind);
+          out += "}";
+        }
+      break; case WC_ARITH: {
+        str e = next_str();
+        auto b = e.find_first_not_of(" \t\n");
+        auto l = e.find_last_not_of(" \t\n");
+        out += "(( " + (b == str::npos ? str{} : e.substr(b, l - b + 1)) + " ))";
+      }
+      break; case WC_COND: --pc; out += "[[ " + cond() + " ]]";
+      break; default: ;
+    }
+    pc = end;
+  }
+};
+
 }  // namespace
 
 str pipeline_text(const CompiledProgram& prog, s::size_t pc) {
@@ -402,6 +669,19 @@ vec<str> pipeline_stage_texts(const CompiledProgram& prog,
 
 str sublist_text(const CompiledProgram& prog, s::size_t pc) {
   return Decompiler{prog, pc}.sublist();
+}
+
+}  // namespace jfsh
+
+namespace jfsh {
+
+str function_text(strv names, const CompiledProgram& body) {
+  Pretty pr{body, 0, {}, {}};
+  pr.out = str(names) + " () {\n\t";
+  pr.body(1);
+  pr.flush_docs();
+  pr.out += "\n}";
+  return pr.out;
 }
 
 }  // namespace jfsh

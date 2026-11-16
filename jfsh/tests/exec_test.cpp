@@ -69,7 +69,7 @@ TEST(Exec, MultiLineProgramsAndComments) {
 
 TEST(Exec, InteractiveCommentsNeedTheOption) {
   Shell sh;
-  sh.opts.assign(OPT_STDIN, true);  // interactive
+  sh.opts.assign(OPT_INTERACTIVE, true);
   EXPECT_EQ(sh.run("echo a # b").out, "a # b\n");
   sh.opts.assign(OPT_INTERACTIVECOMMENTS, true);
   EXPECT_EQ(sh.run("echo a # b").out, "a\n");
