@@ -531,13 +531,14 @@ TEST(Alias, RecursionTrailingBlankGlobalSuffix) {
 TEST(Alias, ParsedWholeForDashCLineByLineForScripts) {
   Shell sh;
   // zsh -c parses the whole string first, so an alias it defines doesn't
-  // apply in it; a script is parsed a line at a time.
-  EXPECT_EQ(sh.run("alias x=echo\nx hi").rc, 127);
-  sh.run("unalias x");
-  EXPECT_EQ(sh.run_script("alias x=echo\nx hi\n").out, "hi\n");
+  // apply in it; a script is parsed a line at a time. The alias names must
+  // not be commands on $PATH (x-cmd installs an `x`).
+  EXPECT_EQ(sh.run("alias jfsh_ax=echo\njfsh_ax hi").rc, 127);
+  sh.run("unalias jfsh_ax");
+  EXPECT_EQ(sh.run_script("alias jfsh_ax=echo\njfsh_ax hi\n").out, "hi\n");
   // Function bodies keep the aliases of when they were defined.
-  EXPECT_EQ(sh.run_script("f() { y in-f; }\nalias y=echo\nf\n").rc, 127);
-  EXPECT_EQ(sh.run_script("unsetopt aliases\nx hi\nsetopt aliases\nx back\n").out, "back\n");
+  EXPECT_EQ(sh.run_script("f() { jfsh_ay in-f; }\nalias jfsh_ay=echo\nf\n").rc, 127);
+  EXPECT_EQ(sh.run_script("unsetopt aliases\njfsh_ax hi\nsetopt aliases\njfsh_ax back\n").out, "back\n");
 }
 
 TEST(Alias, ListingAndUnalias) {
