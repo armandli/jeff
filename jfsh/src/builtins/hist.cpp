@@ -89,7 +89,8 @@ int fc_common(vec<str>& args, ExecContext& ctx, bool list_mode) {
     if (file.empty())
       if (auto p = ctx.params.lookup("HISTFILE"); p and p->get().is_set()) file = p->get().scalar();
     if (file.empty()) return builtin_error(cmd, "no history file");
-    auto r = o.has('R') ? hist.load(file) : hist.save(file);
+    auto r = o.has('R') ? hist.load(file)
+           : hist.save(file, o.has('A') ? HistSave::Append : HistSave::Rewrite);
     if (not r) return builtin_error(cmd, r.error().message);
     return 0;
   }

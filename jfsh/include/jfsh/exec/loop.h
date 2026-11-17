@@ -11,6 +11,7 @@
 
 #include <jfsh/core/aliases.h>
 #include <jfsh/exec/executor.h>
+#include <jfsh/history/history.h>
 
 #ifndef JFSH_SYSCONFDIR
 #define JFSH_SYSCONFDIR "/etc"
@@ -66,6 +67,11 @@ void run_sched(Executor& ex, s::time_t now);
 // Checks $mailpath (or $MAILPATH, or $MAIL) and reports files that changed
 // since the last check, on stderr.
 void check_mail(Executor& ex, s::time_t now);
+
+// The history settings as the options and $HISTSIZE, $SAVEHIST,
+// $HISTFILE and $histchars have them now.  $HISTSIZE defaults to 1000,
+// $SAVEHIST to $HISTSIZE.
+HistOptions history_options(const ExecContext& ctx);
 
 }  // namespace jfsh
 

@@ -8,6 +8,7 @@ add_executable(jfsh_tests
   builtins_test.cpp
   compound_test.cpp
   cond_test.cpp
+  editor_test.cpp
   exec_test.cpp
   glob_test.cpp
   history_test.cpp
@@ -17,14 +18,16 @@ add_executable(jfsh_tests
   math_test.cpp
   params_test.cpp
   parser_test.cpp
+  prompt_test.cpp
   signals_test.cpp
   startup_test.cpp
   subst_test.cpp
 )
 target_link_libraries(jfsh_tests PRIVATE
-  # jfsh_exec brings jfsh_parser, jfsh_lexer, jfsh_core, jfsh_glob and jfsh_builtins; naming
-  # them here too put them on the link line twice, which Apple's ld warns about.
-  jfsh_exec jfsh_history jfsh_agent
+  # jfsh_exec brings jfsh_parser, jfsh_lexer, jfsh_core, jfsh_glob, jfsh_builtins,
+  # jfsh_history, jfsh_prompt and jfsh_editor; naming them here too put them on the
+  # link line twice, which Apple's ld warns about.
+  jfsh_exec jfsh_agent
   GTest::gtest_main
   jfsh_compiler_options
 )

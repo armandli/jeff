@@ -6,6 +6,8 @@
 // (and RPROMPT / RPS1 / RPS2) percent-escape sequences, colors, and
 // conditional substrings to produce the final display string.
 
+#include <cstdint>
+
 #include <string>
 #include <string_view>
 
@@ -15,6 +17,13 @@
 #include <jfsh/core/types.h>
 
 namespace jfsh {
+
+// An expanded prompt marks the text that takes no room on the screen
+// (escape sequences: %B, %F{…}, %{…%}) with these two bytes, as readline
+// does, so the editor can tell how wide the prompt is.  Strip them before
+// writing the prompt anywhere (strip_markers, or the editor's refresh).
+inline constexpr char PROMPT_ZW_START = '\x01';
+inline constexpr char PROMPT_ZW_END   = '\x02';
 
 struct PromptVars {
   str PS1;
@@ -26,37 +35,59 @@ struct PromptVars {
   str SPROMPT;
 };
 
+// What the prompt needs from the rest of the shell.  Each hook is
+// optional; without it the value comes from the parameters ($?, $LINENO,
+// $0) or is empty.
+struct PromptHooks {
+  // PROMPT_SUBST: parameter, command and arithmetic expansion of the
+  // prompt before the percent escapes.
+  func<str(strv)> subst;
+  func<int()>     job_count;     // %j
+  func<str()>     script_name;   // %N: the script, sourced file or function
+  func<int()>     eval_depth;    // %e
+};
+
 struct PromptRenderer {
   PromptRenderer(const ParamTable& params, const OptionState& opts)
     : mParams(params), mOpts(opts) {
     reload();
   }
 
-  // Returns the rendered string; with strip_escapes=true, ANSI sequences
-  // are removed (for width calculation).
-  str render(strv prompt_str,
-             bool strip_escapes = false) const;
+  void set_hooks(PromptHooks hooks) { mHooks = s::move(hooks); }
 
-  str primary()      const { return render(mVars.PS1); }
-  str continuation() const { return render(mVars.PS2); }
-  str right()        const { return render(mVars.RPS1); }
-  str xtrace()       const { return render(mVars.PS4); }
+  // Expands `prompt_str`, with the zero-width parts between
+  // PROMPT_ZW_START and PROMPT_ZW_END.
+  str expand(strv prompt_str) const;
 
+  // Expands `prompt_str` for output (`print -P`, PS4): markers removed.
+  // With strip_escapes the escape sequences go too, leaving the text.
+  str render(strv prompt_str, bool strip_escapes = false) const;
+
+  str primary()            const { return expand(mVars.PS1); }
+  str continuation()       const { return expand(mVars.PS2); }
+  str right()              const { return expand(mVars.RPS1); }
+  str right_continuation() const { return expand(mVars.RPS2); }
+  str select()             const { return expand(mVars.PS3); }
+  str xtrace()             const { return expand(mVars.PS4); }
+
+  // Reads PS1 … SPROMPT from the parameters again.
   void reload();
 
-  static int visual_width(strv rendered) noexcept;
+  // Removes the markers, keeping the zero-width text between them (or,
+  // with drop_zero_width, dropping it).
+  static str strip_markers(strv expanded, bool drop_zero_width = false);
 
-protected:
-  // Returns (expanded_string, chars_consumed).
-  s::pair<str, int>
-  expand_percent(strv src, int pos) const;
-
-  str do_subst(strv s) const;
+  // Columns the last line of an expanded prompt takes: zero-width parts
+  // and escape sequences don't count.
+  static int visual_width(strv expanded) noexcept;
 
 private:
-  const ParamTable& mParams;
-  [[maybe_unused]] const OptionState& mOpts;   // not used yet
+  const ParamTable&  mParams;
+  const OptionState& mOpts;
   PromptVars         mVars;
+  PromptHooks        mHooks;
+
+  friend struct PromptExpander;
 };
 
 }  // namespace jfsh

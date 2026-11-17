@@ -23,6 +23,8 @@
 #include <jfsh/builtins/cond.h>
 #include <jfsh/builtins/math.h>
 #include <jfsh/core/aliases.h>
+#include <jfsh/editor/completion.h>
+#include <jfsh/editor/zle.h>
 #include <jfsh/exec/subst.h>
 #include <jfsh/glob/glob.h>
 #include <jfsh/lexer/input.h>
@@ -40,9 +42,18 @@ Executor::Executor(ExecContext& ctx) : mCtx(ctx) {
     Builtins.register_all();
     initialized = true;
   }
+  if (not mCtx.zle) {
+    mOwnZle        = s::make_unique<Zle>();
+    mOwnCompletion = s::make_unique<CompletionEngine>(mCtx.params);
+    mOwnZle->completion = mOwnCompletion.get();
+    mCtx.zle = mOwnZle.get();
+  }
+  install_zle_hooks(*this);
 }
 
-Executor::~Executor() = default;
+Executor::~Executor() {
+  if (mCtx.zle == mOwnZle.get()) mCtx.zle = nullptr;
+}
 
 int Executor::exec(const CompiledProgram& prog) {
   if (prog.empty()) return 0;
@@ -1042,7 +1053,7 @@ int Executor::exec_select(ExecState& es, WordCode head) {
   for (;;) {
     if (menu) show_menu();
     auto ps3 = mCtx.params.lookup("PS3");
-    str prompt = (ps3 and ps3->get().is_set()) ? ps3->get().scalar() : "?# ";
+    str prompt = expand_prompt((ps3 and ps3->get().is_set()) ? ps3->get().scalar() : "?# ");
     s::fprintf(stderr, "%s", prompt.c_str());
     s::fflush(stderr);
     auto line = read_line_fd0();
@@ -1862,18 +1873,13 @@ static str trace_quote(strv w) {
   return out + "'";
 }
 
-// TODO(M9): PS4 is printed as is; it should go through prompt expansion
-//   (zsh's default is `+%N:%i> `).
+// PS4 goes through prompt expansion; zsh's default is `+%N:%i> `.
 void Executor::trace(const vec<str>& args,
                      const vec<Assignment>&  assigns) {
   auto ps4 = mCtx.params.lookup("PS4");
-  str line = (ps4 and ps4->get().is_set()) ? ps4->get().scalar() : "+ ";
-  bool first = true;
-  auto add = [&](const str& word) {
-    if (not first) line += ' ';
-    line += word;
-    first = false;
-  };
+  str line = expand_prompt((ps4 and ps4->get().is_set()) ? ps4->get().scalar() : "+%N:%i> ");
+  // As zsh: each assignment is followed by a space, the words are
+  // separated by one.
   for (const auto& a : assigns) {
     str value = trace_quote(a.value);
     if (a.array) {
@@ -1881,9 +1887,14 @@ void Executor::trace(const vec<str>& args,
       for (const auto& e : a.elements) value += ' ' + trace_quote(e);
       value += " )";
     }
-    add(a.name + (a.append ? "+=" : "=") + value);
+    line += a.name + (a.append ? "+=" : "=") + value + " ";
   }
-  for (const auto& w : args) add(trace_quote(w));
+  bool first = true;
+  for (const auto& w : args) {
+    if (not first) line += ' ';
+    line += trace_quote(w);
+    first = false;
+  }
   s::fprintf(stderr, "%s\n", line.c_str());
 }
 
@@ -2331,6 +2342,29 @@ pid_t Executor::fork_child(Pid pgid, bool foreground, ChildKind kind) {
 str Executor::current_job_text() const {
   if (not mPipeProg or mPipePc >= mPipeProg->prog.size()) return {};
   return pipeline_text(*mPipeProg, mPipePc);
+}
+
+PromptHooks Executor::prompt_hooks() {
+  PromptHooks h;
+  h.subst = [this](strv text) -> str {
+    Expander x(*this, mCtx);
+    auto r = x.heredoc(text);
+    return r ? *r : str(text);
+  };
+  h.job_count   = [this] {
+    int n = 0;
+    mCtx.jobs.for_each([&](const Job&) { ++n; });
+    return n;
+  };
+  h.script_name = [this] { return mCtx.source_name.empty() ? mCtx.arg0 : mCtx.source_name; };
+  h.eval_depth  = [this] { return s::max(0, mStringDepth - 1); };
+  return h;
+}
+
+str Executor::expand_prompt(strv prompt) {
+  PromptRenderer r(mCtx.params, mCtx.opts);
+  r.set_hooks(prompt_hooks());
+  return r.render(prompt);
 }
 
 void Executor::update_window_size() {

@@ -2,9 +2,9 @@
 
 Status as of 2026-11-16: M1 (simple commands), M2 (pipelines, redirections, lists,
 background jobs), M3 (word expansion), M4 (compound commands and functions), M5
-(arithmetic, `[[ ]]`, `test`), M6 (job control, signals, traps), M7 (builtins) and M8
-(startup files, invocation, the interactive loop's hooks) are done, along with the part
-of M0 they needed.
+(arithmetic, `[[ ]]`, `test`), M6 (job control, signals, traps), M7 (builtins), M8
+(startup files, invocation, the interactive loop's hooks) and M9 (line editor,
+completion, prompt, history) are done, along with the part of M0 they needed.
 
 jfsh builds on macOS and Linux and has gtest coverage for the pieces that work. It runs
 **simple commands**, pipelines and background jobs joined by `;`, newlines, `&&`, `||` and
@@ -18,11 +18,14 @@ prompt (with `PS2`). Interactively it has job control (Ctrl-Z, `fg`, `bg`, `jobs
 notices, Ctrl-C that ends the command line but not the shell), and `trap`, `kill` and
 `wait` work in every shell. The builtins are real (M7): options (`set`, `setopt`,
 `emulate`), sourcing, aliases, the directory stack, `print`/`printf`, history,
-`whence` and friends; only the ones that need the line editor or modules (`bindkey`,
-`zle`, `vared`, `zmodload`, `zpty`, `compinit`) say `not implemented`. It reads zsh-style
-startup files (`.jfshenv`, `.jfshrc`, …), takes zsh's command-line options, and runs
-`precmd`/`preexec`/`periodic`/`zshexit` hooks, `sched` events and mail checks (M8).
-The System 1 router and the LLM agent layer work end to end.
+`whence` and friends; only the ones that need modules (`zmodload`, `zpty`) say `not
+implemented`. It reads zsh-style startup files (`.jfshenv`, `.jfshrc`, …), takes zsh's
+command-line options, and runs `precmd`/`preexec`/`periodic`/`zshexit` hooks, `sched`
+events and mail checks (M8). The line editor has zsh's emacs and vi keymaps,
+`bindkey`, `zle` user widgets and `vared`; Tab completes commands, files, parameters and
+users, and `compdef` functions; prompts have zsh's escapes; `!` history expansion works
+anywhere in a line, and the history file is zsh's format (M9). The System 1 router and
+the LLM agent layer work end to end.
 
 This file has two parts:
 
@@ -569,65 +572,141 @@ the `jfsh` binary run with arguments) and the M8 cases in `tests/interactive_tes
 
 ### M9. Line editor (ZLE), completion, prompt, history
 
-**Line editor** [refresh/*], [vi/*]:
-- Make the keymap data-driven: `bindkey` → `Keymap` → named widgets. Today
-  `bind_key`, `register_widget` and both `install_*_bindings` are empty and keys are
-  hard-coded in `read_line`.
-- Emacs widgets:
-  - Ctrl-B/F/A/E and Alt-B/F for movement;
-  - Ctrl-D (delete-char-or-list), Ctrl-H/DEL, Ctrl-W, Alt-D, Ctrl-K, Ctrl-U, Ctrl-Y (yank);
-  - Ctrl-T, Ctrl-L (clear-screen), Ctrl-R/Ctrl-S (incremental history search), Alt-.
-    (insert-last-word), Ctrl-X Ctrl-E (edit in `$EDITOR`);
-  - Ctrl-C aborts the line (done with M6, B24);
-  - Home, End and Delete keys.
-- Vi mode: insert/normal/visual/replace, motions, operators, text objects, registers,
-  counts, undo/redo, and history `k`/`j`, all per [vi/*].
-- **UTF-8:** the cursor moves by code point and width comes from `wcwidth`, so wide and
-  combining characters work (bug B25).
-- **Rendering:** multi-line buffers and wrapped prompts, `RPROMPT`, re-layout on
-  `SIGWINCH` (bugs B26, B27); bracketed paste; `zle -N` user widgets; `vared`.
-- **Syntax highlighting** of commands and strings, and an **autosuggestion** from
-  history, are both optional.
+**Done.** Expected behaviour comes from zsh 5.9 (`zsh -f`, `zsh -f -i`), which could be
+run on the machine M9 was written on: default keymaps and `bindkey` listings, `print -P`
+output, bang expansions and xtrace lines were compared with it.
+- **Keymaps and widgets** (`src/editor/keymap.cpp`, `include/jfsh/editor/zle.h`): keys
+  are looked up in data-driven keymaps (`emacs`, `viins`, `vicmd`, `visual`, `viopp`,
+  `isearch`, `command`, `.safe`; `main` is another name for emacs or viins) holding
+  zsh's default bindings, plus Home/End/Delete, Shift-Tab and Ctrl-X Ctrl-E. A
+  sequence that is a prefix of a longer binding waits `$KEYTIMEOUT`; unbound escape
+  sequences are swallowed, not inserted. `main` is viins when `$VISUAL`/`$EDITOR`
+  mentions vi, as in zsh. Keymaps live in the `Zle` object (one per shell, on
+  `ExecContext::zle`), so a .jfshrc can set them up before the first prompt.
+- **Emacs widgets** (`src/editor/editor.cpp`): movement by character, word (zsh's
+  `forward-word`, with `$WORDCHARS`) and line; deleting and killing with a kill ring
+  (kills in a row join, `yank`/`yank-pop`); transpose and case; mark and region;
+  undo/redo (typing is one step); numeric arguments (`Alt-digits`, `neg-argument`,
+  `universal-argument`); `quoted-insert`; overwrite mode; bracketed paste; history
+  (`up/down-line-or-history`, `history-search-*`, `history-beginning-search-*`,
+  incremental search with `^R`/`^S`/`^G`/backspace, `insert-last-word`,
+  `copy-prev-word`, `infer-next-history`); `push-line`/`get-line`, `accept-and-hold`,
+  `accept-line-and-down-history`; `expand-history`/`magic-space`;
+  `edit-command-line` (`$VISUAL`/`$EDITOR`); `execute-named-cmd`; `run-help` and
+  `which-command`; `clear-screen`. Ctrl-D on an empty line is EOF (IGNORE_EOF says
+  "use 'exit' to exit").
+- **Vi mode** (`src/editor/vi.cpp`): insert/normal/visual (`v`, `V`)/replace (`R`);
+  motions `h l w W b B e E ge gE 0 ^ $ | f F t T ; , %`, history `k j + - G / ? n N`;
+  operators `d c y gu gU g~ > <` with a motion, doubled for lines, or a text object
+  (`iw aw iW aW i" a" i' a' i( a( i[ a[ i{ a{ i< a<`); `x X D C S s Y p P r ~ J o O i a
+  I A`; counts on both the operator and the motion (`2d3w`); registers `"a`–`"z`
+  (`"A` appends, `"_` discards); marks `m` `` ` `` `'`; `u` and `^R`; `.` repeats the
+  last change, an insert included. Leaving insert mode steps back a character, and the
+  cursor stays on the line's last character in vicmd.
+- **UTF-8** (`src/core/utf8.cpp`, B25): the cursor moves by character (a base
+  character and its combining marks are one), widths come from `wcwidth()` with a
+  built-in table for characters the locale doesn't know. `main` sets `LC_CTYPE` from
+  the environment.
+- **Rendering** (`src/editor/refresh.cpp`, B26, B27): the prompt is expanded once per
+  line; each refresh draws prompt and buffer again from the prompt's first row,
+  breaking rows itself (so it always knows where the cursor is): multi-line prompts and
+  buffers, wrapped lines, wide characters, control characters as `^X`, the region in
+  standout, `RPROMPT`/`RPS1` on the last prompt row when the line fits
+  (TRANSIENT_RPROMPT drops it on accept), messages and completion lists below the
+  line. The width is read on every refresh, so SIGWINCH means drawing again.
+  PROMPT_CR/PROMPT_SP mark output that didn't end in a newline with
+  `$PROMPT_EOL_MARK`, as zsh does. A job notice or trap output while typing clears the
+  line first and draws it again below (`Editor::trash`).
+- **`bindkey`** (`src/builtins/zle.cpp`): `-e -v -a -M -l -L -N -A -D -d -r -s -R -p`,
+  listing in zsh's format (ranges like `" "-"~" self-insert`, `bindkey -L` commands),
+  zsh's key notation (`^X`, `\e`, `\M-x`, `\C-x`, `\NNN`, `\xNN`).
+- **`zle`**: `-N` (user widgets, which may replace builtin ones; `.name` is always the
+  builtin), `-D`, `-A`, `-l [-L] [-a]`, `-M`, `-U`, `-K`, `-R`, `-I`, and `zle widget`
+  from inside a widget. A user widget's function sees `$BUFFER`, `$CURSOR`, `$LBUFFER`,
+  `$RBUFFER`, `$PREBUFFER`, `$WIDGET`, `$LASTWIDGET`, `$KEYS`, `$KEYMAP`, `$NUMERIC`,
+  `$HISTNO`, `$MARK`, `$CUTBUFFER`, `$BUFFERLINES`, `$REGION_ACTIVE` as special
+  parameters bound to the editor, so assigning them edits the line at once.
+- **`vared [-p prompt] [-r rprompt] [-c] [-a|-A] [-h] [-M keymap] name`**.
+- **Completion** (`src/editor/completion.cpp`, B28, B52): the word at the cursor is
+  found by a small tokenizer (quotes, backslashes, separators, redirections, `$(`,
+  precommand modifiers, assignments). Contexts: `$name` and `${name` → parameters (with
+  the closing `}`); `~user` → users; command position → builtins, functions, aliases,
+  reserved words and `$PATH` executables (executable only, each name once, sorted,
+  cached per directory mtime), or files when the word has a `/`; after `cd`, `pushd`,
+  `rmdir` → directories; otherwise files, with `/` after directories, LIST_TYPES
+  markers in lists, and quoting (backslashes, or inside an open `'`/`"`, closed on a
+  unique match). Tab inserts the longest common prefix; a Tab that adds nothing lists
+  (AUTO_LIST, LIST_AMBIGUOUS, LIST_ROWS_FIRST, columns, `$LISTMAX` with "do you wish to
+  see all N possibilities"); the next one starts menu completion (AUTO_MENU,
+  MENU_COMPLETE, Shift-Tab goes back). COMPLETE_IN_WORD is honoured.
+  `compdef fn cmd…` / `compdef -d` hand a command's arguments to a shell function,
+  which sees `$words`, `$CURRENT`, `$PREFIX` and adds matches with `compadd [-S suf] [-P
+  pre] [-d disp] [-a] [-U] -- words`, or `_files [-/] [-g pat]`, `_directories` and
+  `_command_names`. `compinit` is accepted and does nothing.
+- **Prompt** (`src/prompt/prompt.cpp`, B34–B37, B61): numeric arguments (`%2~`,
+  `%-1/`, `%3c`, `%2m`); `%~` replaces `$HOME` (from the shell's parameters) only at a
+  component boundary; `%B %b %U %u %S %s %E`, `%F{…}`/`%K{…}` with names, 0–255 and
+  `#rrggbb`, `%f %k` (with zsh's re-emission of colours after `%B`/`%b`); `%? %j %L %h
+  %! %i %I %N %x %e %y %l %n %m %M %# %v %d %/ %c %. %C`; `%D{fmt}` (with zsh's `%f %K
+  %L`), `%D %T %t %@ %* %w %W`; `%(x.true.false)` with every test zsh has; truncation
+  `%N<…<`, `%N>…>`, `%N[…]`, ended by `%<<` or the enclosing group; `%{…%}`; unknown
+  escapes expand to nothing. PROMPT_SUBST (parameter, command and arithmetic
+  expansion first; quotes kept), PROMPT_BANG and PROMPT_PERCENT. Zero-width parts are
+  marked so the editor knows the prompt's width. `print -P`, PS3 and PS4 use the same
+  expander; PS4 now defaults to zsh's `+%N:%i> ` (and an assignment's trace ends in a
+  space, as zsh's does).
+- **History** (`src/history/history.cpp`): bang expansion anywhere in the line: `!!`,
+  `!N`, `!-N`, `!str`, `!?str?`, `!#`, `!{…}`, `^old^new^`, word designators (`:0 ^ $ * %
+  x-y -y x* x-`, the colon optional before `^ $ * %`), modifiers (`:h :t :r :e :s :gs :&
+  :g& :q :x :u :l :a :A :p`), `$histchars`; nothing expands inside single quotes,
+  after a backslash, or before a blank, `=` or `(`. The interactive loop prints an
+  expanded line before running it; HIST_VERIFY puts it back in the editor; `:p` only
+  prints it. Errors are zsh's (`no such event: N`, `event not found: str`, `no such
+  word in event`, `substitution failed`, `illegal modifier: z`).
+- **History file**: reads and writes zsh's format: EXTENDED_HISTORY lines (`: start:
+  elapsed;cmd`), multi-line entries as `\` continuations, and zsh's metafied bytes.
+  APPEND_HISTORY appends only entries not yet in the file (B5) and then cuts the file
+  back to `$SAVEHIST`; without it the file is rewritten (HIST_SAVE_NO_DUPS honoured).
+  `fcntl` locks while reading and writing. INC_APPEND_HISTORY writes each line as it is
+  entered, INC_APPEND_HISTORY_TIME after it ran (with its time), SHARE_HISTORY also
+  reads what other shells wrote before each prompt. `fc -W` rewrites, `fc -A` appends.
+- **History options**, read from the options and `$HISTSIZE` (default 1000),
+  `$SAVEHIST` (default `$HISTSIZE`), `$HISTFILE` before each prompt: HIST_IGNORE_SPACE,
+  HIST_IGNORE_DUPS, HIST_IGNORE_ALL_DUPS (drops the older copy, B58), HIST_NO_STORE
+  (drops `history`/`fc -l` lines, B40), HIST_REDUCE_BLANKS, HIST_FIND_NO_DUPS (in the
+  editor's searches), HIST_VERIFY, BANG_HIST.
+- Without a terminal (`jfsh -i < file`) the prompt goes to stderr and the line is read
+  unbuffered (B54).
+- Tests: `tests/editor_test.cpp` drives an `Editor` through a pty in process and feeds
+  its output to a small terminal emulator, so the tests check the screen and cursor;
+  `tests/prompt_test.cpp`; bang expansion and history-file cases in
+  `tests/history_test.cpp`; Tab, `^R`, bang expansion and .jfshrc bindings end to end in
+  `tests/interactive_test.cpp`; history file and prompts without a terminal in
+  `tests/startup_test.cpp`.
 
-**Completion** [refresh/completion], [builtin/compinit]:
-- Wire `CompletionEngine` into `main.cpp`, which currently installs a completer that
-  returns nothing.
-- Complete the word at the cursor, not the whole line (bug B28).
-- Contexts: command position → builtins, functions, aliases and `PATH` executables
-  (deduplicated and executable-only); after `$` → parameters; `~` → users; otherwise
-  files, with `/` added to directories and quoting of special characters.
-- Insert the longest common prefix; on a second Tab, list candidates in columns, with a
-  menu-select option.
-- `compdef` / `_arguments`-style per-command specs; reading zsh completion functions is
-  a stretch goal.
-
-**Prompt** [prompt/subst]:
-- Numeric arguments (`%1~`, `%2d`): the default prompt currently renders as
-  `user@host 1~ %` (bug B34).
-- Escapes:
-  - text and colour: `%B %b %U %u %S %s`, `%F{color}`, `%K{color}`, `%f %k`, 256-colour
-    and `#rrggbb` (bug B35);
-  - values: `%?`, `%j`, `%L`, `%h`/`%!` (real history number, bug B37), `%y`/`%l`, `%d`;
-  - date formats `%D{fmt}`, `%t`, `%@`;
-  - conditionals `%(x.true.false)`, truncation `%<…<` and `%>…>`;
-  - `%{…%}`, so zero-width sequences are excluded from the width.
-- `PROMPT_SUBST`: expand parameters, commands and arithmetic in the prompt before the
-  percent escapes.
-
-**History** [hist/expand]:
-- **Bang expansion anywhere in the line**, not only at the start: `!!`, `!N`, `!-N`,
-  `!str`, `!?str?`, `!#`, `^old^new`, word designators and modifiers, `HIST_VERIFY`, and
-  no expansion inside single quotes.
-- **History file:**
-  - read zsh `EXTENDED_HISTORY` lines (`: ts:elapsed;cmd`) and multi-line entries,
-    stored with `\` continuations;
-  - write only new entries when appending (bug B5 makes the file double every session);
-  - respect `SAVEHIST`;
-  - use `fcntl` locking;
-  - support `SHARE_HISTORY` / `INC_APPEND_HISTORY`.
-- **Remaining options:** `HIST_IGNORE_SPACE`, `HIST_NO_STORE`, `HIST_REDUCE_BLANKS`,
-  `HIST_SAVE_NO_DUPS`, `HIST_FIND_NO_DUPS`, and `HISTSIZE`/`HISTFILE` read from
-  parameters (`main.cpp` hard-codes 1000).
+**Left**
+- Syntax highlighting and autosuggestions (optional in the plan) aren't done.
+- Completion: no `_arguments`/`_describe`-style specs, no option or `--long` completion,
+  no reading of zsh's own completion functions, no menu selection (`menuselect`
+  keymap, arrow keys in the list), no named directories (`hash -d`) or `cdpath`; a
+  compdef function's `compadd` options beyond `-S -P -d -a -U` are accepted and
+  ignored. `expand-word`, `list-expand` and `spell-word` only beep, so Tab doesn't
+  expand globs or `$vars` in place.
+- `zle -F` (fd handlers) and `zle -T` say `not implemented`; `zle-line-init`,
+  `zle-line-finish` and `zle-keymap-select` hooks aren't called; `$zle_highlight` and
+  `$region_highlight` are ignored; `vared -i/-f` (init/finish widgets) are accepted and
+  ignored; vared can't be used inside a widget.
+- Vi: no `:` ex commands beyond `execute-named-cmd`; `.` repeats with the original
+  count only; `aa`/`ia` (shell words) are treated as blank-delimited words.
+- Rendering redraws everything on every key: fine for normal lines, slow for a buffer
+  of thousands of characters over a slow link. After SIGWINCH, a terminal that reflows
+  the old lines can leave stale rows above a multi-row prompt. `%G` is ignored.
+- `sched -o` still has no line to clear (the events don't run while the editor waits).
+- History: HIST_EXPIRE_DUPS_FIRST, HIST_LEX_WORDS, HIST_SAVE_BY_COPY (the file is
+  rewritten in place, under the lock), HIST_NO_FUNCTIONS and CSH_JUNKIE_HISTORY aren't
+  honoured; `fc -p`/`-P` (history stacks) aren't implemented; HIST_IGNORE_SPACE drops
+  the line at once instead of keeping it until the next one.
+- `%_` (parser state) is always empty, so PS2's default `%_> ` is `> `.
 
 ### Glob, modules, misc
 
@@ -699,7 +778,8 @@ the `jfsh` binary run with arguments) and the M8 cases in `tests/interactive_tes
 - A zsh compatibility corpus: `tests/compat/*.zsh` scripts run under both `zsh` and
   `jfsh`, with their outputs compared. Generate expected outputs from zsh in CI.
 - Interactive tests: drive the editor through a pty (`forkpty`) and assert on screen
-  output.
+  output. Since M9, `tests/editor_test.cpp` does this in process (an `Editor` on a pty
+  plus a small terminal emulator) and `tests/interactive_test.cpp` with the binary.
 - The two former `DISABLED_` tests (`GlobPatternMatch.BracketExpressions`,
   `Lexer.SubstitutionsStayOneWord`) are enabled since M3.
 - `tests/compound_test.cpp` covers M4 end to end, and `tests/cond_test.cpp` and
@@ -716,6 +796,9 @@ the `jfsh` binary run with arguments) and the M8 cases in `tests/interactive_tes
 - Run the suite under ASan/UBSan in CI. jfsh's Debug build has no sanitizer flags yet,
   although the top-level build does. (The suite passed under ASan + UBSan + LeakSanitizer
   when M1 landed, using a scratch build with `-fsanitize=address,undefined`.)
+- When M9 landed the whole suite (448 tests) passed under ASan + UBSan on macOS (Apple
+  clang, Debug, scratch build). Homebrew's clang 23 couldn't build it on that machine
+  (its libc++ headers don't find the SDK's), and g++ has no ASan on macOS.
 - On macOS under ASan + UBSan (checked when M5 landed), every test passes except
   `Subst.ProcessSubstitutionIsLeftToTheExecutor`, and that one only in a full run: alone,
   or with any single other test left out, it passes, and it passes in the plain Debug
@@ -739,7 +822,6 @@ Severity:
 | ID | Location | Bug | Evidence |
 |---|---|---|---|
 | B4 | `src/core/jobs.cpp:18` | On an empty table, `find_free_slot()` returns `mTable.size()` (0), so the first job gets id 0. Id 0 means "free slot", so that job is invisible to `get()`, `for_each()`, notifications and `reap()`. | **confirmed**: first `alloc` → id 0, `get(0)` = missing |
-| B5 | `src/history/history.cpp:122` | `save()` in append mode, the default, writes **all** entries, including those just loaded from the file, so `HISTFILE` doubles every session (1 → 3 → 7 → 15 …). | **confirmed**: 3 sessions × 1 command = 7 lines |
 
 ### High
 
@@ -753,23 +835,12 @@ Severity:
 
 | ID | Location | Bug | Evidence |
 |---|---|---|---|
-| B25 | `src/editor/editor.cpp:96` | The cursor and backspace work on bytes, so editing any multi-byte UTF-8 character corrupts the line. `PromptRenderer::visual_width` (`src/prompt/prompt.cpp:143`) counts bytes too. | code reading |
-| B26 | `src/editor/editor.cpp:146` | `refresh_display` rewrites the whole prompt with a single `\r`, so prompts containing newlines are reprinted on every keystroke and lines wider than the terminal break. It also recomputes the prompt (`getpwuid`, `gethostname`, `getcwd`) on every key. | code reading |
-| B27 | `src/editor/editor.cpp` | The editor doesn't re-layout on `SIGWINCH`: since M6 the shell updates `$COLUMNS`/`$LINES` and redraws the line after a signal, but `Editor::terminal_width()` is never called. | code reading |
-| B28 | `src/editor/editor.cpp:115` | Tab completion inserts `candidates[0].substr(mBuf.cursor)`, using the **line** cursor as an offset into a **word** candidate. That only works when the word starts at column 0. `main.cpp:184` installs a completer that returns nothing anyway. | code reading |
-| B34 | `src/prompt/prompt.cpp:128` | Numeric prompt arguments aren't parsed: the default `PS1` `%n@%m %1~ %# ` renders as `user@host 1~ % `. | **confirmed** |
-| B35 | `src/prompt/prompt.cpp:123`, `:128` | `%F{color}` always emits "default colour" and ignores the colour. Unsupported escapes fall into `default:` and print the letter, so `%B…%b` renders as `B…b`. | **confirmed**: `%Bx%b` → `Bxb` |
-| B36 | `src/prompt/prompt.cpp:79` | `%~` uses a bare prefix compare: with `HOME=/Users/a` and cwd `/Users/ab`, it renders `~b`. | code reading |
-| B37 | `src/prompt/prompt.cpp:93` | `%h` and `%!` always render `0`. | code reading |
-| B39 | `src/history/history.cpp:104` | `load()` treats every line as one command: zsh `EXTENDED_HISTORY` lines keep their `: ts:0;` prefix, and multi-line commands come back as several entries. `sync()` (`:131`) just calls `load()` and duplicates everything. | code reading |
-| B40 | `src/history/history.cpp:15` | `should_suppress` returns early when `no_store` is set, which skips the `ignore_dups`/`ignore_all` checks. `no_store` is supposed to drop `history`/`fc -l` lines themselves. | code reading |
 | B42 | `src/router/router.cpp:20` | `HeuristicRouter` runs `system("zsh -n -c …")` for **every** line, which costs a fork plus exec of `/bin/sh` and `zsh`. If zsh isn't installed, `system` returns 127 and **every line is routed to the LLM**. `zsh -n` also accepts most natural language (`what is ls`), so only lines that happen to be invalid syntax, such as an unbalanced apostrophe in `what's ls`, reach the agent. | code reading |
 | B43 | `src/router/jeff.cpp:83`, `src/router/jev.cpp:111` | When the service is down, each line waits for the full timeout (1 s for jeff, 10 s for JEV), prints a warning and falls back. There's no backoff, so the shell becomes unusable. JEV also sends `Authorization: Bearer ` with an empty key. | code reading |
 | B45 | `src/agent/provider.cpp:35`, `include/jfsh/agent/provider.h:43` | The default Anthropic model `claude-opus-4-7` (in `from_env()` and the `default_anthropic` default argument) is outdated; it should probably be `claude-opus-5-5`. | code reading |
 | B46 | `include/jfsh/agent/provider.h:37` | `timeout_ms = 30000` is applied as `CURLOPT_TIMEOUT_MS`, a **total** transfer limit, so any streamed answer longer than 30 s is cut off. | code reading |
 | B47 | `include/jfsh/agent/provider.h:25` | `temperature`, `top_p` and `seed` in `ModelParams` are never sent to any provider. | code reading |
 | B48 | `include/jfsh/agent/openrouter.h:24` | The `HTTP-Referer`/`X-Title` headers the header comment promises are never sent. `OpenAIBackend::http_post` supports `extra_headers` (`src/agent/openai.cpp:92`), but `OpenRouterBackend` never passes any, and `chat_stream` makes its own curl request (`openai.cpp:187`) with no way to add headers, so both paths need it. | code reading |
-| B58 | `src/history/history.cpp:20`, `:51` | `HIST_IGNORE_ALL_DUPS` is inverted: `should_suppress` drops the **new** command when it duplicates any older entry, so the old entry stays where it was. zsh removes the older entry and appends the new one. The erase loop in `add()` that was meant to do this is dead code, since `should_suppress` has already returned. | code reading |
 | B59 | `src/lexer/lexer.cpp:126`, `:192` | Redirection lexing is incomplete. `read_token` routes `&>` to `read_redir('&')`, but it has already consumed the `>`, so `&>file` lexes as a bare `&` redirection and `&>>` as `&>` followed by `>`. `>&-`/`<&-` lex as `>&` plus a word `-`, and `>>\|` is split. Conversely, any `<`/`>` followed by `<`, `>`, `\|`, `&` or `-` is kept as one token, so invalid pairs like `<-`, `><` and `>-` are accepted. | code reading |
 
 ### Low
@@ -778,18 +849,30 @@ Severity:
 |---|---|---|
 | B49 | `src/agent/agent.cpp` | The non-streaming path of `Agent::handle` prints a newline even when the request failed. |
 | B51 | `include/jfsh/core/param.h:63` | It uses `std::unique_ptr` without `#include <memory>` and only compiles through `types.h`. |
-| B52 | `src/editor/completion.cpp:83` | `complete_commands` doesn't check the executable bit, deduplicate across `PATH` or sort. It also lists `.` and `..`. `complete_files` lists dotfiles when the prefix is empty, and adds no `/` to directories. |
 | B53 | `src/modules/module.cpp` | `ModuleManager` is never instantiated. Its `resolve_path` maps `zsh/x` → `zsh_x.so` but has no default search path, so `zmodload` can't work even once implemented. |
-| B54 | `src/editor/editor.cpp` (`read_line`, non-tty path) | It prints `PS1` even when stdin is not a terminal, which pollutes the output of `jfsh -i < file`. |
-| B55 | `CMakeLists.txt` | Possibly macOS only: Apple's linker was reported to warn `ld: warning: ignoring duplicate libraries` for `jfsh_core`, `jfsh_lexer` and `jfsh_parser`. Not reproducible on Linux: `CMakeLists.txt` lists no library twice, the library graph has no cycles, and the generated link line has each `.a` once. Re-check on macOS before fixing; if it persists, it is CMake's static-library ordering, not a duplicate in our files. |
 | B56 | `cmake/CompilerOptions.cmake` | Release builds use `-march=native`, so binaries only run on CPUs like the build machine's. simdjson already dispatches at runtime. `-Wno-unused-parameter` is still on "for the stub phase". |
 | B57 | `src/main.cpp` | `curl_global_init` is never called, and the HTTP code relies on `curl_easy_init`'s implicit, non-thread-safe init. |
-| B61 | `src/prompt/prompt.cpp:78` | `%~` (and the B36 prefix check) reads `HOME` with `getenv`, not from the shell's `ParamTable`, so changing `HOME` inside jfsh won't affect the prompt. |
 
 ### Fixed
 
 | ID | Fixed by |
 |---|---|
+| B5 | M9: with APPEND_HISTORY only the entries not yet in `HISTFILE` are appended. |
+| B25 | M9: the editor moves by UTF-8 character and measures widths with `wcwidth()` (`src/core/utf8.cpp`). |
+| B26 | M9: the prompt is expanded once per line; each refresh redraws from the prompt's first row, wrapping rows itself. |
+| B27 | M9: the terminal width is read on every refresh, and the editor redraws after a SIGWINCH. |
+| B28 | M9: completion replaces the word at the cursor, found by a shell-aware tokenizer; the engine is wired in. |
+| B34 | M9: numeric prompt arguments (`%1~`, `%2d`, `%-1/`, `%3c`, `%2m`). |
+| B35 | M9: `%F{…}`/`%K{…}` take names, 0–255 and `#rrggbb`; `%B %U %S` work; unknown escapes expand to nothing. |
+| B36 | M9: `%~` replaces `$HOME` only at a component boundary. |
+| B37 | M9: `%h`/`%!` are the history number (`$HISTCMD`). |
+| B39 | M9: the history file's EXTENDED_HISTORY lines and `\`-continued multi-line entries are read; `sync()` reads only what is new. |
+| B40 | M9: HIST_NO_STORE drops `history`/`fc -l` lines and no longer skips the duplicate checks. |
+| B52 | M9: command completion lists executables only, each once, sorted; file completion hides dotfiles unless asked and adds `/` to directories. |
+| B54 | M9: without a terminal the prompt goes to stderr. |
+| B55 | M9: re-checked on macOS: no duplicate-library warnings once `jfsh_tests` stopped naming `jfsh_history` (which `jfsh_exec` brings). |
+| B58 | M9: HIST_IGNORE_ALL_DUPS drops the older copy and keeps the new one. |
+| B61 | M9: the prompt reads `$HOME` and `$PWD` from the shell's parameters. |
 | B6 | M7: `HistoryManager::lookup(0)` finds nothing instead of reading past the end. |
 | B32 | M8: `parse_invocation` rejects unknown options, `-c`/`-o` with no argument, and unknown `--router`/`--provider` values. |
 | B38 | M8: the interactive loop reloads `PS1`/`PROMPT` and friends before every prompt. |

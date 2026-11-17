@@ -9,6 +9,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+
 #include <jfsh/core/aliases.h>
 #include <jfsh/exec/subst.h>
 
@@ -236,6 +238,41 @@ void check_mail(Executor& ex, s::time_t now) {
     s::fprintf(stderr, "%s\n", msg.c_str());
   }
   s::fflush(stderr);
+}
+
+HistOptions history_options(const ExecContext& ctx) {
+  auto param = [&](strv name) {
+    auto p = ctx.params.lookup(name);
+    return (p and p->get().is_set()) ? p->get().scalar() : str{};
+  };
+  const OptionState& o = ctx.opts;
+  HistOptions h;
+  str size = param("HISTSIZE");
+  h.histsize = size.empty() ? 1000
+             : static_cast<int>(s::clamp(s::strtol(size.c_str(), nullptr, 10), 1L, 1L << 30));
+  str save = param("SAVEHIST");
+  h.savehist = save.empty() ? h.histsize
+             : static_cast<int>(s::clamp(s::strtol(save.c_str(), nullptr, 10), 0L, 1L << 30));
+  h.histfile      = param("HISTFILE");
+  h.append        = o.get(OPT_APPENDHISTORY);
+  h.inc_append    = o.get(OPT_INCAPPENDHISTORY) or o.get(OPT_INCAPPENDHISTORYTIME);
+  h.share         = o.get(OPT_SHAREHISTORY);
+  h.extended      = o.get(OPT_EXTENDEDHISTORY) or h.share;
+  h.ignore_dups   = o.get(OPT_HISTIGNOREDUPS);
+  h.ignore_all    = o.get(OPT_HISTIGNOREALLDUPS);
+  h.ignore_space  = o.get(OPT_HISTIGNORESPACE);
+  h.no_store      = o.get(OPT_HISTNOSTORE);
+  h.no_functions  = o.get(OPT_HISTNOFUNCTIONS);
+  h.reduce_blanks = o.get(OPT_HISTREDUCEBLANKS);
+  h.save_no_dups  = o.get(OPT_HISTSAVENODUPS);
+  h.find_no_dups  = o.get(OPT_HISTFINDNODUPS);
+  h.verify        = o.get(OPT_HISTVERIFY);
+  h.bang          = o.get(OPT_BANGHIST);
+  h.fcntl_lock    = true;
+  str chars = param("histchars");
+  if (chars.empty()) chars = param("HISTCHARS");
+  if (not chars.empty()) h.histchars = chars;
+  return h;
 }
 
 }  // namespace jfsh
