@@ -562,8 +562,6 @@ struct Scan {
       v.make_array(c.dirstack);
       return v;
     }
-    if (name == "PPID")   { scalar(s::to_string(::getppid())); return v; }
-    if (name == "RANDOM") { scalar(s::to_string(s::rand() % 32768)); return v; }
 
     auto p = c.params.lookup(name);
     if (not p or not p->get().is_set()) return v;

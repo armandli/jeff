@@ -282,6 +282,13 @@ bool Parser::par_cmd() {
   skip_newlines();
   while (expand_alias(true)) skip_newlines();
   s::size_t start = mProg->prog.size();
+  // A command's words are emitted after the lexer has read past them, so
+  // its first word is tagged with the line the command starts on ($LINENO).
+  auto first_line = static_cast<s::uint32_t>(mLex.peek().line);
+  auto tag_line = [&](bool parsed) {
+    if (parsed and start < mProg->line_map.size()) mProg->line_map[start] = first_line;
+    return parsed;
+  };
   bool ok = false;
   switch (mLex.peek().type) {
     case TokType::TK_IF:       ok = par_if();      break;
@@ -296,11 +303,11 @@ bool Parser::par_cmd() {
     case TokType::TK_FUNCTION: ok = par_funcdef(); break;
     case TokType::TK_DLPAREN:  ok = par_arith();   break;
     case TokType::TK_WORD:
-      if (mLex.peek().text != "[[") return par_simple();
+      if (mLex.peek().text != "[[") return tag_line(par_simple());
       ok = par_cond();
-      break; default: return par_simple();
+      break; default: return tag_line(par_simple());
   }
-  return ok and par_trailing_redirs(start);
+  return tag_line(ok and par_trailing_redirs(start));
 }
 
 bool Parser::par_trailing_redirs(s::size_t start) {

@@ -1,5 +1,6 @@
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <iterator>
@@ -41,21 +42,35 @@ umap<str, str> Param::hash() const noexcept {
   return {};
 }
 
+// A special parameter's value is computed when it is read ($SECONDS,
+// $RANDOM, …): its getter refreshes the stored value, so every reader
+// (expansion, arithmetic, typeset -p, the environment) sees the same thing.
+static void refresh(Param& p) noexcept {
+  if (not p.handlers or not p.is_set()) return;
+  if (p.handlers->get_array) {
+    p.value = p.handlers->get_array();
+  } else if (p.handlers->get_scalar) {
+    str v = p.handlers->get_scalar();
+    if (p.is_integer()) p.value = static_cast<s::int64_t>(s::strtoll(v.c_str(), nullptr, 10));
+    else                p.value = s::move(v);
+  }
+}
+
 optref<Param> ParamTable::lookup(strv name) noexcept {
   for (int i = static_cast<int>(mScopes.size()) - 1; i >= 0; --i) {
     auto it = mScopes[static_cast<s::size_t>(i)].find(str(name));
-    if (it != mScopes[static_cast<s::size_t>(i)].end())
+    if (it != mScopes[static_cast<s::size_t>(i)].end()) {
+      refresh(it->second);
       return s::ref(it->second);
+    }
   }
   return s::nullopt;
 }
 
+// Refreshing a special parameter changes only its cached value, so the
+// const lookup may do it too.
 optref<const Param> ParamTable::lookup(strv name) const noexcept {
-  for (int i = static_cast<int>(mScopes.size()) - 1; i >= 0; --i) {
-    auto it = mScopes[static_cast<s::size_t>(i)].find(str(name));
-    if (it != mScopes[static_cast<s::size_t>(i)].end())
-      return s::cref(it->second);
-  }
+  if (auto p = const_cast<ParamTable*>(this)->lookup(name)) return s::cref(p->get());
   return s::nullopt;
 }
 
@@ -86,6 +101,10 @@ Result<void> ParamTable::set_scalar(
       return s::unexpected(ShellError{ErrorKind::ExecError,
           "read-only variable: " + str(name)});
     if (append) value = p.scalar() + value;
+    if (p.handlers and p.handlers->set_scalar) {
+      p.handlers->set_scalar(s::move(value));   // read back when next looked up
+      return {};
+    }
     // typeset -u / -l stay in force.
     if (p.flags & PM_UPPER)
       for (char& ch : value) ch = static_cast<char>(s::toupper(static_cast<unsigned char>(ch)));
@@ -110,6 +129,15 @@ Result<void> ParamTable::set_array(
     if (p.is_readonly())
       return s::unexpected(ShellError{ErrorKind::ExecError,
           "read-only variable: " + str(name)});
+    if (p.handlers and p.handlers->set_array) {
+      if (append) {
+        auto old = p.array();
+        old.insert(old.end(), words.begin(), words.end());
+        words = s::move(old);
+      }
+      p.handlers->set_array(s::move(words));
+      return {};
+    }
     if (p.is_hash()) {
       if (words.size() % 2 != 0)
         return s::unexpected(ShellError{ErrorKind::ExecError,
@@ -206,6 +234,7 @@ void ParamTable::for_each(func<void(const Param&)> fn) const {
     for (auto const& [name, p] : mScopes[static_cast<s::size_t>(i)]) {
       if (not seen.count(name)) {
         seen[name] = &p;
+        refresh(const_cast<Param&>(p));
         fn(p);
       }
     }

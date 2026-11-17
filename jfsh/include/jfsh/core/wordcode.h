@@ -281,6 +281,9 @@ struct CompiledProgram {
   int    shf_flags  = 0;              // set when this is a shell function body
   int    ref_count  = 0;
   vec<s::uint32_t> line_map; // prog index → source line number
+  // Subtracted from line_map for $LINENO: a function body counts lines
+  // from the line its definition starts on, as in zsh.
+  s::uint32_t      line_base = 0;
 
   bool empty() const noexcept { return prog.empty(); }
 };

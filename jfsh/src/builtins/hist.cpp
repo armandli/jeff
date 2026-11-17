@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <span>
 
 #include <jfsh/builtins/builtins.h>
 #include <jfsh/builtins/util.h>
@@ -19,7 +20,7 @@ namespace {
 
 // The index into `entries` an event names: a number (negative counts
 // back from the last), or the latest event that starts with the text.
-opt<s::size_t> find_event(const vec<HistEntry>& entries, strv spec) {
+opt<s::size_t> find_event(s::span<const HistEntry> entries, strv spec) {
   if (entries.empty()) return s::nullopt;
   bool numeric = not spec.empty()
       and spec.find_first_not_of("0123456789", spec[0] == '-' or spec[0] == '+' ? 1 : 0) == strv::npos
@@ -65,9 +66,13 @@ int run_again(strv cmd, str text, ExecContext& ctx) {
   (void)cmd;
   s::printf("%s\n", text.c_str());
   s::fflush(stdout);
-  int rc = ctx.executor->exec_string(text);
-  if (ctx.history) ctx.history->add(text);
-  return rc;
+  // The line that ran fc is replaced by the command it runs (it is in the
+  // history already when the interactive loop added it before running it).
+  if (ctx.history) {
+    if (ctx.hist_current) ctx.history->replace_last(text);
+    else                  ctx.history->add(text);
+  }
+  return ctx.executor->exec_string(text);
 }
 
 int fc_common(vec<str>& args, ExecContext& ctx, bool list_mode) {
@@ -88,7 +93,11 @@ int fc_common(vec<str>& args, ExecContext& ctx, bool list_mode) {
     if (not r) return builtin_error(cmd, r.error().message);
     return 0;
   }
-  const auto& entries = hist.entries();
+  // The line being run is left out, so -1 is the command before it, as in
+  // zsh.
+  const auto& all = hist.entries();
+  s::span<const HistEntry> entries(all.data(),
+      all.size() - (ctx.hist_current and not all.empty() ? 1 : 0));
   vec<str> rest(args.begin() + static_cast<s::ptrdiff_t>(o.next), args.end());
   // `old=new` words come before the event range.
   vec<str> subs;

@@ -1,9 +1,10 @@
 # jfsh — remaining work
 
-Status as of 2026-11-15: M1 (simple commands), M2 (pipelines, redirections, lists,
+Status as of 2026-11-16: M1 (simple commands), M2 (pipelines, redirections, lists,
 background jobs), M3 (word expansion), M4 (compound commands and functions), M5
-(arithmetic, `[[ ]]`, `test`), M6 (job control, signals, traps) and M7 (builtins) are
-done, along with the part of M0 they needed.
+(arithmetic, `[[ ]]`, `test`), M6 (job control, signals, traps), M7 (builtins) and M8
+(startup files, invocation, the interactive loop's hooks) are done, along with the part
+of M0 they needed.
 
 jfsh builds on macOS and Linux and has gtest coverage for the pieces that work. It runs
 **simple commands**, pipelines and background jobs joined by `;`, newlines, `&&`, `||` and
@@ -18,7 +19,9 @@ notices, Ctrl-C that ends the command line but not the shell), and `trap`, `kill
 `wait` work in every shell. The builtins are real (M7): options (`set`, `setopt`,
 `emulate`), sourcing, aliases, the directory stack, `print`/`printf`, history,
 `whence` and friends; only the ones that need the line editor or modules (`bindkey`,
-`zle`, `vared`, `zmodload`, `sched`, `zpty`, `compinit`) say `not implemented`.
+`zle`, `vared`, `zmodload`, `zpty`, `compinit`) say `not implemented`. It reads zsh-style
+startup files (`.jfshenv`, `.jfshrc`, …), takes zsh's command-line options, and runs
+`precmd`/`preexec`/`periodic`/`zshexit` hooks, `sched` events and mail checks (M8).
 The System 1 router and the LLM agent layer work end to end.
 
 This file has two parts:
@@ -474,15 +477,13 @@ expected output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
   octal or symbolic, `times` from `getrusage`.
 - **Control:** `exit`/`return` take arithmetic expressions and reject extra arguments.
 - **Stubs** that need later milestones print `jfsh: NAME: not implemented` and return 1:
-  `bindkey`, `zle`, `vared` (M9), `sched` (M8), `zpty` (now registered, B21),
+  `bindkey`, `zle`, `vared` (M9), `zpty` (now registered, B21),
   `compinit`; `zmodload` alone lists nothing.
 
 **Left**
 - `typeset -T`, `-Z`/`-L`/`-R` padding, `-h`, `-t`; `emulate -l`; `autoload -X`;
   `read -z -c -l -n -p`; `print -z` and `-p`; `fc -p/-P`; `hash -d` (named directories,
   no table yet).
-- zsh adds a line to the history before running it, so `history` lists itself and `r`
-  is recorded as `r`; jfsh adds it afterwards.
 - A command that runs in a forked pipeline stage hashes its path in the child, so
   HASH_CMDS doesn't remember it in the shell.
 - zsh errors in special builtins (`set -o nosuch`, `unset readonly`) exit a
@@ -494,37 +495,77 @@ expected output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
 
 ### M8. Startup, REPL loop, invocation [loop/*]
 
-**Requirements**
-- **Startup files**, in zsh order: `/etc/zshenv`-equivalent, `$ZDOTDIR/.jfshenv` (always),
-  `.jfsh_profile` (login), `.jfshrc` (interactive), `.jfsh_login` (login); `.jfsh_logout`
-  on exit.
-  - Decide whether to also read the user's real `.zshrc`; a flag such as
-    `--zsh-compat-rc` would make that opt-in.
-- **Invocation:**
-  - `-c CMD [arg0 [args…]]` sets `$0` and the positional parameters; `script args…` does
-    the same;
-  - `-i`, `-s`, `-l`/`--login`, `-o option`, `+o option`, `--`;
-  - unknown options are an error, not silently ignored (bug B32).
-- **Script and stdin mode:** parse incrementally from a `FileInputSource`, a complete
-  command at a time. Since M4, stdin mode collects lines until `is_incomplete()` says the
-  command is whole (bug B31 fixed), but a script file is still read whole and parsed in
-  one go, so a syntax error at the end stops the whole script from running.
-- **Each REPL iteration**, in this order:
-  1. drain pending signals and traps;
-  2. reap jobs and print notifications;
-  3. run `precmd`, then `periodic` if `$PERIOD` has elapsed;
-  4. check `sched` events and mail (`MAIL`, `MAILPATH`);
-  5. reload `PS1` and render the prompt;
-  6. read a line, then add it to history;
-  7. run `preexec`, then execute;
-  8. after execution, set `$?` and run the `ZERR` trap on failure.
-- **Continuation:** done with M4. Lines that end inside an open construct (quote, `if`
-  without `fi`, here-document, trailing `|`/`&&`, `\` at end of line) prompt with `PS2`
-  and keep reading. `PS2` is rendered raw (no `%_` construct names yet, M9).
-- **`ERR_EXIT`** is applied by the executor with zsh's exemptions since M6 (B33).
-- **Special parameters:** `$$`, `$PPID`, `$SHLVL` (incremented), `$PWD`, `$OLDPWD`,
-  `$RANDOM`, `$SECONDS`, `$EPOCHSECONDS`, `$LINENO`, `$HISTCMD`, `$status`,
-  `$pipestatus`. They use `ParamHandlers`; nothing sets those yet.
+**Done.** Invocation is parsed in `src/exec/invocation.cpp` (`parse_invocation`), the
+startup files, hooks, `sched` events and mail checks are in `src/exec/loop.cpp`
+(`include/jfsh/exec/loop.h`), the special parameters in `src/exec/context.cpp`, and
+`src/main.cpp` strings them together. Tests: `tests/startup_test.cpp` (in-process, plus
+the `jfsh` binary run with arguments) and the M8 cases in `tests/interactive_test.cpp`.
+- **Invocation:** zsh's rules: letter clusters (`-xe`, `+x`, `-xc cmd`), `-o name`/`+o
+  name`/`-oname`, `--name`/`--no-name` for any option, `-c` taking the first argument
+  after the options (later ones are `$0` and the positional parameters), `script
+  args…`, `-s args…`, `-i`, `-l`/`--login` (or a `$0` starting with `-`), `-f`
+  (NO_RCS), `-d` (NO_GLOBAL_RCS), `--` and `-`. `--help`, `--version`. Errors are
+  zsh's and exit 1: `bad option: -q`, `no such option: x`, `string expected after
+  -c`/`-o`; an unknown `--router` or `--provider` value is an error too (B32). A
+  script that can't be opened: `can't open input file: x`, 127.
+- **Startup files**, in zsh's order: `SYSCONFDIR/jfshenv` (always), `$ZDOTDIR/.jfshenv`,
+  then for a login shell `jfsh_profile`/`.jfsh_profile`, for an interactive one
+  `jfshrc`/`.jfshrc`, for a login shell `jfsh_login`/`.jfsh_login`; a login shell reads
+  `.jfsh_logout` then `SYSCONFDIR/jfsh_logout` on exit. RCS and GLOBAL_RCS are checked
+  before each file, `$ZDOTDIR` (default `$HOME`) is re-read before each, `exit` in a
+  file ends the shell. `SYSCONFDIR` is the CMake cache variable `JFSH_SYSCONFDIR`
+  (default `/etc`).
+  - **Decision on `.zshrc`:** not read by default, since a real `.zshrc` usually needs
+    ZLE, `compinit` and modules jfsh doesn't have yet. `--zsh-compat-rc` reads the
+    user's `.zshenv`, `.zprofile`, `.zshrc`, `.zlogin` and `.zlogout` right after the
+    matching jfsh file (not `/etc/zsh*`).
+- **Exit**, as zsh's `zexit`: the history is saved (when `HISTFILE` is set and
+  `SAVEHIST` isn't 0), a login shell reads its logout files, then the EXIT trap runs,
+  then the `zshexit` hook.
+- **The interactive loop**, each iteration: traps and job reaping, job notices,
+  `precmd` (and `precmd_functions`), `periodic` when `$PERIOD` seconds have passed,
+  due `sched` events, mail (`$mailpath`, `$MAILPATH` or `$MAIL`, every `$MAILCHECK`
+  seconds, default 60; `file?message` with `$_` set to the file); the prompt from
+  `$PS1` as it is now (B38); the line is added to the history **before** it runs, so
+  `$HISTCMD` is its number, `fc`/`history`/`r` leave it out, and `r`/`fc -s` replace it
+  with the command they run; `preexec` (and `preexec_functions`) with the line as `$1`,
+  `$2` and `$3`; then the line. Hooks keep `$?` and `$pipestatus`. History settings
+  (`HISTFILE`, `HISTSIZE`, `SAVEHIST`) are read after the startup files.
+- **`sched`** (`src/builtins/sched.cpp`): `sched [-o] [+]hh:mm[:ss]|[+]secs cmd…`,
+  `sched` lists in zsh's format, `sched -N` removes.
+- **Special parameters** (getters and setters in `ParamHandlers`, which `ParamTable` now
+  calls on every lookup and assignment, so expansion, arithmetic, `typeset` and the
+  environment all see them): `$SECONDS` (assignable), `$RANDOM` (assigning seeds it),
+  `$LINENO` (lines of the script, `-c` string, sourced file or `eval` text; in a
+  function, counted from the line its definition starts on), `$HISTCMD`, `$status`,
+  `$pipestatus`, `$PPID` (fixed at startup, readonly), `$EPOCHSECONDS`,
+  `$EPOCHREALTIME`. `$SHLVL` is incremented and `$PWD`/`$OLDPWD` set and exported at
+  startup. Each command's first word now records the line the command starts on (the
+  parser emits a command's words after the lexer has read past the end of its line).
+- **Scripts** were already run a command at a time (`Parser::parse_line`), so a syntax
+  error at the end no longer stops the lines before it from running.
+
+**Left**
+- `sched` events only run before a prompt; zsh also runs them while the line editor
+  waits for input. `sched -o` is accepted but there is no line to clear.
+- Mail: maildir directories and `MAIL_WARNING` aren't handled; the message is expanded
+  for parameters but not prompt escapes.
+- `preexec`'s `$2` should be a size-limited single-line version of the command (zsh
+  elides function bodies); it is the whole line.
+- Some zsh specials are still missing: `$TTYIDLE`, `$UID`/`$EUID`/`$GID`/`$EGID`
+  (assignable in zsh), `$USERNAME`, `$ZSH_SUBSHELL`, `$funcstack`, `$funcfiletrace`.
+  `local SECONDS` doesn't make a local copy of a special; `unset` drops the special
+  meaning for good, as in zsh.
+- `$LINENO` in a one-line function (`f() { echo $LINENO; }`) is 1; not checked against
+  zsh. `$pipestatus` after a function call is that call's status, not the last
+  pipeline inside it; also not checked against zsh.
+- `PRIVILEGED` doesn't skip the user's startup files.
+- An error in a startup file of a non-interactive shell ends the shell, as one in a
+  script does; zsh only abandons that file.
+- zsh couldn't be run on this machine while M8 was written (it isn't installed, and
+  running a downloaded copy was blocked), so the expected outputs come from zsh's
+  documentation and source rather than from running it, except `$LINENO` in a function
+  and `$SHLVL`.
 
 ### M9. Line editor (ZLE), completion, prompt, history
 
@@ -572,7 +613,6 @@ expected output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
   - `%{…%}`, so zero-width sequences are excluded from the width.
 - `PROMPT_SUBST`: expand parameters, commands and arithmetic in the prompt before the
   percent escapes.
-- Re-read `PS1` and friends every time a prompt is shown (bug B38).
 
 **History** [hist/expand]:
 - **Bang expansion anywhere in the line**, not only at the start: `!!`, `!N`, `!-N`,
@@ -717,12 +757,10 @@ Severity:
 | B26 | `src/editor/editor.cpp:146` | `refresh_display` rewrites the whole prompt with a single `\r`, so prompts containing newlines are reprinted on every keystroke and lines wider than the terminal break. It also recomputes the prompt (`getpwuid`, `gethostname`, `getcwd`) on every key. | code reading |
 | B27 | `src/editor/editor.cpp` | The editor doesn't re-layout on `SIGWINCH`: since M6 the shell updates `$COLUMNS`/`$LINES` and redraws the line after a signal, but `Editor::terminal_width()` is never called. | code reading |
 | B28 | `src/editor/editor.cpp:115` | Tab completion inserts `candidates[0].substr(mBuf.cursor)`, using the **line** cursor as an offset into a **word** candidate. That only works when the word starts at column 0. `main.cpp:184` installs a completer that returns nothing anyway. | code reading |
-| B32 | `src/main.cpp:84` | Unknown options are ignored silently, as is `-c` with no argument (`main.cpp:58`). (Arguments after the script, or after `-c cmd`, now become `$0` and the positional parameters.) `--router` with an unknown value silently means heuristic, and `--provider` with an unknown value silently means Ollama (`main.cpp:143`). | code reading |
 | B34 | `src/prompt/prompt.cpp:128` | Numeric prompt arguments aren't parsed: the default `PS1` `%n@%m %1~ %# ` renders as `user@host 1~ % `. | **confirmed** |
 | B35 | `src/prompt/prompt.cpp:123`, `:128` | `%F{color}` always emits "default colour" and ignores the colour. Unsupported escapes fall into `default:` and print the letter, so `%B…%b` renders as `B…b`. | **confirmed**: `%Bx%b` → `Bxb` |
 | B36 | `src/prompt/prompt.cpp:79` | `%~` uses a bare prefix compare: with `HOME=/Users/a` and cwd `/Users/ab`, it renders `~b`. | code reading |
 | B37 | `src/prompt/prompt.cpp:93` | `%h` and `%!` always render `0`. | code reading |
-| B38 | `src/prompt/prompt.cpp:10` | `PS1`/`PROMPT` are read once, in the constructor; later assignments never take effect. | code reading |
 | B39 | `src/history/history.cpp:104` | `load()` treats every line as one command: zsh `EXTENDED_HISTORY` lines keep their `: ts:0;` prefix, and multi-line commands come back as several entries. `sync()` (`:131`) just calls `load()` and duplicates everything. | code reading |
 | B40 | `src/history/history.cpp:15` | `should_suppress` returns early when `no_store` is set, which skips the `ignore_dups`/`ignore_all` checks. `no_store` is supposed to drop `history`/`fc -l` lines themselves. | code reading |
 | B42 | `src/router/router.cpp:20` | `HeuristicRouter` runs `system("zsh -n -c …")` for **every** line, which costs a fork plus exec of `/bin/sh` and `zsh`. If zsh isn't installed, `system` returns 127 and **every line is routed to the LLM**. `zsh -n` also accepts most natural language (`what is ls`), so only lines that happen to be invalid syntax, such as an unbalanced apostrophe in `what's ls`, reach the agent. | code reading |
@@ -753,6 +791,8 @@ Severity:
 | ID | Fixed by |
 |---|---|
 | B6 | M7: `HistoryManager::lookup(0)` finds nothing instead of reading past the end. |
+| B32 | M8: `parse_invocation` rejects unknown options, `-c`/`-o` with no argument, and unknown `--router`/`--provider` values. |
+| B38 | M8: the interactive loop reloads `PS1`/`PROMPT` and friends before every prompt. |
 | B19 | M7: every builtin is real, or prints `not implemented` and returns 1. |
 | B20 | M7: `cd` reports errors as zsh does and keeps `$PWD`/`$OLDPWD`. |
 | B21 | M7: `zpty` is registered (as `not implemented`). |

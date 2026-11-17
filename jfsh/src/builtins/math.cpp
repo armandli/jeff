@@ -219,7 +219,9 @@ struct Arith {
     if (lv.indexed) { store_element(lv, v); return; }
     if (p and p->get().is_set()) {
       Param& param = p->get();
-      if (param.is_integer())    param.set(v.as_int());
+      if (param.handlers) {   // $SECONDS, $RANDOM, …: their setter decides
+        if (auto r = params.set_scalar(lv.name, format_math(v)); not r) fail(r.error().message);
+      } else if (param.is_integer()) param.set(v.as_int());
       else if (param.is_float()) param.set(v.as_float());
       else if (auto r = params.set_scalar(lv.name, format_math(v)); not r) fail(r.error().message);
       return;

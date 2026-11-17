@@ -7,6 +7,7 @@
 // plus subshell, function call, and async execution paths.
 
 #include <cstdint>
+#include <ctime>
 #include <unistd.h>
 
 #include <array>
@@ -37,6 +38,21 @@ enum ExecFlags : s::uint32_t {
 
 struct Executor;
 struct HistoryManager;
+
+// A `sched` event: a command to run before the first prompt at or after
+// `when`.
+struct SchedEvent {
+  s::time_t when      = 0;
+  str       cmd{};
+  bool      trash_zle = false;   // -o: clear the line editor first (no-op)
+};
+
+// What the interactive loop remembers between prompts (M8).
+struct LoopState {
+  vec<SchedEvent> sched{};            // sorted by `when`
+  s::time_t       last_periodic  = 0; // when `periodic` last ran
+  s::time_t       last_mailcheck = 0; // when the mail files were last checked
+};
 
 struct ExecContext {
   ParamTable&    params;
@@ -89,7 +105,19 @@ struct ExecContext {
   vec<str> positional{};    // $1 … $N, also $@ $* $argv
   str      arg0 = "jfsh";   // $0
   Pid      shell_pid = ::getpid();  // $$, unchanged in subshells
+
+  vec<int>    pipestatus{0};   // $pipestatus: each stage of the last pipeline
+  s::uint32_t lineno = 0;      // $LINENO: line of the command being run
+  // The interactive loop added the line being run to the history before
+  // running it, so `fc` and `r` leave that entry out.
+  bool        hist_current = false;
+  LoopState   loop{};
 };
+
+// Gives `ctx.params` the parameters whose values the shell computes:
+// $SECONDS, $RANDOM, $LINENO, $HISTCMD, $status, $pipestatus, $PPID,
+// $EPOCHSECONDS and $EPOCHREALTIME.  The Executor constructor calls it.
+void install_special_params(ExecContext& ctx);
 
 // A `name=value` (or `name+=value`, `name=(…)`) word in front of a simple
 // command.  For an array assignment `value` holds the source between the
