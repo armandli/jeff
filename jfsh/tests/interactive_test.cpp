@@ -45,6 +45,9 @@ struct Pty {
       ::setenv("TERM", "dumb", 1);
       ::setenv("ZDOTDIR", zdotdir.c_str(), 1);
       ::unsetenv("HISTFILE");
+      // vi editing would follow an $EDITOR that mentions vi.
+      ::unsetenv("EDITOR");
+      ::unsetenv("VISUAL");
       ::execl(JFSH_BINARY, JFSH_BINARY, "--norouter", "-i", static_cast<char*>(nullptr));
       _exit(127);
     }
@@ -303,14 +306,19 @@ TEST(Interactive, JfshrcHooksAndPromptReload) {
   RcDir rc("precmd() { print -n '<pre>' }\n"
            "preexec() { print -r -- \"<exec $1>\" }\n");
   Pty sh(rc.path);
-  ASSERT_TRUE(sh.expect("<pre>% ")) << sh.out;
+  // precmd's output doesn't end in a newline, so PROMPT_SP marks it with
+  // an inverse `%` and the prompt starts on the next line, as in zsh.
+  ASSERT_TRUE(sh.expect("<pre>\x1b[1m\x1b[7m%")) << sh.out;
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
   sh.line("echo hi");
   EXPECT_TRUE(sh.expect("<exec echo hi>")) << sh.out;
   EXPECT_TRUE(sh.expect("hi")) << sh.out;
-  EXPECT_TRUE(sh.expect("<pre>% ")) << sh.out;
+  EXPECT_TRUE(sh.expect("<pre>")) << sh.out;
+  EXPECT_TRUE(sh.expect("% ")) << sh.out;
   // A new $PS1 takes effect at the next prompt (B38).
   sh.line("PS1='new> '");
-  EXPECT_TRUE(sh.expect("<pre>new> ")) << sh.out;
+  EXPECT_TRUE(sh.expect("<pre>")) << sh.out;
+  EXPECT_TRUE(sh.expect("new> ")) << sh.out;
   sh.line("exit");
   int st;
   EXPECT_TRUE(sh.exits(st)) << sh.out;
@@ -337,3 +345,51 @@ TEST(Interactive, SchedRunsBeforeThePrompt) {
   EXPECT_TRUE(sh.expect("fired")) << sh.out;
   EXPECT_TRUE(sh.expect("% ")) << sh.out;
 }
+
+// ---- M9: the line editor in the real shell ------------------------------------------
+
+TEST(Interactive, TabCompletionAndHistoryKeys) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.send("ech\t");
+  ASSERT_TRUE(sh.expect("echo ")) << sh.out;
+  sh.line("first-word");
+  EXPECT_TRUE(sh.expect("first-word\r\n")) << sh.out;
+  // Ctrl-R finds it again; Enter runs it.
+  sh.send("\x12" "first");
+  EXPECT_TRUE(sh.expect("bck-i-search: first_")) << sh.out;
+  sh.send("\r");
+  EXPECT_TRUE(sh.expect("first-word\r\n")) << sh.out;
+  // Up arrow, then edit.
+  sh.send("\x1b[A\x17" "again\r");
+  EXPECT_TRUE(sh.expect("again\r\n")) << sh.out;
+}
+
+TEST(Interactive, BangHistoryIsShownThenRun) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("echo one two");
+  ASSERT_TRUE(sh.expect("one two\r\n"));
+  sh.line("echo !!:2 !$");
+  EXPECT_TRUE(sh.expect("echo two two\r\ntwo two\r\n")) << sh.out;
+  sh.line("echo !nosuch");
+  EXPECT_TRUE(sh.expect("jfsh: event not found: nosuch")) << sh.out;
+  // HIST_VERIFY: the expansion comes back to be edited.
+  sh.line("setopt histverify");
+  sh.line("echo !!:0x");
+  EXPECT_TRUE(sh.expect("% echo setoptx")) << sh.out;
+  sh.send("\r");
+  EXPECT_TRUE(sh.expect("setoptx\r\n")) << sh.out;
+}
+
+TEST(Interactive, RcBindingsAndWidgets) {
+  RcDir rc("bindkey -s '^Xh' 'echo from-macro\\n'\n"
+           "up() { BUFFER=${(U)BUFFER} }\nzle -N up\nbindkey '^Xu' up\n");
+  Pty sh(rc.path);
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  sh.send("\x18h");
+  EXPECT_TRUE(sh.expect("from-macro\r\n")) << sh.out;
+  sh.send("echo shout\x18u\r");
+  EXPECT_TRUE(sh.expect("SHOUT\r\n")) << sh.out;
+}
+

@@ -24,6 +24,7 @@
 #include <jfsh/core/signals.h>
 #include <jfsh/core/types.h>
 #include <jfsh/core/wordcode.h>
+#include <jfsh/prompt/prompt.h>
 
 namespace jfsh {
 
@@ -38,6 +39,8 @@ enum ExecFlags : s::uint32_t {
 
 struct Executor;
 struct HistoryManager;
+struct Zle;
+struct CompletionEngine;
 
 // A `sched` event: a command to run before the first prompt at or after
 // `when`.
@@ -101,6 +104,9 @@ struct ExecContext {
   Executor*       executor = nullptr;
   // The interactive shell's history, for fc/history/r; null without one.
   HistoryManager* history  = nullptr;
+  // The line editor's keymaps, widgets and completion (bindkey, zle,
+  // vared, compdef); the Executor makes one when none is given.
+  Zle*            zle      = nullptr;
 
   vec<str> positional{};    // $1 … $N, also $@ $* $argv
   str      arg0 = "jfsh";   // $0
@@ -223,6 +229,11 @@ struct Executor {
   int  run_exit_trap(int status);
   // Sets $COLUMNS and $LINES from the terminal.
   void update_window_size();
+  // What prompt expansion needs from this shell: PROMPT_SUBST's
+  // expansion, the job count (%j) and the script name (%N).
+  PromptHooks prompt_hooks();
+  // `prompt` (PS3, PS4, `print -P`) expanded for output.
+  str expand_prompt(strv prompt);
   // Job control is on: the shell owns a terminal and MONITOR is set.
   bool job_control() const noexcept {
     return mCtx.signals.job_control() and mCtx.opts.monitor();
@@ -350,7 +361,14 @@ private:
   bool           mExitTrapRan = false;
   HashTable<str> mCmdHash;     // command name → resolved path
   str            mHashedPath;  // $PATH the hash was built against
+  uptr<Zle>              mOwnZle;
+  uptr<CompletionEngine> mOwnCompletion;
 };
+
+// Lets the line editor run shell functions (user widgets, compdef
+// functions) and commands through `ex`, and tells completion about its
+// builtins, functions and aliases (src/builtins/zle.cpp).
+void install_zle_hooks(Executor& ex);
 
 // ---- Job control (src/exec/jobctl.cpp) ---------------------------------------
 

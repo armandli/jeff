@@ -381,38 +381,6 @@ str expand_tabs(strv s, s::size_t tab, bool all) {
   return out;
 }
 
-// Minimal prompt expansion for `print -P`: %%, %~, %d/%/, %n, %m, %#, %?,
-// %L; other sequences print as they are.
-str prompt_expand(strv s, ExecContext& ctx) {
-  str out;
-  for (s::size_t i = 0; i < s.size(); ++i) {
-    if (s[i] != '%' or i + 1 >= s.size()) { out += s[i]; continue; }
-    char c = s[++i];
-    auto param = [&](strv n) {
-      auto p = ctx.params.lookup(n);
-      return (p and p->get().is_set()) ? p->get().scalar() : str{};
-    };
-    switch (c) {
-      case '%': out += '%'; break;
-      case '~': out += tilde_abbrev(ctx.params, param("PWD")); break;
-      case 'd': case '/': out += param("PWD"); break;
-      case 'n': out += param("USER"); break;
-      case 'm': {
-        char host[256] = {};
-        ::gethostname(host, sizeof host - 1);
-        str h = host;
-        out += h.substr(0, h.find('.'));
-        break;
-      }
-      case '#': out += ::geteuid() == 0 ? '#' : '%'; break;
-      case '?': out += s::to_string(ctx.last_exit); break;
-      case 'L': out += param("SHLVL"); break;
-      default: out += '%'; out += c;
-    }
-  }
-  return out;
-}
-
 }  // namespace
 
 // echo [-neE] [arg …]: escapes are interpreted unless -E or BSD_ECHO
@@ -495,7 +463,7 @@ int builtin_print(vec<str>& args, ExecContext& ctx) {
   }
   for (auto& w : words) {
     if (not raw and not stop) w = unescape(w, Octal::ZeroPrefixed, stop);
-    if (o.has('P')) w = prompt_expand(w, ctx);
+    if (o.has('P')) w = ctx.executor->expand_prompt(w);
     if (o.has('D')) w = tilde_abbrev(ctx.params, w);
   }
   if (o.has('o') or o.has('O')) {

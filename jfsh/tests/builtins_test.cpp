@@ -88,7 +88,7 @@ TEST(Set, XTrace) {
   Shell sh;
   auto r = sh.run("set -x; echo hi; set +x; echo bye");
   EXPECT_EQ(r.out, "hi\nbye\n");
-  EXPECT_EQ(r.err, "+ echo hi\n+ set +x\n");
+  EXPECT_EQ(r.err, "+jfsh:1> echo hi\n+jfsh:1> set +x\n");
 }
 
 TEST(Set, PositionalParameters) {
@@ -740,7 +740,7 @@ TEST(History, ListsAndReruns) {
 
 TEST(Unimplemented, SayNotImplemented) {
   Shell sh;
-  for (const char* name : {"bindkey", "vared", "zle", "zpty", "compinit"}) {
+  for (const char* name : {"zpty"}) {
     auto r = sh.run(str(name) + " x");
     EXPECT_EQ(r.err, "jfsh: " + str(name) + ": not implemented\n") << name;
     EXPECT_EQ(r.rc, 1) << name;

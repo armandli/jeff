@@ -1,6 +1,7 @@
 #include <jfsh/parser/parser.h>
 
 #include <cctype>
+#include <cstdlib>
 
 #include <algorithm>
 #include <memory>

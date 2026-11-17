@@ -84,6 +84,11 @@ void BuiltinTable::register_all() {
   add({"which",    builtin_which,      BINF_NONE});
   add({"type",     builtin_type,       BINF_NONE});
   add({"compinit", builtin_compinit,   BINF_NONE});
+  add({"compdef",  builtin_compdef,    BINF_NONE});
+  add({"compadd",  builtin_compadd,    BINF_NONE});
+  add({"_files",   builtin__files,     BINF_NONE});
+  add({"_directories", builtin__directories, BINF_NONE});
+  add({"_command_names", builtin__command_names, BINF_NONE});
   add({"setopt",   builtin_setopt,     BINF_NONE});
   add({"unsetopt", builtin_unsetopt,   BINF_NONE});
   add({"bindkey",  builtin_bindkey,    BINF_NONE});
@@ -159,16 +164,13 @@ static int run_words(vec<str>& args, ExecContext& ctx, strv prefix) {
 int builtin_noglob(vec<str>& args, ExecContext& ctx) { return run_words(args, ctx, "noglob"); }
 int builtin_dash(vec<str>& args, ExecContext& ctx)   { return run_words(args, ctx, "-"); }
 
-// Builtins that need the line editor, the module system or the REPL hooks
-// (M9 and later) say so rather than pretending to work (B19).
+// Builtins that need the module system say so rather than pretending to
+// work (B19).  The line editor's (bindkey, zle, vared, compinit, …) are in
+// zle.cpp.
 static int not_implemented(const vec<str>& args) {
   s::fprintf(stderr, "jfsh: %s: not implemented\n", args[0].c_str());
   return 1;
 }
-int builtin_compinit(vec<str>& args, ExecContext&) { return not_implemented(args); }
-int builtin_bindkey (vec<str>& args, ExecContext&) { return not_implemented(args); }
-int builtin_vared   (vec<str>& args, ExecContext&) { return not_implemented(args); }
-int builtin_zle     (vec<str>& args, ExecContext&) { return not_implemented(args); }
 int builtin_zpty    (vec<str>& args, ExecContext&) { return not_implemented(args); }
 // zmodload with no arguments lists the loaded modules: there are none.
 int builtin_zmodload(vec<str>& args, ExecContext&) {

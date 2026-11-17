@@ -33,6 +33,7 @@ add_library(jfsh_core STATIC
   src/core/mem.cpp
   src/core/utils.cpp
   src/core/sort.cpp
+  src/core/utf8.cpp
 )
 target_include_directories(jfsh_core PUBLIC include)
 target_link_libraries(jfsh_core PUBLIC jfsh_compiler_options Threads::Threads)
@@ -112,13 +113,15 @@ add_library(jfsh_exec STATIC
   src/builtins/sched.cpp
   src/builtins/setopt.cpp
   src/builtins/vars.cpp
+  src/builtins/zle.cpp
 )
 target_include_directories(jfsh_exec PUBLIC include)
 # Where the system-wide startup files (jfshenv, jfshrc, …) are read from.
 set(JFSH_SYSCONFDIR "/etc" CACHE PATH "Directory of jfsh's system-wide startup files")
 target_compile_definitions(jfsh_exec PUBLIC JFSH_SYSCONFDIR="${JFSH_SYSCONFDIR}")
 target_link_libraries(jfsh_exec PUBLIC
-  jfsh_parser jfsh_glob jfsh_builtins jfsh_history jfsh_compiler_options)
+  jfsh_parser jfsh_glob jfsh_builtins jfsh_history jfsh_prompt jfsh_editor
+  jfsh_compiler_options)
 
 # ---------------------------------------------------------------------------
 # jfsh_history — history file, search, deduplication.
@@ -208,7 +211,6 @@ add_executable(jfsh src/main.cpp)
 target_compile_definitions(jfsh PRIVATE JFSH_VERSION="${PROJECT_VERSION}")
 target_link_libraries(jfsh PRIVATE
   jfsh_exec
-  jfsh_editor
   jfsh_modules
   jfsh_router
   jfsh_agent

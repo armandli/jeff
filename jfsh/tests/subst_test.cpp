@@ -430,7 +430,7 @@ TEST(Subst, XtraceShowsExpandedWords) {
   Shell sh;
   sh.opts.set(OPT_XTRACE);
   auto r = sh.run("x='a b'; echo $x {1,2}");
-  EXPECT_EQ(r.err, "+ x='a b'\n+ echo 'a b' 1 2\n");
+  EXPECT_EQ(r.err, "+jfsh:1> x='a b' \n+jfsh:1> echo 'a b' 1 2\n");
 }
 
 TEST(Subst, BadSubstitutionIsAnError) {

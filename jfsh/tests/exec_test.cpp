@@ -250,7 +250,7 @@ TEST(Exec, XtracePrintsPs4AndTheExpandedCommandFirst) {
   Shell sh;
   sh.opts.assign(OPT_XTRACE, true);
   auto r = sh.run("X='a b' echo hi 'c d'");
-  EXPECT_EQ(r.err, "+ X='a b' echo hi 'c d'\n");
+  EXPECT_EQ(r.err, "+jfsh:1> X='a b' echo hi 'c d'\n");
   EXPECT_EQ(r.out, "hi c d\n");
 
   sh.params.set_scalar("PS4", "trace> ");

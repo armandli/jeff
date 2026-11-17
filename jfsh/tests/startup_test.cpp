@@ -531,7 +531,7 @@ TEST(Binary, OptionsReachTheShell) {
   EXPECT_EQ(jfsh({"-s", "a", "b"}, {zd}, "echo $@ $-\n").out, "a b 569Xs\n");
   auto x = jfsh({"-xc", "echo x"}, {zd});
   EXPECT_EQ(x.out, "x\n");
-  EXPECT_EQ(x.err, "+ echo x\n");
+  EXPECT_EQ(x.err, "+" JFSH_BINARY ":1> echo x\n");
   EXPECT_EQ(jfsh({"--version"}).out.starts_with("jfsh "), true);
 }
 
@@ -568,6 +568,24 @@ TEST(Binary, ScriptRunsUpToASyntaxError) {
   auto p = jfsh({script.string()}, {"ZDOTDIR=" + home.path.string()});
   EXPECT_EQ(p.out, "a\nb\n");
   EXPECT_EQ(p.rc, 1);
+}
+
+
+TEST(Binary, B5HistoryFileGetsOnlyNewLines) {
+  TempDir home;
+  str file = (home.path / "hist").string();
+  vec<str> env{"ZDOTDIR=" + home.path.string(), "HISTFILE=" + file};
+  jfsh({"-i"}, env, "echo a\n");
+  jfsh({"-i"}, env, "echo b\n");
+  s::ifstream f{file};
+  EXPECT_EQ(str(s::istreambuf_iterator<char>(f), {}), "echo a\necho b\n");
+}
+
+TEST(Binary, B54PromptsGoToStderrWithoutATerminal) {
+  TempDir home;
+  auto p = jfsh({"-i"}, {"ZDOTDIR=" + home.path.string(), "PS1=P> "}, "echo out\n");
+  EXPECT_EQ(p.out, "out\n");
+  EXPECT_EQ(p.err.substr(0, 3), "P> ");
 }
 
 }  // namespace

@@ -1,4 +1,5 @@
 #include <cerrno>
+#include <clocale>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +19,7 @@
 #include <jfsh/core/signals.h>
 #include <jfsh/core/types.h>
 #include <jfsh/editor/editor.h>
+#include <jfsh/editor/zle.h>
 #include <jfsh/exec/executor.h>
 #include <jfsh/exec/invocation.h>
 #include <jfsh/exec/loop.h>
@@ -82,6 +84,8 @@ str param(jfsh::ParamTable& params, s::string_view name) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+  // The line editor measures characters with wcwidth().
+  std::setlocale(LC_CTYPE, "");
   auto parsed = jfsh::parse_invocation(vec<str>(argv, argv + argc));
   if (not parsed) {
     s::fprintf(stderr, "jfsh: %s\n", parsed.error().message.c_str());
@@ -134,27 +138,26 @@ int main(int argc, char* argv[]) {
   jfsh::init_shell_params(ctx);
   if (interactive) executor.update_window_size();
 
+  // zsh's rule: vi editing when $VISUAL or $EDITOR mentions vi; the
+  // startup files can say otherwise (bindkey -e, setopt emacs).
+  {
+    str visual = param(params, "VISUAL"), editor = param(params, "EDITOR");
+    ctx.zle->select_main((visual.empty() ? editor : visual).find("vi") != str::npos);
+  }
+
   jfsh::StartupConfig startup;
   startup.zsh_compat = inv.zsh_compat_rc;
   jfsh::run_startup_files(executor, startup);
   ctx.aborting = false;
 
-  // History, after the startup files have had their say on HISTFILE and
-  // HISTSIZE.  Only an interactive shell keeps one.
-  jfsh::HistOptions hist_opts;
-  hist_opts.histsize = 1000;
-  jfsh::HistoryManager history(hist_opts);
-  bool save_history = false;
+  // History, after the startup files have had their say on HISTFILE,
+  // HISTSIZE and the history options.  Only an interactive shell keeps
+  // one.
+  jfsh::HistoryManager history(jfsh::history_options(ctx));
+  bool save_history = interactive;   // to $HISTFILE as it is on the way out
   if (interactive) {
-    if (str n = param(params, "HISTSIZE"); not n.empty())
-      hist_opts.histsize = static_cast<int>(s::clamp(s::strtol(n.c_str(), nullptr, 10), 1L, 1L << 30));
-    hist_opts.histfile = param(params, "HISTFILE");
-    history.set_options(hist_opts);
-    if (not hist_opts.histfile.empty()) {
-      (void)history.load(hist_opts.histfile);
-      str keep = param(params, "SAVEHIST");
-      save_history = keep.empty() or s::strtol(keep.c_str(), nullptr, 10) > 0;
-    }
+    auto hist_opts = jfsh::history_options(ctx);
+    if (not hist_opts.histfile.empty()) (void)history.load(hist_opts.histfile);
     ctx.history = &history;   // fc, history, r, $HISTCMD
   }
 
@@ -162,7 +165,11 @@ int main(int argc, char* argv[]) {
   // its logout files, then the EXIT trap and the zshexit hook run.
   auto finish = [&](int rc) {
     if (ctx.exiting) rc = ctx.exit_val;
-    if (save_history) (void)history.save(hist_opts.histfile);
+    if (save_history) {
+      auto hist_opts = jfsh::history_options(ctx);
+      history.set_options(hist_opts);
+      (void)history.save(hist_opts.histfile);
+    }
     ctx.last_exit = rc;
     jfsh::run_logout_files(executor, startup);
     if (ctx.exiting) rc = ctx.exit_val;
@@ -193,18 +200,17 @@ int main(int argc, char* argv[]) {
 
   if (interactive) {
     jfsh::PromptRenderer prompt_renderer(params, opts);
-    jfsh::Editor editor(opts, history, prompt_renderer);
-    editor.set_completer([](s::string_view) -> vec<str> {
-      return {};  // completion engine wired in later
-    });
+    prompt_renderer.set_hooks(executor.prompt_hooks());
+    jfsh::Editor editor(opts, history, prompt_renderer, *ctx.zle);
     // Signals that arrive while a line is being typed: traps run, and with
-    // NOTIFY finished or stopped jobs are reported at once.
+    // NOTIFY finished or stopped jobs are reported at once, where the
+    // prompt was; the editor draws it again below.
     editor.set_wake(jfsh::Signals.wake_fd(), [&](bool& quit) {
       bool printed = jfsh::Signals.pending_trapped() != 0;
-      if (printed) s::fputc('\n', stderr);
+      if (printed) editor.trash();
       executor.handle_signals();
       if (opts.monitor() and opts.get(jfsh::OPT_NOTIFY) and ctx.jobs.has_changes()) {
-        if (not printed) s::fputc('\n', stderr);
+        if (not printed) editor.trash();
         ctx.jobs.notify_changes();
         printed = true;
       }
@@ -249,8 +255,15 @@ int main(int argc, char* argv[]) {
         ctx.exiting = false;
       }
 
+      // The history settings as they are now; with SHARE_HISTORY, what
+      // other shells added.
+      auto hist_opts = jfsh::history_options(ctx);
+      history.set_options(hist_opts);
+      if (hist_opts.share and not hist_opts.histfile.empty()) (void)history.sync(hist_opts.histfile);
+
       // 5–6. The prompt, from $PS1 as it is now, and the line.
       prompt_renderer.reload();
+      editor.set_prebuffer({});
       auto line_opt = editor.read_line();
       if (not line_opt) {   // EOF or hangup
         if (ctx.exiting or not exit_blocked()) break;
@@ -264,6 +277,7 @@ int main(int argc, char* argv[]) {
       // next lines, read after PS2.  Ctrl-C there drops the whole command.
       bool comments = opts.get(jfsh::OPT_INTERACTIVECOMMENTS);
       while (jfsh::is_incomplete(line, comments)) {
+        editor.set_prebuffer(line + "\n");
         auto more = editor.read_line(/*continuation=*/true);
         if (not more) break;
         if (editor.interrupted()) {
@@ -275,15 +289,34 @@ int main(int argc, char* argv[]) {
       }
       if (line.empty()) continue;
 
-      auto expanded = history.expand(line);
+      // Bang history.  An expanded line is shown before it runs; with
+      // HIST_VERIFY it comes back to be edited instead, and :p only shows
+      // it (and keeps it in the history).
+      auto expanded = history.expand_line(line);
       if (not expanded) {
         s::fprintf(stderr, "jfsh: %s\n", expanded.error().message.c_str());
+        ctx.last_exit = 1;
         continue;
       }
-      line = s::move(*expanded);
+      if (expanded->changed) {
+        line = s::move(expanded->text);
+        if (hist_opts.verify and not expanded->print_only) {
+          ctx.zle->next_buffer = line;
+          continue;
+        }
+        s::fprintf(stderr, "%s\n", line.c_str());
+        if (expanded->print_only) {
+          history.add(line);
+          continue;
+        }
+      }
       // The line is in the history before it runs, as in zsh: `history`
       // and $HISTCMD see it, and `r` replaces it with what it runs.
       ctx.hist_current = history.add(line) != 0;
+      bool inc_append = not hist_opts.histfile.empty()
+          and (hist_opts.share or opts.get(jfsh::OPT_INCAPPENDHISTORY));
+      if (inc_append and ctx.hist_current) (void)history.save(hist_opts.histfile, jfsh::HistSave::Append);
+      s::time_t started = s::time(nullptr);
 
       // System 1 routing
       auto decision = router.classify(line);
@@ -308,6 +341,13 @@ int main(int argc, char* argv[]) {
         if (not ctx.exiting) ctx.last_exit = executor.exec_string(line);
         // Ctrl-C: the terminal echoed ^C; start the prompt on a new line.
         if (ctx.aborting) s::fputc('\n', stderr);
+      }
+      if (ctx.hist_current) {
+        history.set_last_elapsed(static_cast<s::uint32_t>(s::time(nullptr) - started));
+        // INC_APPEND_HISTORY_TIME: written once it is done, with its time.
+        if (opts.get(jfsh::OPT_INCAPPENDHISTORYTIME) and not opts.get(jfsh::OPT_INCAPPENDHISTORY)
+            and not hist_opts.share and not hist_opts.histfile.empty())
+          (void)history.save(hist_opts.histfile, jfsh::HistSave::Append);
       }
       ctx.hist_current = false;
 
