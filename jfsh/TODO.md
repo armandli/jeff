@@ -1,10 +1,19 @@
 # jfsh — remaining work
 
-Status as of 2026-11-16: M1 (simple commands), M2 (pipelines, redirections, lists,
+Status as of 2026-11-18: M1 (simple commands), M2 (pipelines, redirections, lists,
 background jobs), M3 (word expansion), M4 (compound commands and functions), M5
 (arithmetic, `[[ ]]`, `test`), M6 (job control, signals, traps), M7 (builtins), M8
 (startup files, invocation, the interactive loop's hooks) and M9 (line editor,
 completion, prompt, history) are done, along with the part of M0 they needed.
+
+**Goal: full zsh feature compatibility.** M10–M20 extend the plan to cover every
+remaining component of zsh (every module zsh ships, every builtin, every option,
+every special parameter, the full compsys completion system, ZLE hooks and
+highlighting, emulation modes, PCRE/`BASH_REMATCH`, coprocesses and named
+references, zsh's shipped function library, and `.zshrc` compatibility). M20
+runs the upstream `zsh/Test` suite plus a hand-curated corpus as the final pass
+criterion. Every milestone from M10 on is a cumulative step toward "a `.zshrc`
+that works under `zsh -f` works under `jfsh -f`, with the same output".
 
 jfsh builds on macOS and Linux and has gtest coverage for the pieces that work. It runs
 **simple commands**, pipelines and background jobs joined by `;`, newlines, `&&`, `||` and
@@ -56,11 +65,31 @@ flowchart TD
   M7 --> M8["M8 Startup files + REPL hooks"]
   M6 --> M8
   M8 --> M9["M9 Line editor, completion,<br/>prompt, history polish"]
+  M9 --> M10["M10 Modules framework<br/>+ core modules"]
+  M10 --> M11["M11 Specialized modules<br/>(pcre, curses, net, zpty, ...)"]
+  M7 --> M12["M12 Emulation modes<br/>(sh/ksh/zsh, invocation name)"]
+  M3 --> M13["M13 Expansion + glob<br/>completeness"]
+  M4 --> M14["M14 Short compound forms<br/>+ PCRE =~ + BASH_REMATCH"]
+  M10 --> M15["M15 Full compsys<br/>(_arguments, menu-select,<br/>shipped functions)"]
+  M9 --> M16["M16 ZLE hooks, $region_highlight,<br/>syntax highlighting, autosuggest"]
+  M7 --> M17["M17 Remaining builtins, specials,<br/>history options, PRIVILEGED"]
+  M15 --> M18["M18 Default function library<br/>+ .zshrc compatibility"]
+  M2 --> M19["M19 Coproc, fd allocation,<br/>named references, time"]
+  M11 --> M20["M20 zsh compatibility corpus<br/>+ CI + packaging"]
+  M12 --> M20
+  M13 --> M20
+  M14 --> M20
+  M16 --> M20
+  M17 --> M20
+  M18 --> M20
+  M19 --> M20
   M1 --> R["R System 1 router / agent<br/>(independent track)"]
 ```
 
-Milestones M0–M4 are the minimum for jfsh to be usable as a shell. The router/agent track
-(R) can proceed in parallel at any time.
+Milestones M0–M4 are the minimum for jfsh to be usable as a shell; M0–M9 are the
+daily-driver subset already in main. Milestones M10–M20 bring jfsh to full zsh
+feature compatibility, culminating in M20's upstream-test corpus. The router/agent
+track (R) can proceed in parallel at any time.
 
 ---
 
@@ -708,25 +737,539 @@ output, bang expansions and xtrace lines were compared with it.
   the line at once instead of keeping it until the next one.
 - `%_` (parser state) is always empty, so PS2's default `%_> ` is `> `.
 
-### Glob, modules, misc
+### M10. Modules framework and core modules [modules/*]
 
-- **Glob:** done with M3 (`src/glob/glob.cpp`). `CompiledPattern` matches `*`, `?`,
-  `[…]` (ranges, `!`/`^`, `[:class:]`), `\` escapes, `(a|b)` and `<lo-hi>`, and under
-  `EXTENDED_GLOB` `x#`, `x##`, `^pat` and `a~b` (whole-path exclusion). `glob_expand`
-  walks multi-segment paths, `**/` and `***/`, honours `GLOB_DOTS`, `CASE_GLOB`,
-  `NULL_GLOB`, `NOMATCH` ("no matches found"), `MARK_DIRS` and `NUMERIC_GLOB_SORT`, and the
-  qualifiers `. / @ * = p % r w x R W X ^ - N D`, `o`/`O` by `n L m a c`, and `[n,m]`.
-  Still missing: globbing flags `(#i)`/`(#b)`/`(#a1)`, `KSH_GLOB`, the size/age/owner
-  qualifiers, `(e:…:)` and `:` modifiers in qualifiers [glob/extglob], [glob/quals].
-- **Modules:**
-  - `ModuleManager` is never instantiated;
-  - `zmodload` needs search paths (`$module_path`);
-  - modules must register builtins with the executor's table, and loaded builtins must
-    be visible to it;
-  - decide whether binary modules are worth supporting at all, or whether built-in
-    "modules" (e.g. `zsh/datetime`, `zsh/mathfunc`) should be compiled in.
-- **Emulation:** `emulate sh|ksh|zsh` via `OptionState::apply_emulation`, and `sh`/`ksh`
-  behaviour when invoked as `sh`.
+Builds the module subsystem that every other zsh module, most of the compsys
+completion code (M15), and the shipped function library (M18) depend on. Fixes
+bug B53 (`ModuleManager` never instantiated).
+
+**Framework**
+- Wire `ModuleManager` into `Shell`/`Executor`; own it on `ExecContext`. Expose
+  `$module_path` (default `/usr/lib/zsh/$ZSH_VERSION`, plus jfsh's own module
+  dir, configurable via `JFSH_MODULE_DIR` CMake cache). Walk it to resolve
+  `zsh/x` → `$module_path/zsh/x.so` / `.bundle` / `.dylib`.
+- `zmodload [-abcdeFiIlLmpuUR] [-A|-R alias=name] [name [params…]]`: load,
+  unload, list (`-L` in sourceable form), features (`-F`, `-l -F`), aliases
+  (`-A`, `-R`), autoload builtins (`-a`, `-ab`, `-ac`, `-ap`), parameters
+  (`-p`), conditions (`-c`), math functions (`-f`), unload with `-u`. Match
+  zsh's error wording (`failed to load module: x`, `no such feature: y`).
+- Module ABI: a C API — `boot_<module>`, `cleanup_<module>`, `features_<module>`,
+  `enables_<module>`, `finish_<module>`. Built-in modules link into the binary
+  and register through the same table as loaded ones, so a jfsh built without
+  `dlopen` support still has every shipped module available. Loaded builtins
+  are visible to `whence`, `which`, `builtin`, `hash`, `type`, `command -v`.
+- Decision recorded in code: shipped modules are compiled in by default; the
+  `dlopen` path is for third-party modules only. A CMake option
+  `JFSH_MODULES_STATIC=ON|OFF` picks.
+- `autoload` finds module-provided functions through `$fpath` once
+  `zsh/parameter` (below) exposes it.
+
+**Core modules** (each compiled in; each also loadable at runtime)
+- `zsh/datetime`: `strftime [-rs] fmt [epochtime]`, `$EPOCHSECONDS`,
+  `$EPOCHREALTIME`, `$epochtime` array. Wire the existing specials through
+  the module's parameter table so `unset` drops them as zsh does.
+- `zsh/mathfunc`: `sqrt sin cos tan asin acos atan atan2 exp log log10 pow
+  abs int float ceil floor rint logb erf erfc gamma lgamma j0 j1 y0 y1 hypot
+  cosh sinh tanh asinh acosh atanh cbrt expm1 log1p` as math-function
+  names via a `MathEvaluator::register_function` hook. Also `rand48`.
+- `zsh/parameter`: expose shell state as live associative-array / array
+  parameters. Each of these must read through to the live table: `$parameters`,
+  `$commands`, `$functions`, `$dis_functions`, `$aliases`, `$dis_aliases`,
+  `$galiases`, `$dis_galiases`, `$saliases`, `$dis_saliases`, `$builtins`,
+  `$dis_builtins`, `$reswords`, `$dis_reswords`, `$patchars`, `$dis_patchars`,
+  `$options`, `$modules`, `$widgets`, `$jobdirs`, `$jobstates`, `$jobtexts`,
+  `$nameddirs`, `$userdirs`, `$history`, `$historywords`, `$funcstack`,
+  `$funcfiletrace`, `$funcsourcetrace`, `$functrace`. Needed by compsys
+  (`_arguments`, `_describe` scan these).
+- `zsh/zutil`: `zstyle [-eLs delim name param|…]` with pattern contexts;
+  `zformat -f var spec args…` and `zformat -a var sep key=val…`;
+  `zregexparse [-c] [-d] [-A arr] [-M arr] subject regex`;
+  `zparseopts [-D] [-K] [-M] [-E] [-F] [-A arr] [-a arr] spec…` with
+  `name+=` / `name:` / `name:-` / `name::` forms; `zcompile [-UMcma]`
+  bytecode cache (writes `.zwc`, read by `autoload`); the `is-at-least`
+  comparison builtin. Needed by compsys and every non-trivial zsh script.
+- `zsh/system`: `syserror [-e var] [-p prefix] errno`, `sysopen -o flags
+  -u fd file`, `sysread [-c count] [-i fd] [-o fd] [-s size] [-t secs]
+  [name]`, `sysseek [-u fd] [-w start|end|current] offset`, `syswrite
+  [-c count] [-o fd] data`, `zsystem flock [-t secs] [-f fd] [-r] file`,
+  `zsystem supports feature`, `$errnos` associative array.
+- `zsh/files`: builtin `chmod`, `chown`, `chgrp`, `ln`, `mkdir`, `mv`, `rm`,
+  `rmdir`, `sync`. Register through the module so they override the externals
+  only when enabled, as zsh does.
+- `zsh/stat` (alias `zstat`): `zstat [-glLnoNrstT] [+element] [-A arr | -H
+  hash] file…` with every stat field; a format string with zsh's placeholders.
+- `zsh/pcre`: `pcre_compile [-aimsx] pattern`, `pcre_study`,
+  `pcre_match [-v var] [-a arr] [-n offset] string`, `$PCRE_MATCH`,
+  `$pcre_match`; `[[ string -pcre-match pattern ]]` condition (wired into
+  `[[ ]]` in M14). Uses PCRE2.
+
+**Tests**
+- `tests/modules_test.cpp`: `zmodload` listing, loading, unloading, aliases,
+  autoload, `-F`, dependencies, and failure wording.
+- One test file per core module (`tests/modules/datetime_test.cpp`,
+  `mathfunc_test.cpp`, `parameter_test.cpp`, `zutil_test.cpp`, `system_test.cpp`,
+  `files_test.cpp`, `stat_test.cpp`, `pcre_test.cpp`) with expected output from
+  `zsh -f -c` captured once zsh is installable on the test host (today it is
+  not; the sanitizer/clang/g++ test matrix still applies).
+
+### M11. Specialized modules [modules/*]
+
+The modules that round out zsh's feature set but aren't required by the core
+runtime. Each lands with its own tests; group ordering is suggested, not
+required.
+
+**Networking and IPC**
+- `zsh/net/tcp`: `ztcp [-acflLv] [-d fd] [host [port]]`, `ztcp -c fd [count]`;
+  `$REPLY` for the accepted fd.
+- `zsh/net/socket`: `zsocket -a listenfd` (accept), `zsocket -d fd`,
+  `zsocket -l path`, `zsocket path`.
+- `zsh/zftp`: `zftp open|cd|ls|dir|get|put|append|getat|putat|appendat|delete
+  |mkdir|rmdir|remote|local|type|ascii|binary|mode|rename|quote|site|close
+  |test|session|rmsession`.
+- `zsh/zselect`: `zselect [-rwe] [-t timeout] fd…` wrapping `pselect`.
+- `zsh/socket`: older name for `zsocket`, kept for compat with old scripts.
+
+**Terminal, display, i18n**
+- `zsh/termcap`: `echotc capability`, `$termcap` associative array.
+- `zsh/terminfo`: `echoti capability`, `$terminfo` associative array.
+- `zsh/langinfo`: `$langinfo` associative array (`CODESET`, `YESEXPR`,
+  `NOEXPR`, `D_FMT`, `T_FMT`, `D_T_FMT`, `AM_STR`, `PM_STR`, `ABDAY_1`…).
+- `zsh/curses`: `zcurses init|end|addwin|delwin|refresh|move|char|string|
+  clear|attr|bg|border|scroll|input|mouse|timeout|touch|resize|querychar|
+  position`.
+- `zsh/nearcolor`: approximate truecolor `%F{#rrggbb}` down to 256 or 16
+  colors based on `$TERM`; hooked into `src/prompt/prompt.cpp`.
+
+**Data and regex**
+- `zsh/regex`: `[[ string -regex-match pattern ]]`, sets `$MATCH`, `$match`,
+  `$MBEGIN`/`$MEND`. Uses POSIX ERE (already on hand through `<regex.h>`).
+- `zsh/mapfile`: `$mapfile` associative array whose keys are file paths and
+  values the files' contents (read on lookup, write on assignment, delete
+  on `unset mapfile[path]`).
+- `zsh/db/gdbm`: `ztie -d db/gdbm -f file name`, `zuntie [-u] name`,
+  `zgdbmpath name`; associative-array semantics backed by GDBM.
+- `zsh/private`: `private [name[=value]…]`: parameter visible only to the
+  function that declared it, not to callees. Needs a small change to the
+  parameter-scope lookup rules (new flag `PM_PRIVATE`).
+
+**Pty, profiling, attributes, ZLE extras**
+- `zsh/zpty`: replace the "not implemented" stub with `zpty [-e] [-b] name
+  cmd`, `zpty -d name`, `zpty -r name [param [pattern]]`, `zpty -w name
+  string`, `zpty -t name`, `zpty -L`, `$REPLY`. Used by zsh's own tests.
+- `zsh/zprof`: `zprof [-c] [-n]` profiler; per-function cumulative and
+  self times via a hook on function entry/exit in `ExecContext`.
+- `zsh/attr`: `zgetattr`, `zsetattr`, `zdelattr`, `zlistattr` via Linux
+  `sys/xattr.h` and BSD `sys/extattr.h`.
+- `zsh/cap`: `cap [name…]`, `getcap`, `setcap` on Linux capability-aware
+  builds (`sys/capability.h`).
+- `zsh/zleparameter`: expose `$widgets` and `$keymaps` to ZLE scripts.
+- `zsh/deltochar`: `delete-to-char` and `zap-to-char` ZLE widgets.
+- `zsh/compctl`: legacy `compctl`-style completion. Parse the full syntax
+  but implement only the subset `oh-my-zsh`/`prezto` legacy plugins still
+  reach for, forwarding to compsys internally; mark unsupported combinations
+  with `jfsh: compctl: unsupported option`.
+- `zsh/example`: the tiny loadable example that exercises the module ABI;
+  kept as a build/test target only.
+- `zsh/clone`: `clone tty` (re-parents the shell onto a different tty).
+- `zsh/watch`: `$watch`, `$WATCHFMT`, the `log` builtin, periodic
+  who/last scan driven off the same timer as `$PERIOD` (M8).
+- `zsh/newuser`: run the equivalent of `zsh-newuser-install` on first
+  interactive login with no rc files (prompt theme picker, basic rc stub).
+
+**Tests**
+- One test per module under `tests/modules/`. Network modules use loopback
+  on an ephemeral port; `zpty` tests go through `forkpty`; `curses`,
+  `terminfo`, `termcap` tests spin up a pty with a stub terminfo entry.
+
+### M12. Emulation modes [core/options], [exec/invocation]
+
+Already in place: zsh's full option table (M7) with each emulation's defaults.
+
+**Remaining**
+- `emulate [-LR] sh|ksh|zsh [-c cmd]`: switch the option set, special-parameter
+  semantics, keyword rules and reserved words for the duration of the script,
+  the function (`-L`) or the `-c` command. On function return under `-L`,
+  restore the option set the function saw.
+- `emulate -l`: list in a sourceable form the options that differ from the
+  emulation's defaults.
+- Invocation-name behavior: when `argv[0]` is `sh`, `ksh`, `csh` or starts with
+  `-` followed by any of those (login shell), pick the matching emulation at
+  startup, read the right rc files (`/etc/profile`, `~/.profile`, `$ENV`, …),
+  and skip zsh's.
+- Every option below gets its code path wired through, not just the flag:
+  `POSIX_BUILTINS`, `POSIX_IDENTIFIERS`, `POSIX_STRINGS`, `POSIX_ALIASES`,
+  `POSIX_CD`, `POSIX_JOBS`, `POSIX_TRAPS`, `KSH_ARRAYS` (0-based indexing,
+  `$a` means `$a[0]`, `${a[*]}` needed for all elements), `KSH_AUTOLOAD`,
+  `KSH_GLOB` (M13), `KSH_OPTION_PRINT`, `KSH_TYPESET`, `KSH_ZERO_SUBSCRIPT`,
+  `SH_FILE_EXPANSION`, `SH_GLOB`, `SH_NULLCMD`, `SH_OPTION_LETTERS`,
+  `SH_WORD_SPLIT`, `BSD_ECHO`, `BASH_REMATCH` (M14), `TRAPS_ASYNC`,
+  `CSH_JUNKIE_HISTORY`/`LOOPS`/`QUOTES`, `CSH_NULL_GLOB`, `CSH_NULLCMD`.
+- `sh` and `ksh` entry: set emulation + option set + rc-file paths + prompt
+  defaults (`$` for `sh`) up front, before reading the rc files.
+
+**Tests**
+- `tests/emulate_test.cpp`: under each emulation, `[[ -o option ]]` reports the
+  right defaults; `KSH_ARRAYS` indexing switches base; `SH_WORD_SPLIT` splits
+  scalars; `POSIX_BUILTINS` keeps assignments after special builtins;
+  `POSIX_TRAPS` resets EXIT between functions; `sh -c` reads `/etc/profile`.
+
+### M13. Expansion and glob completeness [exec/expand], [glob/*]
+
+**Expansion**
+- `${^x}` / `RC_EXPAND_PARAM`: array in a word becomes "prefix $x_i suffix"
+  for each element; `${^^x}` also splits on `$IFS`.
+- `${x:#pat}` and `${(M)x:#pat}`: filter array elements by pattern (match /
+  non-match).
+- Subscript flags `[(r)pat]`, `[(R)pat]`, `[(i)pat]`, `[(I)pat]`, `[(e)]`,
+  `[(n)]` (numeric order), `[(b)n]`.
+- Padding flags `(l:n::s::f:)`, `(r:n::s::f:)`.
+- `(%)` prompt-escape expansion; `(e)` evaluate as a shell expression;
+  `(D)` abbreviate home-relative paths; `(V)` make non-printables visible;
+  `(c)`/`(w)` count characters / words; `(#)` arithmetic evaluate each
+  element; `:s/x/y/`, `:s|x|y|`, `:gs/x/y/`, `:&` (repeat), `:G` (all),
+  `:x` (quote-remove).
+- A failed `${x?}` in a non-interactive shell exits the shell (subst/errexit).
+- In `${x:-word}`, unquoted pattern characters in `word` glob (subst/glob).
+- `KSH_ARRAYS` indexing (tied to M12).
+
+**Glob**
+- Globbing flags `(#i)` (case-insensitive subpattern), `(#l)` (letter-case-
+  insensitive), `(#I)` (case-sensitive scope), `(#b)` (named backreferences
+  → `$match`), `(#B)` (no backref), `(#m)` (sets `$MATCH`), `(#M)` (no
+  `$MATCH`), `(#a1)` / `(#a2)` approximate matching (Damerau–Levenshtein,
+  bounded).
+- `KSH_GLOB`: `?(…)`, `*(…)`, `+(…)`, `@(…)`, `!(…)`.
+- Qualifier modifiers: add `(e:expr:)` (file passes a shell expression),
+  `(+function)` (file passes a function test), size `(L[+-]n[kmp])`, age
+  `(m[Mwhms][+-]n)`, link count `(l[+-]n)`, owner `(u:name:)`, group
+  `(g:group:)`, `(U)` user-owned, `(G)` group-owned, `(f:perm:)` permission
+  mask, `(d:dev:)` device, `(k:nlinks:)`, `(:modifier:)` (apply history
+  modifier to each result).
+- `CSH_NULL_GLOB`: unmatched patterns empty only if **every** pattern on the
+  command line is unmatched.
+- `NO_GLOB` option slot (`set -f`).
+
+**Tests**
+- Extend `tests/subst_test.cpp` and `tests/glob_test.cpp`; add
+  `tests/glob_quals_test.cpp` with every qualifier under temp-file setups
+  checked against `zsh -f -c`.
+
+### M14. Compound short forms, PCRE `=~`, `BASH_REMATCH` [parser/short], [builtins/cond]
+
+**Short compound forms**
+- `if [[ … ]] { … }` / `if cond { … }` with `{ } else { } elif cond { }`.
+- `while cond { … }`, `until cond { … }`, `for name (words) { … }`,
+  `for ((;;)) { … }`, `select name (words) { … }`, `repeat N { … }`.
+- `foreach name (words); body; end`.
+- `for x in a b; cmd` (no `do … done`; single command after `;`).
+- Redirections on a function definition (`f() { … } > log`) become part of
+  the function body (M4 left item).
+- `f() {}` parses as a function with an empty body (today it parses as "run
+  the command `{}`"; M7 left item).
+- `< <(cmd)` (process substitution as a redirection target) parses (M7 left
+  item).
+- `EF_NOFORK` for a `( … )` subshell that is already a forked pipeline stage
+  (M4 left item).
+
+**Regex**
+- `[[ s =~ p ]]` under `REMATCH_PCRE`: compile `p` with PCRE2 (through
+  `zsh/pcre` from M10); fall back to POSIX ERE without the option.
+- `BASH_REMATCH` option: write `$BASH_REMATCH` array with full-match at
+  index 0 (for ksh/bash emulations).
+- `[[ -pcre-match ]]` and `[[ -regex-match ]]` conditions wired in from
+  M10/M11.
+- `[[ -n ]]` alone becomes an unknown condition (zsh's wording), not a
+  string test (M5 left item).
+- `test` / `[` accepts `<` and `>` (POSIX 2024) and `test -o option`
+  (M5 left item).
+- xtrace prints `[[ … ]]` and `(( … ))` commands (M5 left item).
+
+**Tests**
+- `tests/compound_test.cpp`: every short form under `zsh -f -c`.
+- `tests/cond_test.cpp`: PCRE under feature flag; `BASH_REMATCH`.
+
+### M15. Full completion system (compsys) [completion/*]
+
+Replaces the hand-rolled context code (M9) with the full compsys framework.
+
+**Core framework** (`src/completion/compsys.cpp`, headers under
+`include/jfsh/completion/`)
+- `_main_complete` dispatcher: propose a set of `_tag`s, then fill them with
+  `_complete` / `_approximate` / `_correct` / `_expand` / `_history` /
+  `_oldlist` / `_prefix` / `_match` / `_ignored` / `_menu` / `_user_expand`.
+- `compstate` associative array: `context`, `nmatches`, `unambiguous`,
+  `exact_string`, `list`, `insert`, `old_insert`, `old_list`, `last_prompt`,
+  `pattern_insert`, `pattern_match`, `ignored`, `restore`, `to_end`,
+  `vared`, `redirect`, `parameter`.
+- Live editable `$words`, `$CURRENT`, `$PREFIX`, `$SUFFIX`, `$IPREFIX`,
+  `$ISUFFIX`, `$QIPREFIX`, `$QISUFFIX`.
+- `compadd` with every option (`-S`, `-s`, `-r`, `-R func`, `-q`, `-Q`,
+  `-X`, `-x`, `-J`, `-V`, `-O`, `-M matcher`, `-W`, `-F ignore`, `-n`,
+  `-U`, `-l`, `-o`, `-E`, `-k`, `-K`, `-a`, `-d`, `-i`, `-p`, `-P`, `-f`,
+  `-A`).
+- `compdescribe`, `compfiles`, `compgroups`, `compquote`, `comptags`,
+  `comptry`, `compvalues`.
+- `_arguments [-s] [-A pattern] [-C] [-R] [-O arr] [-M spec] [-w] [-W]
+  specs…`: option specs (`-opt[desc]`, `--long=VALUE[desc]:action`,
+  `*::rest::action`), action syntax (`(a b c)`, `(( a\:desc b\:desc ))`,
+  `->state`, `->state=cond`, `{compl-code}`, `*`, `(-)`).
+- `_describe`, `_values`, `_wanted`, `_requested`, `_alternative`,
+  `_message`, `_tags`, `_prefix`, `_suffix`, `_complete`, `_default`,
+  `_normal`, `_files`, `_directories`, `_hosts`, `_users`, `_groups`,
+  `_commands`, `_parameters`, `_options`, `_cd`, `_path_files`.
+- `_approximate` / `_correct` using M13's `(#a1)`.
+
+**Menu selection** (`zsh/complist`)
+- `menu-select` ZLE widget: a key at the list opens a selection navigator;
+  arrow keys and vi keys move, Enter inserts; completion is replaced as the
+  highlight moves.
+- `menuselect` keymap with zsh's defaults (accept, cancel, accept-and-infer-
+  next-history, down/up-line-or-history, left/right, forward/backward-word,
+  undo, history-incremental-search-forward).
+- `$MENUSELECT`, `$LIST_PACKED`, `$LIST_ROWS_FIRST`.
+- `LIST_COLORS` and `list-colors` zstyle for colored listings.
+
+**Named directories and cdpath in completion**
+- `hash -d name=path` (M17 ties this into the builtin), `~name` and `%~`
+  display, `_cdpath` walking `$cdpath`.
+
+**Shipped function library** (`share/jfsh/functions/Completion/`)
+- Install zsh's shipped completion functions under `JFSH_FUNCTIONS_DIR`
+  (CMake cache, default `share/jfsh/functions`), autoload them on
+  `compinit`. Start with Base (`_main_complete`, `_arguments`,
+  `_description`, `_tags`, `_message`, `_alternative`, …), Unix
+  (`_cd`, `_ls`, `_rm`, `_mv`, `_cp`, `_ssh`, `_scp`, `_rsync`, `_grep`,
+  `_find`, `_tar`, `_make`, `_sudo`, `_git`), and iteratively ship the
+  rest; publish `completion-compat.md` listing what is supported.
+- `compinit [-D] [-u] [-U] [-d dump] [-i] [-C]`: build `.zcompdump` of
+  autoload definitions with zsh's security check (fpath directory
+  ownership, 022 umask, insecure directory warning).
+
+**Tests**
+- `tests/completion_test.cpp`: `_arguments` dispatch, `_describe` display,
+  `compstate` feedback, menu selection in a pty.
+- The M20 compat corpus runs the function-library tests zsh ships.
+
+### M16. ZLE polish and highlighting [editor/*]
+
+**Hooks and parameters**
+- User-widget hooks: `zle-line-init`, `zle-line-finish`, `zle-keymap-select`,
+  `zle-isearch-exit`, `zle-isearch-update`, `zle-history-line-set`,
+  `zle-finish`. Each gets the right environment (`$KEYMAP`, `$OLDKEYMAP`,
+  `$BUFFER`, …) on entry.
+- `$zle_highlight` array (default `(isearch region special suffix paste)`
+  plus `default:none`); `$region_highlight` array of entries
+  `start end spec [memo:tag]` with spec `fg=…,bg=…,bold,standout,underline,
+  blink,reverse`. Redraw groups per entry; keep per-key state.
+- `zle -F fd [handler]`: install fd handlers invoked between keystrokes
+  (needed by `zftp` async and by async completion).
+- `zle -T tc widget`: tie a terminal cap to a widget.
+
+**Widgets and keymaps**
+- `menuselect` keymap (from M15) and `expand-word`, `list-expand`,
+  `spell-word` fully implemented (M9 only beeps).
+- Vi `:` ex commands: `:w`, `:q`, `:wq`, `:q!`, `:s/.../.../`, `:set opt`,
+  `:map`.
+- Vi `.` repeat with its own count (not just the recorded one); `aa`/`ia`
+  shell-word text objects using the completion-side tokenizer.
+
+**Rendering**
+- SIGWINCH redraw of multi-row prompts fully reflowed, not just updated
+  (M9 left item).
+- Dirty-line tracking in `src/editor/refresh.cpp`: redraw only the differences
+  for very long buffers, so a 50 k-character line stays usable over a slow
+  link (M9 left item).
+- `%G` prompt escape honoured.
+- `sched -o` clears the editor line and runs events while the editor is
+  waiting for input (M8/M9 left item).
+
+**Syntax highlighting and autosuggestions**
+- Optional, built-in: tokenize the buffer as the user types, drive colors
+  through `$region_highlight` (so themeable via `.zshrc`). Fast path:
+  incremental re-tokenization on insert/delete around the cursor.
+- Autosuggestions (a la `zsh-autosuggestions`): dim-text suggestion after
+  the cursor drawn from history or completion; accept with `forward-char`
+  / End; configurable through `$ZSH_AUTOSUGGEST_STRATEGY`.
+
+**`vared` extras**
+- `vared -i init-widget -f finish-widget`.
+- `vared` inside a ZLE widget: push/pop the editor state.
+
+**Tests**
+- `tests/editor_test.cpp`: hooks fire with the right parameters;
+  `$region_highlight` colors a region; syntax highlight stays correct across
+  edits; autosuggest doesn't leak past Enter.
+
+### M17. Remaining builtins, specials, history options, PRIVILEGED
+
+**Builtins**
+- `typeset -T NAME SCALAR[=val] [sep]`: tied scalar/array pair
+  (`PATH`/`path`), separator, two-way updates.
+- `typeset -Z N`, `-L N`, `-R N` padding; `-h` hidden from listing;
+  `-t` tagged (per-param tracing).
+- `typeset -n ref=name`: nameref semantics (M19 implements the lookup; this
+  milestone wires the flag through the typeset builtin).
+- `emulate -l` listing (M12 adds the full behavior; this is the output
+  format).
+- `autoload -X` (mark as "file is a function body, parse as body on first
+  call"; current `-U` is already there).
+- `read -z` (one `NUL`-terminated record), `-c`, `-l`, `-n`, `-p`
+  (co-process input from M19).
+- `print -z` (push to the editor buffer), `-p` (co-process output).
+- `fc -p [file [histsize [savehist]]]`, `fc -P`: history stack.
+- `hash -d name=path`: named directories. Builtin lists `-d` entries in
+  zsh's format; fills `$nameddirs`.
+- `suspend [-f]`.
+- `time pipeline` and `time` with no pipeline; `$TIMEFMT`; `JOB_TIMED` flag
+  on jobs; `$REPORTTIME` threshold.
+- Special-builtin errors (`set -o nosuch`, `unset readonly`) exit a
+  non-interactive shell under `POSIX_BUILTINS` (M7 left item).
+- A forked pipeline stage's `HASH_CMDS` hit flows back to the parent through
+  the self-pipe, so a path hashed inside a `|` is visible after (M7 left
+  item).
+- zsh's default aliases (`run-help`, `which-command`) and functions added by
+  `zsh -f` are defined (M7 left item; the function bodies are M18's problem).
+- Error messages name the shell as `zsh:` under emulation; add zsh's line
+  numbers and `(eval)` where it uses them (M7 left item).
+
+**Specials**
+- `$TTYIDLE` (seconds since last keystroke).
+- `$UID`, `$EUID`, `$GID`, `$EGID`: readable; assignable through
+  setuid/setgid.
+- `$USERNAME`: readable; assignable through setuid.
+- `$ZSH_SUBSHELL` auto-incremented on fork.
+- `$funcstack`, `$funcfiletrace`, `$funcsourcetrace`, `$functrace`,
+  `$ZSH_EVAL_CONTEXT`, `$ZSH_SCRIPT`, `$ZSH_ARGZERO`, `$HISTCHARS` (already
+  have `$histchars`).
+- `local SECONDS` makes a local copy of the special and preserves live-
+  update semantics (M8 left item).
+- `unset` on a special drops its special meaning for good; next assignment
+  is a plain scalar (M8 left item).
+- `$LINENO` in a one-line function (`f() { echo $LINENO; }`) is 1; check
+  against zsh (M8 left item).
+- `$pipestatus` after a function call is the function body's last pipeline
+  (M8 left item).
+
+**History options**
+- `HIST_EXPIRE_DUPS_FIRST`: when trimming to `$SAVEHIST`, drop duplicates
+  before unique lines.
+- `HIST_LEX_WORDS`: lex-based word splitting for `fc` / `!$`.
+- `HIST_SAVE_BY_COPY`: write to a temp file and rename under the lock.
+- `HIST_NO_FUNCTIONS`: don't save a function-definition line.
+- `CSH_JUNKIE_HISTORY`: `!x` is `!?x?`, not `!x*`.
+- `HIST_IGNORE_SPACE` keeps the line until the next prompt so `!!` still
+  finds it (M9 left item).
+
+**PRIVILEGED mode**
+- Under `-p` / `PRIVILEGED`, do not read the user's rc files; use
+  `/etc/zshenv.privileged` if present, else `/etc/zshenv`.
+- Drop `IFS` back to the default at startup and after assignment.
+
+**Tests**
+- `tests/builtins_test.cpp`, `tests/vars_test.cpp`, `tests/history_test.cpp`,
+  `tests/privileged_test.cpp`. Expected outputs from `zsh -f -c`.
+
+### M18. Default function library and `.zshrc` compatibility [share/*]
+
+- Install `share/jfsh/functions/` (CMake cache `JFSH_FUNCTIONS_DIR`) with a
+  subset of zsh's shipped function library: `Base/`, `Completion/`, `Misc/`,
+  `Prompts/`, `VCS_Info/`, `Zle/`, `Zftp/`, `Zutil/`, `Chpwd/`, `MIME/`.
+- Default aliases `run-help`, `which-command`, `history` (`fc -l 1`) and
+  whatever else `zsh -f` sets up (M7 left item).
+- `run-help` function dispatching to `man` or format-specific handlers;
+  `run-help-git`, `run-help-sudo`, `run-help-svn`.
+- `promptinit`, `prompt -l`, `prompt theme [args]` and a handful of bundled
+  themes (`adam1`, `clint`, `fade`, `walters`, `redhat`, `bart`).
+- `vcs_info` with git support at minimum (`hg`, `svn` optional):
+  `zstyle ':vcs_info:*' …` keys, `$vcs_info_msg_N_`.
+- `add-zsh-hook`, `add-zle-hook-widget` (compose the hook arrays
+  `precmd_functions`, `preexec_functions`, …).
+- `.zshrc` compatibility: the current `--zsh-compat-rc` opt-in becomes the
+  default once M10–M16 are landed, with `--no-zsh-compat-rc` to turn it
+  off. Read `/etc/zsh/zshenv`, `/etc/zsh/zprofile`, `/etc/zsh/zshrc`,
+  `/etc/zsh/zlogin`, `/etc/zsh/zlogout` alongside the `jfsh*` ones.
+- A shipped `jfsh/zsh-compat-check` shell script scans a `.zshrc` for
+  constructs jfsh doesn't yet support and prints a summary.
+
+**Tests**
+- `tests/compat_rc_test.cpp`: a corpus of real-world `.zshrc` lines
+  (oh-my-zsh, prezto, starship, powerlevel10k) parse and set the expected
+  state.
+- `tests/prompt_themes_test.cpp`: every bundled theme renders without errors.
+- Manual-run suite: start jfsh under a fresh user with oh-my-zsh's default
+  `.zshrc`; the prompt renders, Tab works, `git` completion works.
+
+### M19. Coprocesses, fd allocation, named references, async traps [exec/*]
+
+- `coproc cmd`: fork the command into a subshell with its stdin/stdout
+  connected to shell-accessible fds; set `$COPROC` to the fd pair and
+  `$!` to the pid. Multiple concurrent coprocs allowed (one named per fd
+  pair).
+- `print -p`, `read -p`: coproc I/O (M17 adds the flags; this milestone
+  wires them to the coproc fds).
+- `cmd |& cmd` (stderr merge) stays as-is, separate from `coproc`.
+- Fd allocation `{var}>file`, `{var}<file`, `{var}>&-`, `{var}<&fd`:
+  parser allocates a shell-reserved fd ≥ 10 and stores it in `$var`; close
+  on last use unless the user explicitly closes it.
+- `typeset -n ref=name`: nameref semantics; assignment to `$ref` writes
+  through to `name`; scope-aware lookup for `$name` resolution.
+- `anonymous () { … } args`: `$0 = (anon)`, correct scoping, arguments
+  through full expansion; `always` block after `return`.
+- `( )` subshell honours `EF_NOFORK` when it is already a forked pipeline
+  stage, so `cmd | ( body )` doesn't double-fork (M4 left item).
+- Background pipeline reports each stage's pid in `jobs -l` (M6 left item).
+- Suspended command's remaining pipeline becomes its own suspended job
+  (M6 left item).
+- `TRAPS_ASYNC`, `POSIX_TRAPS`, `POSIX_JOBS`, `AUTO_CONTINUE`, `AUTO_RESUME`.
+- `time pipeline` with `$TIMEFMT`; `$REPORTTIME` threshold emits the time
+  report when a pipeline runs longer than N seconds (M17 adds the builtin;
+  this milestone adds the per-pipeline timing hook in the executor).
+
+**Tests**
+- `tests/coproc_test.cpp`, `tests/fdalloc_test.cpp`, `tests/nameref_test.cpp`,
+  `tests/async_trap_test.cpp`.
+
+### M20. zsh compatibility corpus, CI, packaging
+
+The final pass criterion: jfsh runs the upstream zsh test suite, plus a hand-
+curated real-world corpus, and ships as a drop-in `/bin/zsh` for interactive
+use.
+
+**Corpus**
+- `tests/compat/` zsh scripts: each runnable under `zsh -f` and `jfsh -f`,
+  with outputs diffed in CI. Grows per milestone.
+- Import zsh's own `Test/` suite: `A*.ztst` (basic), `B*` (builtins),
+  `C*` (compat), `D*` (prompts/ZLE), `E*` (modules), `V*` (variables),
+  `Y*` (completion). Write a `.ztst` parser/runner (`tests/ztst_runner.cpp`);
+  mark unsupported cases `SKIP`; grow the pass set per milestone. A green
+  run is the "full zsh compatibility" line.
+- Real-world corpus: oh-my-zsh, prezto, starship and powerlevel10k `.zshrc`s
+  parse and start a prompt.
+
+**CI**
+- Matrix: g++-15, clang-21, Apple clang; Debug + Release + ASan+UBSan + LSan;
+  on every PR.
+- Benchmark harness: compare jfsh and zsh on startup time, prompt latency,
+  a 50 k-line history read, and a 1 MB pipeline. Thresholds in CI: jfsh
+  within 20% of zsh on each.
+- Warn-free under `-Wall -Wextra -Wpedantic -Werror`; B56's
+  `-Wno-unused-parameter` comes off.
+
+**Packaging**
+- `make install` lays out `bin/jfsh`, `share/jfsh/functions/*`,
+  `lib/jfsh/modules/*.so`, `share/man/man1/jfsh.1` (generated from
+  `jfsh --help` and the per-builtin `--help` strings), `share/doc/jfsh/`.
+- Debian, RPM and Homebrew formulas once the compat corpus is green.
+- `update-shells` integration: install adds `/usr/local/bin/jfsh` to
+  `/etc/shells`.
+
+**Pass criteria**
+- `zsh/Test` A, B, C, D, E, V, Y run at ≥ 95% pass rate.
+- A fresh user's `.zshrc` from `oh-my-zsh` or `prezto` starts a prompt in
+  under 500 ms on reference hardware.
+- Running `jfsh` with no flags against the same `.zshrc` as `zsh` shows the
+  same prompt, the same completion for a dozen common commands, and the
+  same output for the compat corpus.
 
 ### R. System 1 router and LLM agent (jfsh-specific track)
 
