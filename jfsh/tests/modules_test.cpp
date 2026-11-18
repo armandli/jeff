@@ -1,8 +1,16 @@
-// Tests for the M10 module framework and the shipped Phase-1 modules
-// (zsh/datetime, zsh/mathfunc).  Uses the in-process Shell fixture; expected
-// outputs match zsh 5.9's `zsh -f -c`.
+// Tests for the M10 module framework and the shipped modules
+// (zsh/datetime + zsh/mathfunc from Phase 1; zsh/parameter + zsh/zutil
+// from Phase 2a; zsh/system + zsh/files from Phase 2b).  Uses the
+// in-process Shell fixture; expected outputs match zsh 5.9's
+// `zsh -f -c`.
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <fcntl.h>
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -481,6 +489,236 @@ TEST(Modules, ZformatMissingKeyEmpty) {
   auto r = sh.run("zformat -f out 'a%zb' x:v; echo $out");
   EXPECT_EQ(r.rc, 0);
   EXPECT_EQ(r.out, "ab\n");
+}
+
+// ---------------------------------------------------------------------------
+// zsh/system (Phase 2b).
+// ---------------------------------------------------------------------------
+
+TEST(Modules, ErrnosHashHasCommonEntries) {
+  Shell sh;
+  auto r = sh.run("echo $errnos[EACCES] $errnos[ENOENT]");
+  EXPECT_EQ(r.rc, 0);
+  // The actual numbers vary by platform; just sanity-check both present.
+  EXPECT_NE(r.out, " \n");
+  EXPECT_NE(r.out.find(' '), std::string::npos);
+}
+
+TEST(Modules, SyserrorPrintsMessageForErrnoName) {
+  Shell sh;
+  auto r = sh.run("syserror ENOENT 2>&1");
+  EXPECT_EQ(r.rc, 0);
+  // strerror text varies by libc but always contains "file" or "directory".
+  EXPECT_FALSE(r.err.empty() and r.out.empty());
+}
+
+TEST(Modules, SyserrorDashEStoresMessage) {
+  Shell sh;
+  auto r = sh.run("syserror -e msg ENOENT; echo $msg");
+  EXPECT_EQ(r.rc, 0);
+  // Something non-empty was stored.
+  EXPECT_GT(r.out.size(), 1u);
+}
+
+TEST(Modules, SyserrorUnknownErrnoFails) {
+  Shell sh;
+  auto r = sh.run("syserror FAKEERRNO");
+  EXPECT_NE(r.rc, 0);
+  EXPECT_NE(r.err.find("unknown errno"), std::string::npos);
+}
+
+TEST(Modules, SysopenSysreadSyswriteSysseekRoundTrip) {
+  Shell sh;
+  char path[] = "/tmp/jfsh_sysioXXXXXX";
+  int fd = ::mkstemp(path);
+  ASSERT_GE(fd, 0);
+  ::write(fd, "hello world", 11);
+  ::close(fd);
+
+  // Open the file, read 5 bytes, then seek back to 6 and read "world".
+  str cmd = str("sysopen -o read -u fd ") + path + "\n"
+            "sysread -i $fd -s 5 part\n"
+            "echo \"[$part]\"\n"
+            "sysseek -u $fd -w start 6\n"
+            "sysread -i $fd -s 5 part2\n"
+            "echo \"[$part2]\"\n"
+            "exec {fd}>&- 2>/dev/null; true\n";
+  auto r = sh.run(cmd);
+  ::unlink(path);
+  EXPECT_EQ(r.out, "[hello]\n[world]\n");
+}
+
+TEST(Modules, SyswriteWritesToStdout) {
+  Shell sh;
+  auto r = sh.run("syswrite 'hi'");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "hi");
+}
+
+TEST(Modules, ZsystemSupportsFlock) {
+  Shell sh;
+  EXPECT_EQ(sh.run("zsystem supports flock").rc, 0);
+  EXPECT_NE(sh.run("zsystem supports no-such-feature").rc, 0);
+}
+
+TEST(Modules, ZsystemFlockTakesAndReleasesLock) {
+  Shell sh;
+  char path[] = "/tmp/jfsh_lockXXXXXX";
+  int fd = ::mkstemp(path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  str cmd = str("zsystem flock -f lfd ") + path + "\n"
+            "zsystem unflock $lfd\n"
+            "echo done";
+  auto r = sh.run(cmd);
+  ::unlink(path);
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "done\n");
+}
+
+TEST(Modules, SysreadTimeoutZeroReturnsTwoOnEmpty) {
+  Shell sh;
+  int pipefd[2];
+  ASSERT_EQ(::pipe(pipefd), 0);
+  str cmd = "sysread -t 0 -i " + std::to_string(pipefd[0]) + "; echo $?";
+  auto r = sh.run(cmd);
+  ::close(pipefd[0]);
+  ::close(pipefd[1]);
+  // Status printed is 2 when the read would block.
+  EXPECT_EQ(r.out, "2\n");
+}
+
+// ---------------------------------------------------------------------------
+// zsh/files (Phase 2b): registered but NOT auto-loaded by the fixture.
+// Tests opt in via `zmodload zsh/files` first.
+// ---------------------------------------------------------------------------
+
+TEST(Modules, FilesNotLoadedByDefault) {
+  Shell sh;
+  // Before `zmodload zsh/files`, mkdir/rm are either the external
+  // commands or not found — either way, `${+builtins[mkdir]}` is 0.
+  auto r = sh.run("echo ${+builtins[mkdir]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "0\n");
+}
+
+TEST(Modules, FilesAfterZmodloadBuiltinsExist) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/files\n"
+      "echo ${builtins[mkdir]} ${builtins[rm]} ${builtins[chmod]}");
+  EXPECT_EQ(r.rc, 0);
+  // Each is now a module-contributed builtin → value is "zsh/files".
+  EXPECT_EQ(r.out, "zsh/files zsh/files zsh/files\n");
+}
+
+TEST(Modules, FilesMkdirCreatesDirectory) {
+  Shell sh;
+  TempDir td;
+  str path = td.path.string() + "/newdir";
+  auto r = sh.run("zmodload zsh/files; mkdir " + path);
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_TRUE(std::filesystem::is_directory(path));
+}
+
+TEST(Modules, FilesMkdirDashPCreatesParents) {
+  Shell sh;
+  TempDir td;
+  str path = td.path.string() + "/a/b/c";
+  auto r = sh.run("zmodload zsh/files; mkdir -p " + path);
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_TRUE(std::filesystem::is_directory(path));
+}
+
+TEST(Modules, FilesRmDeletesFile) {
+  Shell sh;
+  TempDir td;
+  str path = td.path.string() + "/victim";
+  std::ofstream{path} << "x";
+  auto r = sh.run("zmodload zsh/files; rm " + path);
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_FALSE(std::filesystem::exists(path));
+}
+
+TEST(Modules, FilesRmDashRfRecursive) {
+  Shell sh;
+  TempDir td;
+  str dir = td.path.string() + "/tree";
+  std::filesystem::create_directories(dir + "/sub");
+  std::ofstream{dir + "/sub/leaf"} << "x";
+  auto r = sh.run("zmodload zsh/files; rm -rf " + dir);
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_FALSE(std::filesystem::exists(dir));
+}
+
+TEST(Modules, FilesRmdirRemovesEmptyDir) {
+  Shell sh;
+  TempDir td;
+  str dir = td.path.string() + "/empty";
+  std::filesystem::create_directory(dir);
+  auto r = sh.run("zmodload zsh/files; rmdir " + dir);
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_FALSE(std::filesystem::exists(dir));
+}
+
+TEST(Modules, FilesMvRenamesFile) {
+  Shell sh;
+  TempDir td;
+  str src = td.path.string() + "/src";
+  str dst = td.path.string() + "/dst";
+  std::ofstream{src} << "hi";
+  auto r = sh.run("zmodload zsh/files; mv " + src + " " + dst);
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_FALSE(std::filesystem::exists(src));
+  EXPECT_TRUE(std::filesystem::exists(dst));
+}
+
+TEST(Modules, FilesLnDashSSymlink) {
+  Shell sh;
+  TempDir td;
+  str target = td.path.string() + "/target";
+  str link   = td.path.string() + "/link";
+  std::ofstream{target} << "x";
+  auto r = sh.run("zmodload zsh/files; ln -s " + target + " " + link);
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_TRUE(std::filesystem::is_symlink(link));
+}
+
+TEST(Modules, FilesChmodChangesMode) {
+  Shell sh;
+  TempDir td;
+  str path = td.path.string() + "/f";
+  std::ofstream{path} << "x";
+  auto r = sh.run("zmodload zsh/files; chmod 600 " + path);
+  EXPECT_EQ(r.rc, 0);
+  auto perms = std::filesystem::status(path).permissions();
+  EXPECT_EQ(perms & std::filesystem::perms::owner_read,
+            std::filesystem::perms::owner_read);
+  EXPECT_EQ(perms & std::filesystem::perms::group_read,
+            std::filesystem::perms::none);
+}
+
+TEST(Modules, FilesChmodBadModeFails) {
+  Shell sh;
+  TempDir td;
+  str path = td.path.string() + "/f";
+  std::ofstream{path} << "x";
+  auto r = sh.run("zmodload zsh/files; chmod xyz " + path);
+  EXPECT_NE(r.rc, 0);
+}
+
+TEST(Modules, FilesSyncReturnsZero) {
+  Shell sh;
+  auto r = sh.run("zmodload zsh/files; sync");
+  EXPECT_EQ(r.rc, 0);
+}
+
+TEST(Modules, FilesRmMissingWithDashFIgnores) {
+  Shell sh;
+  TempDir td;
+  str path = td.path.string() + "/does-not-exist";
+  auto r = sh.run("zmodload zsh/files; rm -f " + path);
+  EXPECT_EQ(r.rc, 0);
 }
 
 }  // namespace jfsh::test

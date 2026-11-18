@@ -95,6 +95,8 @@ add_library(jfsh_builtins STATIC
   src/modules/mathfunc.cpp
   src/modules/parameter.cpp
   src/modules/zutil.cpp
+  src/modules/system.cpp
+  src/modules/files.cpp
 )
 target_include_directories(jfsh_builtins PUBLIC include)
 # jfsh_glob gives zsh/zutil access to CompiledPattern for zstyle's pattern

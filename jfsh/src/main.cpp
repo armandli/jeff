@@ -26,8 +26,10 @@
 #include <jfsh/history/history.h>
 #include <jfsh/lexer/lexer.h>
 #include <jfsh/modules/datetime.h>
+#include <jfsh/modules/files.h>
 #include <jfsh/modules/mathfunc.h>
 #include <jfsh/modules/parameter.h>
+#include <jfsh/modules/system.h>
 #include <jfsh/modules/zutil.h>
 #include <jfsh/parser/parser.h>
 #include <jfsh/prompt/prompt.h>
@@ -151,10 +153,17 @@ int main(int argc, char* argv[]) {
   jfsh::register_mathfunc_module (ctx.modules);
   jfsh::register_parameter_module(ctx.modules);
   jfsh::register_zutil_module    (ctx.modules);
+  jfsh::register_system_module   (ctx.modules);
+  jfsh::register_files_module    (ctx.modules);
   (void)ctx.modules.load("zsh/datetime",  &ctx);
   (void)ctx.modules.load("zsh/mathfunc",  &ctx);
   (void)ctx.modules.load("zsh/parameter", &ctx);
   (void)ctx.modules.load("zsh/zutil",     &ctx);
+  (void)ctx.modules.load("zsh/system",    &ctx);
+  // zsh/files is registered but NOT auto-loaded: its builtins replace
+  // common externals (rm, mv, …), which many users prefer to keep as
+  // GNU coreutils for `-i`, `-v` and fuller option sets.  Load with
+  // `zmodload zsh/files` to opt in.
 
   if (interactive) executor.update_window_size();
 
