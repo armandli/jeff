@@ -87,9 +87,15 @@ add_library(jfsh_builtins STATIC
   src/builtins/math.cpp
   src/builtins/util.cpp
   src/exec/jobctl.cpp
+  # Shipped modules that contribute builtins live here, not in
+  # jfsh_modules, to keep the static-lib graph acyclic: these need
+  # BuiltinDef (from jfsh_builtins) and ModuleManager (from jfsh_modules),
+  # so putting them here and depending on jfsh_modules PUBLIC-ly works.
+  src/modules/datetime.cpp
+  src/modules/mathfunc.cpp
 )
 target_include_directories(jfsh_builtins PUBLIC include)
-target_link_libraries(jfsh_builtins PUBLIC jfsh_parser jfsh_core jfsh_compiler_options)
+target_link_libraries(jfsh_builtins PUBLIC jfsh_parser jfsh_core jfsh_modules jfsh_compiler_options)
 
 # ---------------------------------------------------------------------------
 # jfsh_exec — command executor: list → pipeline → command dispatch, context,
@@ -163,8 +169,13 @@ target_link_libraries(jfsh_editor PUBLIC
   jfsh_dep_curses jfsh_compiler_options)
 
 # ---------------------------------------------------------------------------
-# jfsh_modules — loadable module system (zmodload equivalent).
-#                Mirrors zsh Src/{module,modentry}.c
+# jfsh_modules — loadable and compiled-in module framework (M10).
+#                Mirrors zsh Src/{module,modentry}.c.  The shipped modules
+#                (zsh/datetime, zsh/mathfunc) live in jfsh_builtins below
+#                because they define BuiltinDefs and so need the builtin
+#                layer; keeping them there avoids a static-lib cycle.
+#                Phase 2 adds: zsh/parameter, zsh/zutil, zsh/system,
+#                zsh/files, zsh/stat, zsh/pcre (see TODO.md M10 "Left").
 # ---------------------------------------------------------------------------
 add_library(jfsh_modules STATIC
   src/modules/module.cpp

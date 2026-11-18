@@ -24,6 +24,7 @@
 #include <jfsh/core/signals.h>
 #include <jfsh/core/types.h>
 #include <jfsh/core/wordcode.h>
+#include <jfsh/modules/module.h>
 #include <jfsh/prompt/prompt.h>
 
 namespace jfsh {
@@ -98,6 +99,10 @@ struct ExecContext {
   vec<str>           dirstack{};   // pushd/popd, without $PWD ($dirstack)
   int                source_depth = 0;   // `.`/`source` files being read
   str                source_name{};      // the file being read, if any
+  // Loadable and compiled-in modules (M10).  `modules.math_funcs()` feeds
+  // the arithmetic evaluator; `modules.all_builtins()` is folded into the
+  // builtin dispatch when a module registers new builtins.
+  ModuleManager      modules{};
 
   // The executor running this context, set by its constructor, for the
   // builtins that run code (eval, source, command, …).

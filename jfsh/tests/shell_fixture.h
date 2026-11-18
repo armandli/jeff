@@ -18,6 +18,8 @@
 #include <jfsh/core/param.h>
 #include <jfsh/core/signals.h>
 #include <jfsh/exec/executor.h>
+#include <jfsh/modules/datetime.h>
+#include <jfsh/modules/mathfunc.h>
 
 namespace jfsh::test {
 
@@ -51,6 +53,12 @@ struct Shell {
     const char* path = s::getenv("PATH");
     params.assign("PATH", str(path ? path : "/usr/bin:/bin"),
                   PM_SCALAR | PM_EXPORTED);
+    // Register and auto-load the Phase-1 shipped modules so the in-process
+    // shell sees zsh/datetime and zsh/mathfunc the way the jfsh binary does.
+    register_datetime_module(ctx.modules);
+    register_mathfunc_module(ctx.modules);
+    (void)ctx.modules.load("zsh/datetime", &ctx);
+    (void)ctx.modules.load("zsh/mathfunc", &ctx);
   }
   // Traps live in the process-wide Signals: don't let one test's traps
   // reach the next.

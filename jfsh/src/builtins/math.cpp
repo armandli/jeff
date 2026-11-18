@@ -12,9 +12,8 @@
 #include <string_view>
 
 #include <jfsh/core/aliases.h>
+#include <jfsh/modules/module.h>
 
-// TODO(math/mathfunc): the zsh/mathfunc functions (sin, sqrt, int, …), once
-//   zmodload exists.
 // TODO(math/output): output bases `$(( [#16] x ))` and C_BASES.
 
 namespace jfsh {
@@ -110,12 +109,13 @@ constexpr strv ASSIGN_OPS[] = {
 };
 
 struct Arith {
-  strv        s;
-  ParamTable& params;
-  MathOptions opts;
-  int         depth;
-  s::size_t   pos = 0;
-  str         err;
+  strv                    s;
+  ParamTable&             params;
+  MathOptions             opts;
+  int                     depth;
+  const MathFuncRegistry* funcs = nullptr;
+  s::size_t               pos   = 0;
+  str                     err;
 
   // An lvalue is a parameter name, with the text of its subscript when it
   // is `name[sub]`; anything else has an empty name.
@@ -158,7 +158,7 @@ struct Arith {
   // A sub-evaluation of `text` with the same parameters and options.
   MathNum eval_sub(strv text, const str& what) {
     if (depth >= MAX_DEPTH) { fail("math recursion limit exceeded: " + what); return {}; }
-    Arith sub{text, params, opts, depth + 1, 0, {}};
+    Arith sub{text, params, opts, depth + 1, funcs, 0, {}};
     MathNum v = sub.run();
     if (sub.failed()) fail(sub.err);
     return v;
@@ -362,6 +362,40 @@ struct Arith {
       for (char& ch : lower) ch = static_cast<char>(s::tolower(static_cast<unsigned char>(ch)));
       if (lower == "nan") return num(MathNum::of(s::numeric_limits<double>::quiet_NaN()));
       if (lower == "inf") return num(MathNum::of(s::numeric_limits<double>::infinity()));
+      // Math function call: `name(arg[, arg…])`.  Matches on the bare `(`
+      // with no whitespace, like zsh.
+      if (pos < s.size() and s[pos] == '(') {
+        if (not funcs or not funcs->find(name)) {
+          bad("unknown math function: " + name);
+          return {};
+        }
+        const MathFuncDef* def = funcs->find(name);
+        ++pos;  // past '('
+        vec<MathNum> fargs;
+        skip_ws();
+        if (not eat(")")) {
+          for (;;) {
+            if (failed()) return {};
+            fargs.push_back(rvalue(assign(live)));
+            if (failed()) return {};
+            if (eat(",")) continue;
+            if (eat(")")) break;
+            bad("',' or ')' expected in call to " + name);
+            return {};
+          }
+        }
+        if (def->min_args >= 0 and static_cast<int>(fargs.size()) < def->min_args) {
+          bad("too few arguments to " + name);
+          return {};
+        }
+        if (def->max_args >= 0 and static_cast<int>(fargs.size()) > def->max_args) {
+          bad("too many arguments to " + name);
+          return {};
+        }
+        auto r = def->fn(fargs);
+        if (not r) { fail(r.error().message); return {}; }
+        return num(*r);
+      }
       Val v{{}, s::move(name), {}, false};
       if (pos < s.size() and s[pos] == '[') v.indexed = subscript(v.sub);
       return v;
@@ -556,16 +590,18 @@ struct Arith {
 
 }  // namespace
 
-Result<MathNum> math_eval(strv expr, ParamTable& params, MathOptions opts) {
-  Arith a{expr, params, opts, 0, 0, {}};
+Result<MathNum> math_eval(strv expr, ParamTable& params, MathOptions opts,
+                          const MathFuncRegistry* funcs) {
+  Arith a{expr, params, opts, 0, funcs, 0, {}};
   MathNum v = a.run();
   if (a.failed())
     return s::unexpected(ShellError{ErrorKind::BadSubstitution, a.err});
   return v;
 }
 
-Result<s::int64_t> arith_eval(strv expr, ParamTable& params, MathOptions opts) {
-  auto v = math_eval(expr, params, opts);
+Result<s::int64_t> arith_eval(strv expr, ParamTable& params, MathOptions opts,
+                              const MathFuncRegistry* funcs) {
+  auto v = math_eval(expr, params, opts, funcs);
   if (not v) return s::unexpected(v.error());
   return v->as_int();
 }

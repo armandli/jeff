@@ -5,6 +5,8 @@ background jobs), M3 (word expansion), M4 (compound commands and functions), M5
 (arithmetic, `[[ ]]`, `test`), M6 (job control, signals, traps), M7 (builtins), M8
 (startup files, invocation, the interactive loop's hooks) and M9 (line editor,
 completion, prompt, history) are done, along with the part of M0 they needed.
+**M10 Phase 1** (modules framework, `zmodload` rewrite, zsh/datetime,
+zsh/mathfunc) is done on branch `jfsh-m10-modules`.
 
 **Goal: full zsh feature compatibility.** M10–M20 extend the plan to cover every
 remaining component of zsh (every module zsh ships, every builtin, every option,
@@ -742,6 +744,44 @@ output, bang expansions and xtrace lines were compared with it.
 Builds the module subsystem that every other zsh module, most of the compsys
 completion code (M15), and the shipped function library (M18) depend on. Fixes
 bug B53 (`ModuleManager` never instantiated).
+
+**Phase 1 — done** (branch `jfsh-m10-modules`): the framework is wired in and
+two core modules ship. `ExecContext::modules` owns a `ModuleManager`;
+`main.cpp` registers compiled-in modules at startup and auto-loads
+`zsh/datetime` and `zsh/mathfunc`. `zmodload` is a real builtin with
+`-L/-l/-i/-u/-A/-R/-a/-e/-F`, listing in zsh's sourceable form, aliases
+(`zmodload -A new=zsh/x`), autoload marking, and zsh-worded errors. The
+arithmetic evaluator takes an optional `const MathFuncRegistry*` and resolves
+bare `name(args…)` through it (fed by `ctx.modules.math_funcs()`); every
+`math_eval` / `arith_eval` call site passes it. Executor's builtin lookup
+checks `ctx.modules.find_builtin()` after the core `Builtins` table, so
+module-contributed builtins (`strftime`) run through the same dispatch.
+
+New files: `include/jfsh/modules/{module,datetime,mathfunc}.h`,
+`src/modules/{datetime,mathfunc}.cpp`, `tests/modules_test.cpp`.
+Shipped module contents:
+- `zsh/datetime`: `strftime [-rs] fmt [epochtime]` builtin (forward and
+  reverse through `strptime`); records `$EPOCHSECONDS`/`$EPOCHREALTIME`/
+  `$epochtime` in its feature list (the specials themselves are still
+  installed by `install_special_params`, M8).
+- `zsh/mathfunc`: 37 math functions resolvable from `$((…))`, `(( ))` and
+  `let`: `abs acos acosh asin asinh atan atan2 cbrt ceil cos cosh erf erfc
+  exp expm1 fabs float floor gamma hypot int lgamma log log10 log1p log2
+  logb pow rand48 rint signgam sin sinh sqrt tan tanh` (plus `j0 j1 y0 y1`
+  on glibc).
+
+Tests: 27 cases in `tests/modules_test.cpp` covering zmodload list / load /
+unload / alias / autoload / `-e` / bad flags, and per-module math function
+arity, truncation, promotion, unknown-function errors, and strftime
+formatting. `tests/shell_fixture.h` registers and auto-loads the shipped
+modules so the in-process `Shell` matches the real binary.
+
+**Phase 2 — left** (next branch): the remaining six core modules
+(`zsh/parameter`, `zsh/zutil`, `zsh/system`, `zsh/files`, `zsh/stat`,
+`zsh/pcre`), plus the framework polish below (binary-module ABI exercised
+by an in-tree example, `$module_path` default set from CMake,
+`zmodload -F` feature toggles, module-contributed parameters flowing
+through `ParamHandlers` instead of `install_special_params`).
 
 **Framework**
 - Wire `ModuleManager` into `Shell`/`Executor`; own it on `ExecContext`. Expose
