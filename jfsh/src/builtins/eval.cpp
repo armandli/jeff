@@ -64,7 +64,8 @@ opt<int> status_arg(vec<str>& args, ExecContext& ctx) {
     return s::nullopt;
   }
   if (args.size() < 2) return ctx.last_exit;
-  auto v = arith_eval(args[1], ctx.params, math_options(ctx.opts));
+  auto v = arith_eval(args[1], ctx.params, math_options(ctx.opts),
+                      &ctx.modules.math_funcs());
   if (not v) {
     builtin_error(args[0], v.error().message);
     return s::nullopt;

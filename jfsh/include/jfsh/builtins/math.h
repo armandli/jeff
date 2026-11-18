@@ -44,6 +44,8 @@
 
 namespace jfsh {
 
+struct MathFuncRegistry;  // forward — defined in jfsh/modules/module.h
+
 // zsh's mnumber.
 struct MathNum {
   bool       is_float = false;
@@ -67,9 +69,13 @@ struct MathOptions {
 
 MathOptions math_options(const OptionState& opts) noexcept;
 
-Result<MathNum>    math_eval (strv expr, ParamTable& params, MathOptions opts = {});
+// `funcs` is the loaded modules' math function registry (zsh/mathfunc,
+// zsh/datetime, …).  Pass nullptr when the caller has no shell context.
+Result<MathNum>    math_eval (strv expr, ParamTable& params, MathOptions opts = {},
+                              const MathFuncRegistry* funcs = nullptr);
 // math_eval converted to an integer, for counts, indexes and `typeset -i`.
-Result<s::int64_t> arith_eval(strv expr, ParamTable& params, MathOptions opts = {});
+Result<s::int64_t> arith_eval(strv expr, ParamTable& params, MathOptions opts = {},
+                              const MathFuncRegistry* funcs = nullptr);
 
 // The text of a result as $((…)) prints it: an integer in decimal, a float
 // with 17 significant digits and always a `.` or exponent (`10.`, `1.5`,

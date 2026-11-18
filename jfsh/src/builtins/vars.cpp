@@ -85,7 +85,8 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
   s::uint32_t flags = (p->flags | attrs.on) & ~attrs.off;
   value = fold_case(s::move(value), flags);
   auto math = [&](strv text) -> opt<MathNum> {
-    auto v = math_eval(text, ctx.params, math_options(ctx.opts));
+    auto v = math_eval(text, ctx.params, math_options(ctx.opts),
+                       &ctx.modules.math_funcs());
     if (not v) {
       s::fprintf(stderr, "jfsh: %.*s: %s\n", static_cast<int>(cmd.size()), cmd.data(),
                  v.error().message.c_str());
@@ -353,7 +354,8 @@ int builtin_unset(vec<str>& args, ExecContext& ctx) {
         h.erase(key);
         prm.set(s::move(h));
       } else if (prm.is_array()) {
-        auto v = math_eval(key, ctx.params, math_options(ctx.opts));
+        auto v = math_eval(key, ctx.params, math_options(ctx.opts),
+                           &ctx.modules.math_funcs());
         if (not v) {
           s::fprintf(stderr, "jfsh: unset: %s\n", v.error().message.c_str());
           rc = 1;

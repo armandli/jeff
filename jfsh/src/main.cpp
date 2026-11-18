@@ -25,6 +25,8 @@
 #include <jfsh/exec/loop.h>
 #include <jfsh/history/history.h>
 #include <jfsh/lexer/lexer.h>
+#include <jfsh/modules/datetime.h>
+#include <jfsh/modules/mathfunc.h>
 #include <jfsh/parser/parser.h>
 #include <jfsh/prompt/prompt.h>
 #include <jfsh/router/jeff.h>
@@ -136,6 +138,16 @@ int main(int argc, char* argv[]) {
   ctx.positional = inv.positional;
   jfsh::Executor executor(ctx);
   jfsh::init_shell_params(ctx);
+
+  // M10: register the shipped modules.  Register makes `zmodload NAME`
+  // able to find them; auto-load the two Phase-1 modules so the shell
+  // knows about $EPOCHSECONDS/strftime and sqrt()/sin() by default, as
+  // zsh does with a typical distribution zshrc.
+  jfsh::register_datetime_module(ctx.modules);
+  jfsh::register_mathfunc_module(ctx.modules);
+  (void)ctx.modules.load("zsh/datetime",  &ctx);
+  (void)ctx.modules.load("zsh/mathfunc",  &ctx);
+
   if (interactive) executor.update_window_size();
 
   // zsh's rule: vi editing when $VISUAL or $EDITOR mentions vi; the

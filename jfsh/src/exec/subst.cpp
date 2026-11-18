@@ -515,7 +515,8 @@ struct Scan {
   Result<MathNum> math(strv expr) {
     auto text = expand_scalar(expr);
     if (not text) return s::unexpected(text.error());
-    return math_eval(*text, ctx().params, math_options(opts()));
+    return math_eval(*text, ctx().params, math_options(opts()),
+                     &ctx().modules.math_funcs());
   }
 
   Result<s::int64_t> arith(strv expr) {

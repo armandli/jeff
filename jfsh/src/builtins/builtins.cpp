@@ -128,7 +128,8 @@ static int loop_control(vec<str>& args, ExecContext& ctx,
   const char* name = args[0].c_str();
   s::int64_t n = 1;
   if (args.size() > 1) {
-    auto v = arith_eval(args[1], ctx.params, math_options(ctx.opts));
+    auto v = arith_eval(args[1], ctx.params, math_options(ctx.opts),
+                        &ctx.modules.math_funcs());
     if (not v) {
       s::fprintf(stderr, "jfsh: %s: %s\n", name, v.error().message.c_str());
       return 1;
@@ -172,9 +173,174 @@ static int not_implemented(const vec<str>& args) {
   return 1;
 }
 int builtin_zpty    (vec<str>& args, ExecContext&) { return not_implemented(args); }
-// zmodload with no arguments lists the loaded modules: there are none.
-int builtin_zmodload(vec<str>& args, ExecContext&) {
-  return args.size() < 2 ? 0 : not_implemented(args);
+
+// `zmodload` (M10): loads, unloads, lists, and aliases modules.  Flags
+// accepted:
+//   -L           list in a sourceable form (used by `zmodload` alone too)
+//   -l           list as `zmodload -L` does, long form
+//   -i           ignore "already loaded" / "not loaded" errors
+//   -u           unload the module
+//   -A alias=target  alias chain (`zmodload -A new=zsh/old`)
+//   -R alias     remove an alias
+//   -a NAME [BLTN]  autoload: the first use of BLTN loads NAME
+//   -d           show module dependencies (treated as "list", none kept)
+//   -e NAME…     exit status 0 iff every NAME is loaded
+//   -F NAME ±ft  features (accepted; no fine-grained toggles yet)
+// Unsupported combinations print `jfsh: zmodload: …` and return 1.
+int builtin_zmodload(vec<str>& args, ExecContext& ctx) {
+  bool list_short = false;    // -L
+  bool list_long  = false;    // -l
+  bool ignore     = false;    // -i
+  bool unload     = false;    // -u
+  bool alias_set  = false;    // -A
+  bool alias_del  = false;    // -R
+  bool autoload   = false;    // -a
+  bool check      = false;    // -e
+  bool features   = false;    // -F
+
+  s::size_t i = 1;
+  for (; i < args.size(); ++i) {
+    const str& a = args[i];
+    if (a.size() < 2 or a[0] != '-' or a == "--") { if (a == "--") ++i; break; }
+    for (s::size_t k = 1; k < a.size(); ++k) {
+      switch (a[k]) {
+        case 'L': list_short = true; break;
+        case 'l': list_long  = true; break;
+        case 'i': ignore     = true; break;
+        case 'u': unload     = true; break;
+        case 'A': alias_set  = true; break;
+        case 'R': alias_del  = true; break;
+        case 'a': autoload   = true; break;
+        case 'e': check      = true; break;
+        case 'F': features   = true; break;
+        case 'd': /* dependency listing: tracked but unused */ break;
+        case 'b': case 'c': case 'p': case 'f':
+          // -b/-c/-p/-f fine-grained autoload categories: parsed, treated
+          // the same as -a.
+          autoload = true; break;
+        case 'm': case 'U': case 'I':
+          // -m pattern matching, -U unloadable, -I ignore if listed:
+          // accepted, no-op.
+          break;
+        default:
+          s::fprintf(stderr, "jfsh: zmodload: bad option: -%c\n", a[k]);
+          return 1;
+      }
+    }
+  }
+
+  // Alias set: zmodload -A alias=target …
+  if (alias_set) {
+    bool any = false;
+    for (; i < args.size(); ++i) {
+      auto eq = args[i].find('=');
+      if (eq == str::npos) {
+        if (not any) {
+          // zmodload -A alone lists aliases.
+          for (const auto& [k, v] : ctx.modules.aliases())
+            s::printf("%s -> %s\n", k.c_str(), v.c_str());
+          return 0;
+        }
+        s::fprintf(stderr, "jfsh: zmodload: -A arguments must be of the form name=module\n");
+        return 1;
+      }
+      ctx.modules.add_alias(args[i].substr(0, eq), args[i].substr(eq + 1));
+      any = true;
+    }
+    if (not any) {
+      for (const auto& [k, v] : ctx.modules.aliases())
+        s::printf("%s -> %s\n", k.c_str(), v.c_str());
+    }
+    return 0;
+  }
+
+  if (alias_del) {
+    if (i >= args.size()) {
+      s::fprintf(stderr, "jfsh: zmodload: -R requires an alias name\n");
+      return 1;
+    }
+    for (; i < args.size(); ++i) ctx.modules.remove_alias(args[i]);
+    return 0;
+  }
+
+  if (check) {
+    for (; i < args.size(); ++i)
+      if (not ctx.modules.is_loaded(args[i])) return 1;
+    return 0;
+  }
+
+  if (autoload) {
+    if (i >= args.size()) {
+      s::fprintf(stderr, "jfsh: zmodload: -a requires a module name\n");
+      return 1;
+    }
+    str mod = args[i++];
+    if (i >= args.size()) {
+      ctx.modules.mark_autoload(mod);
+    } else {
+      for (; i < args.size(); ++i) ctx.modules.mark_autoload(mod, args[i]);
+    }
+    return 0;
+  }
+
+  // No module arguments → list.  zsh's `-L` is a sourceable form that
+  // includes autoloads and aliases; `-l` lists loaded modules only; no
+  // flag lists loaded modules by name.
+  if (i >= args.size()) {
+    auto entries = list_short ? ctx.modules.list_all() : ctx.modules.list();
+    for (const auto& e : entries) {
+      if (list_short or list_long) {
+        if (e.loaded)       s::printf("zmodload %s\n", e.name.c_str());
+        else if (e.auto_)   s::printf("zmodload -a %s\n", e.name.c_str());
+      } else {
+        s::printf("%s\n", e.name.c_str());
+      }
+    }
+    if (list_short) {
+      for (const auto& [a, t] : ctx.modules.aliases())
+        s::printf("zmodload -A %s=%s\n", a.c_str(), t.c_str());
+    }
+    return 0;
+  }
+
+  // Unload one or more modules.
+  if (unload) {
+    int rc = 0;
+    for (; i < args.size(); ++i) {
+      if (not ctx.modules.is_loaded(args[i])) {
+        if (not ignore) {
+          s::fprintf(stderr, "jfsh: zmodload: no such module: %s\n", args[i].c_str());
+          rc = 1;
+        }
+        continue;
+      }
+      auto r = ctx.modules.unload(args[i]);
+      if (not r) {
+        s::fprintf(stderr, "jfsh: zmodload: %s\n", r.error().message.c_str());
+        rc = 1;
+      }
+    }
+    return rc;
+  }
+
+  // Load one or more modules.  -F NAME feature-list: accepted; we just
+  // load the module and ignore the feature toggles for now.
+  (void)features;
+  int rc = 0;
+  for (; i < args.size(); ++i) {
+    if (ctx.modules.is_loaded(args[i])) {
+      if (not ignore) {
+        // zsh is silent on re-load; stay silent too.
+      }
+      continue;
+    }
+    auto r = ctx.modules.load(args[i], &ctx);
+    if (not r) {
+      s::fprintf(stderr, "jfsh: zmodload: %s\n", r.error().message.c_str());
+      rc = 1;
+    }
+  }
+  return rc;
 }
 
 // `let expr…`: evaluates each expression; the status is 0 when the last
@@ -182,7 +348,8 @@ int builtin_zmodload(vec<str>& args, ExecContext&) {
 int builtin_let(vec<str>& args, ExecContext& ctx) {
   MathNum last;
   for (s::size_t i = 1; i < args.size(); ++i) {
-    auto v = math_eval(args[i], ctx.params, math_options(ctx.opts));
+    auto v = math_eval(args[i], ctx.params, math_options(ctx.opts),
+                       &ctx.modules.math_funcs());
     if (not v) {
       s::fprintf(stderr, "jfsh: let: %s\n", v.error().message.c_str());
       return 2;

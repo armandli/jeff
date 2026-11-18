@@ -365,11 +365,17 @@ int Executor::exec_simple(vec<str> args,
     }
   }
   auto def = fn == mCtx.functions.end() ? Builtins.find(args[0]) : s::nullopt;
-  if (only == Only::Builtin and not def) {
+  // A loaded module may have contributed the builtin; fall through to that
+  // before trying an external command.
+  const BuiltinDef* mod_def = nullptr;
+  if (not def and fn == mCtx.functions.end())
+    mod_def = mCtx.modules.find_builtin(args[0]);
+  const BuiltinDef* defp = def ? &def->get() : mod_def;
+  if (only == Only::Builtin and not defp) {
     s::fprintf(stderr, "jfsh: no such builtin: %s\n", args[0].c_str());
     return 1;
   }
-  if (fn == mCtx.functions.end() and not def)
+  if (fn == mCtx.functions.end() and not defp)
     return run_external(args, assigns, redirs, flags);
 
   SavedFds saved;
@@ -394,13 +400,13 @@ int Executor::exec_simple(vec<str> args,
   // POSIX_BUILTINS; otherwise they last while the builtin runs.  Without
   // any, no scope is pushed, so `local` declares in the caller's scope.
   bool scoped = not assigns.empty();
-  if ((def->get().flags & BINF_SPECIAL) and mCtx.opts.get(OPT_POSIXBUILTINS)) {
+  if ((defp->flags & BINF_SPECIAL) and mCtx.opts.get(OPT_POSIXBUILTINS)) {
     rc = apply_assigns(assigns);
     scoped = false;
   } else if (scoped) {
     rc = push_prefix_assigns(assigns, false);
   }
-  if (rc == 0) rc = def->get().fn(args, mCtx);
+  if (rc == 0) rc = defp->fn(args, mCtx);
   // A signal the builtin brought on (`kill -USR1 $$`) is handled before
   // its status replaces $?, as in zsh.
   if (mCtx.signals.has_pending()) handle_signals();
@@ -1819,11 +1825,10 @@ bool Executor::expand_command(vec<str>& args,
 
 // `name=value` on an integer or float parameter keeps its type: the value
 // is an arithmetic expression, and `name+=value` adds it, as in zsh.
-static Result<void> set_numeric(ParamTable& params, const OptionState& opts,
-                                Param& p, const Assignment& a) {
+static Result<void> set_numeric(ExecContext& ctx, Param& p, const Assignment& a) {
   if (p.is_readonly())
     return s::unexpected(ShellError{ErrorKind::ExecError, "read-only variable: " + a.name});
-  auto v = math_eval(a.value, params, math_options(opts));
+  auto v = math_eval(a.value, ctx.params, math_options(ctx.opts), &ctx.modules.math_funcs());
   if (not v) return s::unexpected(v.error());
   MathNum n = *v;
   if (a.append) {
@@ -1835,7 +1840,7 @@ static Result<void> set_numeric(ParamTable& params, const OptionState& opts,
             : MathNum::of(static_cast<s::int64_t>(static_cast<U>(old.i) + static_cast<U>(n.i)));
   }
   // $SECONDS, $RANDOM, …: their setter decides what the value means.
-  if (p.handlers) return params.set_scalar(a.name, s::to_string(n.as_int()));
+  if (p.handlers) return ctx.params.set_scalar(a.name, s::to_string(n.as_int()));
   if (p.is_float()) p.set(n.as_float());
   else              p.set(n.as_int());
   return {};
@@ -1848,7 +1853,7 @@ int Executor::apply_assigns(const vec<Assignment>& assigns) {
     bool numeric = not a.array and p and p->get().is_set()
                and (p->get().is_integer() or p->get().is_float());
     auto r = a.array ? mCtx.params.set_array(a.name, a.elements, a.append)
-           : numeric ? set_numeric(mCtx.params, mCtx.opts, p->get(), a)
+           : numeric ? set_numeric(mCtx, p->get(), a)
                      : mCtx.params.set_scalar(a.name, a.value, a.append);
     if (not r) {
       s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
