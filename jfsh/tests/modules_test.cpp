@@ -220,4 +220,267 @@ TEST(Modules, ZmodloadDashAMarksAutoload) {
   EXPECT_NE(r.out.find("zmodload -a zsh/pcre"), std::string::npos);
 }
 
+// ---------------------------------------------------------------------------
+// zsh/parameter (Phase 2a): live hash and array views of shell state.
+// ---------------------------------------------------------------------------
+
+TEST(Modules, ParameterParametersIncludesNewScalars) {
+  Shell sh;
+  auto r = sh.run("x=1; echo ${parameters[x]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "scalar\n");
+}
+
+TEST(Modules, ParameterParametersClassifiesTypes) {
+  Shell sh;
+  auto r = sh.run("typeset -i n=1; typeset -A h; a=(x y); "
+                  "echo ${parameters[n]} ${parameters[a]} ${parameters[h]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_NE(r.out.find("integer"),     std::string::npos);
+  EXPECT_NE(r.out.find("array"),       std::string::npos);
+  EXPECT_NE(r.out.find("association"), std::string::npos);
+}
+
+TEST(Modules, ParameterFunctionsListsDefinedFunctions) {
+  Shell sh;
+  auto r = sh.run("greet() { echo hi; }; echo ${+functions[greet]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "1\n");
+}
+
+TEST(Modules, ParameterFunctionsSubscriptGivesBody) {
+  Shell sh;
+  auto r = sh.run("f() { echo one; }; echo ${functions[f]}");
+  EXPECT_EQ(r.rc, 0);
+  // function_text renders a header + body; "echo one" must be present.
+  EXPECT_NE(r.out.find("echo one"), std::string::npos);
+}
+
+TEST(Modules, ParameterAliasesLiveView) {
+  Shell sh;
+  auto r = sh.run("alias ll='ls -l'; echo ${aliases[ll]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "ls -l\n");
+}
+
+TEST(Modules, ParameterGaliasesSeparateFromAliases) {
+  Shell sh;
+  auto r = sh.run("alias -g G='|grep'; echo ${+aliases[G]} ${+galiases[G]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "0 1\n");
+}
+
+TEST(Modules, ParameterBuiltinsContainsCore) {
+  Shell sh;
+  auto r = sh.run("echo ${+builtins[echo]} ${+builtins[cd]} ${+builtins[unset]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "1 1 1\n");
+}
+
+TEST(Modules, ParameterBuiltinsIncludesModuleContributed) {
+  Shell sh;
+  // strftime is contributed by zsh/datetime.
+  auto r = sh.run("echo ${builtins[strftime]}");
+  EXPECT_EQ(r.rc, 0);
+  // Value is the contributing module's name.
+  EXPECT_EQ(r.out, "zsh/datetime\n");
+}
+
+TEST(Modules, ParameterOptionsHasExpectedKeys) {
+  Shell sh;
+  auto r = sh.run("echo ${+options[extendedglob]} ${options[monitor]:-missing}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_NE(r.out.find("1"), std::string::npos);
+}
+
+TEST(Modules, ParameterOptionsReflectsSetopt) {
+  Shell sh;
+  auto r = sh.run("setopt extendedglob; echo ${options[extendedglob]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "on\n");
+}
+
+TEST(Modules, ParameterModulesIncludesAutoloaded) {
+  Shell sh;
+  auto r = sh.run("echo ${modules[zsh/datetime]} ${modules[zsh/mathfunc]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "loaded loaded\n");
+}
+
+TEST(Modules, ParameterReswordsIncludesIf) {
+  Shell sh;
+  // ${reswords[(r)…]} is a subscript flag (M13 left item); use `(M)…:#…`
+  // via a loop instead.  The last `[[ ]]` likely returns 1 (no match on
+  // the last iteration); check only the captured output.
+  auto r = sh.run("for w in $reswords; do [[ $w = if ]] && echo yes; done; true");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "yes\n");
+}
+
+TEST(Modules, ParameterParametersSelfReferences) {
+  Shell sh;
+  // $parameters is itself a special: it lists itself.
+  auto r = sh.run("echo ${parameters[parameters]}");
+  EXPECT_EQ(r.rc, 0);
+  // Type string begins with "association" since $parameters is a hash.
+  EXPECT_EQ(r.out.substr(0, 11), "association");
+}
+
+// ---------------------------------------------------------------------------
+// zsh/zutil: zstyle, zparseopts, is-at-least, zformat -f.
+// ---------------------------------------------------------------------------
+
+TEST(Modules, ZstyleSetAndQuery) {
+  Shell sh;
+  auto r = sh.run(
+      "zstyle ':completion:*' menu select\n"
+      "zstyle -s ':completion:*' menu val\n"
+      "echo $val");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "select\n");
+}
+
+TEST(Modules, ZstylePatternMatching) {
+  Shell sh;
+  auto r = sh.run(
+      "zstyle ':completion:*:git-*' format foo\n"
+      "zstyle -s ':completion:fooctx:git-push' format val\n"
+      "echo $val");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "foo\n");
+}
+
+TEST(Modules, ZstyleTruthTest) {
+  Shell sh;
+  auto r = sh.run(
+      "zstyle ':ctx' enabled yes\n"
+      "zstyle -t ':ctx' enabled && echo yes || echo no\n"
+      "zstyle -t ':nothere' enabled && echo yes || echo no");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "yes\nno\n");
+}
+
+TEST(Modules, ZstyleDelete) {
+  Shell sh;
+  auto r = sh.run(
+      "zstyle ':x' k v\n"
+      "zstyle -d ':x' k\n"
+      "zstyle -s ':x' k val && echo found || echo missing");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "missing\n");
+}
+
+TEST(Modules, ZstyleArrayQuery) {
+  Shell sh;
+  auto r = sh.run(
+      "zstyle ':c' styles one two three\n"
+      "zstyle -a ':c' styles arr\n"
+      "echo $#arr $arr[1] $arr[3]");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "3 one three\n");
+}
+
+TEST(Modules, ZparseoptsBasicFlag) {
+  Shell sh;
+  auto r = sh.run(
+      "set -- -f -x\n"
+      "zparseopts -a opts f x\n"
+      "echo \"$opts\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "f  x \n");
+}
+
+TEST(Modules, ZparseoptsWithArgument) {
+  Shell sh;
+  auto r = sh.run(
+      "set -- -O logfile.txt -v\n"
+      "zparseopts -a opts O: v\n"
+      "echo \"${opts[1]} ${opts[2]} ${opts[3]} ${opts[4]}\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "O logfile.txt v \n");
+}
+
+TEST(Modules, ZparseoptsDashDDeletesFromArgv) {
+  Shell sh;
+  auto r = sh.run(
+      "set -- -f one two\n"
+      "zparseopts -D -a opts f\n"
+      "echo \"$@\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "one two\n");
+}
+
+TEST(Modules, ZparseoptsFailOnUnknown) {
+  Shell sh;
+  auto r = sh.run(
+      "set -- -q\n"
+      "zparseopts -F -a opts f");
+  EXPECT_NE(r.rc, 0);
+  EXPECT_NE(r.err.find("bad option"), std::string::npos);
+}
+
+TEST(Modules, IsAtLeastExactVersion) {
+  Shell sh;
+  auto r = sh.run("ZSH_VERSION=5.9; is-at-least 5.9 && echo ok");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "ok\n");
+}
+
+TEST(Modules, IsAtLeastGreater) {
+  Shell sh;
+  auto r = sh.run("is-at-least 4.0 5.9 && echo yes");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "yes\n");
+}
+
+TEST(Modules, IsAtLeastLess) {
+  Shell sh;
+  auto r = sh.run("is-at-least 6.0 5.9 || echo too-old");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "too-old\n");
+}
+
+TEST(Modules, IsAtLeastNumericComponents) {
+  Shell sh;
+  // 5.10 > 5.9 when components compared as integers.
+  auto r = sh.run("is-at-least 5.9 5.10 && echo yes");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "yes\n");
+}
+
+TEST(Modules, ZformatSubstitutesKeys) {
+  Shell sh;
+  auto r = sh.run("zformat -f out 'hello %n!' n:world; echo $out");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "hello world!\n");
+}
+
+TEST(Modules, ZformatPercentPercentIsLiteral) {
+  Shell sh;
+  auto r = sh.run("zformat -f out '%%' ; echo $out");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "%\n");
+}
+
+TEST(Modules, ZformatWidthRightAlign) {
+  Shell sh;
+  auto r = sh.run("zformat -f out '[%5x]' x:hi; echo \"$out\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "[   hi]\n");
+}
+
+TEST(Modules, ZformatWidthLeftAlign) {
+  Shell sh;
+  auto r = sh.run("zformat -f out '[%-5x]' x:hi; echo \"$out\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "[hi   ]\n");
+}
+
+TEST(Modules, ZformatMissingKeyEmpty) {
+  Shell sh;
+  auto r = sh.run("zformat -f out 'a%zb' x:v; echo $out");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "ab\n");
+}
+
 }  // namespace jfsh::test

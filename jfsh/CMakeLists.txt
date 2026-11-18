@@ -93,9 +93,13 @@ add_library(jfsh_builtins STATIC
   # so putting them here and depending on jfsh_modules PUBLIC-ly works.
   src/modules/datetime.cpp
   src/modules/mathfunc.cpp
+  src/modules/parameter.cpp
+  src/modules/zutil.cpp
 )
 target_include_directories(jfsh_builtins PUBLIC include)
-target_link_libraries(jfsh_builtins PUBLIC jfsh_parser jfsh_core jfsh_modules jfsh_compiler_options)
+# jfsh_glob gives zsh/zutil access to CompiledPattern for zstyle's pattern
+# matching.
+target_link_libraries(jfsh_builtins PUBLIC jfsh_parser jfsh_core jfsh_modules jfsh_glob jfsh_compiler_options)
 
 # ---------------------------------------------------------------------------
 # jfsh_exec — command executor: list → pipeline → command dispatch, context,

@@ -27,6 +27,8 @@
 #include <jfsh/lexer/lexer.h>
 #include <jfsh/modules/datetime.h>
 #include <jfsh/modules/mathfunc.h>
+#include <jfsh/modules/parameter.h>
+#include <jfsh/modules/zutil.h>
 #include <jfsh/parser/parser.h>
 #include <jfsh/prompt/prompt.h>
 #include <jfsh/router/jeff.h>
@@ -140,13 +142,19 @@ int main(int argc, char* argv[]) {
   jfsh::init_shell_params(ctx);
 
   // M10: register the shipped modules.  Register makes `zmodload NAME`
-  // able to find them; auto-load the two Phase-1 modules so the shell
-  // knows about $EPOCHSECONDS/strftime and sqrt()/sin() by default, as
-  // zsh does with a typical distribution zshrc.
-  jfsh::register_datetime_module(ctx.modules);
-  jfsh::register_mathfunc_module(ctx.modules);
+  // able to find them; the four modules jfsh ships today are auto-loaded
+  // so $EPOCHSECONDS/strftime, sqrt()/sin(), $functions/$commands/… and
+  // zstyle/zparseopts/is-at-least/zformat are available without a
+  // `zmodload` in the user's rc files, as zsh does with a typical
+  // distribution zshrc.
+  jfsh::register_datetime_module (ctx.modules);
+  jfsh::register_mathfunc_module (ctx.modules);
+  jfsh::register_parameter_module(ctx.modules);
+  jfsh::register_zutil_module    (ctx.modules);
   (void)ctx.modules.load("zsh/datetime",  &ctx);
   (void)ctx.modules.load("zsh/mathfunc",  &ctx);
+  (void)ctx.modules.load("zsh/parameter", &ctx);
+  (void)ctx.modules.load("zsh/zutil",     &ctx);
 
   if (interactive) executor.update_window_size();
 
