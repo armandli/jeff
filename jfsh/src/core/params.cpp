@@ -47,13 +47,23 @@ umap<str, str> Param::hash() const noexcept {
 // (expansion, arithmetic, typeset -p, the environment) sees the same thing.
 static void refresh(Param& p) noexcept {
   if (not p.handlers or not p.is_set()) return;
-  if (p.handlers->get_array) {
+  // A getter that itself reads the parameter table (zsh/parameter's live
+  // $parameters, $functions, …) can recurse through for_each → refresh →
+  // get → for_each.  Guard with a per-call-depth thread-local; depth > 1
+  // skips the refresh and lets the reader see the cached value.
+  static thread_local int depth = 0;
+  if (depth > 0) return;
+  ++depth;
+  if (p.handlers->get_hash) {
+    p.value = p.handlers->get_hash();
+  } else if (p.handlers->get_array) {
     p.value = p.handlers->get_array();
   } else if (p.handlers->get_scalar) {
     str v = p.handlers->get_scalar();
     if (p.is_integer()) p.value = static_cast<s::int64_t>(s::strtoll(v.c_str(), nullptr, 10));
     else                p.value = s::move(v);
   }
+  --depth;
 }
 
 optref<Param> ParamTable::lookup(strv name) noexcept {

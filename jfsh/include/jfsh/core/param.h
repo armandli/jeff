@@ -50,11 +50,13 @@ using ParamValue = s::variant<
 >;
 
 struct ParamHandlers {
-  func<str()>          get_scalar;
-  func<void(str)>      set_scalar;
-  func<vec<str>()>     get_array;
-  func<void(vec<str>)> set_array;
-  func<void()>         unset_fn;
+  func<str()>                     get_scalar;
+  func<void(str)>                 set_scalar;
+  func<vec<str>()>                get_array;
+  func<void(vec<str>)>            set_array;
+  func<umap<str, str>()>          get_hash;   // M10 Phase 2: live hash views
+  func<void(umap<str, str>)>      set_hash;
+  func<void()>                    unset_fn;
 };
 
 struct Param {

@@ -6,7 +6,8 @@ background jobs), M3 (word expansion), M4 (compound commands and functions), M5
 (startup files, invocation, the interactive loop's hooks) and M9 (line editor,
 completion, prompt, history) are done, along with the part of M0 they needed.
 **M10 Phase 1** (modules framework, `zmodload` rewrite, zsh/datetime,
-zsh/mathfunc) is done on branch `jfsh-m10-modules`.
+zsh/mathfunc) is done (merged, PR #18). **M10 Phase 2a** (zsh/parameter,
+zsh/zutil) is done on branch `jfsh-m10-phase2-parameter-zutil`.
 
 **Goal: full zsh feature compatibility.** M10–M20 extend the plan to cover every
 remaining component of zsh (every module zsh ships, every builtin, every option,
@@ -776,12 +777,46 @@ arity, truncation, promotion, unknown-function errors, and strftime
 formatting. `tests/shell_fixture.h` registers and auto-loads the shipped
 modules so the in-process `Shell` matches the real binary.
 
-**Phase 2 — left** (next branch): the remaining six core modules
-(`zsh/parameter`, `zsh/zutil`, `zsh/system`, `zsh/files`, `zsh/stat`,
-`zsh/pcre`), plus the framework polish below (binary-module ABI exercised
-by an in-tree example, `$module_path` default set from CMake,
-`zmodload -F` feature toggles, module-contributed parameters flowing
-through `ParamHandlers` instead of `install_special_params`).
+**Phase 2a — done** (branch `jfsh-m10-phase2-parameter-zutil`):
+`zsh/parameter` and `zsh/zutil` ship.
+- `zsh/parameter` installs 19 live-view specials through a new
+  `ParamHandlers::get_hash`/`set_hash` channel: `$parameters`, `$commands`,
+  `$functions`, `$dis_functions`, `$aliases`, `$galiases`, `$saliases`,
+  `$dis_aliases`, `$dis_galiases`, `$dis_saliases`, `$builtins`,
+  `$dis_builtins`, `$modules`, `$options`, `$widgets`, `$reswords`,
+  `$dis_reswords`, `$patchars`, `$dis_patchars`.  Each is PM_READONLY and
+  recomputed on every lookup, so compsys sees the current state of the
+  function / alias / module / option tables.  `refresh()` gained a
+  thread-local reentrancy guard so a getter that walks `ParamTable` doesn't
+  recurse through itself.
+- `zsh/zutil` ships `zstyle` (set / list / `-L` / `-d` / `-s` / `-b` /
+  `-a` / `-t` / `-T` / `-m` / `-e`, pattern contexts resolved through
+  `CompiledPattern`), `zparseopts` (`-D -E -K -F -M -A -a` plus
+  `name[+][:[:]][=target]` specs), `is-at-least` (numeric-aware version
+  comparison, falls back to `$ZSH_VERSION`), and `zformat -f var fmt
+  args…` (`%key`, `%NNkey`, `%-NNkey`, `%%`, missing key → empty).
+- `main.cpp` and `tests/shell_fixture.h` register and auto-load all four
+  Phase-1/2a modules so compsys-style code works without a user
+  `zmodload`.
+- 31 new tests (62 total in `tests/modules_test.cpp`) cover every surface.
+
+**Phase 2 — left**: the remaining four core modules.
+- **zsh/system**: `syserror`, `sysopen -o flags -u fd file`, `sysread
+  -t timeout -i fd -o fd -s size [name]`, `sysseek -u fd -w start|end|
+  current offset`, `syswrite -c count -o fd data`, `zsystem flock
+  [-t secs] [-f fd] [-r] file`, `zsystem supports feature`, `$errnos`.
+- **zsh/files**: builtin `chmod`, `chown`, `chgrp`, `ln`, `mkdir`, `mv`,
+  `rm`, `rmdir`, `sync` (register through the module so externals are
+  still reached under the usual `$PATH` resolution).
+- **zsh/stat** (`zstat`): `[-glLnoNrstT] [+element] [-A arr | -H hash]
+  file…` with every stat field and zsh's format placeholders.
+- **zsh/pcre**: `pcre_compile [-aimsx] pattern`, `pcre_study`, `pcre_match
+  [-v var] [-a arr] [-n offset] string`, `$PCRE_MATCH`, `$pcre_match`,
+  `[[ string -pcre-match pattern ]]`; depends on PCRE2 as a new build dep.
+- Framework polish still open: binary-module ABI exercised by an in-tree
+  example, `$module_path` default set from CMake, `zmodload -F` feature
+  toggles, module-contributed parameters flowing entirely through
+  `ParamHandlers` instead of `install_special_params`.
 
 **Framework**
 - Wire `ModuleManager` into `Shell`/`Executor`; own it on `ExecContext`. Expose
