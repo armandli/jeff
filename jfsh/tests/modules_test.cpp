@@ -793,7 +793,7 @@ TEST(Modules, StatSymlinkFollowedByDefault) {
   str target = td.path.string() + "/real";
   str link   = td.path.string() + "/sym";
   std::ofstream{target} << "x";
-  ::symlink(target.c_str(), link.c_str());
+  ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
   auto r = sh.run("zmodload zsh/stat; zstat -H s +type " + link + "; echo $s[type]");
   EXPECT_EQ(r.rc, 0);
   EXPECT_EQ(r.out, "regular\n");
@@ -805,7 +805,7 @@ TEST(Modules, StatDashLDoesNotFollowSymlink) {
   str target = td.path.string() + "/real";
   str link   = td.path.string() + "/sym";
   std::ofstream{target} << "x";
-  ::symlink(target.c_str(), link.c_str());
+  ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
   auto r = sh.run("zmodload zsh/stat; zstat -L -H s +type " + link + "; echo $s[type]");
   EXPECT_EQ(r.rc, 0);
   EXPECT_EQ(r.out, "link\n");
@@ -920,6 +920,162 @@ TEST(Modules, PcreMatchDashVNames) {
       "echo $m");
   EXPECT_EQ(r.rc, 0);
   EXPECT_EQ(r.out, "foo\n");
+}
+
+// ---------------------------------------------------------------------------
+// M10 polish: [[ -pcre-match ]] and [[ -regex-match ]] module conditions.
+// ---------------------------------------------------------------------------
+
+TEST(Modules, CondPcreMatchWithoutModuleReportsClearError) {
+  Shell sh;
+  auto r = sh.run("[[ hello -pcre-match ^hel ]] && echo ok");
+  // The parser accepts -pcre-match; the executor refuses it until the
+  // module is loaded.
+  EXPECT_NE(r.rc, 0);
+  EXPECT_NE(r.err.find("module not loaded"), std::string::npos);
+}
+
+TEST(Modules, CondPcreMatchTrue) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/pcre\n"
+      "[[ hello -pcre-match '^hel' ]] && echo yes");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "yes\n");
+}
+
+TEST(Modules, CondPcreMatchFalse) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/pcre\n"
+      "[[ bye -pcre-match '^hel' ]] || echo no");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "no\n");
+}
+
+TEST(Modules, CondPcreMatchSetsMatchArray) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/pcre\n"
+      "[[ 'name=42' -pcre-match '(\\w+)=(\\d+)' ]]\n"
+      "echo \"$MATCH ${match[1]}=${match[2]}\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "name=42 name=42\n");
+}
+
+TEST(Modules, CondRegexMatchNeedsModule) {
+  Shell sh;
+  auto r = sh.run("[[ abc -regex-match '^a' ]] && echo ok");
+  EXPECT_NE(r.rc, 0);
+  EXPECT_NE(r.err.find("module not loaded"), std::string::npos);
+}
+
+TEST(Modules, CondRegexMatchTrue) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/regex\n"
+      "[[ 'abc123' -regex-match '[a-z]+([0-9]+)' ]] && echo \"$MATCH/${match[1]}\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "abc123/123\n");
+}
+
+TEST(Modules, CondRegexMatchFalse) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/regex\n"
+      "[[ 'hello' -regex-match '^[0-9]' ]] || echo no");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "no\n");
+}
+
+// ---------------------------------------------------------------------------
+// M10 polish: zmodload -F feature toggles.
+// ---------------------------------------------------------------------------
+
+TEST(Modules, ZmodloadDashFDisablesABuiltin) {
+  Shell sh;
+  // Load zsh/example, then disable the builtin named `example`.  The
+  // module reloads with the builtin filtered out, so the next call
+  // fails with "command not found".
+  auto r = sh.run(
+      "zmodload zsh/example\n"
+      "example\n"
+      "zmodload -F zsh/example -example\n"
+      "example 2>&1 || echo gone");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_NE(r.out.find("jfsh zsh/example"), std::string::npos);
+  EXPECT_NE(r.out.find("gone"), std::string::npos);
+}
+
+TEST(Modules, ZmodloadDashFReenablesFeature) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/example\n"
+      "zmodload -F zsh/example -example\n"      // disable builtin
+      "zmodload -F zsh/example +example\n"      // re-enable
+      "example");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "jfsh zsh/example\n");
+}
+
+// ---------------------------------------------------------------------------
+// M10 polish: zsh/example reference module (compiled-in ABI exerciser).
+// ---------------------------------------------------------------------------
+
+TEST(Modules, ExampleModuleBuiltinPrintsGreeting) {
+  Shell sh;
+  auto r = sh.run("zmodload zsh/example; example");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "jfsh zsh/example\n");
+}
+
+TEST(Modules, ExampleModuleMathFunc) {
+  Shell sh;
+  auto r = sh.run("zmodload zsh/example; echo $((example(100)))");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "142\n");
+}
+
+TEST(Modules, ExampleModuleCondition) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/example\n"
+      "[[ 'hello world' -example-match 'world' ]] && echo yes");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "yes\n");
+}
+
+TEST(Modules, ExampleModuleDashMChecksMathFuncExists) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/example\n"
+      "example -M sqrt && echo known\n"
+      "example -M no_such && echo unknown || echo missing");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "known\nmissing\n");
+}
+
+TEST(Modules, ExampleModuleCanBeUnloaded) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/example\n"
+      "zmodload -u zsh/example\n"
+      "example 2>&1 || echo gone");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_NE(r.out.find("gone"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// M10 polish: generalised cond_is_binary accepts arbitrary -NAME-match.
+// ---------------------------------------------------------------------------
+
+TEST(Modules, UnknownDashNameMatchParsesButErrors) {
+  Shell sh;
+  // `-flubber-match` is a well-formed binary op shape; the parser accepts
+  // it, but no module claims it, so the executor reports "unknown".
+  auto r = sh.run("[[ x -flubber-match y ]] && echo ok");
+  EXPECT_NE(r.rc, 0);
+  EXPECT_NE(r.err.find("unknown condition"), std::string::npos);
 }
 
 }  // namespace jfsh::test

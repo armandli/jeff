@@ -1257,6 +1257,18 @@ int Executor::exec_cond(ExecState& es, WordCode head) {
   if (op == "<")  return finish(*lhs < *rhs ? 0 : 1);
   if (op == ">")  return finish(*lhs > *rhs ? 0 : 1);
   if (op == "-nt" or op == "-ot" or op == "-ef") return finish(cond_file_binary(op, *lhs, *rhs));
+  // Module-provided conditions (M10 Phase 2c polish).  The parser accepts
+  // `-pcre-match` / `-regex-match` as binary ops whether or not the owning
+  // module is loaded; this dispatch runs the function if the module is
+  // loaded and reports a clear error otherwise.
+  if (auto* cd = mCtx.modules.find_cond(op))
+    return finish(cd->fn(*lhs, *rhs, mCtx));
+  if (op == "-pcre-match" or op == "-regex-match") {
+    s::fprintf(stderr, "jfsh: [[: %s: module not loaded (zmodload %s)\n",
+               op.c_str(),
+               op == "-pcre-match" ? "zsh/pcre" : "zsh/regex");
+    return finish(2);
+  }
   s::fprintf(stderr, "jfsh: unknown condition: %s\n", op.c_str());
   return finish(2);
 }

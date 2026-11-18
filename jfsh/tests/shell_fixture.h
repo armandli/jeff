@@ -19,10 +19,12 @@
 #include <jfsh/core/signals.h>
 #include <jfsh/exec/executor.h>
 #include <jfsh/modules/datetime.h>
+#include <jfsh/modules/example.h>
 #include <jfsh/modules/files.h>
 #include <jfsh/modules/mathfunc.h>
 #include <jfsh/modules/parameter.h>
 #include <jfsh/modules/pcre.h>
+#include <jfsh/modules/regex.h>
 #include <jfsh/modules/stat.h>
 #include <jfsh/modules/system.h>
 #include <jfsh/modules/zutil.h>
@@ -70,6 +72,8 @@ struct Shell {
     register_files_module    (ctx.modules);
     register_stat_module     (ctx.modules);
     register_pcre_module     (ctx.modules);
+    register_regex_module    (ctx.modules);
+    register_example_module  (ctx.modules);
     (void)ctx.modules.load("zsh/datetime",  &ctx);
     (void)ctx.modules.load("zsh/mathfunc",  &ctx);
     (void)ctx.modules.load("zsh/parameter", &ctx);

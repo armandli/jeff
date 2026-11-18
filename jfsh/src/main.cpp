@@ -26,10 +26,12 @@
 #include <jfsh/history/history.h>
 #include <jfsh/lexer/lexer.h>
 #include <jfsh/modules/datetime.h>
+#include <jfsh/modules/example.h>
 #include <jfsh/modules/files.h>
 #include <jfsh/modules/mathfunc.h>
 #include <jfsh/modules/parameter.h>
 #include <jfsh/modules/pcre.h>
+#include <jfsh/modules/regex.h>
 #include <jfsh/modules/stat.h>
 #include <jfsh/modules/system.h>
 #include <jfsh/modules/zutil.h>
@@ -151,6 +153,10 @@ int main(int argc, char* argv[]) {
   // zstyle/zparseopts/is-at-least/zformat are available without a
   // `zmodload` in the user's rc files, as zsh does with a typical
   // distribution zshrc.
+  // $module_path default from the CMake cache (M10 polish).  A user can
+  // override with `module_path=(…)` in their rc, as with zsh.
+  if (sizeof JFSH_MODULE_DIR > 1) ctx.modules.add_search_path(JFSH_MODULE_DIR);
+
   jfsh::register_datetime_module (ctx.modules);
   jfsh::register_mathfunc_module (ctx.modules);
   jfsh::register_parameter_module(ctx.modules);
@@ -159,17 +165,21 @@ int main(int argc, char* argv[]) {
   jfsh::register_files_module    (ctx.modules);
   jfsh::register_stat_module     (ctx.modules);
   jfsh::register_pcre_module     (ctx.modules);
+  jfsh::register_regex_module    (ctx.modules);
+  jfsh::register_example_module  (ctx.modules);
   (void)ctx.modules.load("zsh/datetime",  &ctx);
   (void)ctx.modules.load("zsh/mathfunc",  &ctx);
   (void)ctx.modules.load("zsh/parameter", &ctx);
   (void)ctx.modules.load("zsh/zutil",     &ctx);
   (void)ctx.modules.load("zsh/system",    &ctx);
-  // zsh/files, zsh/stat and zsh/pcre are registered but NOT auto-loaded:
+  // zsh/files, zsh/stat, zsh/pcre, zsh/regex and zsh/example are
+  // registered but NOT auto-loaded:
   //   - zsh/files replaces externals (rm, mv, …) which users often prefer
   //     to keep as GNU coreutils.
   //   - zsh/stat shadows the common `stat` external.
-  //   - zsh/pcre needs libpcre2 at build time; a user who wants PCRE in
-  //     scripts opts in with `zmodload zsh/pcre`.
+  //   - zsh/pcre needs libpcre2 at build time; opt in with `zmodload zsh/pcre`.
+  //   - zsh/regex supplies `[[ -regex-match ]]`; opt in with `zmodload zsh/regex`.
+  //   - zsh/example is a reference for third-party module authors.
 
   if (interactive) executor.update_window_size();
 
