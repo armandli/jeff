@@ -101,6 +101,10 @@ add_library(jfsh_builtins STATIC
   src/modules/pcre.cpp
   src/modules/regex.cpp
   src/modules/example.cpp
+  src/modules/langinfo.cpp
+  src/modules/zselect.cpp
+  src/modules/net_socket.cpp
+  src/modules/zleparameter.cpp
 )
 target_include_directories(jfsh_builtins PUBLIC include)
 # jfsh_glob gives zsh/zutil access to CompiledPattern for zstyle's pattern

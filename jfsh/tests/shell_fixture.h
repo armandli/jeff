@@ -21,12 +21,16 @@
 #include <jfsh/modules/datetime.h>
 #include <jfsh/modules/example.h>
 #include <jfsh/modules/files.h>
+#include <jfsh/modules/langinfo.h>
 #include <jfsh/modules/mathfunc.h>
+#include <jfsh/modules/net_socket.h>
 #include <jfsh/modules/parameter.h>
 #include <jfsh/modules/pcre.h>
 #include <jfsh/modules/regex.h>
 #include <jfsh/modules/stat.h>
 #include <jfsh/modules/system.h>
+#include <jfsh/modules/zleparameter.h>
+#include <jfsh/modules/zselect.h>
 #include <jfsh/modules/zutil.h>
 
 namespace jfsh::test {
@@ -64,16 +68,21 @@ struct Shell {
     // Register and auto-load the shipped modules so the in-process shell
     // sees zsh/datetime, zsh/mathfunc, zsh/parameter and zsh/zutil the
     // way the jfsh binary does.
-    register_datetime_module (ctx.modules);
-    register_mathfunc_module (ctx.modules);
-    register_parameter_module(ctx.modules);
-    register_zutil_module    (ctx.modules);
-    register_system_module   (ctx.modules);
-    register_files_module    (ctx.modules);
-    register_stat_module     (ctx.modules);
-    register_pcre_module     (ctx.modules);
-    register_regex_module    (ctx.modules);
-    register_example_module  (ctx.modules);
+    register_datetime_module    (ctx.modules);
+    register_mathfunc_module    (ctx.modules);
+    register_parameter_module   (ctx.modules);
+    register_zutil_module       (ctx.modules);
+    register_system_module      (ctx.modules);
+    register_files_module       (ctx.modules);
+    register_stat_module        (ctx.modules);
+    register_pcre_module        (ctx.modules);
+    register_regex_module       (ctx.modules);
+    register_example_module     (ctx.modules);
+    // M11 Phase 11a modules — registered, not auto-loaded.
+    register_langinfo_module    (ctx.modules);
+    register_zselect_module     (ctx.modules);
+    register_net_socket_module  (ctx.modules);
+    register_zleparameter_module(ctx.modules);
     (void)ctx.modules.load("zsh/datetime",  &ctx);
     (void)ctx.modules.load("zsh/mathfunc",  &ctx);
     (void)ctx.modules.load("zsh/parameter", &ctx);

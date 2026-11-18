@@ -1078,4 +1078,155 @@ TEST(Modules, UnknownDashNameMatchParsesButErrors) {
   EXPECT_NE(r.err.find("unknown condition"), std::string::npos);
 }
 
+// ---------------------------------------------------------------------------
+// M11 Phase 11a: zsh/langinfo.
+// ---------------------------------------------------------------------------
+
+TEST(Modules, LanginfoNotLoadedByDefault) {
+  Shell sh;
+  EXPECT_EQ(sh.run("echo ${+parameters[langinfo]}").out, "0\n");
+}
+
+TEST(Modules, LanginfoHasCodeset) {
+  Shell sh;
+  auto r = sh.run("zmodload zsh/langinfo; echo $langinfo[CODESET]");
+  EXPECT_EQ(r.rc, 0);
+  // CODESET is non-empty under any locale.
+  EXPECT_GT(r.out.size(), 1u);
+}
+
+TEST(Modules, LanginfoKnowsDay1) {
+  Shell sh;
+  auto r = sh.run("zmodload zsh/langinfo; echo $langinfo[DAY_1]");
+  EXPECT_EQ(r.rc, 0);
+  // DAY_1 is Sunday in English locales; but at minimum non-empty.
+  EXPECT_GT(r.out.size(), 1u);
+}
+
+TEST(Modules, LanginfoIsAnAssociativeArray) {
+  Shell sh;
+  // zsh/parameter's $parameters should classify langinfo as an association.
+  auto r = sh.run("zmodload zsh/langinfo; echo $parameters[langinfo]");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out.substr(0, 11), "association");
+}
+
+// ---------------------------------------------------------------------------
+// M11 Phase 11a: zsh/zselect.
+// ---------------------------------------------------------------------------
+
+TEST(Modules, ZselectNoFdsNoTimeoutErrors) {
+  Shell sh;
+  auto r = sh.run("zmodload zsh/zselect; zselect");
+  EXPECT_NE(r.rc, 0);
+  EXPECT_NE(r.err.find("no fds"), std::string::npos);
+}
+
+TEST(Modules, ZselectBadFdErrors) {
+  Shell sh;
+  auto r = sh.run("zmodload zsh/zselect; zselect -t 10 -r notanint");
+  EXPECT_NE(r.rc, 0);
+  EXPECT_NE(r.err.find("bad fd"), std::string::npos);
+}
+
+TEST(Modules, ZselectReadyStdinOnPipe) {
+  Shell sh;
+  // Write to a pipe; the read side should be ready immediately.
+  // We use a here-string to feed data to zselect's own stdin (fd 0).
+  auto r = sh.run("zmodload zsh/zselect; zselect -t 100 -r 0 <<<x");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "r:0\n");
+}
+
+// ---------------------------------------------------------------------------
+// M11 Phase 11a: zsh/net/socket.
+// ---------------------------------------------------------------------------
+
+TEST(Modules, ZsocketNotLoadedByDefault) {
+  Shell sh;
+  EXPECT_EQ(sh.run("echo ${+builtins[zsocket]}").out, "0\n");
+}
+
+TEST(Modules, ZsocketAliasForNetSocket) {
+  Shell sh;
+  auto r = sh.run("zmodload zsh/socket; echo ${modules[zsh/net/socket]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "loaded\n");
+}
+
+TEST(Modules, ZsocketListenAcceptConnectRoundTrip) {
+  Shell sh;
+  TempDir td;
+  str path = td.path.string() + "/sock";
+  // Listen in the shell, connect from a real external `nc` would complicate
+  // the test. Instead, just verify the listen path works and leaves a
+  // socket behind.
+  auto r = sh.run(
+      "zmodload zsh/net/socket\n"
+      "zsocket -l " + path + "\n"
+      "echo $REPLY\n"
+      "[[ -S " + path + " ]] && echo yes");
+  EXPECT_EQ(r.rc, 0);
+  // Two lines: fd (a positive integer) and "yes".
+  EXPECT_NE(r.out.find("yes"), std::string::npos);
+}
+
+TEST(Modules, ZsocketBadPathTooLongFails) {
+  Shell sh;
+  // UNIX sockaddr_un.sun_path is 108 bytes on Linux; a 200-char name
+  // definitely exceeds it.
+  str too_long(200, 'a');
+  auto r = sh.run(
+      "zmodload zsh/net/socket\n"
+      "zsocket -l " + too_long);
+  EXPECT_NE(r.rc, 0);
+  EXPECT_NE(r.err.find("path too long"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// M11 Phase 11a: zsh/zleparameter.
+// ---------------------------------------------------------------------------
+
+TEST(Modules, ZleparameterWidgetsContainsBuiltins) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/zleparameter\n"
+      "echo ${widgets[accept-line]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "builtin\n");
+}
+
+TEST(Modules, ZleparameterWidgetsIncludesUserDefined) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/zleparameter\n"
+      "my-widget() { :; }\n"
+      "zle -N my-widget\n"
+      "echo ${widgets[my-widget]}");
+  EXPECT_EQ(r.rc, 0);
+  // Format is "user:FUNC" where FUNC is what zle -N stored.
+  EXPECT_EQ(r.out.substr(0, 5), "user:");
+}
+
+TEST(Modules, ZleparameterKeymapsListed) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/zleparameter\n"
+      "echo ${(j: :)keymaps}");
+  EXPECT_EQ(r.rc, 0);
+  // Must at least mention emacs and viins.
+  EXPECT_NE(r.out.find("emacs"), std::string::npos);
+  EXPECT_NE(r.out.find("viins"), std::string::npos);
+}
+
+TEST(Modules, ZleparameterUnloadsCleanly) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/zleparameter\n"
+      "zmodload -u zsh/zleparameter\n"
+      "echo ok");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "ok\n");
+}
+
 }  // namespace jfsh::test

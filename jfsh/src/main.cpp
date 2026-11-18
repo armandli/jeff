@@ -28,12 +28,16 @@
 #include <jfsh/modules/datetime.h>
 #include <jfsh/modules/example.h>
 #include <jfsh/modules/files.h>
+#include <jfsh/modules/langinfo.h>
 #include <jfsh/modules/mathfunc.h>
+#include <jfsh/modules/net_socket.h>
 #include <jfsh/modules/parameter.h>
 #include <jfsh/modules/pcre.h>
 #include <jfsh/modules/regex.h>
 #include <jfsh/modules/stat.h>
 #include <jfsh/modules/system.h>
+#include <jfsh/modules/zleparameter.h>
+#include <jfsh/modules/zselect.h>
 #include <jfsh/modules/zutil.h>
 #include <jfsh/parser/parser.h>
 #include <jfsh/prompt/prompt.h>
@@ -157,16 +161,21 @@ int main(int argc, char* argv[]) {
   // override with `module_path=(…)` in their rc, as with zsh.
   if (sizeof JFSH_MODULE_DIR > 1) ctx.modules.add_search_path(JFSH_MODULE_DIR);
 
-  jfsh::register_datetime_module (ctx.modules);
-  jfsh::register_mathfunc_module (ctx.modules);
-  jfsh::register_parameter_module(ctx.modules);
-  jfsh::register_zutil_module    (ctx.modules);
-  jfsh::register_system_module   (ctx.modules);
-  jfsh::register_files_module    (ctx.modules);
-  jfsh::register_stat_module     (ctx.modules);
-  jfsh::register_pcre_module     (ctx.modules);
-  jfsh::register_regex_module    (ctx.modules);
-  jfsh::register_example_module  (ctx.modules);
+  jfsh::register_datetime_module    (ctx.modules);
+  jfsh::register_mathfunc_module    (ctx.modules);
+  jfsh::register_parameter_module   (ctx.modules);
+  jfsh::register_zutil_module       (ctx.modules);
+  jfsh::register_system_module      (ctx.modules);
+  jfsh::register_files_module       (ctx.modules);
+  jfsh::register_stat_module        (ctx.modules);
+  jfsh::register_pcre_module        (ctx.modules);
+  jfsh::register_regex_module       (ctx.modules);
+  jfsh::register_example_module     (ctx.modules);
+  // M11 Phase 11a modules — registered, not auto-loaded.
+  jfsh::register_langinfo_module    (ctx.modules);
+  jfsh::register_zselect_module     (ctx.modules);
+  jfsh::register_net_socket_module  (ctx.modules);
+  jfsh::register_zleparameter_module(ctx.modules);
   (void)ctx.modules.load("zsh/datetime",  &ctx);
   (void)ctx.modules.load("zsh/mathfunc",  &ctx);
   (void)ctx.modules.load("zsh/parameter", &ctx);
