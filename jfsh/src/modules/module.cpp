@@ -68,6 +68,21 @@ ModuleManager::load(strv name, ExecContext* ctx, bool autoload) {
     handle->auto_ = autoload;
     handle->register_fn = bi->second;
     handle->register_fn(handle->features, *ctx);
+    // Honour `zmodload -F NAME -feat` by pruning disabled features before
+    // they go live.  A feature name must have been present in the
+    // ModuleFeatures.feature_names declared by the register callback, else
+    // the user's `-F -feat` request is silently ignored (as in zsh).
+    if (auto* off = disabled_features(sname); off and not off->empty()) {
+      auto drop = [&](auto& list, auto getter) {
+        list.erase(
+            s::remove_if(list.begin(), list.end(),
+                         [&](const auto& item) { return off->count(getter(item)) > 0; }),
+            list.end());
+      };
+      drop(handle->features.builtins,  [](const BuiltinDef&  b){ return str(b.name); });
+      drop(handle->features.mathfuncs, [](const MathFuncDef& m){ return m.name; });
+      drop(handle->features.conds,     [](const CondDef&     c){ return c.name; });
+    }
     // Fold math funcs into the live registry.
     for (auto& f : handle->features.mathfuncs)
       mMathFuncs.add(f);
@@ -180,6 +195,13 @@ const BuiltinDef* ModuleManager::find_builtin(strv name) const {
   for (const auto& [_, h] : mModules)
     for (const auto& b : h->features.builtins)
       if (strv(b.name) == name) return &b;
+  return nullptr;
+}
+
+const CondDef* ModuleManager::find_cond(strv name) const {
+  for (const auto& [_, h] : mModules)
+    for (const auto& c : h->features.conds)
+      if (strv(c.name) == name) return &c;
   return nullptr;
 }
 

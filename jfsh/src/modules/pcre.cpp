@@ -40,6 +40,46 @@ struct PcreState {
 
 static PcreState& state() { static PcreState s; return s; }
 
+// [[ lhs -pcre-match rhs ]]: compile rhs on the fly, match lhs.  Sets
+// $MATCH / $match (zsh's names, same as `=~`) in addition to the module's
+// own $PCRE_MATCH / $pcre_match.
+int cond_pcre_match(const str& lhs, const str& rhs, ExecContext& ctx) {
+  int errcode = 0;
+  PCRE2_SIZE erroffset = 0;
+  pcre2_code* code = pcre2_compile(
+      reinterpret_cast<PCRE2_SPTR>(rhs.c_str()), rhs.size(),
+      0, &errcode, &erroffset, nullptr);
+  if (not code) {
+    PCRE2_UCHAR msg[256];
+    pcre2_get_error_message(errcode, msg, sizeof msg);
+    s::fprintf(stderr, "jfsh: [[: -pcre-match: %s\n",
+               reinterpret_cast<const char*>(msg));
+    return 2;
+  }
+  pcre2_match_data* md = pcre2_match_data_create_from_pattern(code, nullptr);
+  int rc = pcre2_match(code,
+                       reinterpret_cast<PCRE2_SPTR>(lhs.c_str()), lhs.size(),
+                       0, 0, md, nullptr);
+  if (rc >= 0) {
+    PCRE2_SIZE* ov = pcre2_get_ovector_pointer(md);
+    str whole(lhs.data() + ov[0], ov[1] - ov[0]);
+    (void)ctx.params.set_scalar("MATCH",      whole);
+    (void)ctx.params.set_scalar("PCRE_MATCH", whole);
+    vec<str> captures;
+    for (int k = 1; k < rc; ++k) {
+      PCRE2_SIZE start = ov[2 * k];
+      PCRE2_SIZE end   = ov[2 * k + 1];
+      if (start == PCRE2_UNSET) captures.emplace_back();
+      else captures.emplace_back(lhs.data() + start, end - start);
+    }
+    (void)ctx.params.set_array("match",       captures, false);
+    (void)ctx.params.set_array("pcre_match",  captures, false);
+  }
+  pcre2_match_data_free(md);
+  pcre2_code_free(code);
+  return rc < 0 ? 1 : 0;
+}
+
 int builtin_pcre_compile(vec<str>& args, ExecContext&) {
   uint32_t options = 0;
   s::size_t i = 1;
@@ -161,6 +201,11 @@ void register_pcre_module(ModuleManager& mm) {
     out.builtins.push_back(BuiltinDef{"pcre_match",   builtin_pcre_match,   BINF_NONE, 1});
     out.params.emplace_back("PCRE_MATCH");
     out.params.emplace_back("pcre_match");
+#ifdef JFSH_HAVE_PCRE2
+    out.conds.push_back(CondDef{"-pcre-match", cond_pcre_match});
+#endif
+    out.feature_names = {"b:pcre_compile", "b:pcre_study", "b:pcre_match",
+                         "p:PCRE_MATCH", "p:pcre_match", "c:-pcre-match"};
   });
 }
 

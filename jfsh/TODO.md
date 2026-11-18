@@ -9,7 +9,10 @@ completion, prompt, history) are done, along with the part of M0 they needed.
 zsh/mathfunc) is done (merged, PR #18). **M10 Phase 2a** (zsh/parameter,
 zsh/zutil) is done (merged, PR #19). **M10 Phase 2b** (zsh/system,
 zsh/files) is done (merged, PR #20). **M10 Phase 2c** (zsh/stat,
-zsh/pcre) is done on branch `jfsh-m10-phase2c-stat-pcre`.
+zsh/pcre) is done (merged, PR #21). **M10 polish**
+(`$module_path` default, `zmodload -F` toggles, `[[ -pcre-match ]]` /
+`[[ -regex-match ]]` cond wiring, `zsh/regex` + `zsh/example` modules)
+is done on branch `jfsh-m10-polish`. **M10 is now feature-complete.**
 
 **Goal: full zsh feature compatibility.** M10–M20 extend the plan to cover every
 remaining component of zsh (every module zsh ships, every builtin, every option,
@@ -859,16 +862,35 @@ and `zsh/files` ship.
   bad pattern / no-match-returns-1, and the `pcre_match` without compile
   error wording.
 
-**Framework polish still open** (moved out of Phase 2 since the core
-modules are done):
-- Binary-module ABI exercised by an in-tree `zsh/example`.
-- `$module_path` default set from CMake (currently only gets what main
-  adds).
-- `zmodload -F NAME +feat / -feat` fine-grained feature toggles.
+**M10 polish — done** (branch `jfsh-m10-polish`).  The last framework
+items landed together, closing M10:
+- `$module_path` default seeded from the `JFSH_MODULE_DIR` CMake cache
+  variable (defaults to `${CMAKE_INSTALL_PREFIX}/lib/jfsh`; empty disables
+  the dlopen search).
+- `zmodload -F NAME +feat / -feat` filter: a module-local `uset<str>` of
+  disabled feature names drops matching `BuiltinDef`, `MathFuncDef` and
+  `CondDef` entries at load/re-load time.  `-F` with no toggle is a no-op.
+- `[[ … -pcre-match … ]]` and `[[ … -regex-match … ]]` wired through the
+  executor's cond dispatch.  New `ModuleFeatures.conds` + `CondDef` +
+  `ModuleManager::find_cond()`.  `cond_is_binary()` accepts any
+  `-[a-z0-9-]+-[a-z0-9]+` string so third-party modules register new
+  conditions without touching the parser.  Both shipped matchers set
+  `$MATCH` and `$match` the way `=~` does.
+- `zsh/regex` (new, registered but not auto-loaded): POSIX ERE bindings
+  via `<regex.h>`, contributes only `[[ -regex-match ]]`.
+- `zsh/example` (new, registered but not auto-loaded): minimal reference
+  module exercising every `ModuleFeatures` contribution type (builtin,
+  math function, binary condition, feature names).  Used by the `-F`
+  tests and documented in the header as a template for third-party
+  module authors.
+
+**Still open** (moved to follow-up work; not blocking M10 "done"):
 - Module-contributed parameters flowing entirely through `ParamHandlers`
-  instead of `install_special_params` (M8 overlap).
-- `[[ … -pcre-match … ]]` and `[[ … -regex-match … ]]` module conditions
-  wired into the `[[ ]]` executor (M14 overlap).
+  instead of `install_special_params` (M8 overlap) — a refactor, not a
+  feature gap.
+- A loadable `.so` example (today the module ABI runs through compiled-in
+  `RegisterFn` callbacks; the `dlopen` path exists but has no in-tree
+  test target).  Lands with the M11 external-module work.
 
 **Framework**
 - Wire `ModuleManager` into `Shell`/`Executor`; own it on `ExecContext`. Expose

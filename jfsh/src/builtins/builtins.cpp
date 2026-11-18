@@ -323,10 +323,42 @@ int builtin_zmodload(vec<str>& args, ExecContext& ctx) {
     return rc;
   }
 
-  // Load one or more modules.  -F NAME feature-list: accepted; we just
-  // load the module and ignore the feature toggles for now.
-  (void)features;
+  // Load one or more modules.  `-F NAME +feat / -feat / feat`: a leading
+  // `+feat` or bare `feat` is a no-op (the feature is on by default); a
+  // leading `-feat` records the feature as disabled, so the module's
+  // next load leaves it out.  Matches zsh's behaviour when combined with
+  // the re-register path below.
   int rc = 0;
+  if (features) {
+    if (i >= args.size()) {
+      s::fprintf(stderr, "jfsh: zmodload: -F requires a module name\n");
+      return 1;
+    }
+    str mod = args[i++];
+    uset<str> off;
+    // Preserve any previously-disabled features so successive -F calls
+    // add to the set rather than replacing it.
+    if (auto* prev = ctx.modules.disabled_features(mod)) off = *prev;
+    for (; i < args.size(); ++i) {
+      const str& a = args[i];
+      if (a.empty()) continue;
+      if (a[0] == '-')       off.insert(a.substr(1));
+      else if (a[0] == '+')  off.erase (a.substr(1));
+      else                   off.erase (a);      // bare feature = enable
+    }
+    bool was_loaded = ctx.modules.is_loaded(mod);
+    if (was_loaded) (void)ctx.modules.unload(mod);
+    ctx.modules.set_disabled_features(mod, s::move(off));
+    if (was_loaded) {
+      auto r = ctx.modules.load(mod, &ctx);
+      if (not r) {
+        s::fprintf(stderr, "jfsh: zmodload: %s\n", r.error().message.c_str());
+        return 1;
+      }
+    }
+    return 0;
+  }
+
   for (; i < args.size(); ++i) {
     if (ctx.modules.is_loaded(args[i])) {
       if (not ignore) {

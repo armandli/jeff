@@ -65,6 +65,15 @@ private:
   HashTable<MathFuncDef> mFuncs;
 };
 
+// A binary condition contributed by a module, used in `[[ lhs OP rhs ]]`.
+// Returns 0 on true, 1 on false, 2 on error (zsh's convention).
+using CondBinaryFn = func<int(const str& lhs, const str& rhs, ExecContext&)>;
+
+struct CondDef {
+  str          name;   // e.g. "-pcre-match"
+  CondBinaryFn fn;
+};
+
 // Everything a module can contribute.  `builtins` holds BuiltinDef, which is
 // forward-declared here and defined in jfsh/builtins/builtins.h; the vec of
 // incomplete type is fine because its storage is only emitted from .cpp
@@ -72,7 +81,12 @@ private:
 struct ModuleFeatures {
   vec<BuiltinDef>   builtins;
   vec<MathFuncDef>  mathfuncs;
-  vec<str>          params;   // names of specials this module installed
+  vec<CondDef>      conds;      // [[ lhs -NAME rhs ]] binary conditions
+  vec<str>          params;     // names of specials this module installed
+  // Enables / disables for `zmodload -F NAME +feat / -feat` (features
+  // turned off are skipped at load time; the names here match what
+  // zmodload -lF prints).
+  vec<str>          feature_names;
 };
 
 // A loaded module.  Compiled-in modules fill only the `str` fields,
@@ -173,6 +187,20 @@ struct ModuleManager {
   // no loaded module provides `name`.
   const BuiltinDef* find_builtin(strv name) const;
 
+  // Find a binary condition (`[[ lhs NAME rhs ]]`) contributed by a loaded
+  // module.  Returns nullptr when none matches.
+  const CondDef* find_cond(strv name) const;
+
+  // The disabled-feature set for `NAME`, used by `zmodload -F` toggles.
+  // Each entry is the feature name (as it appears in `feature_names`).
+  const uset<str>* disabled_features(strv name) const noexcept {
+    auto it = mDisabled.find(str(name));
+    return it == mDisabled.end() ? nullptr : &it->second;
+  }
+  void set_disabled_features(str name, uset<str> features) {
+    mDisabled[s::move(name)] = s::move(features);
+  }
+
 protected:
   str resolve_path(strv name) const;
   str resolved(strv name) const;  // apply alias chain; no load
@@ -182,6 +210,7 @@ private:
   HashTable<ModuleHandle::RegisterFn> mBuiltin;   // compiled-in registry
   HashTable<str>                      mAliases;   // alias → target
   HashTable<str>                      mAutoloads; // builtin → module
+  HashTable<uset<str>>                mDisabled;  // name → off features (-F)
   MathFuncRegistry                    mMathFuncs;
   vec<str>                            mPaths;
 };

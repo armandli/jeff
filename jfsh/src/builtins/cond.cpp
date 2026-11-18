@@ -31,8 +31,22 @@ bool cond_is_numeric(strv op) noexcept {
 }
 
 bool cond_is_binary(strv op) noexcept {
-  return op == "=" or op == "==" or op == "!=" or op == "<" or op == ">"
-      or op == "-nt" or op == "-ot" or op == "-ef" or cond_is_numeric(op);
+  if (op == "=" or op == "==" or op == "!=" or op == "<" or op == ">"
+      or op == "-nt" or op == "-ot" or op == "-ef" or cond_is_numeric(op))
+    return true;
+  // Module-provided conditions follow zsh's `-NAME-match` or `-NAME-cmp`
+  // naming convention; the parser accepts any `-[a-z][a-z-]+` string so
+  // modules can register their own without touching this code.  The
+  // executor reports "unknown condition" if nothing's registered for it.
+  if (op.size() > 1 and op[0] == '-') {
+    for (char c : op.substr(1))
+      if (not ((c >= 'a' and c <= 'z') or c == '-' or (c >= '0' and c <= '9')))
+        return false;
+    // At least one internal dash so we don't swallow the unary tests `-a`,
+    // `-b`, `-c`, …; cond_is_unary handles those.
+    return op.find('-', 1) != strv::npos;
+  }
+  return false;
 }
 
 int cond_compare(strv op, int cmp) noexcept {

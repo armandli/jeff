@@ -99,6 +99,8 @@ add_library(jfsh_builtins STATIC
   src/modules/files.cpp
   src/modules/stat.cpp
   src/modules/pcre.cpp
+  src/modules/regex.cpp
+  src/modules/example.cpp
 )
 target_include_directories(jfsh_builtins PUBLIC include)
 # jfsh_glob gives zsh/zutil access to CompiledPattern for zstyle's pattern
@@ -134,7 +136,15 @@ add_library(jfsh_exec STATIC
 target_include_directories(jfsh_exec PUBLIC include)
 # Where the system-wide startup files (jfshenv, jfshrc, …) are read from.
 set(JFSH_SYSCONFDIR "/etc" CACHE PATH "Directory of jfsh's system-wide startup files")
-target_compile_definitions(jfsh_exec PUBLIC JFSH_SYSCONFDIR="${JFSH_SYSCONFDIR}")
+# Where dynamically-loaded `zsh/…` modules are looked up (M10 polish).
+# main.cpp feeds this to `ctx.modules.add_search_path()` as the default
+# `$module_path`.  Empty = no default; only the compiled-in modules are
+# resolvable (which is fine for the jfsh/zsh feature set).
+set(JFSH_MODULE_DIR "${CMAKE_INSTALL_PREFIX}/lib/jfsh" CACHE PATH
+    "Directory for loadable zsh/* .so modules (empty disables dlopen)")
+target_compile_definitions(jfsh_exec PUBLIC
+  JFSH_SYSCONFDIR="${JFSH_SYSCONFDIR}"
+  JFSH_MODULE_DIR="${JFSH_MODULE_DIR}")
 target_link_libraries(jfsh_exec PUBLIC
   jfsh_parser jfsh_glob jfsh_builtins jfsh_history jfsh_prompt jfsh_editor
   jfsh_compiler_options)
