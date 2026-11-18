@@ -19,8 +19,10 @@
 #include <jfsh/core/signals.h>
 #include <jfsh/exec/executor.h>
 #include <jfsh/modules/datetime.h>
+#include <jfsh/modules/files.h>
 #include <jfsh/modules/mathfunc.h>
 #include <jfsh/modules/parameter.h>
+#include <jfsh/modules/system.h>
 #include <jfsh/modules/zutil.h>
 
 namespace jfsh::test {
@@ -62,10 +64,15 @@ struct Shell {
     register_mathfunc_module (ctx.modules);
     register_parameter_module(ctx.modules);
     register_zutil_module    (ctx.modules);
+    register_system_module   (ctx.modules);
+    register_files_module    (ctx.modules);
     (void)ctx.modules.load("zsh/datetime",  &ctx);
     (void)ctx.modules.load("zsh/mathfunc",  &ctx);
     (void)ctx.modules.load("zsh/parameter", &ctx);
     (void)ctx.modules.load("zsh/zutil",     &ctx);
+    (void)ctx.modules.load("zsh/system",    &ctx);
+    // zsh/files is registered but not loaded by default; tests that want
+    // its builtins use `sh.run("zmodload zsh/files; …")`.
   }
   // Traps live in the process-wide Signals: don't let one test's traps
   // reach the next.

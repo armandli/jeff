@@ -7,7 +7,8 @@ background jobs), M3 (word expansion), M4 (compound commands and functions), M5
 completion, prompt, history) are done, along with the part of M0 they needed.
 **M10 Phase 1** (modules framework, `zmodload` rewrite, zsh/datetime,
 zsh/mathfunc) is done (merged, PR #18). **M10 Phase 2a** (zsh/parameter,
-zsh/zutil) is done on branch `jfsh-m10-phase2-parameter-zutil`.
+zsh/zutil) is done (merged, PR #19). **M10 Phase 2b** (zsh/system,
+zsh/files) is done on branch `jfsh-m10-phase2b-system-files`.
 
 **Goal: full zsh feature compatibility.** M10–M20 extend the plan to cover every
 remaining component of zsh (every module zsh ships, every builtin, every option,
@@ -800,14 +801,34 @@ modules so the in-process `Shell` matches the real binary.
   `zmodload`.
 - 31 new tests (62 total in `tests/modules_test.cpp`) cover every surface.
 
-**Phase 2 — left**: the remaining four core modules.
-- **zsh/system**: `syserror`, `sysopen -o flags -u fd file`, `sysread
-  -t timeout -i fd -o fd -s size [name]`, `sysseek -u fd -w start|end|
-  current offset`, `syswrite -c count -o fd data`, `zsystem flock
-  [-t secs] [-f fd] [-r] file`, `zsystem supports feature`, `$errnos`.
-- **zsh/files**: builtin `chmod`, `chown`, `chgrp`, `ln`, `mkdir`, `mv`,
-  `rm`, `rmdir`, `sync` (register through the module so externals are
-  still reached under the usual `$PATH` resolution).
+**Phase 2b — done** (branch `jfsh-m10-phase2b-system-files`): `zsh/system`
+and `zsh/files` ship.
+- **`zsh/system`** (auto-loaded): `syserror [-e var] [-p prefix] errno`
+  (accepts a numeric errno or a name like `EACCES`); `sysopen -o
+  read|write|readwrite|append|create|excl|truncate|nonblock|noctty|
+  sync|cloexec -u var file` plus `-r`/`-w`/`-a` shortcuts; `sysread
+  [-c cnt] [-i fd] [-o fd] [-s size] [-t timeout] [name]` with
+  `select()`-based timeout (exit 1 on timeout, 2 on `-t 0` would-block,
+  zsh's convention); `syswrite [-c cnt] [-o fd] data`; `sysseek [-u fd]
+  [-w start|end|current] offset`; `zsystem flock [-t secs] [-f var]
+  [-r] file` (polls with `LOCK_NB` under a timeout), `zsystem unflock
+  fd`, `zsystem supports feature`; `$errnos` associative array covering
+  ~80 POSIX+GNU errno names.
+- **`zsh/files`** (registered but NOT auto-loaded, so user keeps GNU
+  coreutils' extended flags by default; opt in with `zmodload zsh/files`):
+  `chmod MODE file…`, `chown OWNER[:GROUP] file…`, `chgrp GROUP file…`
+  (names or numeric ids, `-` sentinel to leave unchanged), `ln [-fs]
+  src dst`, `mkdir [-p] [-m MODE] dir…`, `mv src… dst` (dst can be a
+  directory), `rm [-rRfv] file…`, `rmdir dir…`, `sync`.  Errors follow
+  zsh's `jfsh: NAME: strerror: path` format.
+- `main.cpp` registers both, auto-loads only `zsh/system`.  Test fixture
+  mirrors that.
+- 22 new tests (84 total in `tests/modules_test.cpp`) cover every
+  surface: errno lookup, pipe-based sysread timing, fd round-trips with
+  sysopen/sysseek, flock acquire/release, mkdir/rm/mv/ln/chmod against
+  a `TempDir`, dispatch from `${builtins[…]}` showing module ownership.
+
+**Phase 2c — left**: the final two core modules.
 - **zsh/stat** (`zstat`): `[-glLnoNrstT] [+element] [-A arr | -H hash]
   file…` with every stat field and zsh's format placeholders.
 - **zsh/pcre**: `pcre_compile [-aimsx] pattern`, `pcre_study`, `pcre_match
