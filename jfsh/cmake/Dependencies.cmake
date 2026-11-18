@@ -34,5 +34,24 @@ endif()
 
 # (LibTorch is not used by the shell — inference runs in jeff-server.)
 
+# ---- PCRE2 (zsh/pcre module in M10 Phase 2c) --------------------------------
+# Optional: when PCRE2 is missing, the pcre_* builtins return "not built in"
+# but zsh/pcre still registers so `zmodload zsh/pcre` prints the expected
+# error wording.  Debian/Ubuntu: `apt-get install libpcre2-dev`.
+find_package(PkgConfig QUIET)
+add_library(jfsh_dep_pcre2 INTERFACE IMPORTED)
+if(PkgConfig_FOUND)
+  pkg_check_modules(PCRE2 QUIET libpcre2-8)
+endif()
+if(PCRE2_FOUND)
+  target_include_directories(jfsh_dep_pcre2 INTERFACE ${PCRE2_INCLUDE_DIRS})
+  target_link_libraries(jfsh_dep_pcre2 INTERFACE ${PCRE2_LIBRARIES})
+  target_compile_definitions(jfsh_dep_pcre2 INTERFACE JFSH_HAVE_PCRE2
+                             PCRE2_CODE_UNIT_WIDTH=8)
+  message(STATUS "jfsh: PCRE2 found — zsh/pcre fully functional")
+else()
+  message(STATUS "jfsh: PCRE2 not found — zsh/pcre builtins will be stubs (install libpcre2-dev)")
+endif()
+
 # ---- threads (async agent calls) --------------------------------------------
 find_package(Threads REQUIRED)

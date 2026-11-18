@@ -152,9 +152,14 @@ vec<ModuleEntry> ModuleManager::list_all() const {
   for (const auto& [name, _] : mBuiltin)
     if (not seen.count(name))
       seen[name] = {name, "<builtin>", false, true, false};
-  for (const auto& [bi, mod] : mAutoloads)
-    if (not seen.count(mod))
-      seen[mod] = {mod, "<autoload>", false, false, true};
+  // An autoload mark overrides builtin/not-loaded status in the listing:
+  // zsh prints `zmodload -a NAME` for every autoloaded name, loaded or
+  // not, builtin-registered or not.
+  for (const auto& [bi, mod] : mAutoloads) {
+    auto& e = seen[mod];
+    if (e.name.empty()) e = {mod, "<autoload>", false, false, true};
+    else if (not e.loaded) e.auto_ = true;
+  }
   vec<ModuleEntry> out;
   out.reserve(seen.size());
   for (auto& [_, e] : seen) out.push_back(s::move(e));
