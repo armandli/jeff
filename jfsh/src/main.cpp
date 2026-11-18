@@ -29,6 +29,8 @@
 #include <jfsh/modules/files.h>
 #include <jfsh/modules/mathfunc.h>
 #include <jfsh/modules/parameter.h>
+#include <jfsh/modules/pcre.h>
+#include <jfsh/modules/stat.h>
 #include <jfsh/modules/system.h>
 #include <jfsh/modules/zutil.h>
 #include <jfsh/parser/parser.h>
@@ -155,15 +157,19 @@ int main(int argc, char* argv[]) {
   jfsh::register_zutil_module    (ctx.modules);
   jfsh::register_system_module   (ctx.modules);
   jfsh::register_files_module    (ctx.modules);
+  jfsh::register_stat_module     (ctx.modules);
+  jfsh::register_pcre_module     (ctx.modules);
   (void)ctx.modules.load("zsh/datetime",  &ctx);
   (void)ctx.modules.load("zsh/mathfunc",  &ctx);
   (void)ctx.modules.load("zsh/parameter", &ctx);
   (void)ctx.modules.load("zsh/zutil",     &ctx);
   (void)ctx.modules.load("zsh/system",    &ctx);
-  // zsh/files is registered but NOT auto-loaded: its builtins replace
-  // common externals (rm, mv, …), which many users prefer to keep as
-  // GNU coreutils for `-i`, `-v` and fuller option sets.  Load with
-  // `zmodload zsh/files` to opt in.
+  // zsh/files, zsh/stat and zsh/pcre are registered but NOT auto-loaded:
+  //   - zsh/files replaces externals (rm, mv, …) which users often prefer
+  //     to keep as GNU coreutils.
+  //   - zsh/stat shadows the common `stat` external.
+  //   - zsh/pcre needs libpcre2 at build time; a user who wants PCRE in
+  //     scripts opts in with `zmodload zsh/pcre`.
 
   if (interactive) executor.update_window_size();
 

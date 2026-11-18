@@ -97,11 +97,15 @@ add_library(jfsh_builtins STATIC
   src/modules/zutil.cpp
   src/modules/system.cpp
   src/modules/files.cpp
+  src/modules/stat.cpp
+  src/modules/pcre.cpp
 )
 target_include_directories(jfsh_builtins PUBLIC include)
 # jfsh_glob gives zsh/zutil access to CompiledPattern for zstyle's pattern
-# matching.
-target_link_libraries(jfsh_builtins PUBLIC jfsh_parser jfsh_core jfsh_modules jfsh_glob jfsh_compiler_options)
+# matching.  jfsh_dep_pcre2 is an INTERFACE library that is empty when PCRE2
+# is missing — safe to link either way.
+target_link_libraries(jfsh_builtins PUBLIC
+  jfsh_parser jfsh_core jfsh_modules jfsh_glob jfsh_dep_pcre2 jfsh_compiler_options)
 
 # ---------------------------------------------------------------------------
 # jfsh_exec — command executor: list → pipeline → command dispatch, context,

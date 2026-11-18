@@ -8,7 +8,8 @@ completion, prompt, history) are done, along with the part of M0 they needed.
 **M10 Phase 1** (modules framework, `zmodload` rewrite, zsh/datetime,
 zsh/mathfunc) is done (merged, PR #18). **M10 Phase 2a** (zsh/parameter,
 zsh/zutil) is done (merged, PR #19). **M10 Phase 2b** (zsh/system,
-zsh/files) is done on branch `jfsh-m10-phase2b-system-files`.
+zsh/files) is done (merged, PR #20). **M10 Phase 2c** (zsh/stat,
+zsh/pcre) is done on branch `jfsh-m10-phase2c-stat-pcre`.
 
 **Goal: full zsh feature compatibility.** M10–M20 extend the plan to cover every
 remaining component of zsh (every module zsh ships, every builtin, every option,
@@ -828,16 +829,46 @@ and `zsh/files` ship.
   sysopen/sysseek, flock acquire/release, mkdir/rm/mv/ln/chmod against
   a `TempDir`, dispatch from `${builtins[…]}` showing module ownership.
 
-**Phase 2c — left**: the final two core modules.
-- **zsh/stat** (`zstat`): `[-glLnoNrstT] [+element] [-A arr | -H hash]
-  file…` with every stat field and zsh's format placeholders.
-- **zsh/pcre**: `pcre_compile [-aimsx] pattern`, `pcre_study`, `pcre_match
-  [-v var] [-a arr] [-n offset] string`, `$PCRE_MATCH`, `$pcre_match`,
-  `[[ string -pcre-match pattern ]]`; depends on PCRE2 as a new build dep.
-- Framework polish still open: binary-module ABI exercised by an in-tree
-  example, `$module_path` default set from CMake, `zmodload -F` feature
-  toggles, module-contributed parameters flowing entirely through
-  `ParamHandlers` instead of `install_special_params`.
+**Phase 2c — done** (branch `jfsh-m10-phase2c-stat-pcre`): `zsh/stat` and
+`zsh/pcre` ship, closing out M10's core-module set.
+- **`zsh/stat`** (registered but NOT auto-loaded so GNU coreutils `stat`
+  stays the default; opt in with `zmodload zsh/stat`): `zstat [-glLnoNrstT]
+  [-H hash | -A arr] [+element] file…` with the 15 zsh elements
+  (`device inode mode nlink uid gid rdev size atime mtime ctime blksize
+  blocks link type`).  Flags implemented: `-l` list elements, `-L` don't
+  follow symlinks, `-o` octal mode, `-r` raw numeric, `-s` symbolic
+  (uid→name, gid→name, mode→-rwxr-xr-x, type→"regular"/"directory"/…),
+  `-t` / `-T` timestamp-as-integer.  Also registers `stat` as an alias
+  of `zstat`.
+- **`zsh/pcre`** (registered but NOT auto-loaded; requires `libpcre2-dev`
+  at build time, else the builtins register but return "not built in"):
+  `pcre_compile [-aimsx] pattern` (PCRE2_ANCHORED / CASELESS / MULTILINE
+  / DOTALL / EXTENDED), `pcre_study` (no-op; PCRE2 JITs on demand),
+  `pcre_match [-v var] [-a arr] [-n offset] string` setting `$PCRE_MATCH`
+  (whole match) and `$pcre_match` (array of captured groups, 1-based).
+  State is a single compiled pattern per shell (matches zsh's module-
+  local heap approach).  CMake's `cmake/Dependencies.cmake` adds a
+  `jfsh_dep_pcre2` INTERFACE target via `pkg_check_modules(libpcre2-8)`.
+- `main.cpp` registers both; test fixture mirrors that; `ModuleManager::
+  list_all()` now preserves autoload marks on registered builtin modules
+  so `zmodload -L` prints `zmodload -a zsh/pcre` after `zmodload -a`
+  regardless of whether the module is also compiled in.
+- 20 new tests (104 total in `tests/modules_test.cpp`) cover zstat
+  elements (array / hash / stdout, octal mode, symlink follow vs `-L`,
+  directory type), pcre compile / match / captures / case-insensitive /
+  bad pattern / no-match-returns-1, and the `pcre_match` without compile
+  error wording.
+
+**Framework polish still open** (moved out of Phase 2 since the core
+modules are done):
+- Binary-module ABI exercised by an in-tree `zsh/example`.
+- `$module_path` default set from CMake (currently only gets what main
+  adds).
+- `zmodload -F NAME +feat / -feat` fine-grained feature toggles.
+- Module-contributed parameters flowing entirely through `ParamHandlers`
+  instead of `install_special_params` (M8 overlap).
+- `[[ … -pcre-match … ]]` and `[[ … -regex-match … ]]` module conditions
+  wired into the `[[ ]]` executor (M14 overlap).
 
 **Framework**
 - Wire `ModuleManager` into `Shell`/`Executor`; own it on `ExecContext`. Expose

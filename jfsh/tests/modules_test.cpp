@@ -532,7 +532,7 @@ TEST(Modules, SysopenSysreadSyswriteSysseekRoundTrip) {
   char path[] = "/tmp/jfsh_sysioXXXXXX";
   int fd = ::mkstemp(path);
   ASSERT_GE(fd, 0);
-  ::write(fd, "hello world", 11);
+  ASSERT_EQ(::write(fd, "hello world", 11), 11);
   ::close(fd);
 
   // Open the file, read 5 bytes, then seek back to 6 and read "world".
@@ -719,6 +719,207 @@ TEST(Modules, FilesRmMissingWithDashFIgnores) {
   str path = td.path.string() + "/does-not-exist";
   auto r = sh.run("zmodload zsh/files; rm -f " + path);
   EXPECT_EQ(r.rc, 0);
+}
+
+// ---------------------------------------------------------------------------
+// zsh/stat (Phase 2c): registered but NOT auto-loaded.
+// ---------------------------------------------------------------------------
+
+TEST(Modules, StatNotLoadedByDefault) {
+  Shell sh;
+  auto r = sh.run("echo ${+builtins[zstat]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "0\n");
+}
+
+TEST(Modules, StatAfterZmodloadBuiltinExists) {
+  Shell sh;
+  auto r = sh.run("zmodload zsh/stat; echo ${builtins[zstat]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "zsh/stat\n");
+}
+
+TEST(Modules, StatListsElementsWithDashL) {
+  Shell sh;
+  auto r = sh.run("zmodload zsh/stat; zstat -l");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_NE(r.out.find("size"),  std::string::npos);
+  EXPECT_NE(r.out.find("mode"),  std::string::npos);
+  EXPECT_NE(r.out.find("mtime"), std::string::npos);
+  EXPECT_NE(r.out.find("type"),  std::string::npos);
+}
+
+TEST(Modules, StatHashOutput) {
+  Shell sh;
+  TempDir td;
+  str path = td.path.string() + "/f";
+  std::ofstream{path} << "hello";
+  auto r = sh.run("zmodload zsh/stat; zstat -H s +size " + path + "; echo $s[size]");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "5\n");
+}
+
+TEST(Modules, StatArrayOutput) {
+  Shell sh;
+  TempDir td;
+  str path = td.path.string() + "/f";
+  std::ofstream{path} << "abc";
+  auto r = sh.run("zmodload zsh/stat; zstat -A a +size +type " + path + "; echo $a[1] $a[2]");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "3 regular\n");
+}
+
+TEST(Modules, StatSingleElementToStdout) {
+  Shell sh;
+  TempDir td;
+  str path = td.path.string() + "/empty";
+  std::ofstream{path};
+  auto r = sh.run("zmodload zsh/stat; zstat +size " + path);
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "0\n");
+}
+
+TEST(Modules, StatDirectoryTypeIsDirectory) {
+  Shell sh;
+  TempDir td;
+  auto r = sh.run("zmodload zsh/stat; zstat -H s +type " + td.path.string() + "; echo $s[type]");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "directory\n");
+}
+
+TEST(Modules, StatSymlinkFollowedByDefault) {
+  Shell sh;
+  TempDir td;
+  str target = td.path.string() + "/real";
+  str link   = td.path.string() + "/sym";
+  std::ofstream{target} << "x";
+  ::symlink(target.c_str(), link.c_str());
+  auto r = sh.run("zmodload zsh/stat; zstat -H s +type " + link + "; echo $s[type]");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "regular\n");
+}
+
+TEST(Modules, StatDashLDoesNotFollowSymlink) {
+  Shell sh;
+  TempDir td;
+  str target = td.path.string() + "/real";
+  str link   = td.path.string() + "/sym";
+  std::ofstream{target} << "x";
+  ::symlink(target.c_str(), link.c_str());
+  auto r = sh.run("zmodload zsh/stat; zstat -L -H s +type " + link + "; echo $s[type]");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "link\n");
+}
+
+TEST(Modules, StatMissingFileFails) {
+  Shell sh;
+  auto r = sh.run("zmodload zsh/stat; zstat +size /no/such/path");
+  EXPECT_NE(r.rc, 0);
+  EXPECT_NE(r.err.find("No such"), std::string::npos);
+}
+
+TEST(Modules, StatOctalModeFlag) {
+  Shell sh;
+  TempDir td;
+  str path = td.path.string() + "/f";
+  std::ofstream{path};
+  ::chmod(path.c_str(), 0644);
+  auto r = sh.run("zmodload zsh/stat; zstat -o -H s +mode " + path + "; echo $s[mode]");
+  EXPECT_EQ(r.rc, 0);
+  // Mode begins with `0` and ends in `644`.
+  EXPECT_EQ(r.out.back(), '\n');
+  EXPECT_NE(r.out.find("644"), std::string::npos);
+  EXPECT_EQ(r.out.front(), '0');
+}
+
+// ---------------------------------------------------------------------------
+// zsh/pcre (Phase 2c): registered but NOT auto-loaded.  These tests assume
+// the build picked up libpcre2.
+// ---------------------------------------------------------------------------
+
+TEST(Modules, PcreNotLoadedByDefault) {
+  Shell sh;
+  auto r = sh.run("echo ${+builtins[pcre_match]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "0\n");
+}
+
+TEST(Modules, PcreCompileAndMatchSimple) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/pcre\n"
+      "pcre_compile '^foo'\n"
+      "pcre_match 'foobar'");
+  EXPECT_EQ(r.rc, 0);
+}
+
+TEST(Modules, PcreMatchSetsPcreMatch) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/pcre\n"
+      "pcre_compile 'he(l+)o'\n"
+      "pcre_match 'say hello now'\n"
+      "echo $PCRE_MATCH ${pcre_match[1]}");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "hello ll\n");
+}
+
+TEST(Modules, PcreMatchNonMatchReturnsOne) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/pcre\n"
+      "pcre_compile '^foo'\n"
+      "pcre_match 'bar'");
+  EXPECT_EQ(r.rc, 1);
+}
+
+TEST(Modules, PcreCompileRejectsBadPattern) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/pcre\n"
+      "pcre_compile '[unclosed'");
+  EXPECT_NE(r.rc, 0);
+  EXPECT_NE(r.err.find("failed to compile"), std::string::npos);
+}
+
+TEST(Modules, PcreCompileDashICaseInsensitive) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/pcre\n"
+      "pcre_compile -i 'HELLO'\n"
+      "pcre_match 'say hello there'");
+  EXPECT_EQ(r.rc, 0);
+}
+
+TEST(Modules, PcreMatchWithoutCompileFails) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/pcre\n"
+      "pcre_match 'x'");
+  EXPECT_NE(r.rc, 0);
+  EXPECT_NE(r.err.find("no pattern compiled"), std::string::npos);
+}
+
+TEST(Modules, PcreMultipleCaptures) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/pcre\n"
+      "pcre_compile '(\\w+)=(\\d+)'\n"
+      "pcre_match 'name=42'\n"
+      "echo \"${pcre_match[1]}/${pcre_match[2]}\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "name/42\n");
+}
+
+TEST(Modules, PcreMatchDashVNames) {
+  Shell sh;
+  auto r = sh.run(
+      "zmodload zsh/pcre\n"
+      "pcre_compile 'foo'\n"
+      "pcre_match -v m 'foobar'\n"
+      "echo $m");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "foo\n");
 }
 
 }  // namespace jfsh::test
