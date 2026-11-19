@@ -967,22 +967,45 @@ The modules that round out zsh's feature set but aren't required by the core
 runtime. Each lands with its own tests; group ordering is suggested, not
 required.
 
+**Phase 11a — done** (branch `jfsh-m11a-small-modules`): four small
+POSIX-only modules, each registered but not auto-loaded.
+- `zsh/langinfo`: `$langinfo` associative array over `nl_langinfo(3)`,
+  ~55 standard items (`CODESET`, `D_FMT`, `T_FMT`, `AM_STR`, `DAY_1`…
+  `DAY_7`, `ABDAY_*`, `MON_*`, `ABMON_*`, `ERA_*`, `RADIXCHAR`, `YESEXPR`,
+  `NOEXPR`, `CRNCYSTR`, `ALT_DIGITS`).  Getter re-queries `nl_langinfo`
+  on every lookup so `setlocale()` changes are live.
+- `zsh/zselect`: `zselect [-A arr] [-t centisec] [-r fd…] [-w fd…] [-e fd…]`
+  wrapping `pselect(2)`; the following-fd convention switches among read
+  / write / except sets with `-r` / `-w` / `-e`.  With `-A`, ready fds
+  land as `r:N` / `w:N` / `e:N` array entries; without, they go to stdout.
+  Returns 1 on timeout, 2 on EINTR.
+- `zsh/net/socket`: `zsocket -l path` (listen), `zsocket path` (connect),
+  `zsocket -a listenfd` (accept), `zsocket -d fd` (close), all for
+  AF_UNIX streams; stores the resulting fd in `$REPLY`.  `zsh/socket` is
+  registered as an alias (zsh's historical name).
+- `zsh/zleparameter`: live `$widgets` (name → `"builtin"` / `"user:FUN"`
+  / `"alias:TARGET"`) and `$keymaps` (sorted array) off the shell's
+  `Zle` object, so compsys and ZLE theme functions can introspect.
+  Supersedes `zsh/parameter`'s stub `$widgets` when loaded.
+
+15 new tests (134 total in `tests/modules_test.cpp`).
+
+**Phase 11 left — not yet implemented:**
+
 **Networking and IPC**
 - `zsh/net/tcp`: `ztcp [-acflLv] [-d fd] [host [port]]`, `ztcp -c fd [count]`;
   `$REPLY` for the accepted fd.
-- `zsh/net/socket`: `zsocket -a listenfd` (accept), `zsocket -d fd`,
-  `zsocket -l path`, `zsocket path`.
+- *(`zsh/net/socket`: done in Phase 11a.)*
 - `zsh/zftp`: `zftp open|cd|ls|dir|get|put|append|getat|putat|appendat|delete
   |mkdir|rmdir|remote|local|type|ascii|binary|mode|rename|quote|site|close
   |test|session|rmsession`.
-- `zsh/zselect`: `zselect [-rwe] [-t timeout] fd…` wrapping `pselect`.
+- *(`zsh/zselect`: done in Phase 11a.)*
 - `zsh/socket`: older name for `zsocket`, kept for compat with old scripts.
 
 **Terminal, display, i18n**
 - `zsh/termcap`: `echotc capability`, `$termcap` associative array.
 - `zsh/terminfo`: `echoti capability`, `$terminfo` associative array.
-- `zsh/langinfo`: `$langinfo` associative array (`CODESET`, `YESEXPR`,
-  `NOEXPR`, `D_FMT`, `T_FMT`, `D_T_FMT`, `AM_STR`, `PM_STR`, `ABDAY_1`…).
+- *(`zsh/langinfo`: done in Phase 11a.)*
 - `zsh/curses`: `zcurses init|end|addwin|delwin|refresh|move|char|string|
   clear|attr|bg|border|scroll|input|mouse|timeout|touch|resize|querychar|
   position`.
@@ -1011,7 +1034,7 @@ required.
   `sys/xattr.h` and BSD `sys/extattr.h`.
 - `zsh/cap`: `cap [name…]`, `getcap`, `setcap` on Linux capability-aware
   builds (`sys/capability.h`).
-- `zsh/zleparameter`: expose `$widgets` and `$keymaps` to ZLE scripts.
+- *(`zsh/zleparameter`: done in Phase 11a.)*
 - `zsh/deltochar`: `delete-to-char` and `zap-to-char` ZLE widgets.
 - `zsh/compctl`: legacy `compctl`-style completion. Parse the full syntax
   but implement only the subset `oh-my-zsh`/`prezto` legacy plugins still
