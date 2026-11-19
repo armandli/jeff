@@ -334,6 +334,15 @@ int Executor::exec_simple(vec<str> args,
   // With no command word the redirections apply to the current shell and
   // the assignments update shell parameters.  Both happen in-process.
   if (args.empty()) {
+    // SH_NULLCMD / CSH_NULLCMD (M12 Phase 12c): sh and csh refuse a
+    // command made of nothing but redirections.  zsh's own default runs
+    // $NULLCMD; jfsh's redirect-against-the-shell semantics stand in
+    // until the full $NULLCMD plumbing lands.
+    if (not redirs.empty()
+        and (mCtx.opts.get(OPT_SHNULLCMD) or mCtx.opts.get(OPT_CSHNULLCMD))) {
+      s::fprintf(stderr, "jfsh: redirection with no command\n");
+      return 1;
+    }
     SavedFds saved;
     if (not redirs.empty()) {
       s::fflush(nullptr);
@@ -2051,8 +2060,11 @@ int Executor::call_function(const ProgRef& body,
   }
 
   // LOCAL_TRAPS as it stands when the function returns decides, as does
-  // LOCAL_OPTIONS.  An EXIT trap set in the function runs now.
-  auto exit_trap = mCtx.signals.pop_trap_frame(mCtx.opts.get(OPT_LOCALTRAPS));
+  // LOCAL_OPTIONS.  An EXIT trap set in the function runs now.  Under
+  // POSIX_TRAPS (M12 Phase 12c), the frame is always isolated: traps set
+  // in the function stay in the function, matching POSIX.
+  auto exit_trap = mCtx.signals.pop_trap_frame(
+      mCtx.opts.get(OPT_LOCALTRAPS) or mCtx.opts.get(OPT_POSIXTRAPS));
   if (exit_trap and exit_trap->action == TrapAction::Command and not mCtx.exiting) {
     int saved = mCtx.last_exit;
     exec_string(exit_trap->command);
