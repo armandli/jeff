@@ -117,6 +117,16 @@ struct Editor {
 
   static vec<str> builtin_widget_names();
 
+  // For widgets written by modules (Zle::module_widgets).
+  // Reads one character (UTF-8) from the keyboard; empty on ^G/^C/ESC/EOF.
+  str  read_char() { return vi_read_char(); }
+  // The numeric argument, 1 without one.
+  int  repeat_count() const noexcept { return count(); }
+  // Kills [from, to) into the kill ring, as kill-word does.
+  void kill_range(s::size_t from, s::size_t to, bool backward) {
+    kill_text(from, to, backward);
+  }
+
   // The widget functions, by name.
   using WidgetFn = bool (Editor::*)();
   static const umap<str, WidgetFn>& widget_table();

@@ -8,6 +8,7 @@
 
 #include <cstdint>
 
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -89,6 +90,11 @@ private:
 
   friend struct PromptExpander;
 };
+
+// zsh/nearcolor (M11): while set, a `%F{#rrggbb}` / `%K{#rrggbb}` colour
+// is handed here for the SGR sequence to use instead of a 24-bit one, so a
+// terminal without truecolor gets the nearest palette colour.
+inline func<str(unsigned r, unsigned g, unsigned b, bool fg)> truecolor_mapper;
 
 }  // namespace jfsh
 

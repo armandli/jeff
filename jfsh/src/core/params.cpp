@@ -66,15 +66,27 @@ static void refresh(Param& p) noexcept {
   --depth;
 }
 
-optref<Param> ParamTable::lookup(strv name) noexcept {
+// A private parameter (zsh/private) is seen only from the scope that
+// declared it: a function it calls looks straight through to the outer one.
+static bool hidden_private(const Param& p, int scope, int current) noexcept {
+  return (p.flags & PM_PRIVATE) and scope != current;
+}
+
+optref<Param> ParamTable::lookup_raw(strv name) noexcept {
   for (int i = static_cast<int>(mScopes.size()) - 1; i >= 0; --i) {
     auto it = mScopes[static_cast<s::size_t>(i)].find(str(name));
     if (it != mScopes[static_cast<s::size_t>(i)].end()) {
-      refresh(it->second);
+      if (hidden_private(it->second, i, current_scope())) continue;
       return s::ref(it->second);
     }
   }
   return s::nullopt;
+}
+
+optref<Param> ParamTable::lookup(strv name) noexcept {
+  auto p = lookup_raw(name);
+  if (p) refresh(p->get());
+  return p;
 }
 
 // Refreshing a special parameter changes only its cached value, so the
@@ -195,11 +207,30 @@ Param& ParamTable::declare_local(str name, s::uint32_t flags) {
   return p;
 }
 
+Result<void> ParamTable::unset_element(strv name, const str& key) {
+  auto existing = lookup_raw(name);
+  if (not existing) return {};
+  Param& p = existing->get();
+  if (p.is_readonly() and not (p.handlers and p.handlers->unset_elem))
+    return s::unexpected(ShellError{ErrorKind::ExecError,
+        "read-only variable: " + str(name)});
+  if (p.handlers and p.handlers->unset_elem) {
+    p.handlers->unset_elem(key);
+    return {};
+  }
+  if (not p.is_hash())
+    return s::unexpected(ShellError{ErrorKind::ExecError,
+        str(name) + ": invalid element for unset"});
+  if (auto* h = s::get_if<umap<str, str>>(&p.value)) h->erase(key);
+  return {};
+}
+
 Result<void> ParamTable::unset(strv name) {
   for (int i = static_cast<int>(mScopes.size()) - 1; i >= 0; --i) {
     auto& scope = mScopes[static_cast<s::size_t>(i)];
     auto it = scope.find(str(name));
     if (it == scope.end()) continue;
+    if (hidden_private(it->second, i, current_scope())) continue;
     if (it->second.is_readonly())
       return s::unexpected(ShellError{ErrorKind::ExecError,
           "read-only variable: " + str(name)});
@@ -208,7 +239,7 @@ Result<void> ParamTable::unset(strv name) {
     } else {
       // A local stays local, so the outer parameter doesn't show through.
       it->second.value = str{};
-      it->second.flags = PM_SCALAR | PM_UNSET | (it->second.flags & PM_LOCAL);
+      it->second.flags = PM_SCALAR | PM_UNSET | (it->second.flags & (PM_LOCAL | PM_PRIVATE));
     }
     return {};
   }
@@ -242,6 +273,7 @@ void ParamTable::for_each(func<void(const Param&)> fn) const {
   HashTable<const Param*> seen;
   for (int i = static_cast<int>(mScopes.size()) - 1; i >= 0; --i) {
     for (auto const& [name, p] : mScopes[static_cast<s::size_t>(i)]) {
+      if (hidden_private(p, i, current_scope())) continue;
       if (not seen.count(name)) {
         seen[name] = &p;
         refresh(const_cast<Param&>(p));

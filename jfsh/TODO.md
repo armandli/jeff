@@ -990,68 +990,79 @@ POSIX-only modules, each registered but not auto-loaded.
 
 15 new tests (134 total in `tests/modules_test.cpp`).
 
-**Phase 11 left — not yet implemented:**
+**Phase 11b — done** (branch `jfsh-m11b-remaining-modules`): every
+remaining module, each registered but not auto-loaded (`zmodload NAME`).
+- Networking: `zsh/net/tcp` (`ztcp` connect / `-l` listen / `-a [-t]`
+  accept / `-c [-f]` close / `-d fd` / `-L` list, IPv4 and IPv6 through
+  getaddrinfo); `zsh/zftp` (named sessions; open, login/user, params, cd,
+  cdup, dir, ls, get, getat, put, putat, append, appendat, delete, mkdir,
+  rmdir, rename, remote, local, type/ascii/binary, mode S, quote, site,
+  close/quit, test, session, rmsession; passive data connections; ASCII
+  CRLF conversion; `$ZFTP_*` parameters, `$ZFTP_VERBOSE`, `$ZFTP_TMOUT`).
+  `zsh/socket` stays the alias of `zsh/net/socket` from Phase 11a.
+- Terminal: `zsh/terminfo` (`echoti` with tparm arguments, `$terminfo`)
+  and `zsh/termcap` (`echotc` with tgoto arguments, `$termcap`) over
+  (n)curses, sharing one `term_setup()`; `zsh/curses` (`zcurses` init,
+  end, addwin, delwin, refresh, touch, move, clear, position, char,
+  string, border, attr, bg, scroll, input, timeout, mouse (accepted),
+  querychar, resize; `$ZCURSES_COLORS`, `$ZCURSES_COLOR_PAIRS`,
+  `$zcurses_windows`, `$zcurses_attrs`, `$zcurses_colors`; newterm() so a
+  bad terminal is an error, not an exit); `zsh/nearcolor` (a
+  `truecolor_mapper` hook in prompt.cpp maps `#rrggbb` to the nearest of
+  256 colours, or 16 when `$TERM` / terminfo has fewer).
+- Data: `zsh/mapfile` (`$mapfile` read / write / `+=` / unset per key,
+  keys = regular files in `$PWD`); `zsh/db/gdbm` (`ztie -d db/gdbm -f
+  file [-r]`, `zuntie [-u]`, `zgdbmpath`; GDBM when found, else the
+  system ndbm, else stubs); `zsh/private` (`private`, PM_PRIVATE).
+  (`zsh/regex` was done in M10 polish.)
+- Process and ZLE: `zsh/zpty` (replaces the core "not implemented"
+  stub: `-e`, `-b`, `-d`, `-w [-n]`, `-r [-mt] [param [pattern]]`, `-t`,
+  `-L`; the command runs in a forked copy of the shell under forkpty);
+  `zsh/zprof` (calls, total / self time, caller→callee arcs, `-c`);
+  `zsh/attr` (zgetattr / zsetattr / zdelattr / zlistattr, `-h`, macOS
+  and Linux xattr APIs); `zsh/cap` (cap / getcap / setcap with libcap on
+  Linux, "not supported" elsewhere); `zsh/deltochar` (delete-to-char,
+  zap-to-char, with numeric and negative arguments); `zsh/compctl`
+  (full flag syntax parsed; -f -/ -c -v -a -A -B -F -o -u -e -b -k -g -K
+  -P -S -X complete through the completion engine; `-L`, `+ cmd`; `-x`
+  and `+` alternatives say `unsupported option`); `zsh/clone` (`clone
+  tty`); `zsh/watch` (`$watch` with all / notme / user@host%line
+  patterns, `$WATCHFMT` escapes incl. `%(a.x.y)`, `$LOGCHECK`, `log`,
+  utmpx); `zsh/newuser` (`zsh-newuser-install [-f]`: quit / blank rc /
+  starter `.jfshrc` with one of four prompts; main() runs it for an
+  interactive shell with none of the user startup files).
 
-**Networking and IPC**
-- `zsh/net/tcp`: `ztcp [-acflLv] [-d fd] [host [port]]`, `ztcp -c fd [count]`;
-  `$REPLY` for the accepted fd.
-- *(`zsh/net/socket`: done in Phase 11a.)*
-- `zsh/zftp`: `zftp open|cd|ls|dir|get|put|append|getat|putat|appendat|delete
-  |mkdir|rmdir|remote|local|type|ascii|binary|mode|rename|quote|site|close
-  |test|session|rmsession`.
-- *(`zsh/zselect`: done in Phase 11a.)*
-- `zsh/socket`: older name for `zsocket`, kept for compat with old scripts.
+Core support that came with them:
+- Subscripted assignment `name[sub]=value`, `+=`, `name[i]=(…)` slices,
+  a character of a scalar; the lexer keeps blanks inside the subscript
+  (`h[a b]=1`).  (Was the TODO(exec/assign) in executor.cpp.)
+- `ParamHandlers::get_elem / set_elem / unset_elem` so `${h[k]}`,
+  `h[k]=v` and `unset 'h[k]'` touch one key of a special association;
+  `ParamTable::lookup_raw`, `ParamTable::unset_element`.
+- `PM_PRIVATE` in ParamTable lookups; `private` parses as a typeset
+  command.
+- `ExecContext::hooks` (function entry/exit, before-prompt) and
+  `ModuleFeatures::on_unload`; `Zle::module_widgets`; module builtins are
+  now seen by `whence`, `builtin`, `$builtins` (Executor::is_builtin /
+  call_builtin / builtin_names).
 
-**Terminal, display, i18n**
-- `zsh/termcap`: `echotc capability`, `$termcap` associative array.
-- `zsh/terminfo`: `echoti capability`, `$terminfo` associative array.
-- *(`zsh/langinfo`: done in Phase 11a.)*
-- `zsh/curses`: `zcurses init|end|addwin|delwin|refresh|move|char|string|
-  clear|attr|bg|border|scroll|input|mouse|timeout|touch|resize|querychar|
-  position`.
-- `zsh/nearcolor`: approximate truecolor `%F{#rrggbb}` down to 256 or 16
-  colors based on `$TERM`; hooked into `src/prompt/prompt.cpp`.
+36 new tests in `tests/modules_m11_test.cpp` (plus `Editor.DeltocharWidgets`
+in `editor_test.cpp`), 615 in all.
 
-**Data and regex**
-- `zsh/regex`: `[[ string -regex-match pattern ]]`, sets `$MATCH`, `$match`,
-  `$MBEGIN`/`$MEND`. Uses POSIX ERE (already on hand through `<regex.h>`).
-- `zsh/mapfile`: `$mapfile` associative array whose keys are file paths and
-  values the files' contents (read on lookup, write on assignment, delete
-  on `unset mapfile[path]`).
-- `zsh/db/gdbm`: `ztie -d db/gdbm -f file name`, `zuntie [-u] name`,
-  `zgdbmpath name`; associative-array semantics backed by GDBM.
-- `zsh/private`: `private [name[=value]…]`: parameter visible only to the
-  function that declared it, not to callees. Needs a small change to the
-  parameter-scope lookup rules (new flag `PM_PRIVATE`).
-
-**Pty, profiling, attributes, ZLE extras**
-- `zsh/zpty`: replace the "not implemented" stub with `zpty [-e] [-b] name
-  cmd`, `zpty -d name`, `zpty -r name [param [pattern]]`, `zpty -w name
-  string`, `zpty -t name`, `zpty -L`, `$REPLY`. Used by zsh's own tests.
-- `zsh/zprof`: `zprof [-c] [-n]` profiler; per-function cumulative and
-  self times via a hook on function entry/exit in `ExecContext`.
-- `zsh/attr`: `zgetattr`, `zsetattr`, `zdelattr`, `zlistattr` via Linux
-  `sys/xattr.h` and BSD `sys/extattr.h`.
-- `zsh/cap`: `cap [name…]`, `getcap`, `setcap` on Linux capability-aware
-  builds (`sys/capability.h`).
-- *(`zsh/zleparameter`: done in Phase 11a.)*
-- `zsh/deltochar`: `delete-to-char` and `zap-to-char` ZLE widgets.
-- `zsh/compctl`: legacy `compctl`-style completion. Parse the full syntax
-  but implement only the subset `oh-my-zsh`/`prezto` legacy plugins still
-  reach for, forwarding to compsys internally; mark unsupported combinations
-  with `jfsh: compctl: unsupported option`.
-- `zsh/example`: the tiny loadable example that exercises the module ABI;
-  kept as a build/test target only.
-- `zsh/clone`: `clone tty` (re-parents the shell onto a different tty).
-- `zsh/watch`: `$watch`, `$WATCHFMT`, the `log` builtin, periodic
-  who/last scan driven off the same timer as `$PERIOD` (M8).
-- `zsh/newuser`: run the equivalent of `zsh-newuser-install` on first
-  interactive login with no rc files (prompt theme picker, basic rc stub).
-
-**Tests**
-- One test per module under `tests/modules/`. Network modules use loopback
-  on an ephemeral port; `zpty` tests go through `forkpty`; `curses`,
-  `terminfo`, `termcap` tests spin up a pty with a stub terminfo entry.
+**Left (non-blocking follow-ups):**
+- zftp: active-mode (PORT/EPRT) data connections and block mode (`mode B`)
+  aren't implemented; `$ZFTP_PREFS` is not read.
+- zcurses: mouse events are accepted but never reported; `input` doesn't
+  fill the mouse parameter.
+- nearcolor measures distance with a weighted RGB metric, not zsh's
+  CIELab; a few near-ties pick a different neighbour.
+- zsh/cap has only been compiled against libcap on Linux, not exercised
+  by tests (the macOS dev host has no capabilities).
+- `zmodload -a` autoload marks still don't load a module on first use of
+  its builtin (ModuleManager::autoload_for_builtin is not consulted by
+  the executor), so e.g. `zpty` needs an explicit `zmodload zsh/zpty`.
+- Prefix assignments with a subscript in front of a command
+  (`h[k]=v cmd`) and `typeset h[k]=v` are not handled.
 
 ### M12. Emulation modes [core/options], [exec/invocation]
 

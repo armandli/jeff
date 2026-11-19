@@ -134,7 +134,6 @@ int builtin_unsetopt  (vec<str>&, ExecContext&);
 int builtin_bindkey   (vec<str>&, ExecContext&);
 int builtin_vared     (vec<str>&, ExecContext&);
 int builtin_zle       (vec<str>&, ExecContext&);
-int builtin_zpty      (vec<str>&, ExecContext&);
 int builtin_sched     (vec<str>&, ExecContext&);
 int builtin_let       (vec<str>&, ExecContext&);
 int builtin_emulate   (vec<str>&, ExecContext&);

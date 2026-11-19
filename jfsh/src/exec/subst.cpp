@@ -708,6 +708,28 @@ struct Scan {
     return CompiledPattern::compile(pat, false, opts().extended_glob());
   }
 
+  // `name[key]` where `name` has a get_elem handler and `key` is not @
+  // or *: the element's value, with `i` moved past the subscript.  Null
+  // when the handlers don't apply.
+  opt<Result<Value>> element_view(strv name, strv t, s::size_t& i) {
+    if (i >= t.size() or t[i] != '[') return s::nullopt;
+    auto p = ctx().params.lookup_raw(name);
+    if (not p or not p->get().handlers or not p->get().handlers->get_elem)
+      return s::nullopt;
+    s::size_t e = find_close(t, i);
+    if (e == strv::npos) return s::nullopt;
+    strv sub = t.substr(i + 1, e - i - 1);
+    if (sub == "@" or sub == "*") return s::nullopt;
+    auto key = expand_scalar(sub, Mode::Scalar);
+    if (not key) return Result<Value>(s::unexpected(key.error()));
+    auto got = p->get().handlers->get_elem(*key);
+    Value v;
+    v.make_scalar(got.value_or(""));
+    v.set = got.has_value();
+    i = e + 1;
+    return Result<Value>(s::move(v));
+  }
+
   Result<void> apply_subscript(Value& v, strv sub, strv name,
                                bool& all) {
     if (sub == "@" or sub == "*") {
@@ -1014,6 +1036,11 @@ struct Scan {
       if (fl.type) {
         v.set = true;
         v.make_scalar(type_of(name));
+      } else if (auto ev = element_view(name, t, i)) {
+        // A special association with per-key handlers ($mapfile, …):
+        // `${h[key]}` reads that key only, not the whole table.
+        if (not *ev) return s::unexpected(ev->error());
+        v = s::move(**ev);
       } else {
         v = get_param(name, fl);
       }

@@ -105,13 +105,40 @@ add_library(jfsh_builtins STATIC
   src/modules/zselect.cpp
   src/modules/net_socket.cpp
   src/modules/zleparameter.cpp
+  # M11 Phase 11b: the rest of the specialized modules.
+  src/modules/net_tcp.cpp
+  src/modules/zftp.cpp
+  src/modules/termcap.cpp
+  src/modules/terminfo.cpp
+  src/modules/curses.cpp
+  src/modules/nearcolor.cpp
+  src/modules/mapfile.cpp
+  src/modules/db_gdbm.cpp
+  src/modules/private.cpp
+  src/modules/zpty.cpp
+  src/modules/zprof.cpp
+  src/modules/attr.cpp
+  src/modules/cap.cpp
+  src/modules/deltochar.cpp
+  src/modules/compctl.cpp
+  src/modules/clone.cpp
+  src/modules/watch.cpp
+  src/modules/newuser.cpp
 )
 target_include_directories(jfsh_builtins PUBLIC include)
 # jfsh_glob gives zsh/zutil access to CompiledPattern for zstyle's pattern
 # matching.  jfsh_dep_pcre2 is an INTERFACE library that is empty when PCRE2
 # is missing — safe to link either way.
+# M11: zsh/deltochar and zsh/compctl reach into the line editor and its
+# completion engine, zsh/nearcolor into prompt colours; zsh/termcap,
+# zsh/terminfo and zsh/curses use (n)curses; zsh/db/gdbm and zsh/cap use
+# GDBM (or ndbm) and libcap when the build found them.
 target_link_libraries(jfsh_builtins PUBLIC
-  jfsh_parser jfsh_core jfsh_modules jfsh_glob jfsh_dep_pcre2 jfsh_compiler_options)
+  jfsh_parser jfsh_core jfsh_modules jfsh_glob jfsh_editor jfsh_prompt
+  jfsh_dep_pcre2 jfsh_dep_curses jfsh_dep_dbm jfsh_dep_cap jfsh_compiler_options)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(jfsh_builtins PUBLIC util)   # forkpty (zsh/zpty)
+endif()
 
 # ---------------------------------------------------------------------------
 # jfsh_exec — command executor: list → pipeline → command dispatch, context,

@@ -129,6 +129,7 @@ Result<void> ModuleManager::unload(strv name) {
         "no such module: " + sname});
   auto& h = *it->second;
   for (const auto& f : h.features.mathfuncs) mMathFuncs.remove(f.name);
+  if (h.features.on_unload) h.features.on_unload();
   if (h.cleanup_fn) h.cleanup_fn(&h);
   if (h.finish_fn)  h.finish_fn(&h);
   if (h.dlhandle)   dlclose(h.dlhandle);

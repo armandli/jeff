@@ -444,6 +444,8 @@ bool Editor::dispatch(const str& name) {
     }
   }
   strv base = name.starts_with('.') ? strv(name).substr(1) : strv(name);
+  if (auto m = mZle.module_widgets.find(str(base)); m != mZle.module_widgets.end())
+    return m->second(*this);
   const auto& table = Editor::widget_table();
   auto it = table.find(str(base));
   if (it == table.end()) return false;

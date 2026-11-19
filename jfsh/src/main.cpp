@@ -25,18 +25,36 @@
 #include <jfsh/exec/loop.h>
 #include <jfsh/history/history.h>
 #include <jfsh/lexer/lexer.h>
+#include <jfsh/modules/attr.h>
+#include <jfsh/modules/cap.h>
+#include <jfsh/modules/clone.h>
+#include <jfsh/modules/compctl.h>
+#include <jfsh/modules/curses.h>
 #include <jfsh/modules/datetime.h>
+#include <jfsh/modules/db_gdbm.h>
+#include <jfsh/modules/deltochar.h>
 #include <jfsh/modules/example.h>
 #include <jfsh/modules/files.h>
 #include <jfsh/modules/langinfo.h>
+#include <jfsh/modules/mapfile.h>
 #include <jfsh/modules/mathfunc.h>
+#include <jfsh/modules/nearcolor.h>
 #include <jfsh/modules/net_socket.h>
+#include <jfsh/modules/net_tcp.h>
+#include <jfsh/modules/newuser.h>
 #include <jfsh/modules/parameter.h>
 #include <jfsh/modules/pcre.h>
+#include <jfsh/modules/private.h>
 #include <jfsh/modules/regex.h>
 #include <jfsh/modules/stat.h>
 #include <jfsh/modules/system.h>
+#include <jfsh/modules/termcap.h>
+#include <jfsh/modules/terminfo.h>
+#include <jfsh/modules/watch.h>
+#include <jfsh/modules/zftp.h>
 #include <jfsh/modules/zleparameter.h>
+#include <jfsh/modules/zprof.h>
+#include <jfsh/modules/zpty.h>
 #include <jfsh/modules/zselect.h>
 #include <jfsh/modules/zutil.h>
 #include <jfsh/parser/parser.h>
@@ -176,6 +194,25 @@ int main(int argc, char* argv[]) {
   jfsh::register_zselect_module     (ctx.modules);
   jfsh::register_net_socket_module  (ctx.modules);
   jfsh::register_zleparameter_module(ctx.modules);
+  // M11 Phase 11b modules — registered, not auto-loaded.
+  jfsh::register_net_tcp_module     (ctx.modules);
+  jfsh::register_zftp_module        (ctx.modules);
+  jfsh::register_termcap_module     (ctx.modules);
+  jfsh::register_terminfo_module    (ctx.modules);
+  jfsh::register_curses_module      (ctx.modules);
+  jfsh::register_nearcolor_module   (ctx.modules);
+  jfsh::register_mapfile_module     (ctx.modules);
+  jfsh::register_db_gdbm_module     (ctx.modules);
+  jfsh::register_private_module     (ctx.modules);
+  jfsh::register_zpty_module        (ctx.modules);
+  jfsh::register_zprof_module       (ctx.modules);
+  jfsh::register_attr_module        (ctx.modules);
+  jfsh::register_cap_module         (ctx.modules);
+  jfsh::register_deltochar_module   (ctx.modules);
+  jfsh::register_compctl_module     (ctx.modules);
+  jfsh::register_clone_module       (ctx.modules);
+  jfsh::register_watch_module       (ctx.modules);
+  jfsh::register_newuser_module     (ctx.modules);
   (void)ctx.modules.load("zsh/datetime",  &ctx);
   (void)ctx.modules.load("zsh/mathfunc",  &ctx);
   (void)ctx.modules.load("zsh/parameter", &ctx);
@@ -198,6 +235,13 @@ int main(int argc, char* argv[]) {
     str visual = param(params, "VISUAL"), editor = param(params, "EDITOR");
     ctx.zle->select_main((visual.empty() ? editor : visual).find("vi") != str::npos);
   }
+
+  // zsh/newuser (M11): an interactive shell with no user startup files
+  // offers to write a starter ~/.jfshrc first, so the one it writes is
+  // read straight away.
+  if (interactive and ctx.opts.get(jfsh::OPT_RCS) and ::isatty(STDIN_FILENO)
+      and jfsh::newuser_needed(ctx) and ctx.modules.load("zsh/newuser", &ctx))
+    (void)executor.run_command({"zsh-newuser-install"});
 
   jfsh::StartupConfig startup;
   startup.zsh_compat = inv.zsh_compat_rc;

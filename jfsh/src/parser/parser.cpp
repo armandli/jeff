@@ -338,6 +338,18 @@ static s::size_t assignment_name_len(strv w, bool& append) {
   if (w.empty() or not ident_start(w[0])) return 0;
   s::size_t i = 1;
   while (i < w.size() and ident_char(w[i])) ++i;
+  // `NAME[subscript]=value`: one element of an array or association.
+  if (i < w.size() and w[i] == '[') {
+    int depth = 0;
+    s::size_t k = i;
+    for (; k < w.size(); ++k) {
+      if (w[k] == '\\' and k + 1 < w.size()) { ++k; continue; }
+      if (w[k] == '[') ++depth;
+      else if (w[k] == ']' and --depth == 0) break;
+    }
+    if (k >= w.size()) return 0;
+    i = k + 1;
+  }
   append = false;
   if (i + 1 < w.size() and w[i] == '+' and w[i + 1] == '=') {
     append = true;
@@ -350,7 +362,7 @@ static s::size_t assignment_name_len(strv w, bool& append) {
 // splitting (`local x=$(cmd)`), as zsh's reserved-word typeset does.
 static bool is_typeset_command(strv w) noexcept {
   return w == "typeset" or w == "local" or w == "declare" or w == "export"
-      or w == "readonly" or w == "integer" or w == "float";
+      or w == "readonly" or w == "integer" or w == "float" or w == "private";
 }
 
 // An assignment word after its NAME (of length len): sets the WC_ASSIGN

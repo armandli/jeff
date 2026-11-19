@@ -374,6 +374,7 @@ str Zle::resolve_widget(strv name) const {
   str n(name);
   for (int hops = 0; hops < 16; ++hops) {
     if (user_widgets.contains(n)) return n;
+    if (module_widgets.contains(n)) return n;
     if (auto a = widget_aliases.find(n); a != widget_aliases.end()) {
       n = a->second;
       continue;

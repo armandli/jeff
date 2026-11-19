@@ -138,6 +138,7 @@ str color_seq(strv spec, bool fg) {
     } else {
       return def;
     }
+    if (truecolor_mapper) return truecolor_mapper(r, g, b, fg);
     char buf[48];
     s::snprintf(buf, sizeof buf, "\x1b[%d;2;%u;%u;%um", fg ? 38 : 48, r, g, b);
     return buf;

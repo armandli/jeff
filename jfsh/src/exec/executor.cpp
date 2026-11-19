@@ -160,6 +160,12 @@ static Redirection fetch_redir(ExecState& es) {
 // Expands an assignment's value in place: a scalar without splitting, an
 // array like command arguments.
 static Result<void> expand_assignment(Expander& ex, Assignment& a) {
+  if (auto lb = a.name.find('['); lb != str::npos and a.name.back() == ']') {
+    auto sub = ex.scalar(strv(a.name).substr(lb + 1, a.name.size() - lb - 2));
+    if (not sub) return s::unexpected(sub.error());
+    a.subscript = s::move(*sub);
+    a.name.resize(lb);
+  }
   if (a.array) {
     auto el = ex.array_elements(a.value);
     if (not el) return s::unexpected(el.error());
@@ -1858,9 +1864,78 @@ static Result<void> set_numeric(ExecContext& ctx, Param& p, const Assignment& a)
   return {};
 }
 
-// TODO(exec/assign): subscripted assignments `a[i]=x`, `h[key]=x`.
+// `name[sub]=value` (or `+=`, or `=(…)` for an array slice): one element
+// of an associative array — through the handlers of a special one such as
+// $mapfile — or of an ordinary array, which grows to fit.  On a scalar the
+// subscript picks a character.
+static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
+  const str& key = *a.subscript;
+  auto raw = ctx.params.lookup_raw(a.name);
+  if (raw and raw->get().is_hash()) {
+    Param& p = raw->get();
+    if (a.array)
+      return s::unexpected(ShellError{ErrorKind::ExecError,
+          a.name + ": attempt to set slice of associative array"});
+    if (p.handlers and p.handlers->set_elem) {
+      str value = a.value;
+      if (a.append and p.handlers->get_elem)
+        value = p.handlers->get_elem(key).value_or("") + value;
+      p.handlers->set_elem(key, s::move(value));
+      return {};
+    }
+    if (p.is_readonly())
+      return s::unexpected(ShellError{ErrorKind::ExecError,
+          "read-only variable: " + a.name});
+    auto h = p.hash();
+    h[key] = a.append ? h[key] + a.value : a.value;
+    p.set(s::move(h));
+    return {};
+  }
+  auto n = math_eval(key, ctx.params, math_options(ctx.opts),
+                     &ctx.modules.math_funcs());
+  if (not n) return s::unexpected(n.error());
+  auto p = ctx.params.lookup(a.name);
+  if (p and p->get().is_readonly())
+    return s::unexpected(ShellError{ErrorKind::ExecError,
+        "read-only variable: " + a.name});
+  bool scalar = p and p->get().is_set() and not p->get().is_array();
+  vec<str> arr;
+  if (scalar) {
+    for (char c : p->get().scalar()) arr.emplace_back(1, c);
+  } else if (p and p->get().is_array()) {
+    arr = p->get().array();
+  }
+  s::int64_t idx = n->as_int();
+  if (idx < 0) idx += static_cast<s::int64_t>(arr.size()) + 1;
+  if (idx <= 0)
+    return s::unexpected(ShellError{ErrorKind::ExecError,
+        a.name + ": assignment to invalid subscript range"});
+  auto at = static_cast<s::size_t>(idx - 1);
+  if (arr.size() <= at) arr.resize(at + 1);
+  if (a.array) {
+    arr.erase(arr.begin() + static_cast<s::ptrdiff_t>(at));
+    arr.insert(arr.begin() + static_cast<s::ptrdiff_t>(at),
+               a.elements.begin(), a.elements.end());
+  } else {
+    arr[at] = a.append ? arr[at] + a.value : a.value;
+  }
+  if (scalar) {
+    str joined;
+    for (const auto& c : arr) joined += c;
+    return ctx.params.set_scalar(a.name, s::move(joined));
+  }
+  return ctx.params.set_array(a.name, s::move(arr));
+}
+
 int Executor::apply_assigns(const vec<Assignment>& assigns) {
   for (const auto& a : assigns) {
+    if (a.subscript) {
+      if (auto r = assign_element(mCtx, a); not r) {
+        s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+        return 1;
+      }
+      continue;
+    }
     auto p = mCtx.params.lookup(a.name);
     bool numeric = not a.array and p and p->get().is_set()
                and (p->get().is_integer() or p->get().is_float());
@@ -1918,18 +1993,22 @@ void Executor::trace(const vec<str>& args,
 vec<str> Executor::builtin_names() const {
   vec<str> names;
   Builtins.for_each([&](const BuiltinDef& d) { names.emplace_back(d.name); });
+  // And those of the loaded modules (zpty, ztcp, …).
+  for (const BuiltinDef* d : mCtx.modules.all_builtins()) names.emplace_back(d->name);
   s::sort(names.begin(), names.end());
+  names.erase(s::unique(names.begin(), names.end()), names.end());
   return names;
 }
 
 bool Executor::is_builtin(strv name) const noexcept {
-  return Builtins.find(name).has_value();
+  return Builtins.find(name).has_value() or mCtx.modules.find_builtin(name) != nullptr;
 }
 
 int Executor::call_builtin(strv name,
                            vec<str>& args,
                            ExecContext& ctx) {
   if (auto def = Builtins.find(name)) return def->get().fn(args, ctx);
+  if (const BuiltinDef* def = ctx.modules.find_builtin(name)) return def->fn(args, ctx);
   return 127;
 }
 
@@ -1963,6 +2042,7 @@ int Executor::call_function(const ProgRef& body,
   int saved_noerrreturn = s::exchange(mCtx.noerrreturn, 0);
   ++mCtx.func_depth;
   mCtx.params.push_scope();
+  for (const auto& [_, hook] : mCtx.hooks.function) hook(args[0], true);
 
   int rc = exec(*body);
   if (mCtx.returning) {
@@ -1978,6 +2058,7 @@ int Executor::call_function(const ProgRef& body,
     exec_string(exit_trap->command);
     if (not mCtx.exiting) mCtx.last_exit = saved;
   }
+  for (const auto& [_, hook] : mCtx.hooks.function) hook(args[0], false);
   mCtx.params.pop_scope();
   --mCtx.func_depth;
   mCtx.noerrreturn = saved_noerrreturn;

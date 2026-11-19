@@ -178,6 +178,7 @@ void before_prompt(Executor& ex, s::time_t now) {
   }
   run_sched(ex, now);
   if (ctx.exiting) return;
+  for (const auto& [_, hook] : ctx.hooks.before_prompt) hook();
   if (s::int64_t every = int_param(ctx, "MAILCHECK", 60); every > 0
       and now - ctx.loop.last_mailcheck > every) {
     check_mail(ex, now);
