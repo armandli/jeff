@@ -139,6 +139,12 @@ int main(int argc, char* argv[]) {
 
   jfsh::ParamTable  params;
   jfsh::OptionState opts;
+  // M12: when argv[0] is `sh`, `ksh` or `csh`, switch to that emulation
+  // before applying any invocation-specific options or environment vars,
+  // so SH_WORD_SPLIT, BSD_ECHO, SH_OPTION_LETTERS, etc. defaults are in
+  // place before the rc files see them.
+  if (inv.emulation != jfsh::OptionState::Emulation::ZSH)
+    opts.apply_emulation(inv.emulation, /*full=*/true);
   opts.assign(jfsh::OPT_INTERACTIVE,   interactive);
   opts.assign(jfsh::OPT_SHINSTDIN,     inv.shinstdin);
   opts.assign(jfsh::OPT_MONITOR,       inv.monitor.value_or(interactive));

@@ -9,6 +9,7 @@ add_executable(jfsh_tests
   compound_test.cpp
   cond_test.cpp
   editor_test.cpp
+  emulate_test.cpp
   exec_test.cpp
   glob_test.cpp
   history_test.cpp
