@@ -40,6 +40,11 @@ struct Invocation {
   bool      rcs       = true;  // -f / -o norcs: read no startup files but jfshenv
   bool      global_rcs = true; // -d / -o noglobalrcs: skip the /etc files
 
+  // Emulation picked from argv[0] (`sh`, `ksh`, `csh`, or `-sh`/`-ksh`/`-csh`
+  // for a login shell).  main() applies this before reading the rc files,
+  // and `emulate` can later override it.  ZSH when no name match.
+  OptionState::Emulation emulation = OptionState::Emulation::ZSH;
+
   // Every other option, in the order given.
   vec<s::pair<OptIndex, bool>> options;
 

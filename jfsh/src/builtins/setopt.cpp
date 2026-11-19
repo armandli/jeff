@@ -239,19 +239,21 @@ int builtin_set(vec<str>& args, ExecContext& ctx) {
 }
 
 // emulate [-lLR] [zsh|sh|ksh|csh|bash] [-c cmd]: with no mode prints the
-// current one.  -L makes the change local to the calling function; -c
-// runs `cmd` under the emulation and puts the options back.
+// current one, or (-l) a sourceable restoration script.  -L makes the
+// change local to the calling function; -R resets every non-special
+// option; -c runs `cmd` under the emulation and puts the options back.
 int builtin_emulate(vec<str>& args, ExecContext& ctx) {
   strv cmd = args[0];
   bool local = false;
   bool full  = false;
+  bool list  = false;
   s::size_t i = 1;
   for (; i < args.size() and args[i].size() > 1 and args[i][0] == '-'; ++i) {
     bool done = false;
     for (char c : strv(args[i]).substr(1)) {
-      if (c == 'L') local = true;
-      else if (c == 'R') full = true;
-      else if (c == 'l') { /* listing the changes is not implemented */ }
+      if      (c == 'L') local = true;
+      else if (c == 'R') full  = true;
+      else if (c == 'l') list  = true;
       else if (c == 'c') { done = true; break; }
       else {
         s::fprintf(stderr, "jfsh: emulate: bad option: -%c\n", c);
@@ -260,9 +262,22 @@ int builtin_emulate(vec<str>& args, ExecContext& ctx) {
     }
     if (done) break;
   }
+  static const char* const NAMES[] = {"zsh", "sh", "ksh", "csh"};
   if (i >= args.size()) {
-    static const char* const NAMES[] = {"zsh", "sh", "ksh", "csh"};
-    s::printf("%s\n", NAMES[static_cast<int>(ctx.opts.emulation())]);
+    if (list) {
+      // Print a sourceable `emulate -R MODE\nsetopt …\nunsetopt …` that
+      // restores the current emulation + option state.
+      s::printf("emulate -R %s\n", NAMES[static_cast<int>(ctx.opts.emulation())]);
+      for (const auto& info : OPTION_INFO) {
+        if (info.special) continue;
+        bool now = ctx.opts.get(info.index);
+        bool def = ctx.opts.default_of(info);
+        if (now == def) continue;
+        s::printf("%s %s\n", now ? "setopt" : "unsetopt", info.name);
+      }
+    } else {
+      s::printf("%s\n", NAMES[static_cast<int>(ctx.opts.emulation())]);
+    }
     return 0;
   }
   const str& mode = args[i++];
@@ -278,6 +293,23 @@ int builtin_emulate(vec<str>& args, ExecContext& ctx) {
       return builtin_error(cmd, "bad argument: " + args[i]);
     run = args[i + 1];
   }
+
+  // `emulate -l MODE` lists what `-R MODE` would do, without changing
+  // the live state.
+  if (list and not run) {
+    OptionState probe = ctx.opts;
+    probe.apply_emulation(e, full);
+    s::printf("emulate -R %s\n", NAMES[static_cast<int>(e)]);
+    for (const auto& info : OPTION_INFO) {
+      if (info.special) continue;
+      bool target = probe.get(info.index);
+      bool here   = ctx.opts.get(info.index);
+      if (target == here) continue;
+      s::printf("%s %s\n", target ? "setopt" : "unsetopt", info.name);
+    }
+    return 0;
+  }
+
   OptionState saved = ctx.opts;
   ctx.opts.apply_emulation(e, full);
   if (run) {

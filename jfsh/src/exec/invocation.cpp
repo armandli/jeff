@@ -71,6 +71,22 @@ Result<Invocation> parse_invocation(const vec<str>& argv) {
   inv.arg0  = argv.empty() ? str("jfsh") : argv[0];
   inv.login = not inv.arg0.empty() and inv.arg0[0] == '-';
 
+  // M12: pick an emulation from argv[0]'s basename (zsh's init.c does the
+  // same).  `-sh` means a login `sh`; `rbash` / `bash` are treated as sh;
+  // `ksh` and `csh` get their own emulations.  Anything else stays zsh.
+  {
+    strv name = inv.arg0;
+    if (not name.empty() and name[0] == '-') name = name.substr(1);
+    if (auto slash = name.rfind('/'); slash != strv::npos) name = name.substr(slash + 1);
+    if (name == "sh" or name == "bash" or name == "rbash" or name == "-sh"
+        or name == "ash" or name == "dash")
+      inv.emulation = OptionState::Emulation::SH;
+    else if (name == "ksh" or name == "ksh93" or name == "mksh" or name == "pdksh")
+      inv.emulation = OptionState::Emulation::KSH;
+    else if (name == "csh" or name == "tcsh")
+      inv.emulation = OptionState::Emulation::CSH;
+  }
+
   OptionState letters;   // single letters are zsh's, not ksh's
   bool want_command = false;
   s::size_t i = 1;

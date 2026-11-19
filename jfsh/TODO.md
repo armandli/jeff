@@ -1068,6 +1068,36 @@ in `editor_test.cpp`), 615 in all.
 
 Already in place: zsh's full option table (M7) with each emulation's defaults.
 
+**Phase 12a — done** (branch `jfsh-m12-emulation`):
+- `emulate [-LR] [zsh|sh|ksh|csh|bash] [-c cmd]` — mode switch with the
+  right options reset; `emulate -R` fully resets non-special options;
+  `-L` sets `LOCAL_OPTIONS`/`LOCAL_TRAPS`/`LOCAL_PATTERNS` so the
+  function-return path restores them (that path was already there from
+  M7 and now covers the `emulate` case too); `-c cmd` runs the command
+  under the new mode and puts options back.
+- `emulate -l` — print `emulate -R MODE` followed by `setopt`/`unsetopt`
+  lines for every non-special option that differs from the mode's default,
+  so the output is a sourceable restoration script.  `emulate -l MODE`
+  prints the delta `MODE` would apply to the current state.
+- Invocation-name detection in `parse_invocation()` — argv[0]'s basename
+  (minus a login `-` prefix, with `/`-stripping) is matched against
+  `sh`/`bash`/`rbash`/`ash`/`dash` → `SH`, `ksh`/`ksh93`/`mksh`/`pdksh`
+  → `KSH`, `csh`/`tcsh` → `CSH`.  `main.cpp` calls
+  `opts.apply_emulation(..., full=true)` before reading rc files, so
+  `SH_WORD_SPLIT`, `BSD_ECHO`, `SH_OPTION_LETTERS`, `POSIX_BUILTINS` and
+  the rest are the emulation's defaults by the time `.jfshrc` runs.
+- Option code paths already wired through (just verified under the new
+  emulations): `SH_WORD_SPLIT` (scalar-param split on `$IFS`),
+  `BSD_ECHO` (`echo` literal unless `-e`), `SH_OPTION_LETTERS` (ksh's
+  letters for `$-`/`set -X`), `POSIX_BUILTINS` (special-builtin dispatch
+  path), `GLOB_SUBST` interplay.
+- 24 new tests in `tests/emulate_test.cpp` cover the builtin (switch,
+  `-R`, `-l`, `-l MODE`, `-c`, unknown-mode), the per-option effects
+  (SHWORDSPLIT off under zsh / on under sh/ksh, BSD_ECHO literal
+  default), special-option exemption, LOCAL_OPTIONS on function return,
+  and the invocation-name path (the real binary copied under
+  `sh`/`ksh`/`csh`/`bash`/`jfsh` basenames via `/tmp/<mktemp>/NAME`).
+
 **Remaining**
 - `emulate [-LR] sh|ksh|zsh [-c cmd]`: switch the option set, special-parameter
   semantics, keyword rules and reserved words for the duration of the script,
