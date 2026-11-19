@@ -1166,6 +1166,35 @@ Already in place: zsh's full option table (M7) with each emulation's defaults.
 
 ### M13. Expansion and glob completeness [exec/expand], [glob/*]
 
+**Phase 13a — done** (branch `jfsh-m13a-expansion`): the parameter-flag
+and element-filter / modifier gaps that compsys and shipped functions
+depend on.
+- **`${x:#pat}` / `${(M)x:#pat}`** — array filter: drops elements that
+  match the pattern (scalar becomes empty on match); `(M)` inverts to
+  keep matches instead.  Pattern operand read with `dq=false` so glob
+  characters stay active inside a `"..."` substitution.
+- **`(V)` flag** — visible representation: `\t` / `\n` / `\r` / `\\`
+  and `\xNN` for every other control byte; empty element renders as
+  `''` so it survives splitting.
+- **`(#)` flag** — arithmetic-evaluate each element through
+  `math_eval()` with the shell's math function registry; a non-numeric
+  element folds to `0`, as in zsh.
+- **`(c)` flag** — character length per element (`${#x}` per array
+  element).
+- **`(w)` flag** — word count per element (IFS-split).
+- **`(D)` flag** — abbreviate home-relative paths: `/home/user/x` →
+  `~/x`.  Named directories (`hash -d`) stay M17.
+- **`(M)` flag** — now parsed as a ParamFlag so `${(M)x:#pat}` works.
+- **`:s/pat/repl/` / `:gs/pat/repl/` / `:&`** modifier: history-style
+  substitution chained after the existing `:h :t :r :e :u :l :q :Q :a
+  :A` modifiers.  Any delimiter (`/`, `|`, `:`, …); `:&` repeats the
+  last `:s` pattern/replacement.
+- **No-op path unjoined under dq**: `"${(flag)x}"` on an array no
+  longer pre-joins before the element-wise flags run; the final
+  dq-join still collapses the result at the end.
+- 27 new tests in `tests/subst_m13_test.cpp` cover filter / (V) / (#) /
+  (c) / (w) / (D) / :s / :gs / :& and their interplay with `:t`.
+
 **Expansion**
 - `${^x}` / `RC_EXPAND_PARAM`: array in a word becomes "prefix $x_i suffix"
   for each element; `${^^x}` also splits on `$IFS`.
