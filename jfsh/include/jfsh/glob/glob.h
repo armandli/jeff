@@ -76,13 +76,18 @@ struct GlobPattern {
 //   *  ?  [abc] [a-z] [!x] [^x] [[:alpha:]]   (a|b)   <lo-hi>
 // and, with `extended`, zsh's EXTENDED_GLOB operators:
 //   x#  (zero or more x)   x##  (one or more)   ^pat  (not pat)   a~b  (a but not b)
+// A leading `(#i)` / `(#l)` makes the whole pattern case-insensitive; a
+// leading `(#I)` resets it back to case-sensitive.  With `ksh_glob`,
+// `?(pat)`, `*(pat)`, `+(pat)`, `@(pat)` and `!(pat)` are accepted as
+// ksh-style extended-glob operators.
 struct CompiledPattern {
   struct Node;
   struct Impl;
 
   static CompiledPattern compile(strv pattern,
                                  bool case_insensitive = false,
-                                 bool extended = false);
+                                 bool extended = false,
+                                 bool ksh_glob = false);
 
   // Whole-string match.
   bool matches(strv text) const;

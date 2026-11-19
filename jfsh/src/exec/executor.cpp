@@ -1005,7 +1005,8 @@ int Executor::exec_case(ExecState& es, WordCode head) {
       if (match) break;
       auto pat = ex.pattern(word);
       if (not pat) return fail(pat.error());
-      match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob())
+      match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob(),
+                                       mCtx.opts.get(OPT_KSH_GLOB))
                   .matches(*subject);
     }
     if (not match) {
@@ -1263,7 +1264,8 @@ int Executor::exec_cond(ExecState& es, WordCode head) {
   if (op == "=" or op == "==" or op == "!=") {
     auto pat = ex.pattern(rhs_word);
     if (not pat) return fail(pat.error());
-    bool match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob()).matches(*lhs);
+    bool match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob(),
+                                       mCtx.opts.get(OPT_KSH_GLOB)).matches(*lhs);
     return finish(match == (op != "!=") ? 0 : 1);
   }
   auto rhs = ex.scalar(rhs_word);

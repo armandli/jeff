@@ -718,7 +718,8 @@ struct Scan {
       if (k) pat += ' ';
       pat += sub.fields[k].as_pattern();
     }
-    return CompiledPattern::compile(pat, false, opts().extended_glob());
+    return CompiledPattern::compile(pat, false, opts().extended_glob(),
+                                    opts().get(OPT_KSH_GLOB));
   }
 
   // `name[key]` where `name` has a get_elem handler and `key` is not @

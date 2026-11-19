@@ -11,6 +11,7 @@ add_executable(jfsh_tests
   editor_test.cpp
   emulate_test.cpp
   exec_test.cpp
+  glob_m13_test.cpp
   glob_test.cpp
   history_test.cpp
   interactive_test.cpp

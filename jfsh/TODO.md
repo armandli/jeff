@@ -1166,6 +1166,37 @@ Already in place: zsh's full option table (M7) with each emulation's defaults.
 
 ### M13. Expansion and glob completeness [exec/expand], [glob/*]
 
+**Phase 13b — done** (branch `jfsh-m13b-glob-flags`): inline globbing
+flags and ksh-style extended-glob operators.
+- **`(#i)` / `(#l)` / `(#I)`** — leading inline globbing flags in
+  `CompiledPattern::compile`.  `(#i)` and `(#l)` set
+  `impl->nocase=true`; `(#I)` resets it (so `(#i)(#I)foo` is
+  case-sensitive).  Works in `[[ s = (#i)pat ]]`, `${x:#(#i)pat}` and
+  `${x:gs/(#i)l/L/}` because every pattern path flows through the
+  same compile entry.
+- **`KSH_GLOB`** — a new `ksh_glob` flag on `CompiledPattern::compile`
+  and `PatternParser`.  `@(a|b)` → `(a|b)`, `?(pat)` → `(|pat)` (zero
+  or one via an inserted empty alternative), `*(pat)` → `(pat)#`
+  (zero or more), `+(pat)` → `(pat)##` (one or more).  `!(pat)` at the
+  top of a pattern becomes `main=*` with the inner pattern in
+  `excludes` — enough to make `[[ x = !(foo) ]]` work and the glob
+  walker honour it when a single segment is the whole `!(…)`.  Flows
+  through from `subst.cpp::operand_pattern`,
+  `executor.cpp` (for `[[ ]]` and `case`), and
+  `glob.cpp::glob_expand` so filesystem globbing, pattern filters and
+  conditions all agree.  Automatic under `emulate ksh` (the
+  `KSH_GLOB` default is already set in the M7 option table).
+- **`NO_GLOB`** — the long-form (`setopt noglob` / `unsetopt noglob`)
+  is already wired through `OPT_GLOB` in `subst.cpp`: this phase
+  documents it and adds coverage.  The letter form uses `set -F`
+  (zsh's own letter for the option, not POSIX's `-f`, which maps to
+  `NO_RCS` under zsh).
+- 17 new tests in `tests/glob_m13_test.cpp` cover the inline
+  case-insensitive flag (incl. in param filter and `:s` replace),
+  the (#I) reset, every ksh-glob operator against a temp-dir corpus,
+  ksh-glob in `[[ ]]` conditions, the off-by-default and
+  `emulate ksh`-enables cases, and the noglob/un-noglob pair.
+
 **Phase 13a — done** (branch `jfsh-m13a-expansion`): the parameter-flag
 and element-filter / modifier gaps that compsys and shipped functions
 depend on.

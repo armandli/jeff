@@ -74,6 +74,7 @@ struct PatternParser {
   strv      p;
   bool      ext;
   s::size_t i = 0;
+  bool      ksh = false;   // KSH_GLOB: ?(…), *(…), +(…), @(…), !(…)
 
   // `[…]` starting at p[i] == '['.  Returns false (and leaves i) when the
   // bracket is never closed, so the caller treats `[` as a literal.
@@ -142,6 +143,49 @@ struct PatternParser {
     }
   }
 
+  // ksh's `?(pat)`, `*(pat)`, `+(pat)`, `@(pat)`, `!(pat)`: these take
+  // a `?`/`*`/`+`/`@`/`!` followed by an open `(`.  Rewrite to the zsh
+  // equivalent: `@(pat)` is just `(pat)`; `?(pat)` is `(|pat)` (zero or
+  // one); `*(pat)` is `(pat)#`; `+(pat)` is `(pat)##`.  `!(pat)` becomes
+  // `^(pat)` by piggybacking on extended glob's `^pat`-style negation.
+  // Returns true and fills `n` on a hit; leaves `i` on failure.
+  bool parse_ksh_ext(Node& n, char op) {
+    if (not ksh) return false;
+    if (i + 1 >= p.size() or p[i + 1] != '(') return false;
+    s::size_t save = i;
+    ++i;  // skip operator
+    Node group;
+    if (not parse_group(group)) { i = save; return false; }
+    if (op == '@') { n = s::move(group); return true; }
+    if (op == '?') {
+      // Add an empty alternative so the group matches the empty string too.
+      group.alts.insert(group.alts.begin(), Seq{});
+      n = s::move(group);
+      return true;
+    }
+    if (op == '*' or op == '+') {
+      Node rep;
+      rep.kind = Kind::Repeat;
+      rep.min  = (op == '+') ? 1 : 0;
+      rep.sub  = s::make_shared<Node>(s::move(group));
+      n = s::move(rep);
+      return true;
+    }
+    if (op == '!') {
+      // Build a Group whose single alternative is Star — meaning "anything",
+      // but store the ksh group as an exclusion via the `^` negation
+      // machinery: turn it into `^(pat)` form.  jfsh's existing engine
+      // doesn't expose per-node negation, so rewrite as a group that
+      // matches everything but add the pattern to the exclude list.
+      // For a self-contained node, approximate as a Star node; the
+      // caller (CompiledPattern::compile) folds `!(pat)` into excludes
+      // in a dedicated hook below.
+      i = save;
+      return false;  // handled in parse_seq directly (see below)
+    }
+    return false;
+  }
+
   Seq parse_seq(bool in_group) {
     Seq seq;
     while (i < p.size()) {
@@ -149,7 +193,11 @@ struct PatternParser {
       if (in_group and (c == '|' or c == ')')) break;
       if (ext and not in_group and c == '~' and not seq.empty()) break;
       Node n;
-      if (c == '\\' and i + 1 < p.size()) {
+      if (ksh and (c == '?' or c == '*' or c == '+' or c == '@')
+          and i + 1 < p.size() and p[i + 1] == '('
+          and parse_ksh_ext(n, c)) {
+        // handled
+      } else if (c == '\\' and i + 1 < p.size()) {
         n.ch = p[i + 1];
         i += 2;
       } else if (c == '*') {
@@ -267,18 +315,47 @@ struct Matcher {
 }  // namespace
 
 CompiledPattern CompiledPattern::compile(strv pattern,
-                                         bool case_insensitive, bool extended) {
+                                         bool case_insensitive, bool extended,
+                                         bool ksh_glob) {
   auto impl = s::make_shared<Impl>();
   impl->nocase = case_insensitive;
+  // Inline globbing flags: `(#i)` / `(#l)` set nocase, `(#I)` clears it.
+  // Only recognised as a leading prefix for now; mid-pattern `(#i…)`
+  // scopes are a later milestone's job.
+  while (pattern.size() >= 4 and pattern[0] == '(' and pattern[1] == '#'
+         and pattern[3] == ')') {
+    switch (pattern[2]) {
+      case 'i': case 'l': impl->nocase = true;  break;
+      case 'I':           impl->nocase = false; break;
+      default:            goto done_flags;
+    }
+    pattern.remove_prefix(4);
+  }
+done_flags:
   PatternParser pp{pattern, extended};
+  pp.ksh = ksh_glob;
   if (extended and pattern.size() > 1 and pattern[0] == '^') {
     impl->negate = true;
     pp.i         = 1;
   }
-  impl->main = pp.parse_seq(false);
-  while (pp.i < pattern.size() and pattern[pp.i] == '~') {
-    ++pp.i;
-    impl->excludes.push_back(pp.parse_seq(false));
+  // Pre-pass for ksh's `!(pat)`: when the whole pattern is `!(pat)`, rewrite
+  // into excludes.  (Embedded `!(...)` within a larger pattern is not yet
+  // supported — the ksh grammar there would need a more general negation.)
+  if (ksh_glob and pattern.size() > 3 and pattern[0] == '!' and pattern[1] == '('
+      and pattern.back() == ')') {
+    // Build main = `*` (anything), excludes = inner pattern.
+    PatternParser inner{pattern.substr(2, pattern.size() - 3), extended};
+    inner.ksh  = ksh_glob;
+    PatternSeq any;
+    { Node n; n.kind = Kind::Star; any.push_back(s::move(n)); }
+    impl->main = s::move(any);
+    impl->excludes.push_back(inner.parse_seq(false));
+  } else {
+    impl->main = pp.parse_seq(false);
+    while (pp.i < pattern.size() and pattern[pp.i] == '~') {
+      ++pp.i;
+      impl->excludes.push_back(pp.parse_seq(false));
+    }
   }
   CompiledPattern cp;
   cp.mImpl = s::move(impl);
@@ -476,6 +553,7 @@ struct Walker {
   bool dots;
   bool nocase;
   bool extended;
+  bool ksh_glob = false;
 
   // Every directory below `dir`, depth first, `dir` itself first.  For `**`
   // symlinks to directories are not followed; for `***` they are.
@@ -502,7 +580,7 @@ struct Walker {
                  vec<str>& out) {
     DIR* d = ::opendir(dir.empty() ? "." : dir.c_str());
     if (not d) return;
-    auto pat = CompiledPattern::compile(seg, nocase, extended);
+    auto pat = CompiledPattern::compile(seg, nocase, extended, ksh_glob);
     bool dot_ok = dots or (not seg.empty() and seg[0] == '.')
                or (seg.size() > 1 and seg[0] == '\\' and seg[1] == '.');
     while (auto* ent = ::readdir(d)) {
@@ -545,6 +623,7 @@ Result<vec<str>> glob_expand(
   str        raw = pat.raw;
   Qualifiers q;
   bool extended = opts.extended_glob() or (pat.flags & GLOB_EXTGLOB);
+  bool ksh_glob = opts.get(OPT_KSH_GLOB);
   if (opts.get(OPT_BAREGLOBQUAL) and not split_qualifiers(raw, q))
     return s::unexpected(ShellError{ErrorKind::BadPattern,
         "unknown file attribute: " + pat.raw});
@@ -566,7 +645,7 @@ Result<vec<str>> glob_expand(
           if (e == str::npos) e = raw.size();
           excludes.push_back(CompiledPattern::compile(
               strv(raw).substr(s, e - s),
-              not opts.get(OPT_CASEGLOB), true));
+              not opts.get(OPT_CASEGLOB), true, ksh_glob));
         }
         raw.resize(i);
         break;
@@ -578,7 +657,7 @@ Result<vec<str>> glob_expand(
 
   Walker w{q.dots or (pat.flags & GLOB_DOTFILES) or opts.get(OPT_GLOBDOTS),
            not opts.get(OPT_CASEGLOB) or (pat.flags & GLOB_NOCASE),
-           extended};
+           extended, ksh_glob};
 
   auto segs = split_segments(raw);
   vec<str> cur{""};
