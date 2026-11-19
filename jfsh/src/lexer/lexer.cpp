@@ -200,6 +200,38 @@ static bool read_numeric_range(InputSource& src, str& text) {
   }
 }
 
+// After `name` and a `[` just read: the rest of a subscript up to its `]`,
+// when `=` or `+=` follows it, appended to `text` with the brackets.
+// Otherwise everything read is given back and nothing is appended.
+static bool read_assign_subscript(InputSource& src, str& text) {
+  str seen = "[";
+  int depth = 1;
+  int c;
+  while (depth > 0 and (c = src.next_char()) != -1 and c != '\n') {
+    seen += static_cast<char>(c);
+    if (c == '\\') {
+      int e = src.next_char();
+      if (e == -1) break;
+      seen += static_cast<char>(e);
+    } else if (c == '[') {
+      ++depth;
+    } else if (c == ']') {
+      --depth;
+    }
+  }
+  int n = depth == 0 ? src.next_char() : -1;
+  if (depth != 0 and c == '\n') seen += '\n';
+  bool ok = depth == 0 and (n == '=' or n == '+');
+  if (depth == 0) src.unget(n);
+  if (ok) {
+    text += seen;
+    return true;
+  }
+  for (auto it = seen.rbegin(); it != seen.rend(); ++it)
+    if (it + 1 != seen.rend()) src.unget(static_cast<unsigned char>(*it));
+  return false;
+}
+
 // `NAME=` or `NAME+=`: the start of an assignment, where a following `(`
 // opens an array value instead of ending the word.
 static bool is_assignment_prefix(strv w) noexcept {
@@ -476,6 +508,13 @@ LexToken Lexer::read_word(int first_char) {
           c = mSrc.next_char();
           continue;
         }
+      }
+      // `name[sub]=value`: the subscript may hold blanks (`h[a b]=1`).
+      if (c == '[' and is_assignment_prefix(text + '=') and not (mFlags & LEX_COND)
+          and read_assign_subscript(mSrc, text)) {
+        all_digits_so_far = false;
+        c = mSrc.next_char();
+        continue;
       }
       if (c == '<' and not text.empty() and read_numeric_range(mSrc, text)) {
         all_digits_so_far = false;

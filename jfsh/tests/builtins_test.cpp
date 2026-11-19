@@ -738,14 +738,12 @@ TEST(History, ListsAndReruns) {
 
 // ---- builtins that need later milestones ---------------------------------------
 
-TEST(Unimplemented, SayNotImplemented) {
+// zpty was a "not implemented" stub until zsh/zpty (M11) took it over: as
+// in zsh, it is there once the module is loaded.
+TEST(Unimplemented, ZptyComesFromItsModule) {
   Shell sh;
-  for (const char* name : {"zpty"}) {
-    auto r = sh.run(str(name) + " x");
-    EXPECT_EQ(r.err, "jfsh: " + str(name) + ": not implemented\n") << name;
-    EXPECT_EQ(r.rc, 1) << name;
-  }
-  EXPECT_EQ(sh.run("zmodload").rc, 0);
+  EXPECT_EQ(sh.run("whence -w zpty").out, "zpty: none\n");
+  EXPECT_EQ(sh.run("zmodload zsh/zpty; whence -w zpty").out, "zpty: builtin\n");
 }
 
 // ---- parser fixes found on the way ----------------------------------------------

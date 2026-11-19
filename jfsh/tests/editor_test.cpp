@@ -245,6 +245,25 @@ TEST(Editor, Killing) {
   EXPECT_EQ(t.line("abc\x08\x7f\r"), "a");
 }
 
+// zsh/deltochar (M11): delete-to-char kills through the character read,
+// zap-to-char up to it; a numeric argument picks the nth, a negative one
+// looks backwards.
+TEST(Editor, DeltocharWidgets) {
+  Rig t;
+  ASSERT_EQ(t.sh.run("zmodload zsh/deltochar; bindkey '^Xd' delete-to-char; bindkey '^Xz' zap-to-char").rc, 0);
+  EXPECT_EQ(t.line("one,two,three\x01\x18" "d,\r"), "two,three");
+  EXPECT_EQ(t.line("one,two,three\x01\x18" "z,\r"), ",two,three");
+  EXPECT_EQ(t.line("one,two,three\x01\x1b" "2\x18" "d,\r"), "three");
+  EXPECT_EQ(t.line("one,two,three\x1b-\x18" "d,\r"), "one,two");
+  EXPECT_EQ(t.line("one,two,three\x1b-\x18" "z,\r"), "one,two,");
+  // No such character: the line stays.
+  EXPECT_EQ(t.line("abc\x01\x18" "dq\r"), "abc");
+  // Killed text can be yanked back.
+  EXPECT_EQ(t.line("ab-cd\x01\x18" "d-\x05\x19\r"), "cdab-");
+  EXPECT_EQ(t.sh.run("zmodload -u zsh/deltochar").rc, 0);
+  EXPECT_FALSE(t.sh.ctx.zle->is_widget("zap-to-char"));
+}
+
 TEST(Editor, TransposeAndCase) {
   Rig t;
   EXPECT_EQ(t.line("ab\x14\r"), "ba");

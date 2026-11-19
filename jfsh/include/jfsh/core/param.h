@@ -39,6 +39,9 @@ enum ParamFlags : s::uint32_t {
   PM_HIDE      = 0x0000'2000,
   PM_UNSET     = 0x0000'4000,
   PM_EFLOAT    = 0x0000'8000,   // float shown in exponent form (typeset -E)
+  // zsh/private (M11): visible only in the scope that declared it, not to
+  // the functions that scope calls.
+  PM_PRIVATE   = 0x0001'0000,
 };
 
 using ParamValue = s::variant<
@@ -57,6 +60,12 @@ struct ParamHandlers {
   func<umap<str, str>()>          get_hash;   // M10 Phase 2: live hash views
   func<void(umap<str, str>)>      set_hash;
   func<void()>                    unset_fn;
+  // M11: per-key access to a special associative array ($mapfile,
+  // $terminfo, a ztie'd database, …), so `${h[key]}`, `h[key]=v` and
+  // `unset 'h[key]'` touch one element instead of the whole table.
+  func<opt<str>(const str& key)>          get_elem;
+  func<void(const str& key, str value)>   set_elem;
+  func<void(const str& key)>              unset_elem;
 };
 
 struct Param {
@@ -118,6 +127,10 @@ struct ParamTable {
 
   optref<const Param> lookup(strv name) const noexcept;
 
+  // As lookup(), without running a special parameter's getter: for a
+  // reader that wants the handlers, not the value.
+  optref<Param> lookup_raw(strv name) noexcept;
+
   // The parameter in the innermost scope only (for `local`).
   optref<Param> lookup_local(strv name) noexcept;
 
@@ -147,6 +160,10 @@ struct ParamTable {
   Param& declare_local(
     str name,
     s::uint32_t flags = PM_SCALAR | PM_UNSET);
+
+  // `unset 'name[key]'`: removes one key of an associative array (through
+  // its handlers' unset_elem when it has one).  Fails on a readonly one.
+  Result<void> unset_element(strv name, const str& key);
 
   // `unset name`: removes the innermost parameter of that name; a local
   // one stays, unset, so the outer one doesn't show through.  Fails on a

@@ -87,6 +87,9 @@ struct ModuleFeatures {
   // turned off are skipped at load time; the names here match what
   // zmodload -lF prints).
   vec<str>          feature_names;
+  // Runs when the module is unloaded (`zmodload -u`): drops the hooks,
+  // parameters and widgets the register callback installed.
+  func<void()>      on_unload;
 };
 
 // A loaded module.  Compiled-in modules fill only the `str` fields,

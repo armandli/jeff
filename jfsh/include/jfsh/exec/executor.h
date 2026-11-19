@@ -58,6 +58,24 @@ struct LoopState {
   s::time_t       last_mailcheck = 0; // when the mail files were last checked
 };
 
+// Where modules hook into the running shell (M11).  Each hook is tagged
+// with the module that added it so unloading the module drops it.
+struct ShellHooks {
+  // Around every shell-function call (zsh/zprof): the function's name and
+  // true on entry, false on return.
+  vec<s::pair<str, func<void(const str& name, bool entering)>>> function;
+  // Before each interactive prompt, after precmd/periodic (zsh/watch).
+  vec<s::pair<str, func<void()>>> before_prompt;
+
+  void remove(strv owner) {
+    auto drop = [&](auto& v) {
+      s::erase_if(v, [&](const auto& e) { return e.first == owner; });
+    };
+    drop(function);
+    drop(before_prompt);
+  }
+};
+
 struct ExecContext {
   ParamTable&    params;
   OptionState&   opts;
@@ -117,6 +135,8 @@ struct ExecContext {
   str      arg0 = "jfsh";   // $0
   Pid      shell_pid = ::getpid();  // $$, unchanged in subshells
 
+  ShellHooks  hooks{};         // module hooks (zsh/zprof, zsh/watch)
+
   vec<int>    pipestatus{0};   // $pipestatus: each stage of the last pipeline
   s::uint32_t lineno = 0;      // $LINENO: line of the command being run
   // The interactive loop added the line being run to the history before
@@ -139,6 +159,9 @@ struct Assignment {
   bool     append = false;
   bool     array  = false;
   vec<str> elements;
+  // `name[sub]=value`: the subscript, expanded, once `name` has been split
+  // off it.
+  opt<str> subscript;
 };
 
 // A single redirection decoded from the bytecode.  `fd == -1` means the

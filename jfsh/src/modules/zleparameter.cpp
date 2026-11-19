@@ -23,6 +23,7 @@ void register_zleparameter_module(ModuleManager& mm) {
       umap<str, str> h;
       if (not ctxp->zle) return h;
       for (const auto& name : Zle::builtin_widgets()) h[name] = "builtin";
+      for (const auto& [name, _] : ctxp->zle->module_widgets) h[name] = "builtin";
       for (const auto& [name, fn] : ctxp->zle->user_widgets)
         h[name] = "user:" + fn;
       for (const auto& [name, target] : ctxp->zle->widget_aliases)

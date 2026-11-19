@@ -81,6 +81,7 @@ struct CompletionEngine {
   void compdef_remove(const str& command) { mCompdefs.erase(command); }
   // A completer written in C++ (tests, built-in specs).
   void compdef_fn(str command, CompletionFn fn) { mBuiltinDefs[s::move(command)] = s::move(fn); }
+  void compdef_fn_remove(const str& command) { mBuiltinDefs.erase(command); }
   const s::map<str, str>& compdefs() const noexcept { return mCompdefs; }
 
   void set_sources(CompletionSources src) { mSources = s::move(src); }

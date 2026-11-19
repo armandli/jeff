@@ -341,6 +341,13 @@ int builtin_unset(vec<str>& args, ExecContext& ctx) {
     if (auto lb = name.find('['); lb != str::npos and name.back() == ']') {
       str base = name.substr(0, lb);
       str key  = name.substr(lb + 1, name.size() - lb - 2);
+      // A special hash with per-key handlers ($mapfile, a ztie'd db)
+      // deletes just that key.
+      if (auto raw = ctx.params.lookup_raw(base);
+          raw and raw->get().handlers and raw->get().handlers->unset_elem) {
+        (void)ctx.params.unset_element(base, key);
+        continue;
+      }
       auto p = ctx.params.lookup(base);
       if (not p or not p->get().is_set()) continue;
       Param& prm = p->get();

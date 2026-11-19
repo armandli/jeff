@@ -100,7 +100,6 @@ void BuiltinTable::register_all() {
   add({"noglob",   builtin_noglob,     BINF_NONE});
   add({"-",        builtin_dash,       BINF_NONE});
   add({"chdir",    builtin_cd,         BINF_NONE, 0, 2});
-  add({"zpty",     builtin_zpty,       BINF_NONE});
 }
 
 optref<const BuiltinDef> BuiltinTable::find(strv name) const noexcept {
@@ -165,14 +164,6 @@ static int run_words(vec<str>& args, ExecContext& ctx, strv prefix) {
 int builtin_noglob(vec<str>& args, ExecContext& ctx) { return run_words(args, ctx, "noglob"); }
 int builtin_dash(vec<str>& args, ExecContext& ctx)   { return run_words(args, ctx, "-"); }
 
-// Builtins that need the module system say so rather than pretending to
-// work (B19).  The line editor's (bindkey, zle, vared, compinit, …) are in
-// zle.cpp.
-static int not_implemented(const vec<str>& args) {
-  s::fprintf(stderr, "jfsh: %s: not implemented\n", args[0].c_str());
-  return 1;
-}
-int builtin_zpty    (vec<str>& args, ExecContext&) { return not_implemented(args); }
 
 // `zmodload` (M10): loads, unloads, lists, and aliases modules.  Flags
 // accepted:

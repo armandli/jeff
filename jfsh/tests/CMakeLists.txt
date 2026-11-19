@@ -17,6 +17,7 @@ add_executable(jfsh_tests
   lexer_test.cpp
   math_test.cpp
   modules_test.cpp
+  modules_m11_test.cpp
   params_test.cpp
   parser_test.cpp
   prompt_test.cpp

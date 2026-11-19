@@ -70,6 +70,9 @@ struct Zle {
   s::map<str, str>        user_widgets;
   // zle -A: widget name → the widget it stands for.
   s::map<str, str>        widget_aliases;
+  // Widgets written in C++ by a loaded module (zsh/deltochar): they act
+  // as builtin widgets while the module is loaded.
+  s::map<str, func<bool(Editor&)>> module_widgets;
   // push-line / push-input: lines to give back at the next prompt.
   vec<str>                buffer_stack;
   // accept-and-hold and friends: the buffer and history position the
