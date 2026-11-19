@@ -762,7 +762,19 @@ struct Scan {
       if (not h) return s::unexpected(h.error());
       hi = *h;
     }
-    auto norm = [](s::int64_t i, s::int64_t n) { return i < 0 ? n + i + 1 : i; };
+    // Normalise an external 1-based (zsh) or 0-based (KSH_ARRAYS)
+    // subscript into a 1-based internal index.  Below any first slot
+    // comes back as 0 so the callers can still clamp uniformly.
+    bool ksh  = opts().get(OPT_KSH_ARRAYS);
+    bool kz   = opts().get(OPT_KSH_ZERO_SUBSCRIPT);
+    auto norm = [&](s::int64_t i, s::int64_t n) -> s::int64_t {
+      if (ksh) {
+        if (i < 0) i += n;
+        return i + 1;   // convert ksh 0-based to internal 1-based
+      }
+      if (i == 0 and kz) return 1;
+      return i < 0 ? n + i + 1 : i;
+    };
     if (v.array) {
       s::int64_t n = static_cast<s::int64_t>(v.arr.size());
       s::int64_t a = norm(*lo, n);

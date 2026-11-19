@@ -279,4 +279,120 @@ TEST(Emulate, InvokedAsBashSelectsShEmulation) {
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// M12 Phase 12b: KSH_ARRAYS, KSH_ZERO_SUBSCRIPT.
+// ---------------------------------------------------------------------------
+
+TEST(Emulate, ZshArraysAreOneBased) {
+  Shell sh;
+  auto r = sh.run("a=(x y z); echo \"$a[1]/$a[2]/$a[3]\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "x/y/z\n");
+}
+
+TEST(Emulate, ZshIndexZeroIsEmpty) {
+  Shell sh;
+  auto r = sh.run("a=(x y z); echo \"[$a[0]]\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "[]\n");
+}
+
+TEST(Emulate, ZshNegativeIndexesFromTheEnd) {
+  Shell sh;
+  auto r = sh.run("a=(x y z); echo \"$a[-1]/$a[-2]/$a[-3]\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "z/y/x\n");
+}
+
+TEST(Emulate, KshArraysAreZeroBased) {
+  Shell sh;
+  auto r = sh.run("setopt ksharrays; a=(x y z); echo \"$a[0]/$a[1]/$a[2]\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "x/y/z\n");
+}
+
+TEST(Emulate, KshNegativeIndexesFromTheEnd) {
+  Shell sh;
+  auto r = sh.run("setopt ksharrays; a=(x y z); echo \"$a[-1]/$a[-2]/$a[-3]\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "z/y/x\n");
+}
+
+TEST(Emulate, KshIndexOutOfRangeIsEmpty) {
+  Shell sh;
+  auto r = sh.run("setopt ksharrays; a=(x y z); echo \"[$a[3]]\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "[]\n");
+}
+
+TEST(Emulate, KshZeroSubscriptInZshMapsZeroToOne) {
+  Shell sh;
+  auto r = sh.run("setopt kshzerosubscript; a=(x y z); echo \"$a[0]\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "x\n");
+}
+
+TEST(Emulate, KshArraysInArithmetic) {
+  Shell sh;
+  auto r = sh.run(
+      "a=(10 20 30)\n"
+      "echo \"zsh=$((a[2])) ksh=$(setopt ksharrays; echo $((a[2])))\"");
+  EXPECT_EQ(r.rc, 0);
+  // zsh: a[2]=20; ksh: a[2]=30.
+  EXPECT_EQ(r.out, "zsh=20 ksh=30\n");
+}
+
+TEST(Emulate, KshArraysSlicePositive) {
+  Shell sh;
+  // Slice: zsh `a[2,3]` picks 2nd..3rd; ksh picks 3rd+ off the 0-based
+  // range, which is only the 3rd slot.
+  auto r = sh.run(
+      "a=(w x y z)\n"
+      "echo \"${a[2,3]}\" \"$(setopt ksharrays; echo ${a[2,3]})\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "x y y z\n");
+}
+
+TEST(Emulate, KshArraysLengthStillArraySize) {
+  Shell sh;
+  // ${#a} is array length under both regimes (not length of $a[0]).
+  auto r = sh.run("setopt ksharrays; a=(x y z); echo \"${#a}\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "3\n");
+}
+
+TEST(Emulate, KshArraysAtGivesAllElements) {
+  Shell sh;
+  auto r = sh.run("setopt ksharrays; a=(x y z); echo \"${a[@]}\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "x y z\n");
+}
+
+TEST(Emulate, KshArraysScalarIndexAssignment) {
+  Shell sh;
+  // `(( a[i] = v ))` through the arithmetic evaluator honours KSH_ARRAYS.
+  auto r = sh.run(
+      "setopt ksharrays; a=(x y z); (( a[0] = 99 )); echo \"$a[0]\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "99\n");
+}
+
+TEST(Emulate, EmulateKshSwitchesIndexingAutomatically) {
+  Shell sh;
+  // ksh emulation turns KSH_ARRAYS on by default.
+  auto r = sh.run("emulate ksh; a=(x y z); echo \"$a[0]/$a[1]/$a[2]\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "x/y/z\n");
+}
+
+TEST(Emulate, EmulateZshRevertsToOneBased) {
+  Shell sh;
+  auto r = sh.run(
+      "emulate ksh\n"
+      "emulate zsh\n"
+      "a=(x y z); echo \"$a[1]\"");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "x\n");
+}
+
 }  // namespace jfsh::test

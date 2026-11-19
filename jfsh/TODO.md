@@ -1068,6 +1068,26 @@ in `editor_test.cpp`), 615 in all.
 
 Already in place: zsh's full option table (M7) with each emulation's defaults.
 
+**Phase 12b — done** (branch `jfsh-m12b-ksh-arrays`):
+- `KSH_ARRAYS`: 0-based array subscripts in parameter expansion
+  (`${a[0]}` → first, `${a[-1]}` → last) and in the arithmetic evaluator
+  (`$((a[i]))`, `(( a[i] = v ))` through `array_slot()`).  `${a[@]}`,
+  `${a[*]}` and `${#a}` continue to mean "all elements" / "array length"
+  regardless of mode.  `emulate ksh` turns the option on by default; the
+  state follows the option, so a script can `setopt ksharrays`
+  mid-execution and the next subscript picks it up.
+- `KSH_ZERO_SUBSCRIPT`: under zsh mode, `$a[0]` reads `$a[1]` instead of
+  being empty, matching zsh's `KSH_ZERO_SUBSCRIPT` semantics.  Also
+  wired through `array_slot()` so expansion and arithmetic agree.
+- Both options flow through a shared `MathOptions` (`ksh_arrays`,
+  `ksh_zero_subscript`) so `math_options(opts)` populates them once and
+  every caller sees the same indexing — no risk of expansion and
+  `(( ))` disagreeing on where an element sits.
+- 14 new tests cover zsh-vs-ksh indexing (positive / negative / zero /
+  out-of-range), ksh slices, `${#a}` under ksh, `${a[@]}` under ksh,
+  arithmetic indexing + assignment, zsh-mode `KSH_ZERO_SUBSCRIPT`, and
+  the round-trip `emulate ksh → emulate zsh`.
+
 **Phase 12a — done** (branch `jfsh-m12-emulation`):
 - `emulate [-LR] [zsh|sh|ksh|csh|bash] [-c cmd]` — mode switch with the
   right options reset; `emulate -R` fully resets non-special options;
