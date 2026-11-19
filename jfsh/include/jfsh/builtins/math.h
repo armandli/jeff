@@ -62,9 +62,11 @@ struct MathNum {
 };
 
 struct MathOptions {
-  bool force_float   = false;   // FORCE_FLOAT
-  bool octal_zeroes  = false;   // OCTAL_ZEROES
-  bool c_precedences = false;   // C_PRECEDENCES
+  bool force_float        = false;   // FORCE_FLOAT
+  bool octal_zeroes       = false;   // OCTAL_ZEROES
+  bool c_precedences      = false;   // C_PRECEDENCES
+  bool ksh_arrays         = false;   // KSH_ARRAYS: 0-based subscripts
+  bool ksh_zero_subscript = false;   // KSH_ZERO_SUBSCRIPT: $a[0] = $a[1]
 };
 
 MathOptions math_options(const OptionState& opts) noexcept;

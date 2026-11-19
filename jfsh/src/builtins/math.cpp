@@ -28,7 +28,11 @@ s::int64_t MathNum::as_int() const noexcept {
 }
 
 MathOptions math_options(const OptionState& opts) noexcept {
-  return {opts.get(OPT_FORCEFLOAT), opts.get(OPT_OCTALZEROES), opts.get(OPT_CPRECEDENCES)};
+  return {opts.get(OPT_FORCEFLOAT),
+          opts.get(OPT_OCTALZEROES),
+          opts.get(OPT_CPRECEDENCES),
+          opts.get(OPT_KSH_ARRAYS),
+          opts.get(OPT_KSH_ZERO_SUBSCRIPT)};
 }
 
 str format_math(const MathNum& n) {
@@ -168,9 +172,20 @@ struct Arith {
   // Parameters.
   // ---------------------------------------------------------------------
 
-  // The 0-based position of 1-based (or negative, from the end) index i in
-  // an array of n elements, or -1 when it is before the start.
-  static s::int64_t array_slot(s::int64_t i, s::int64_t n) noexcept {
+  // The 0-based position of a subscript `i` into an array of `n` elements.
+  //
+  //   zsh (default):              $a[1] → arr[0]; $a[-1] → arr[n-1];
+  //                                $a[0] → no element (returns -1).
+  //   zsh + KSH_ZERO_SUBSCRIPT:   $a[0] is treated as $a[1] (slot 0).
+  //   ksh (KSH_ARRAYS):           $a[0] → arr[0]; $a[-1] → arr[n-1].
+  //
+  // Returns -1 for an index that falls before the first slot.
+  s::int64_t array_slot(s::int64_t i, s::int64_t n) const noexcept {
+    if (opts.ksh_arrays) {
+      if (i < 0) i += n;
+      return i;
+    }
+    if (i == 0 and opts.ksh_zero_subscript) return 0;
     if (i < 0) i += n + 1;
     return i - 1;
   }
