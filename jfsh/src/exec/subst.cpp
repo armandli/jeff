@@ -243,6 +243,13 @@ struct ParamFlags {
   int  quote = 0;              // q count; -1 for (q-)
   bool join = false, split = false;
   str join_sep, split_sep;
+  // M13 Phase 13a additions:
+  bool visible = false;        // (V): escape unprintables; empty elems as ''
+  bool arith   = false;        // (#): arithmetic-eval each element
+  bool count_c = false;        // (c): length in characters (after flags)
+  bool count_w = false;        // (w): count words (after split)
+  bool dirabbr = false;        // (D): abbreviate $HOME as ~ in result
+  bool match_mode = false;     // (M): invert `:#pat` filter to keep matches
 };
 
 enum class Mode : int { Word, Scalar, Heredoc };
@@ -639,6 +646,12 @@ struct Scan {
         break; case 'q':
           if (i + 1 < f.size() and f[i + 1] == '-') { fl.quote = -1; ++i; }
           else if (fl.quote >= 0) ++fl.quote;
+        break; case 'M': fl.match_mode = true;
+        break; case 'V': fl.visible = true;
+        break; case '#': fl.arith = true;
+        break; case 'c': fl.count_c = true;
+        break; case 'w': fl.count_w = true;
+        break; case 'D': fl.dirabbr = true;
         break; case 'f': fl.split = true; fl.split_sep = "\n";
         break; case 'F': fl.join = true; fl.join_sep = "\n";
         break; case 'j': {
@@ -1147,6 +1160,25 @@ struct Scan {
             }
         }
         join_dq();
+      } else if (colon and o == '#') {
+        // ${x:#pat}: drop array elements matching pat (scalar→empty if
+        // it matches); ${(M)x:#pat}: keep matches instead.  Introduced
+        // in M13 Phase 13a.  The pattern operand is read with `dq=false`
+        // so glob characters stay active even when the whole
+        // substitution is in a double-quoted context.
+        auto pat = operand_pattern(rest.substr(1), /*dq=*/false);
+        if (not pat) return s::unexpected(pat.error());
+        auto keep = [&](const str& s) {
+          bool m = pat->matches(s);
+          return fl.match_mode ? m : not m;
+        };
+        if (v.array) {
+          vec<str> out;
+          for (auto& e : v.arr) if (keep(e)) out.push_back(e);
+          v.make_array(s::move(out));
+        } else {
+          if (not keep(v.scalar)) v.make_scalar("");
+        }
       } else if (not colon and (o == '#' or o == '%')) {
         if (not v.set and not opts().get(OPT_UNSET) and not special)
           return s::unexpected(subst_error(name + ": parameter not set"));
@@ -1219,12 +1251,53 @@ struct Scan {
           cut(static_cast<s::int64_t>(v.scalar.size()), b, e);
           v.make_scalar(v.scalar.substr(static_cast<s::size_t>(b), static_cast<s::size_t>(e - b)));
         }
-      } else if (colon and strv("htreulqQaA").find(o) != strv::npos) {
+      } else if (colon and (strv("htreulqQaAs").find(o) != strv::npos or o == 'g')) {
         join_dq();
-        // :h :t … modifiers, possibly chained (`:t:r`).
+        // :h :t :r :e :u :l :q :Q :a :A modifiers, chained (`:t:r`), plus
+        // :s/pat/repl/ (and :gs/pat/repl/ for global), the history-style
+        // substitution modifier (M13 Phase 13a).  Also :& for "repeat the
+        // last :s" and :G as an alias for :g (apply next modifier to every
+        // element already).
         strv mods = op;
+        opt<str> last_pat, last_repl;
         while (mods.size() >= 2 and mods[0] == ':') {
           char m = mods[1];
+          bool global = false;
+          if (m == 'g' and mods.size() >= 3 and (mods[2] == 's' or mods[2] == '&')) {
+            global = true;
+            mods.remove_prefix(1);
+            m = mods[1];
+          }
+          if (m == 's' or m == '&') {
+            str pat_text, repl_text;
+            if (m == 's') {
+              if (mods.size() < 4) return s::unexpected(subst_error("bad substitution"));
+              char delim = mods[2];
+              s::size_t mid = mods.find(delim, 3);
+              if (mid == strv::npos)
+                return s::unexpected(subst_error("bad substitution"));
+              s::size_t end = mods.find(delim, mid + 1);
+              if (end == strv::npos) end = mods.size();
+              pat_text  = str(mods.substr(3, mid - 3));
+              repl_text = str(mods.substr(mid + 1, end - mid - 1));
+              last_pat  = pat_text;
+              last_repl = repl_text;
+              mods.remove_prefix(end < mods.size() ? end + 1 : mods.size());
+            } else {
+              if (not last_pat)
+                return s::unexpected(subst_error(":& without a preceding :s"));
+              pat_text  = *last_pat;
+              repl_text = *last_repl;
+              mods.remove_prefix(2);
+            }
+            auto cp = CompiledPattern::compile(pat_text, false,
+                                               opts().get(OPT_EXTENDEDGLOB));
+            bool g = global;
+            each(v, [&](const str& s) {
+              return replace(s, cp, repl_text, g, /*anchor=*/0);
+            });
+            continue;
+          }
           if (strv("htreulqQaA").find(m) == strv::npos)
             return s::unexpected(
                 subst_error("unrecognized modifier `" + str(1, m) + "'"));
@@ -1238,7 +1311,10 @@ struct Scan {
     } else {
       if (not v.set and not opts().get(OPT_UNSET) and not special and not nested)
         return s::unexpected(subst_error(name + ": parameter not set"));
-      join_dq();
+      // M13 Phase 13a: don't pre-join arrays here — the (V)/(#)/(c)/(w)/
+      // (D) flags below work element-wise through each(), and the final
+      // dq-join at the end of this function still collapses the array
+      // into one word for the scalar `"..."` context.
     }
 
     if (length) {
@@ -1331,6 +1407,68 @@ struct Scan {
     if (fl.quote == -1) each(v, [](const str& s) { return quote_minimal(s); });
     else if (fl.quote == 1) each(v, [](const str& s) { return quote_backslash(s); });
     else if (fl.quote >= 2) each(v, [](const str& s) { return quote_single(s); });
+
+    // (D) — abbreviate home-relative paths as `~` / `~user`.  Only the
+    // shell's own $HOME is consulted; the named-dir table is M17.
+    if (fl.dirabbr) {
+      str home;
+      if (auto p = ctx().params.lookup("HOME"); p and p->get().is_set())
+        home = p->get().scalar();
+      if (not home.empty()) {
+        each(v, [&](str s) -> str {
+          if (s.size() >= home.size() and s.compare(0, home.size(), home) == 0
+              and (s.size() == home.size() or s[home.size()] == '/'))
+            return "~" + s.substr(home.size());
+          return s;
+        });
+      }
+    }
+
+    // (V) — make non-printables visible: C-escapes, and an empty string
+    // becomes `''` so it survives splitting.
+    if (fl.visible) {
+      each(v, [](str s) -> str {
+        if (s.empty()) return "''";
+        str out;
+        for (unsigned char c : s) {
+          if      (c == '\t') out += "\\t";
+          else if (c == '\n') out += "\\n";
+          else if (c == '\r') out += "\\r";
+          else if (c == '\\') out += "\\\\";
+          else if (c < 0x20 or c == 0x7f) {
+            char buf[8]; s::snprintf(buf, sizeof buf, "\\x%02x", c);
+            out += buf;
+          } else out += static_cast<char>(c);
+        }
+        return out;
+      });
+    }
+
+    // (#) — arithmetic-evaluate each element.  Errors fall through to 0
+    // as zsh does when a non-numeric word appears in arithmetic context.
+    if (fl.arith) {
+      each(v, [&](const str& s) -> str {
+        auto r = math_eval(s, ctx().params, math_options(opts()),
+                           &ctx().modules.math_funcs());
+        if (not r) return "0";
+        return format_math(*r);
+      });
+    }
+
+    // (c) — replace each element with its character length (same semantic
+    // as ${#x}, but per-element for arrays).
+    if (fl.count_c) {
+      each(v, [](const str& s) { return s::to_string(s.size()); });
+    }
+
+    // (w) — count words in each element (after `ifs`-style split).  For a
+    // scalar this ends up with a single count; for an array, per-element.
+    if (fl.count_w) {
+      str sep = ifs();
+      each(v, [&](const str& s) {
+        return s::to_string(ifs_split(s, sep).size());
+      });
+    }
 
     // In double quotes a split result is joined again unless (@) is given.
     if (dq and v.array and not res.keep_separate) {
