@@ -395,4 +395,88 @@ TEST(Emulate, EmulateZshRevertsToOneBased) {
   EXPECT_EQ(r.out, "x\n");
 }
 
+// ---------------------------------------------------------------------------
+// M12 Phase 12c: POSIX_TRAPS, SH_NULLCMD / CSH_NULLCMD.
+// ---------------------------------------------------------------------------
+
+TEST(Emulate, ZshTrapSetInFunctionSurvivesReturn) {
+  Shell sh;
+  // Default zsh behaviour: a trap set inside a function stays after
+  // the function returns.  `trap` with no args lists it from the caller.
+  auto r = sh.run(
+      "f() { trap 'echo hit' USR1; }\n"
+      "f\n"
+      "trap");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_NE(r.out.find("USR1"), std::string::npos);
+}
+
+TEST(Emulate, PosixTrapsConfinesTrapToFunction) {
+  Shell sh;
+  // Under POSIX_TRAPS the trap goes out of scope when `f` returns.
+  auto r = sh.run(
+      "setopt posixtraps\n"
+      "f() { trap 'echo hit' USR1; }\n"
+      "f\n"
+      "trap");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out.find("USR1"), std::string::npos);
+}
+
+TEST(Emulate, LocalTrapsAlsoConfinesTrap) {
+  Shell sh;
+  // The existing LOCAL_TRAPS path still does what POSIX_TRAPS now also
+  // gets you — verify they agree.
+  auto r = sh.run(
+      "f() { setopt localoptions localtraps; trap 'echo hit' USR1; }\n"
+      "f\n"
+      "trap");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out.find("USR1"), std::string::npos);
+}
+
+TEST(Emulate, ZshRedirectionWithNoCommandIsOk) {
+  Shell sh;
+  // zsh's default lets `> f` by itself redirect the shell's own stdout.
+  // The test just verifies it doesn't error out of jfsh.
+  auto r = sh.run("( > /tmp/jfsh_null_test_$$ ); echo $?");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "0\n");
+  // Clean up (the subshell created the file).
+  std::remove(("/tmp/jfsh_null_test_" + std::to_string(::getpid())).c_str());
+}
+
+TEST(Emulate, ShNullCmdRejectsRedirectOnlyCommand) {
+  Shell sh;
+  auto r = sh.run("emulate sh; > /tmp/jfsh_shnull_$$ 2>&1 || echo refused");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_NE(r.out.find("refused"), std::string::npos);
+}
+
+TEST(Emulate, CshNullCmdRejectsRedirectOnlyCommand) {
+  Shell sh;
+  auto r = sh.run("setopt cshnullcmd; > /tmp/jfsh_cshnull_$$ 2>&1 || echo refused");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_NE(r.out.find("refused"), std::string::npos);
+}
+
+TEST(Emulate, EmulateKshAlsoEnablesNullCmdError) {
+  Shell sh;
+  // ksh emulation has SH_NULLCMD on by default.
+  auto r = sh.run("emulate ksh; > /tmp/jfsh_kshnull_$$ 2>&1 || echo refused");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_NE(r.out.find("refused"), std::string::npos);
+}
+
+TEST(Emulate, EmulateZshRevertsNullCmdBehaviour) {
+  Shell sh;
+  auto r = sh.run(
+      "emulate sh\n"
+      "emulate zsh\n"
+      "( > /tmp/jfsh_rev_$$ ); echo $?");
+  EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "0\n");
+  std::remove(("/tmp/jfsh_rev_" + std::to_string(::getpid())).c_str());
+}
+
 }  // namespace jfsh::test

@@ -1068,6 +1068,24 @@ in `editor_test.cpp`), 615 in all.
 
 Already in place: zsh's full option table (M7) with each emulation's defaults.
 
+**Phase 12c — done** (branch `jfsh-m12c-posix-traps-nullcmd`):
+- `POSIX_TRAPS`: the function-return path now treats the option as "also
+  restore the trap frame" alongside `LOCAL_TRAPS`, so a `trap … SIG` set
+  inside a function goes out of scope when the function returns —
+  matching POSIX and zsh's `POSIX_TRAPS` semantics.  The existing M6
+  trap-frame plumbing (`push_trap_frame` / `pop_trap_frame(restore)`)
+  carries it with a one-line change at the call site.
+- `SH_NULLCMD` / `CSH_NULLCMD`: a command made of nothing but
+  redirections (`> f`, `< f`) now reports "redirection with no command"
+  and returns 1 when either option is on.  Under default zsh the
+  redirection still applies to the current shell as before.  Automatic
+  under `emulate sh` and `emulate ksh` (both set `SH_NULLCMD`).
+- 7 new tests in `tests/emulate_test.cpp` cover the zsh default (trap
+  survives function return; redirect-only command is accepted), the
+  POSIX_TRAPS path, the LOCAL_TRAPS path (as a consistency check), and
+  the SH_NULLCMD / CSH_NULLCMD / emulate-ksh refusals plus the revert
+  via `emulate zsh`.
+
 **Phase 12b — done** (branch `jfsh-m12b-ksh-arrays`):
 - `KSH_ARRAYS`: 0-based array subscripts in parameter expansion
   (`${a[0]}` → first, `${a[-1]}` → last) and in the arithmetic evaluator
