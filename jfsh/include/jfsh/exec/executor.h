@@ -42,6 +42,7 @@ struct Executor;
 struct HistoryManager;
 struct Zle;
 struct CompletionEngine;
+struct CompState;
 
 // A `sched` event: a command to run before the first prompt at or after
 // `when`.
@@ -96,6 +97,9 @@ struct ExecContext {
   // the command line.  An interactive shell goes back to the prompt, any
   // other shell exits.
   bool aborting    = false;
+  // A failed expansion (`${x?}`) set `aborting`: in a widget function it
+  // throws away the line being edited too.
+  bool abort_line  = false;
   bool hangup      = false; // SIGHUP reached an interactive shell
   // ERR_EXIT, ERR_RETURN and ZERR are off while this is positive: in the
   // conditions of if/while/until, after `!`, and in all but the last
@@ -404,6 +408,13 @@ private:
 // functions) and commands through `ex`, and tells completion about its
 // builtins, functions and aliases (src/builtins/zle.cpp).
 void install_zle_hooks(Executor& ex);
+
+// While a completion function runs: binds $words, $CURRENT, $PREFIX, …
+// and $compstate to `st` in the current scope, and has every function
+// called meanwhile restore them on return as $compstate[restore] says
+// (src/builtins/complete.cpp).  unbind_… drops that again.
+void bind_completion_params(ExecContext& ctx, CompState& st);
+void unbind_completion_params(ExecContext& ctx);
 
 // ---- Job control (src/exec/jobctl.cpp) ---------------------------------------
 

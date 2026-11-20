@@ -86,6 +86,8 @@ void BuiltinTable::register_all() {
   add({"compinit", builtin_compinit,   BINF_NONE});
   add({"compdef",  builtin_compdef,    BINF_NONE});
   add({"compadd",  builtin_compadd,    BINF_NONE});
+  add({"compset",  builtin_compset,    BINF_NONE});
+  add({"compquote", builtin_compquote, BINF_NONE});
   add({"_files",   builtin__files,     BINF_NONE});
   add({"_directories", builtin__directories, BINF_NONE});
   add({"_command_names", builtin__command_names, BINF_NONE});

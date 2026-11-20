@@ -126,6 +126,8 @@ int builtin_type      (vec<str>&, ExecContext&);
 int builtin_compinit  (vec<str>&, ExecContext&);
 int builtin_compdef   (vec<str>&, ExecContext&);
 int builtin_compadd   (vec<str>&, ExecContext&);
+int builtin_compset   (vec<str>&, ExecContext&);
+int builtin_compquote (vec<str>&, ExecContext&);
 int builtin__files    (vec<str>&, ExecContext&);
 int builtin__directories(vec<str>&, ExecContext&);
 int builtin__command_names(vec<str>&, ExecContext&);

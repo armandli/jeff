@@ -66,6 +66,8 @@ struct ParamHandlers {
   func<opt<str>(const str& key)>          get_elem;
   func<void(const str& key, str value)>   set_elem;
   func<void(const str& key)>              unset_elem;
+  // Keys that cannot be assigned (`$compstate[nmatches]`).
+  func<bool(const str& key)>              readonly_elem;
 };
 
 struct Param {

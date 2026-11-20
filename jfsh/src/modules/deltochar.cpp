@@ -53,8 +53,11 @@ void register_deltochar_module(ModuleManager& mm) {
   mm.register_builtin_module("zsh/deltochar", [](ModuleFeatures& out, ExecContext& ctx) {
     if (not ctx.zle) return;
     Zle* zle = ctx.zle;
-    zle->module_widgets["delete-to-char"] = [](Editor& ed) { return kill_to_char(ed, true); };
-    zle->module_widgets["zap-to-char"]    = [](Editor& ed) { return kill_to_char(ed, false); };
+    // Kills: zsh's ZLE_KILL | ZLE_KEEPSUFFIX.
+    zle->module_widgets["delete-to-char"] = {[](Editor& ed) { return kill_to_char(ed, true); },
+                                             SuffixRule::Keep};
+    zle->module_widgets["zap-to-char"]    = {[](Editor& ed) { return kill_to_char(ed, false); },
+                                             SuffixRule::Keep};
     out.on_unload = [zle] {
       zle->module_widgets.erase("delete-to-char");
       zle->module_widgets.erase("zap-to-char");
