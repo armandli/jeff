@@ -137,12 +137,15 @@ opt<str> Editor::run(str initial) {
   mListing.clear();
   mMenuActive   = false;
   mListed       = false;
+  mLastResult.reset();
+  mAutoSuffix.reset();
   mInterrupted  = false;
   mEof          = false;
   mDone         = false;
   mDrawn        = false;
   mCursorRow    = 0;
   mLastWidget.clear();
+  mLastCompleting = false;
   mLocalKeymap.reset();
   mViRegister   = 0;
   mViRecord     = false;
@@ -402,7 +405,9 @@ bool Editor::run_widget(const str& name) {
   }
   str saved_widget = mWidget;
   mWidget = name;
+  remove_suffix(w);
   Snapshot before{mBuf.text, mBuf.cursor};
+  s::size_t nested_before = mNestedCalls;
   mArgSet   = false;
   mKilledNow = false;
   bool ok = dispatch(w);
@@ -419,10 +424,14 @@ bool Editor::run_widget(const str& name) {
   if (not mArgSet) mArg.reset();
   if (in_vicmd() and not mViOperating) vi_clamp_cursor();
   mLastWasKill = mKilledNow;
-  static const uset<str> completion_widgets = {
-    "expand-or-complete", "complete-word", "menu-complete", "reverse-menu-complete",
-    "list-choices", "delete-char-or-list"};
-  if (not completion_widgets.contains(base)) {
+  // A user widget that leaves the line alone doesn't end the menu, nor
+  // the run of completions automenu counts; one that ran widgets with
+  // `zle name` leaves them as those did.
+  bool passive = mZle.user_widgets.contains(w) and not mZle.comp_widgets.contains(w)
+             and (mNestedCalls != nested_before
+                  or (before.text == mBuf.text and before.cursor == mBuf.cursor));
+  if (not passive) mLastCompleting = is_completion_widget(base);
+  if (not mLastCompleting) {
     mMenuActive = false;
     mListed     = false;
   }
@@ -434,8 +443,10 @@ bool Editor::run_widget(const str& name) {
 bool Editor::dispatch(const str& name) {
   if (not name.starts_with('.')) {
     if (auto u = mZle.user_widgets.find(name); u != mZle.user_widgets.end()) {
+      if (auto c = mZle.comp_widgets.find(name); c != mZle.comp_widgets.end())
+        return complete_widget(c->second, u->second);
       if (not mZle.hooks.run_widget) return false;
-      int rc = mZle.hooks.run_widget(*this, name, u->second);
+      int rc = mZle.hooks.run_widget(*this, name, u->second, {});
       mBuf.cursor = s::min(mBuf.cursor, mBuf.text.size());
       while (mBuf.cursor > 0 and mBuf.cursor < mBuf.text.size()
              and (static_cast<unsigned char>(mBuf.text[mBuf.cursor]) & 0xc0) == 0x80)
@@ -445,15 +456,16 @@ bool Editor::dispatch(const str& name) {
   }
   strv base = name.starts_with('.') ? strv(name).substr(1) : strv(name);
   if (auto m = mZle.module_widgets.find(str(base)); m != mZle.module_widgets.end())
-    return m->second(*this);
+    return m->second.fn(*this);
   const auto& table = Editor::widget_table();
   auto it = table.find(str(base));
   if (it == table.end()) return false;
-  return (this->*(it->second))();
+  return (this->*(it->second.fn))();
 }
 
 bool Editor::call_widget(strv name) {
   if (not mReading) return false;
+  ++mNestedCalls;
   return run_widget(str(name));
 }
 
@@ -1612,33 +1624,39 @@ bool Editor::w_which_command() {
 
 // ---- The widget table ----------------------------------------------------------
 
-const umap<str, Editor::WidgetFn>& Editor::widget_table() {
-  static const umap<str, WidgetFn> table = {
+const umap<str, Editor::WidgetInfo>& Editor::widget_table() {
+  // KEEP and PEND mark zsh's ZLE_KEEPSUFFIX widgets (Src/Zle/iwidgets.list):
+  // after PEND ones the suffix can still be removed.
+  constexpr auto KEEP = SuffixRule::Keep;
+  constexpr auto PEND = SuffixRule::Pending;
+  static const umap<str, WidgetInfo> table = {
     {"accept-and-hold",                     &Editor::w_accept_and_hold},
     {"accept-line",                         &Editor::w_accept_line},
     {"accept-line-and-down-history",        &Editor::w_accept_line_and_down_history},
+    {"auto-suffix-remove",                  {&Editor::w_auto_suffix_remove, PEND}},
+    {"auto-suffix-retain",                  {&Editor::w_auto_suffix_retain, KEEP}},
     {"backward-char",                       &Editor::w_backward_char},
-    {"backward-delete-char",                &Editor::w_backward_delete_char},
-    {"backward-delete-word",                &Editor::w_backward_kill_word},
-    {"backward-kill-line",                  &Editor::w_backward_kill_line},
-    {"backward-kill-word",                  &Editor::w_backward_kill_word},
+    {"backward-delete-char",                {&Editor::w_backward_delete_char, KEEP}},
+    {"backward-delete-word",                {&Editor::w_backward_kill_word, KEEP}},
+    {"backward-kill-line",                  {&Editor::w_backward_kill_line, KEEP}},
+    {"backward-kill-word",                  {&Editor::w_backward_kill_word, KEEP}},
     {"backward-word",                       &Editor::w_backward_word},
     {"beep",                                &Editor::w_beep},
     {"beginning-of-buffer-or-history",      &Editor::w_beginning_of_buffer_or_history},
     {"beginning-of-history",                &Editor::w_beginning_of_history},
     {"beginning-of-line",                   &Editor::w_beginning_of_line},
     {"beginning-of-line-hist",              &Editor::w_beginning_of_line},
-    {"bracketed-paste",                     &Editor::w_bracketed_paste},
+    {"bracketed-paste",                     {&Editor::w_bracketed_paste, KEEP}},
     {"capitalize-word",                     &Editor::w_capitalize_word},
-    {"clear-screen",                        &Editor::w_clear_screen},
+    {"clear-screen",                        {&Editor::w_clear_screen, PEND}},
     {"complete-word",                       &Editor::w_complete_word},
-    {"copy-prev-word",                      &Editor::w_copy_prev_word},
-    {"copy-region-as-kill",                 &Editor::w_copy_region_as_kill},
+    {"copy-prev-word",                      {&Editor::w_copy_prev_word, KEEP}},
+    {"copy-region-as-kill",                 {&Editor::w_copy_region_as_kill, KEEP}},
     {"deactivate-region",                   &Editor::w_deactivate_region},
-    {"delete-char",                         &Editor::w_delete_char},
+    {"delete-char",                         {&Editor::w_delete_char, KEEP}},
     {"delete-char-or-list",                 &Editor::w_delete_char_or_list},
-    {"delete-word",                         &Editor::w_kill_word},
-    {"digit-argument",                      &Editor::w_digit_argument},
+    {"delete-word",                         {&Editor::w_kill_word, KEEP}},
+    {"digit-argument",                      {&Editor::w_digit_argument, PEND}},
     {"down-case-word",                      &Editor::w_down_case_word},
     {"down-history",                        &Editor::w_down_history},
     {"down-line",                           &Editor::w_down_line},
@@ -1667,51 +1685,51 @@ const umap<str, Editor::WidgetFn>& Editor::widget_table() {
     {"history-search-backward",             &Editor::w_history_search_backward},
     {"history-search-forward",              &Editor::w_history_search_forward},
     {"infer-next-history",                  &Editor::w_infer_next_history},
-    {"insert-last-word",                    &Editor::w_insert_last_word},
-    {"kill-buffer",                         &Editor::w_kill_buffer},
-    {"kill-line",                           &Editor::w_kill_line},
-    {"kill-region",                         &Editor::w_kill_region},
-    {"kill-whole-line",                     &Editor::w_kill_whole_line},
-    {"kill-word",                           &Editor::w_kill_word},
+    {"insert-last-word",                    {&Editor::w_insert_last_word, KEEP}},
+    {"kill-buffer",                         {&Editor::w_kill_buffer, KEEP}},
+    {"kill-line",                           {&Editor::w_kill_line, KEEP}},
+    {"kill-region",                         {&Editor::w_kill_region, KEEP}},
+    {"kill-whole-line",                     {&Editor::w_kill_whole_line, KEEP}},
+    {"kill-word",                           {&Editor::w_kill_word, KEEP}},
     {"list-choices",                        &Editor::w_list_choices},
     {"list-expand",                         &Editor::w_expand_word},
     {"magic-space",                         &Editor::w_magic_space},
     {"menu-complete",                       &Editor::w_menu_complete},
     {"menu-expand-or-complete",             &Editor::w_menu_complete},
-    {"neg-argument",                        &Editor::w_neg_argument},
+    {"neg-argument",                        {&Editor::w_neg_argument, PEND}},
     {"overwrite-mode",                      &Editor::w_overwrite_mode},
     {"pound-insert",                        &Editor::w_pound_insert},
     {"push-input",                          &Editor::w_push_line},
     {"push-line",                           &Editor::w_push_line},
     {"push-line-or-edit",                   &Editor::w_push_line},
-    {"put-replace-selection",               &Editor::w_put_replace_selection},
+    {"put-replace-selection",               {&Editor::w_put_replace_selection, KEEP}},
     {"quote-line",                          &Editor::w_quote_line},
     {"quote-region",                        &Editor::w_quote_region},
-    {"quoted-insert",                       &Editor::w_quoted_insert},
-    {"redisplay",                           &Editor::w_redisplay},
-    {"redo",                                &Editor::w_redo},
+    {"quoted-insert",                       {&Editor::w_quoted_insert, KEEP}},
+    {"redisplay",                           {&Editor::w_redisplay, PEND}},
+    {"redo",                                {&Editor::w_redo, KEEP}},
     {"reverse-menu-complete",               &Editor::w_reverse_menu_complete},
     {"run-help",                            &Editor::w_run_help},
-    {"select-a-blank-word",                 &Editor::w_select_a_blank_word},
-    {"select-a-bracketed",                  &Editor::w_select_a_bracketed},
-    {"select-a-quoted",                     &Editor::w_select_a_quoted},
-    {"select-a-shell-word",                 &Editor::w_select_a_shell_word},
-    {"select-a-word",                       &Editor::w_select_a_word},
-    {"select-in-blank-word",                &Editor::w_select_in_blank_word},
-    {"select-in-bracketed",                 &Editor::w_select_in_bracketed},
-    {"select-in-quoted",                    &Editor::w_select_in_quoted},
-    {"select-in-shell-word",                &Editor::w_select_in_shell_word},
-    {"select-in-word",                      &Editor::w_select_in_word},
+    {"select-a-blank-word",                 {&Editor::w_select_a_blank_word, KEEP}},
+    {"select-a-bracketed",                  {&Editor::w_select_a_bracketed, KEEP}},
+    {"select-a-quoted",                     {&Editor::w_select_a_quoted, KEEP}},
+    {"select-a-shell-word",                 {&Editor::w_select_a_shell_word, KEEP}},
+    {"select-a-word",                       {&Editor::w_select_a_word, KEEP}},
+    {"select-in-blank-word",                {&Editor::w_select_in_blank_word, KEEP}},
+    {"select-in-bracketed",                 {&Editor::w_select_in_bracketed, KEEP}},
+    {"select-in-quoted",                    {&Editor::w_select_in_quoted, KEEP}},
+    {"select-in-shell-word",                {&Editor::w_select_in_shell_word, KEEP}},
+    {"select-in-word",                      {&Editor::w_select_in_word, KEEP}},
     {"self-insert",                         &Editor::w_self_insert},
-    {"self-insert-unmeta",                  &Editor::w_self_insert_unmeta},
+    {"self-insert-unmeta",                  {&Editor::w_self_insert_unmeta, KEEP}},
     {"send-break",                          &Editor::w_send_break},
-    {"set-mark-command",                    &Editor::w_set_mark_command},
+    {"set-mark-command",                    {&Editor::w_set_mark_command, PEND}},
     {"spell-word",                          &Editor::w_expand_word},
     {"transpose-chars",                     &Editor::w_transpose_chars},
     {"transpose-words",                     &Editor::w_transpose_words},
     {"undefined-key",                       &Editor::w_beep},
     {"undo",                                &Editor::w_undo},
-    {"universal-argument",                  &Editor::w_universal_argument},
+    {"universal-argument",                  {&Editor::w_universal_argument, PEND}},
     {"up-case-word",                        &Editor::w_up_case_word},
     {"up-history",                          &Editor::w_up_history},
     {"up-line",                             &Editor::w_up_line},
@@ -1721,8 +1739,8 @@ const umap<str, Editor::WidgetFn>& Editor::widget_table() {
     {"vi-backward-blank-word",              &Editor::w_vi_backward_blank_word},
     {"vi-backward-blank-word-end",          &Editor::w_vi_backward_blank_word_end},
     {"vi-backward-char",                    &Editor::w_vi_backward_char},
-    {"vi-backward-delete-char",             &Editor::w_vi_backward_delete_char},
-    {"vi-backward-kill-word",               &Editor::w_vi_backward_kill_word},
+    {"vi-backward-delete-char",             {&Editor::w_vi_backward_delete_char, KEEP}},
+    {"vi-backward-kill-word",               {&Editor::w_vi_backward_kill_word, KEEP}},
     {"vi-backward-word",                    &Editor::w_vi_backward_word},
     {"vi-backward-word-end",                &Editor::w_vi_backward_word_end},
     {"vi-beginning-of-line",                &Editor::w_vi_beginning_of_line},
@@ -1730,8 +1748,8 @@ const umap<str, Editor::WidgetFn>& Editor::widget_table() {
     {"vi-change-eol",                       &Editor::w_vi_change_eol},
     {"vi-change-whole-line",                &Editor::w_vi_change_whole_line},
     {"vi-cmd-mode",                         &Editor::w_vi_cmd_mode},
-    {"vi-delete",                           &Editor::w_vi_delete},
-    {"vi-delete-char",                      &Editor::w_vi_delete_char},
+    {"vi-delete",                           {&Editor::w_vi_delete, KEEP}},
+    {"vi-delete-char",                      {&Editor::w_vi_delete_char, KEEP}},
     {"vi-digit-or-beginning-of-line",       &Editor::w_vi_digit_or_beginning_of_line},
     {"vi-down-case",                        &Editor::w_vi_down_case},
     {"vi-down-line-or-history",             &Editor::w_vi_down_line_or_history},
@@ -1756,15 +1774,15 @@ const umap<str, Editor::WidgetFn>& Editor::widget_table() {
     {"vi-insert",                           &Editor::w_vi_insert},
     {"vi-insert-bol",                       &Editor::w_vi_insert_bol},
     {"vi-join",                             &Editor::w_vi_join},
-    {"vi-kill-eol",                         &Editor::w_vi_kill_eol},
-    {"vi-kill-line",                        &Editor::w_vi_kill_line},
+    {"vi-kill-eol",                         {&Editor::w_vi_kill_eol, KEEP}},
+    {"vi-kill-line",                        {&Editor::w_vi_kill_line, KEEP}},
     {"vi-match-bracket",                    &Editor::w_vi_match_bracket},
     {"vi-open-line-above",                  &Editor::w_vi_open_line_above},
     {"vi-open-line-below",                  &Editor::w_vi_open_line_below},
     {"vi-oper-swap-case",                   &Editor::w_vi_oper_swap_case},
-    {"vi-put-after",                        &Editor::w_vi_put_after},
-    {"vi-put-before",                       &Editor::w_vi_put_before},
-    {"vi-quoted-insert",                    &Editor::w_vi_quoted_insert},
+    {"vi-put-after",                        {&Editor::w_vi_put_after, KEEP}},
+    {"vi-put-before",                       {&Editor::w_vi_put_before, KEEP}},
+    {"vi-quoted-insert",                    {&Editor::w_vi_quoted_insert, KEEP}},
     {"vi-repeat-change",                    &Editor::w_vi_repeat_change},
     {"vi-repeat-find",                      &Editor::w_vi_repeat_find},
     {"vi-repeat-search",                    &Editor::w_vi_repeat_search},
@@ -1772,8 +1790,8 @@ const umap<str, Editor::WidgetFn>& Editor::widget_table() {
     {"vi-replace-chars",                    &Editor::w_vi_replace_chars},
     {"vi-rev-repeat-find",                  &Editor::w_vi_rev_repeat_find},
     {"vi-rev-repeat-search",                &Editor::w_vi_rev_repeat_search},
-    {"vi-set-buffer",                       &Editor::w_vi_set_buffer},
-    {"vi-set-mark",                         &Editor::w_vi_set_mark},
+    {"vi-set-buffer",                       {&Editor::w_vi_set_buffer, PEND}},
+    {"vi-set-mark",                         {&Editor::w_vi_set_mark, PEND}},
     {"vi-substitute",                       &Editor::w_vi_substitute},
     {"vi-swap-case",                        &Editor::w_vi_swap_case},
     {"vi-unindent",                         &Editor::w_vi_unindent},
@@ -1783,10 +1801,10 @@ const umap<str, Editor::WidgetFn>& Editor::widget_table() {
     {"vi-yank-whole-line",                  &Editor::w_vi_yank_whole_line},
     {"visual-line-mode",                    &Editor::w_visual_line_mode},
     {"visual-mode",                         &Editor::w_visual_mode},
-    {"what-cursor-position",                &Editor::w_what_cursor_position},
+    {"what-cursor-position",                {&Editor::w_what_cursor_position, PEND}},
     {"which-command",                       &Editor::w_which_command},
-    {"yank",                                &Editor::w_yank},
-    {"yank-pop",                            &Editor::w_yank_pop},
+    {"yank",                                {&Editor::w_yank, KEEP}},
+    {"yank-pop",                            {&Editor::w_yank_pop, KEEP}},
   };
   return table;
 }

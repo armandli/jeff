@@ -217,7 +217,7 @@ int Executor::exec_simple(vec<str> args,
   // A failed expansion (`${x?msg}`, NO_UNSET, `$((1/0))`) ends the command
   // line, as zsh's errflag does: a non-interactive shell exits.
   if (not expanded) {
-    mCtx.aborting = true;
+    mCtx.aborting = mCtx.abort_line = true;
     return 1;
   }
   // typeset's `name=value` arguments: a scalar is passed as `name=value`; an
@@ -1255,7 +1255,7 @@ int Executor::exec_cond_node(ExecState& es, WordCode head) {
   // A failed expansion ends the command line, as for a simple command.
   auto fail = [&](const ShellError& e) {
     s::fprintf(stderr, "jfsh: %s\n", e.message.c_str());
-    mCtx.aborting = true;
+    mCtx.aborting = mCtx.abort_line = true;
     return finish(1);
   };
   auto note = [&](strv s) { if (mCondTrace) *mCondTrace += s; };
@@ -2010,6 +2010,8 @@ static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
     if (a.array)
       return s::unexpected(ShellError{ErrorKind::ExecError,
           a.name + ": attempt to set slice of associative array"});
+    if (p.handlers and p.handlers->readonly_elem and p.handlers->readonly_elem(key))
+      return s::unexpected(ShellError{ErrorKind::ExecError, "read-only variable: " + key});
     if (p.handlers and p.handlers->set_elem) {
       str value = a.value;
       if (a.append and p.handlers->get_elem)

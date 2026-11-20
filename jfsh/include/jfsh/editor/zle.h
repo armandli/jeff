@@ -27,6 +27,17 @@ namespace jfsh {
 struct Editor;
 struct CompletionEngine;
 
+// What a widget does to an auto-removable suffix completion left before
+// the cursor (zsh's ZLE_KEEPSUFFIX): removes it, keeps it, or keeps it
+// and leaves it removable by the widget after.
+enum class SuffixRule : s::uint8_t { Remove, Keep, Pending };
+
+// A widget written in C++ by a loaded module.
+struct ModuleWidget {
+  func<bool(Editor&)> fn;
+  SuffixRule          suffix = SuffixRule::Remove;
+};
+
 struct KeyBinding {
   str  widget;     // the widget to run, or
   str  macro;      // for bindkey -s, the keys to read instead
@@ -55,8 +66,9 @@ str format_key(strv seq);
 // What the editor needs the rest of the shell for.
 struct ZleHooks {
   // Runs the shell function `fn` for a user widget (zle -N), with $BUFFER,
-  // $CURSOR, … set from `ed` and read back afterwards.  Returns its status.
-  func<int(Editor& ed, const str& widget, const str& fn)> run_widget;
+  // $CURSOR, … set from `ed` and read back afterwards, and `args` as its
+  // arguments.  Returns its status.
+  func<int(Editor& ed, const str& widget, const str& fn, const vec<str>& args)> run_widget;
   // Runs a command line (edit-command-line's editor).
   func<int(const str& cmd)>                               run_command;
 };
@@ -66,13 +78,16 @@ struct Zle {
 
   // Keymaps by name; aliases share the object.
   umap<str, sptr<Keymap>> keymaps;
-  // User widgets (zle -N): widget name → shell function.
+  // User widgets (zle -N, zle -C): widget name → shell function.
   s::map<str, str>        user_widgets;
+  // Completion widgets (zle -C): widget name → the builtin completion
+  // widget whose behaviour they have.
+  s::map<str, str>        comp_widgets;
   // zle -A: widget name → the widget it stands for.
   s::map<str, str>        widget_aliases;
   // Widgets written in C++ by a loaded module (zsh/deltochar): they act
   // as builtin widgets while the module is loaded.
-  s::map<str, func<bool(Editor&)>> module_widgets;
+  s::map<str, ModuleWidget> module_widgets;
   // push-line / push-input: lines to give back at the next prompt.
   vec<str>                buffer_stack;
   // accept-and-hold and friends: the buffer and history position the

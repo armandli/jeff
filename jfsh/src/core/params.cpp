@@ -234,6 +234,12 @@ Result<void> ParamTable::unset(strv name) {
     if (it->second.is_readonly())
       return s::unexpected(ShellError{ErrorKind::ExecError,
           "read-only variable: " + str(name)});
+    // A special parameter that stays set ($PREFIX in a completion
+    // function) says what unsetting it means.
+    if (it->second.handlers and it->second.handlers->unset_fn) {
+      it->second.handlers->unset_fn();
+      return {};
+    }
     if (i == 0) {
       scope.erase(it);
     } else {

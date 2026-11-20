@@ -725,10 +725,10 @@ output, bang expansions and xtrace lines were compared with it.
 - Syntax highlighting and autosuggestions (optional in the plan) aren't done.
 - Completion: no `_arguments`/`_describe`-style specs, no option or `--long` completion,
   no reading of zsh's own completion functions, no menu selection (`menuselect`
-  keymap, arrow keys in the list), no named directories (`hash -d`) or `cdpath`; a
-  compdef function's `compadd` options beyond `-S -P -d -a -U` are accepted and
-  ignored. `expand-word`, `list-expand` and `spell-word` only beep, so Tab doesn't
-  expand globs or `$vars` in place.
+  keymap, arrow keys in the list), no named directories (`hash -d`) or `cdpath`.
+  (`compadd` now has every option but `-M`: M15 phase 15a.) `expand-word`,
+  `list-expand` and `spell-word` only beep, so Tab doesn't expand globs or `$vars` in
+  place.
 - `zle -F` (fd handlers) and `zle -T` say `not implemented`; `zle-line-init`,
   `zle-line-finish` and `zle-keymap-select` hooks aren't called; `$zle_highlight` and
   `$region_highlight` are ignored; `vared -i/-f` (init/finish widgets) are accepted and
@@ -1337,23 +1337,148 @@ expansion list, leaving globbing for the next phases.
 
 Replaces the hand-rolled context code (M9) with the full compsys framework.
 
+**Phase 15a — done** (branch `jfsh-m15a-complete-core`): the zsh/complete
+C-side substrate the compsys shell functions build on.  The engine keeps
+its home in `src/editor/completion.cpp` (a `CompState` per run of a
+completion function); the builtins are in `src/builtins/complete.cpp`.
+- **Completion widgets**: `zle -C name builtin-widget function` makes a
+  real completion widget (`complete-word`, `expand-or-complete[-prefix]`,
+  `menu-complete`, `menu-expand-or-complete`, `reverse-menu-complete`,
+  `list-choices`, `delete-char-or-list`, also with a leading `.`).  The
+  function runs with the completion parameters bound, then its matches go
+  through the editor's insertion, listing and menu code as that builtin
+  widget's would; the menu goes round without calling the function again.
+  `zle -l [-L]` lists them as zsh does; `$WIDGETSTYLE` is set, and
+  `$BUFFER`, `$CURSOR`, … are read-only inside.  compdef'd functions (the
+  M9 path) now run through the same code, so they get every parameter and
+  option below.
+- **Special parameters**, live and editable: `$words` (the whole command,
+  words after the cursor too), `$CURRENT`, `$PREFIX`, `$SUFFIX` (the text
+  after the cursor under COMPLETE_IN_WORD), `$IPREFIX`, `$ISUFFIX`,
+  `$QIPREFIX`/`$QISUFFIX` (read-only); `$PREFIX` keeps backslashes and
+  drops quote characters as zsh's does; `$fo`/`${fo` put `$`/`${` in
+  `$IPREFIX`.  compadd matches against the current values and the line is
+  rebuilt from them.  With `compstate[restore]=auto` every function
+  called puts them back on return; `unset PREFIX` empties it.
+- **`$compstate`**: `context` (command, redirect, value, array_value,
+  subscript, condition, math, parameter, brace_parameter), `parameter`,
+  `redirect` (the operator as typed), `quote`, `quoting`, `all_quotes`,
+  `nmatches`, `unambiguous` (quoted as it goes into the line, after the
+  open quote) and `unambiguous_cursor`, `exact`/`exact_string` (REC_EXACT,
+  or `exact` set before the match is added), `ignored`,
+  `list_lines`, `insert` and `list` initialised per widget and options
+  (`automenu-unambiguous`, `automenu` on the press after a listing,
+  `menu`, `unambiguous`; `ambiguous`, `autolist`, `list`, `packed`,
+  `rows`) and honoured on return (`menu[:N]`, `automenu`, `unambiguous`,
+  a number with or without a trailing space — negative inserts nothing, as
+  in zsh 5.9 —, `all`, `tab`, `''`; `list`/`autolist`/`ambiguous`/`force`
+  /`explanations`/`messages`, `''`), `old_list` (`yes`/`shown`, and
+  `keep` reuses the last matches), `old_insert`, `list_max` (used as
+  LISTMAX), `vared`, `to_end`, `last_prompt`, `pattern_insert`,
+  `pattern_match`, `restore`, `insert_positions`,
+  `unambiguous_positions`.  Read-only keys refuse assignment.  As in zsh,
+  an error in a zle -N widget function throws the line away; in a
+  completion function it drops the matches, and an expansion error
+  (`${x?}`, also in `[[ ]]`) throws the line away too.  An error in a
+  widget run with `zle name` stops the widgets that ran it.
+  A user widget that leaves the line alone doesn't end menu completion
+  or the run of presses automenu counts.
+  `compstate[list]=list` (list-choices, `^D`) lists a single match too.
+- **`compadd`** with every option but `-M` (parsed, ignored — phase 15b):
+  zsh's seven fields `-i -P -p -s -S -I` (`-p`/`-s` quoted, a `-P`
+  already on the line skipped when matching, a common hidden suffix
+  inserted after the cursor), `-U`, `-Q`, `-W` (joined to the word as it
+  is) with `-f` (directory slash, no space for a file that isn't there,
+  LIST_TYPES markers), `-e` (AUTO_PARAM_SLASH), `-a`/`-k` with
+  subscripts, `-d` (array or `(…)`), `-l`, `-n`, `-J`/`-V` groups with
+  `-1`/`-2` (duplicates dropped as they are added, so `nmatches` and the
+  status see them gone), `-o [match|nosort,…]` (a named group only), `-X`
+  (prompt attributes left out, `%%`; `-x` in the same call wins) and `-x`
+  in listings, `-F` (feeds `ignored`), `-O`/`-A`/`-D`, `-E` (one empty
+  match per group, sorted as the empty string), `-C`, `-q`/`-r`/`-R`
+  auto-removable suffixes (removed by the next key that matches, by
+  builtin widgets that insert nothing, taken by backspace, left alone by
+  user widgets; `-R`'s function gets the length).  Matching compares the
+  match quoted for the word's quoting with `$PREFIX`/`$SUFFIX`; the
+  unambiguous string is computed on the quoted matches (`a\` for `a b`
+  and `a$c`), as zsh does.
+- **Auto-removable space and slash** (all completion, the builtin
+  completers too): the space after a unique match and (AUTO_REMOVE_SLASH)
+  a directory's slash go when a blank, `;`, `&`, `|` (a `/` after the
+  slash) is typed, or when a builtin widget runs that zsh doesn't mark
+  ZLE_KEEPSUFFIX (accept-line, motion such as forward-word or
+  beginning-of-line, case changes).  The ZLE_KEEPSUFFIX widgets keep it:
+  those that insert after it (yank, quoted-insert, insert-last-word, the
+  vi puts…), kill or delete (kill-line, delete-char, vi-delete…),
+  copy-region-as-kill, redo and the select-* text objects, after which it
+  is no longer removable; and set-mark-command, what-cursor-position,
+  vi-set-mark, vi-set-buffer, the argument widgets, redisplay and
+  clear-screen, after which it still is.  A per-widget `SuffixRule` in
+  `Editor::widget_table()` says which, checked against zsh widget by
+  widget, and module widgets carry the same rule (zsh/deltochar's
+  delete-to-char and zap-to-char keep it).  A widget function that sets
+  `$BUFFER`, `$CURSOR`, `$LBUFFER` or `$RBUFFER` makes it permanent
+  (zsh's fixsuffix).  The `auto-suffix-remove` and `auto-suffix-retain`
+  widgets are there.  As in zsh, `cd dir/<Enter>` runs `cd dir` and vared
+  gets `foo`, not `foo `.
+- **`compset`** `-p -P [n] -s -S [n] -n begin [end] -N beg [end] -q`
+  with zsh's statuses and messages; `-q` takes one level of quoting off
+  and splits the rest as shell words (nested `-q` grows `$QIPREFIX`,
+  `all_quotes`, and sets `quote`/`quoting`); **`compquote [-p]`** for
+  scalars and arrays in each quoting (`-p` leaves a leading `=` alone).
+- `#` is now quoted anywhere in a completed word (`\~x\#`), as zsh does.
+- The editor's pty rig moved to `tests/editor_rig.h`; 26 tests in
+  `tests/completion_test.cpp`, checked against zsh 5.9 (774 tests pass).
+
+**Left after 15a**
+- `-M` match specifications (15b), and the `-prefix`/`-suffix`/`-after`/
+  `-between` condition codes.
+- Listing: zsh lays several groups out on a shared column grid; jfsh lays
+  each group out on its own (same rows, spacing can differ).  `-o
+  numeric`/`reverse` are accepted and, as in zsh 5.9 here, change nothing.
+- `expand-or-complete` still completes without expanding first.
+- A pipeline or a `( … )` subshell in any widget function (`g() { print
+  a | cat >>$LOG }` as a zle -N or zle -C widget) leaves the editor
+  unresponsive afterwards; after a widget that ran a subshell, another
+  whose function redirects (`print … >> $LOG`) kills jfsh.  Already so on
+  main.
+- When an auto-removable suffix becomes permanent (a widget function sets
+  `$BUFFER`…, a ZLE_KEEPSUFFIX widget, auto-suffix-retain) jfsh forgets
+  its `compadd -R` function; zsh keeps it and calls it once with length 0
+  at the next removal (`rf:0:echo foo1/` in zsh, no call in jfsh; the
+  buffers are the same).
+- Module widgets (zsh/deltochar's delete-to-char, zap-to-char) aren't
+  listed by an interactive `zle -la` while the module is loaded (zsh lists
+  them; `$widgets` has them), and their `.name` forms do nothing:
+  `bindkey '^Xq' .delete-to-char`, `echo dduni<Tab>^Xqe|` gives zsh
+  `echo dduniq1/|`, jfsh `echo dduniq1/e|`.  Already so on main.
+- `zle name` returns 1 when the widget fails where zsh returns the widget
+  function's status: `w2(){ return 3 }; w(){ zle w2; BUFFER=after-$? }`
+  gives `after-3` in zsh, `after-1` in jfsh.
+- zsh's ZLE_MENUCMP widgets that don't complete (redisplay, clear-screen,
+  digit-argument) don't end menu completion or the automenu run; jfsh's
+  do (already so on main).  `echo mm<Tab><Tab>^L<Tab>` with mm1/ mm2/
+  mm3/ gives zsh `echo mm2/`, jfsh `echo mm1/`; with `ESC 2` for `^L`
+  zsh gives `mm3/`; listing, redisplay, Tab gives zsh `mm1/`, jfsh `mm`.
+- Errors the executor doesn't treat as ending the command line, so they
+  don't end a widget function (or throw the line away) as in zsh: a
+  failed expansion in `for i in ${x?}`, `case ${x?} in …` and
+  `local y=${x?}`, and `unset` of a read-only parameter.  zsh: `zsh -f -c
+  'for i in ${xx?}; do :; done; echo after'` reports the error with rc 1;
+  jfsh prints `after`, rc 0 (likewise `case`, `f(){ local y=${xx?}; echo
+  after }; f`, `typeset -r ro=1; f(){ unset ro; echo after }; f`).
+- `print` without `-r` keeps the backslash of an unknown escape (`\ `,
+  `\'`, `\]`); zsh drops it.  Found comparing completion probes.
+
 **Core framework** (`src/completion/compsys.cpp`, headers under
 `include/jfsh/completion/`)
 - `_main_complete` dispatcher: propose a set of `_tag`s, then fill them with
   `_complete` / `_approximate` / `_correct` / `_expand` / `_history` /
   `_oldlist` / `_prefix` / `_match` / `_ignored` / `_menu` / `_user_expand`.
-- `compstate` associative array: `context`, `nmatches`, `unambiguous`,
-  `exact_string`, `list`, `insert`, `old_insert`, `old_list`, `last_prompt`,
-  `pattern_insert`, `pattern_match`, `ignored`, `restore`, `to_end`,
-  `vared`, `redirect`, `parameter`.
-- Live editable `$words`, `$CURRENT`, `$PREFIX`, `$SUFFIX`, `$IPREFIX`,
-  `$ISUFFIX`, `$QIPREFIX`, `$QISUFFIX`.
-- `compadd` with every option (`-S`, `-s`, `-r`, `-R func`, `-q`, `-Q`,
-  `-X`, `-x`, `-J`, `-V`, `-O`, `-M matcher`, `-W`, `-F ignore`, `-n`,
-  `-U`, `-l`, `-o`, `-E`, `-k`, `-K`, `-a`, `-d`, `-i`, `-p`, `-P`, `-f`,
-  `-A`).
-- `compdescribe`, `compfiles`, `compgroups`, `compquote`, `comptags`,
-  `comptry`, `compvalues`.
+- `compadd -M matcher` (phase 15b; the rest of compadd, `$compstate` and
+  the special parameters are done in 15a).
+- `compdescribe`, `compfiles`, `compgroups`, `comptags`, `comptry`,
+  `compvalues` (zsh/computil; `compquote` is done in 15a).
 - `_arguments [-s] [-A pattern] [-C] [-R] [-O arr] [-M spec] [-w] [-W]
   specs…`: option specs (`-opt[desc]`, `--long=VALUE[desc]:action`,
   `*::rest::action`), action syntax (`(a b c)`, `(( a\:desc b\:desc ))`,

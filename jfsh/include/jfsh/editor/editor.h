@@ -45,6 +45,7 @@ struct LineBuffer {
 };
 
 struct CompletionResult;
+struct CompCandidate;
 
 struct Editor {
   Editor(const OptionState& opts, HistoryManager& hist, PromptRenderer& prompt, Zle& zle);
@@ -59,6 +60,13 @@ struct Editor {
   // vared: edits `initial` after `prompt` (and `rprompt`), both prompt
   // strings.  nullopt on EOF or Ctrl-C.
   opt<str> edit(str initial, strv prompt, strv rprompt = {});
+
+  // An auto-removable suffix stays for good: a widget function set
+  // $BUFFER, $CURSOR, $LBUFFER or $RBUFFER (zsh's fixsuffix).
+  void fix_suffix() { mAutoSuffix.reset(); }
+
+  // vared: the name of the parameter edited ($compstate[vared]).
+  void set_vared_name(str name) { mVaredName = s::move(name); }
 
   // The lines of an unfinished command read so far ($PREBUFFER).
   void set_prebuffer(str text) { mPrebuffer = s::move(text); }
@@ -95,6 +103,8 @@ struct Editor {
   bool active() const noexcept { return mReading; }
   LineBuffer&       buffer()       noexcept { return mBuf; }
   const LineBuffer& buffer() const noexcept { return mBuf; }
+  // Ends the line being edited as send-break does (an error in a widget).
+  void abort_line() { mInterrupted = mDone = true; }
   // Runs widget `name` (`zle name`); false when it failed or is unknown.
   bool call_widget(strv name);
   void push_input(strv keys) { mPending.insert(0, keys); }   // zle -U
@@ -103,6 +113,9 @@ struct Editor {
   bool select_keymap(strv name);                             // zle -K
   str  keymap_name() const;
   const str& widget_name()      const noexcept { return mWidget; }
+  // The builtin completion widget a completion widget acts like
+  // ($WIDGETSTYLE), empty in other widgets.
+  const str& widget_style()     const noexcept { return mWidgetStyle; }
   const str& last_widget_name() const noexcept { return mLastWidget; }
   const str& keys()             const noexcept { return mKeys; }
   opt<int>   numeric()          const noexcept { return mArg; }
@@ -129,9 +142,23 @@ struct Editor {
 
   // The widget functions, by name.
   using WidgetFn = bool (Editor::*)();
-  static const umap<str, WidgetFn>& widget_table();
+  struct WidgetInfo {
+    WidgetInfo(WidgetFn f, SuffixRule r = SuffixRule::Remove) : fn(f), suffix(r) {}
+    WidgetFn   fn;
+    SuffixRule suffix;
+  };
+
+  static const umap<str, WidgetInfo>& widget_table();
 
 protected:
+  // An auto-removable suffix a completion left before the cursor.
+  struct AutoSuffix {
+    s::size_t end = 0;      // where the suffix ends in the line
+    s::size_t len = 0;
+    str       chars;        // compadd -r's characters
+    str       func;         // compadd -R's function
+  };
+
   void enter_raw_mode();
   void exit_raw_mode();
 
@@ -175,9 +202,26 @@ protected:
   opt<str> minibuffer(strv prompt);   // reads a line below the buffer
 
   // ---- Completion (completion.cpp) ---------------------------------------
-  bool do_complete(bool list_only, bool menu, bool reverse = false);
-  void list_matches(const CompletionResult& r);
-  void apply_match(const CompletionResult& r, s::size_t index, bool final);
+  // Completes the word at the cursor: with the builtin completers, or for
+  // a completion widget (zle -C) with shell function `fn`.
+  bool do_complete(bool list_only, bool menu, bool reverse = false, const str& fn = {});
+  // Acts on the matches as $compstate[insert] and [list] say.
+  bool apply_completion(CompletionResult& r, bool reverse);
+  // `mode` is $compstate[list]: "explanations", "messages", "rows" …
+  void list_matches(const CompletionResult& r, strv mode = {});
+  // Puts match `index` in the line, as menu completion does or, `final`,
+  // as a unique match with its suffix.
+  void insert_match(const CompletionResult& r, s::size_t index, bool final);
+  // Before widget `widget` runs: drops an auto-removable suffix
+  // (compadd -q / -r) or calls its function (-R).
+  void remove_suffix(strv widget);
+  // The auto-removable suffix `m` leaves in the line, if any.
+  opt<AutoSuffix> auto_suffix(const CompCandidate& m, bool final) const;
+  bool is_completion_widget(strv name) const;
+  // A completion widget acting like builtin widget `builtin`.
+  bool complete_widget(strv builtin, const str& fn);
+  // -X / -x text for a listing: %% is %, attributes are left out.
+  static str format_explanation(strv text);
 
   // ---- Builtin widgets ----------------------------------------------------
   bool w_accept_line();
@@ -256,6 +300,8 @@ protected:
   bool w_execute_last_named_cmd();
   bool w_vi_cmd_mode();
   bool w_beep();
+  bool w_auto_suffix_remove();
+  bool w_auto_suffix_retain() { return true; }
   bool w_pound_insert();
   bool w_vi_match_bracket();
   bool w_vi_find_next_char();
@@ -380,6 +426,7 @@ private:
   str                      mPending;          // input to read before the terminal
   str                      mPrebuffer;
   str                      mWidget, mLastWidget, mKeys;
+  str                      mWidgetStyle;
   opt<int>                 mArg;
   bool                     mArgSet       = false;  // the widget set the argument
   bool                     mArgNeg       = false;  // neg-argument, no digits yet
@@ -428,13 +475,19 @@ private:
   str                      mListing;            // completion lists
 
   // Completion state between Tabs.
-  vec<str>                 mMenu;               // menu completion: candidates
+  // Menu completion: each candidate's text and auto-removable suffix.
+  vec<s::pair<str, opt<AutoSuffix>>> mMenu;
   s::size_t                mMenuIndex    = 0;
   s::size_t                mMenuStart    = 0, mMenuEnd = 0;
   str                      mMenuSuffixKind;
   bool                     mMenuActive   = false;
   bool                     mListed       = false;   // the last Tab listed
   str                      mCompleteLine;           // buffer the last Tab saw
+  bool                     mLastCompleting = false; // the last widget completed
+  s::size_t                mNestedCalls    = 0;     // widgets run with `zle name`
+  uptr<CompletionResult>   mLastResult;             // the last matches, for old_list
+  opt<AutoSuffix>          mAutoSuffix;
+  str                      mVaredName;              // the parameter vared edits
 
   // vi state.
   char                     mViRegister   = 0;

@@ -152,6 +152,7 @@ add_library(jfsh_exec STATIC
   src/exec/context.cpp
   src/exec/invocation.cpp
   src/builtins/builtins.cpp
+  src/builtins/complete.cpp
   src/builtins/dirs.cpp
   src/builtins/eval.cpp
   src/builtins/hist.cpp
