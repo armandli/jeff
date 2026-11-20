@@ -29,12 +29,17 @@
 
 #include <jfsh/core/aliases.h>
 #include <jfsh/core/param.h>
+#include <jfsh/editor/compmatch.h>
 #include <jfsh/core/types.h>
 
 namespace jfsh {
 
 struct CompCandidate {
   str  word;            // the match, unquoted (the part after the result's start)
+  // The match as it goes into the line when compadd -M matchers made it
+  // differ from the quoted word (upper-case matchers take parts from the
+  // line); empty otherwise.
+  str  qword;
   str  display;         // shown in a listing; the word when empty
   str  description;
   str  suffix = " ";    // added after a unique match: " ", "/", "}" or nothing
@@ -100,6 +105,7 @@ struct CompAddSpec {
   str      remove_chars;         // -q / -r
   str      remove_func;          // -R
   str      dir_suffix;           // -e / -f: what a directory gets instead of " "
+  sptr<MatcherSpec> matcher;     // -M
 };
 
 // One run of a completion function: the special parameters it sees and
@@ -119,14 +125,22 @@ struct CompState {
   int                ignored   = 0;         // words compadd -F dropped
   int                columns   = 80;        // for list_lines
   bool               rec_exact = false;     // REC_EXACT: exact is "accept"
+  // The matching of this run (compadd -M) and the joined clines the
+  // unambiguous string comes from.
+  sptr<MatchRun>     run = s::make_shared<MatchRun>();
+  // The lengths of $QIPREFIX$IPREFIX$PREFIX and the suffixes on entry, and
+  // whether compadd found them changed (then the unambiguous string goes
+  // in even when it is shorter than the word).
+  s::size_t          orig_lpre = 0, orig_lsuf = 0;
+  bool               lenchanged = false;
 
   // compadd: adds the words (each with the display string in
-  // spec.display at the same place) that match $PREFIX and $SUFFIX, or
-  // all of them with -U, and that their group doesn't have yet (-1: as
-  // its last match, -2: duplicates are kept).  Returns how many words
-  // matched, duplicates included.  With `matched`,
-  // nothing is added: it gets each word's match, and `internal` the
-  // strings that matched (compadd -O, -A, -D).
+  // spec.display at the same place) that match $PREFIX and $SUFFIX (with
+  // the -M matchers), or all of them with -U, and that their group
+  // doesn't have yet (-1: as its last match, -2: duplicates are kept).
+  // Returns how many words matched, duplicates included.  With
+  // `matched`, nothing is added: it gets each word's match, and
+  // `internal` the strings that go in the line (compadd -O, -A, -D).
   int add(const CompAddSpec& spec, const vec<str>& list, vec<bool>* matched = nullptr,
           vec<str>* internal = nullptr);
 
@@ -137,10 +151,11 @@ struct CompState {
   static bool readonly_key(strv key);
 
   s::int64_t nmatches() const;
-  // The longest string all matches start with, as it goes into the line,
-  // and where the cursor goes in it (0-based); a hidden suffix all
-  // matches share follows the cursor.
-  str unambiguous(s::size_t* cursor = nullptr) const;
+  // The unambiguous string of the matches, as it goes into the line
+  // ($QIPREFIX and $QISUFFIX included), and where the cursor goes in it
+  // (0-based): built as zsh does from the parts of the matches that came
+  // from the line and from the matches themselves.
+  str unambiguous(s::size_t* cursor = nullptr, vec<s::size_t>* positions = nullptr) const;
   // A match was added that is accepted as exact (REC_EXACT,
   // compstate[exact]).
   bool accepts_exact() const;
@@ -201,6 +216,9 @@ struct CompletionResult {
   vec<CompGroup> groups;
   str            unambiguous;          // as it goes into the line
   s::size_t      unambiguous_cursor = 0;
+  // The unambiguous string is shorter than the word and the function
+  // changed neither the word's prefix nor its suffix: the word stays.
+  bool           keep_word = false;
   s::map<str, str> keys;               // $compstate on return
 };
 

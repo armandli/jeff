@@ -211,6 +211,8 @@ int builtin_compadd(vec<str>& args, ExecContext& ctx) {
   // Every option counts once (the first wins), but -M and -D, which add up.
   umap<char, str> opt;
   vec<str> delete_arrays;
+  str  match_spec;   // the -M arguments, joined with spaces
+  bool has_match = false;
   char group_opt = 0;   // -J or -V, whichever came first
   constexpr strv FLAGS    = "akqQfenUl12C";
   constexpr strv WITH_ARG = "PSpsiIWdJVXxrRDOAEFM";
@@ -247,8 +249,14 @@ int builtin_compadd(vec<str>& args, ExecContext& ctx) {
         value = args[++i];
       }
       if ((c == 'J' or c == 'V') and not group_opt) group_opt = c;
-      if (c == 'D') delete_arrays.push_back(value);
-      else if (c != 'M') opt.try_emplace(c, value);   // -M: matchers are phase 15b
+      if (c == 'D') {
+        delete_arrays.push_back(value);
+      } else if (c == 'M') {
+        match_spec += (has_match ? " " : "") + value;
+        has_match = true;
+      } else {
+        opt.try_emplace(c, value);
+      }
       break;
     }
   }
@@ -269,6 +277,11 @@ int builtin_compadd(vec<str>& args, ExecContext& ctx) {
   }
 
   CompAddSpec spec;
+  if (has_match) {
+    str err;
+    spec.matcher = MatcherSpec::parse(match_spec, err);
+    if (not spec.matcher) return builtin_error(cmd, err);
+  }
   bool raw = has('Q');
   spec.ipre        = get('i');
   spec.apre        = get('P');
@@ -542,6 +555,105 @@ int builtin_compset(vec<str>& args, ExecContext& ctx) {
     st->quote = q;
     return 0;
   }
+  }
+}
+
+// [[ -prefix [n] pat ]], [[ -suffix [n] pat ]], [[ -after pat ]] and
+// [[ -between pat pat ]]: compset -P, -S and -N's tests, the parameters
+// left alone (zsh's do_comp_vars without its modifications).
+int cond_completion(strv op, const vec<str>& args, ExecContext& ctx) {
+  bool psfix = op == "-prefix" or op == "-suffix";
+  if (not psfix and op != "-after" and op != "-between") return -1;
+  s::size_t least = op == "-between" ? 2 : 1, most = psfix ? 2 : least;
+  if (args.size() < least or args.size() > most) return -1;
+  CompState* st = state_of(ctx);
+  if (not st) {
+    s::fprintf(stderr, "jfsh: condition can only be used in completion function\n");
+    ctx.aborting = ctx.abort_line = true;
+    return 1;
+  }
+  bool ext = ctx.opts.get(OPT_EXTENDEDGLOB);
+  auto status = [](bool b) { return b ? 0 : 1; };
+
+  if (not psfix) {
+    // The last word before the current one that matches, and no word
+    // matching the end pattern from there to the current one.
+    auto beg = CompiledPattern::compile(args[0], false, ext);
+    auto l = static_cast<s::int64_t>(st->words.size());
+    s::int64_t i = st->current - 1;
+    if (i < 0 or i >= l) return 1;
+    s::int64_t b = 0, e = l - 1;
+    bool t = false;
+    for (--i; i >= 0; --i) {
+      if (beg.matches(st->words[static_cast<s::size_t>(i)])) {
+        b = i + 1;
+        t = true;
+        break;
+      }
+    }
+    if (t and args.size() > 1) {
+      auto end = CompiledPattern::compile(args[1], false, ext);
+      bool tt = false;
+      for (++i; i < l; ++i) {
+        if (end.matches(st->words[static_cast<s::size_t>(i)])) {
+          e = i - 1;
+          tt = true;
+          break;
+        }
+      }
+      if (tt and i < st->current) t = false;
+    }
+    return status(t and e >= b);
+  }
+
+  // The count is arithmetic, as zsh's cond_val evaluates it.
+  s::int64_t na = -1;
+  if (args.size() > 1) {
+    auto n = Expander(*ctx.executor, ctx).arith(args[0]);
+    if (not n) {
+      s::fprintf(stderr, "jfsh: %s\n", n.error().message.c_str());
+      ctx.aborting = true;
+      return 1;
+    }
+    na = *n;
+  }
+  if (na == 0) return 1;
+  auto pat = CompiledPattern::compile(args.back(), false, ext);
+  const str& w = op == "-prefix" ? st->prefix : st->suffix;
+  if (w.empty()) return status((na == 1 or na == -1) and pat.matches(w));
+  auto prev = [&](s::size_t at) {
+    s::size_t p = 0;
+    for (s::size_t k = 0; k < at; k = next_char(w, k)) p = k;
+    return p;
+  };
+  // The prefixes from the shortest (or, without a number, the longest);
+  // the n-th that matches.
+  bool up = na > 0;
+  if (not up) na = -na;
+  if (op == "-prefix") {
+    s::size_t p = up ? next_char(w, 0) : w.size();
+    for (;;) {
+      if (pat.matches(strv(w).substr(0, p)) and --na == 0) return 0;
+      if (up) {
+        if (p == w.size()) return 1;
+        p = next_char(w, p);
+      } else {
+        if (p == 0) return 1;
+        p = prev(p);
+      }
+    }
+  }
+  // The suffixes from the shortest (or the longest).
+  s::size_t p = up ? prev(w.size()) : 0;
+  for (;;) {
+    if (pat.matches(strv(w).substr(p)) and --na == 0) return 0;
+    if (not up) {
+      if (p == w.size()) return 1;
+      p = next_char(w, p);
+    } else {
+      if (p == 0) return 1;
+      p = prev(p);
+    }
   }
 }
 

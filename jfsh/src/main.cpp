@@ -29,6 +29,7 @@
 #include <jfsh/modules/cap.h>
 #include <jfsh/modules/clone.h>
 #include <jfsh/modules/compctl.h>
+#include <jfsh/modules/computil.h>
 #include <jfsh/modules/curses.h>
 #include <jfsh/modules/datetime.h>
 #include <jfsh/modules/db_gdbm.h>
@@ -189,6 +190,7 @@ int main(int argc, char* argv[]) {
   jfsh::register_mathfunc_module    (ctx.modules);
   jfsh::register_parameter_module   (ctx.modules);
   jfsh::register_zutil_module       (ctx.modules);
+  jfsh::register_computil_module    (ctx.modules);
   jfsh::register_system_module      (ctx.modules);
   jfsh::register_files_module       (ctx.modules);
   jfsh::register_stat_module        (ctx.modules);
@@ -223,6 +225,7 @@ int main(int argc, char* argv[]) {
   (void)ctx.modules.load("zsh/mathfunc",  &ctx);
   (void)ctx.modules.load("zsh/parameter", &ctx);
   (void)ctx.modules.load("zsh/zutil",     &ctx);
+  (void)ctx.modules.load("zsh/computil",  &ctx);
   (void)ctx.modules.load("zsh/system",    &ctx);
   // zsh/files, zsh/stat, zsh/pcre, zsh/regex and zsh/example are
   // registered but NOT auto-loaded:

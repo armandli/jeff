@@ -897,7 +897,8 @@ output, bang expansions and xtrace lines were compared with it.
 - Completion: no `_arguments`/`_describe`-style specs, no option or `--long` completion,
   no reading of zsh's own completion functions, no menu selection (`menuselect`
   keymap, arrow keys in the list), no named directories (`hash -d`) or `cdpath`.
-  (`compadd` now has every option but `-M`: M15 phase 15a.) `expand-word`,
+  (`compadd` has every option, `-M` matchers included: M15 phases 15a and
+  15b.) `expand-word`,
   `list-expand` and `spell-word` only beep, so Tab doesn't expand globs or `$vars` in
   place.
 - `zle -F` (fd handlers) and `zle -T` say `not implemented`; `zle-line-init`,
@@ -1556,7 +1557,7 @@ completion function); the builtins are in `src/builtins/complete.cpp`.
   A user widget that leaves the line alone doesn't end menu completion
   or the run of presses automenu counts.
   `compstate[list]=list` (list-choices, `^D`) lists a single match too.
-- **`compadd`** with every option but `-M` (parsed, ignored — phase 15b):
+- **`compadd`** with every option but `-M` (phase 15b, below):
   zsh's seven fields `-i -P -p -s -S -I` (`-p`/`-s` quoted, a `-P`
   already on the line skipped when matching, a common hidden suffix
   inserted after the cursor), `-U`, `-Q`, `-W` (joined to the word as it
@@ -1602,9 +1603,89 @@ completion function); the builtins are in `src/builtins/complete.cpp`.
 - The editor's pty rig moved to `tests/editor_rig.h`; 26 tests in
   `tests/completion_test.cpp`, checked against zsh 5.9 (774 tests pass).
 
+**Phase 15b — done** (branch `jfsh-m15b-matchers-computil`): match
+specifications, the completion condition codes and zsh/computil.
+- **`compadd -M`** (`src/editor/compmatch.cpp`, a port of zsh's
+  compmatch.c with parse_cmatcher, add_match_data's cline assembly and
+  compresult.c's cut_cline/cline_str): `m:`, `M:`, `l:`, `L:`, `r:`, `R:`,
+  `b:`, `B:`, `e:`, `E:` with one or two anchors (`l:a|w=t`, `l:a||c=t`,
+  `r:w|a=t`, `r:c||a=t`), `*` and `**`, `?`, `[...]`/`[!...]` and `{...}`
+  equivalence classes with ranges and `[:lower:]`-style classes, several
+  matchers, several `-M` adding up, and `x:`; zsh's messages for bad
+  specifications.  The canonical forms work as in zsh: `m:{a-z}={A-Z}`,
+  `m:{a-zA-Z}={A-Za-z}`, `r:|[._-]=* r:|=*` (`c.s.u` gives `comp.s.unix`
+  with the cursor after the `s`), `l:|=* r:|=*`, `r:|.=* r:|=*`.  Upper-case
+  matchers put the line's characters in the match (`M:_=`: `f_o` →
+  `f_oo`).  Matching goes through zsh's match_str, so `-p`/`-s` are
+  matched as far as the line goes, a `-P` already typed is skipped when it
+  is a prefix of the word or the word of it, and `-O`/`-A`/`-D`, `nmatches`
+  and `exact_string` see the matcher's results (`-A` gets the string that
+  goes in the line).
+- **The unambiguous string** is built as zsh builds it, from every match's
+  cline list joined as the match is added (with or without matchers, so
+  `-p`, `-s`, `-P`, `-S`, `-i`, `-I`, `$IPREFIX`, `$QIPREFIX` … take part
+  as in zsh): `$compstate[unambiguous]`, `unambiguous_cursor` and now
+  `unambiguous_positions` are zsh's, the cursor goes where the matches
+  differ even when the text doesn't change (`l:|=*`: `foo` with `xxfoo
+  yyfoo` puts the cursor before `foo`), and an unambiguous string shorter
+  than the word leaves the word alone unless the function changed
+  `$PREFIX`/`$SUFFIX` or added with `-U` (zsh's lenchanged/hasunmatched).
+- **Condition codes** `[[ -prefix [n] pat ]]`, `-suffix [n] pat`,
+  `-after pat`, `-between pat pat` (zsh's do_comp_vars tests, the
+  parameters left alone, the count evaluated as arithmetic); outside a completion function an error that ends
+  the command line, the wrong number of arguments "unknown condition".
+  The parser takes any `-name arg…` condition with several arguments
+  (`WC_COND_MOD`), printed back by `which`; `-name -x word…` is a parse
+  error, as in zsh.
+- **zsh/computil** (`src/modules/computil.cpp`, loaded at startup like
+  zsh/zutil, `zmodload zsh/computil` works): `comptags -i/-C/-T/-N/-R/-S/
+  -A` (one set of tags per function level, `-X-` for the caller's),
+  `comptry [-s] tags…` and `comptry -m 'pat[:label]…'` (patterns and
+  `{a,b}`; as in zsh each argument's tags add to the ones before),
+  `compdescribe -i/-I` with `-g` grouping of matches with the same
+  description and `-g csl opts matches displays` handing out the runs
+  `_describe` adds (`-l` lines, `-2V` columns, `-E` dummies with the
+  explanation lines, hidden `-`/`--`, zsh's quirks included),
+  `compvalues -i [-s sep] [-S sep] [-w] descr specs…` with `-D -C -V -s -S
+  -d -L -v` (moving the values before the cursor into `$IPREFIX` as zsh
+  does), `compfiles -p/-p-/-P` (the glob patterns `_path_files` uses,
+  `accept-exact`, the special dirs, fake files and matchers turned into
+  character classes), `compfiles -i` and `-r`, and `compgroups`.
+- 17 tests in `tests/computil_test.cpp` (814 pass), every expected value
+  checked against zsh 5.9; 239 zsh probe cases (matchers, conditions, each
+  computil builtin) give the same results but for the `f:compadd:` vs
+  `jfsh: compadd:` message prefix and a hash's key order, and the 15a
+  probe corpus (238 cases run on zsh, this branch and main) gives the
+  same results as main.
+
+**Left after 15b**
+- `comparguments` (zsh/computil's helper for `_arguments`) goes with
+  `_arguments` in phase 15c.
+- `$compstate[insert_positions]` is empty (zsh gives the positions in the
+  line).  Brace expansion in the word (`{a,b}`) isn't handled by matching,
+  as in jfsh before.  Matchers compare bytes; zsh's patterns compare
+  multibyte characters.  `fignore`-style alternates (`-F`) don't feed the
+  unambiguous string when there are no other matches (zsh's fainfo).
+- `[[ -after … ]]` and `[[ -between … ]]` outside a completion function
+  report the error; zsh 5.9 crashes there.
+- Already so on main, found probing: `list-choices` (`^D`) followed by a
+  completion widget starts menu completion in jfsh (zsh doesn't); Tab on
+  an empty line inserts a tab in zsh, not in jfsh; `echo a[b*` gives
+  `$PREFIX` `b*` in zsh, `a[b*` in jfsh; an external command run from a
+  completion widget function (`touch x`) kills jfsh.
+- Also so on main (found reviewing 15b): `[[ -prefix ]]` or `[[ -foo ]]`
+  alone (one `-NAME` word longer than two characters) is a non-empty
+  string test in zsh (status 0), "unknown condition" with status 2 in
+  jfsh.  Under REC_EXACT `$compstate[exact]` starts as `accept` in zsh
+  even with no matches; jfsh leaves it empty until an exact match is
+  added.  `compquote` with no arguments says "not enough arguments" with
+  status 1 in zsh, returns 0 in jfsh.  Matches are sorted by byte value,
+  zsh sorts by the locale's collation (en_US.UTF-8: zsh lists `fax foo
+  Foo`, jfsh `Foo fax foo`).  Without a completion function, with
+  COMPLETE_IN_WORD and the cursor inside the word, `ls abfile` gives `ls
+  abfile file` where zsh gives `ls abfile `.
+
 **Left after 15a**
-- `-M` match specifications (15b), and the `-prefix`/`-suffix`/`-after`/
-  `-between` condition codes.
 - Listing: zsh lays several groups out on a shared column grid; jfsh lays
   each group out on its own (same rows, spacing can differ).  `-o
   numeric`/`reverse` are accepted and, as in zsh 5.9 here, change nothing.
@@ -1647,10 +1728,6 @@ completion function); the builtins are in `src/builtins/complete.cpp`.
 - `_main_complete` dispatcher: propose a set of `_tag`s, then fill them with
   `_complete` / `_approximate` / `_correct` / `_expand` / `_history` /
   `_oldlist` / `_prefix` / `_match` / `_ignored` / `_menu` / `_user_expand`.
-- `compadd -M matcher` (phase 15b; the rest of compadd, `$compstate` and
-  the special parameters are done in 15a).
-- `compdescribe`, `compfiles`, `compgroups`, `comptags`, `comptry`,
-  `compvalues` (zsh/computil; `compquote` is done in 15a).
 - `_arguments [-s] [-A pattern] [-C] [-R] [-O arr] [-M spec] [-w] [-W]
   specs…`: option specs (`-opt[desc]`, `--long=VALUE[desc]:action`,
   `*::rest::action`), action syntax (`(a b c)`, `(( a\:desc b\:desc ))`,
