@@ -320,18 +320,26 @@ protected:
   str current_job_text() const;
   // The failing status `rc` of a command: ZERR, then ERR_EXIT/ERR_RETURN.
   void on_command_error(int rc);
+  // `traced` is the command's xtrace text, printed (by the child) once
+  // the assignments are made; nullptr when not tracing or already traced.
   int  run_external(
     const vec<str>&         args,
     const vec<Assignment>&  assigns,
     const vec<Redirection>& redirs,
-    ExecFlags flags);
+    ExecFlags flags,
+    const str* traced = nullptr);
+  // The child's side of run_external: applies the redirections, makes the
+  // assignments, finds the command (unless `found` already has) and execs.
+  [[noreturn]] void exec_external_child(
+    const vec<str>&         args,
+    vec<Assignment>         assigns,
+    const vec<Redirection>& redirs,
+    opt<Result<str>>        found,
+    const str*              traced);
   // Apply `redirs` in the current process, remembering originals in `saved`
   // so they can be restored.  Returns true on success.
   bool apply_redirects(const vec<Redirection>& redirs,
                        SavedFds& saved);
-  // Apply `redirs` in a freshly forked child (no fd save needed).
-  // Returns true on success; false means the child should exit 1.
-  bool apply_redirects_child(const vec<Redirection>& redirs);
   // Process-substitution helpers.  <(cmd) → read-end fd; >(cmd) → write-end fd.
   // =(cmd) → path to a tmp file.  All fork a subshell internally.
   int procsubst_in (strv src);
@@ -348,20 +356,27 @@ protected:
   };
   ProcSubstResources expand_procsubst(vec<str>& args);
   void               procsubst_release(ProcSubstResources& res) noexcept;
-  // Expands the words, assignments and redirection targets of a simple
-  // command in place (src/exec/subst.cpp does the work).  Prints the error
-  // and returns false when an expansion fails.  `subst_status` receives
-  // the status of the last command substitution, if any ran.
+  // Expands the words, then the redirection targets, of a simple command
+  // in place (src/exec/subst.cpp does the work); the assignments wait for
+  // apply_assigns.  Prints the error and returns false when an expansion
+  // fails.  `subst_status` receives the status of the last command
+  // substitution, if any ran.
   bool expand_command(vec<str>& args,
-                      vec<Assignment>&  assigns,
                       vec<Redirection>& redirs,
                       opt<int>&         subst_status);
-  int  apply_assigns(const vec<Assignment>& assigns);
-  void trace(
-    const vec<str>&        args,
-    const vec<Assignment>& assigns);
-  // One xtrace line: PS4, then `text`.
-  void trace_text(strv text);
+  // Where apply_assigns puts the assignments: the shell's parameters, or
+  // (in front of a command) the current scope, which the caller pushed and
+  // pops, optionally exported.
+  enum class AssignTo : int { Shell, Prefix, Exported };
+  // Expands each assignment and makes it before expanding the next, so a
+  // later one sees the earlier ones (`a=1 b=$a`), as zsh's addvars does.
+  // Prints the error and returns 1 on a failed expansion or a readonly
+  // name.  `subst_status` receives the last command substitution's status.
+  int  apply_assigns(vec<Assignment>& assigns, AssignTo to, opt<int>& subst_status);
+  // The expanded PS4 that starts each xtrace line ("" when PS4 is unset).
+  str  trace_prompt();
+  // One xtrace line: PS4, then `text`, written to `fd`.
+  void trace_text(strv text, int fd = 2);
 
 public:
   bool is_builtin(strv name) const noexcept;
@@ -379,11 +394,10 @@ public:
 protected:
   // `exec cmd`: replaces the shell with `args`.  Returns only on failure,
   // with the status the shell then exits with.
-  int  exec_replace(const vec<str>& args, const vec<Assignment>& assigns,
-                    const str& argv0, bool clear_env);
-  // Puts the assignments in front of a builtin or function into a new
-  // scope, which the caller pops.  Returns non-zero on a readonly name.
-  int  push_prefix_assigns(const vec<Assignment>& assigns, bool exported);
+  // `traced` is as for run_external, printed to `trace_to`.
+  int  exec_replace(const vec<str>& args, vec<Assignment> assigns,
+                    const str& argv0, bool clear_env, const str* traced,
+                    int trace_to);
 
 public:
   ExecContext& context() noexcept { return mCtx; }
@@ -400,6 +414,7 @@ private:
   str*           mCondTrace   = nullptr;   // xtrace text of the [[ ]] being run
   HashTable<str> mCmdHash;     // command name → resolved path
   str            mHashedPath;  // $PATH the hash was built against
+  s::uint64_t    mHashedGen = 0;   // ParamTable::path_generation() then
   uptr<Zle>              mOwnZle;
   uptr<CompletionEngine> mOwnCompletion;
 };
@@ -443,6 +458,13 @@ int wait_background_process(ExecContext& ctx, int jid, s::size_t proc_index);
 // interactive shell leaves behind, unless NO_HUP or disowned.  Returns
 // how many it signalled.
 int hangup_jobs(ExecContext& ctx);
+
+// ---- $PATH (src/exec/executor.cpp) -------------------------------------------
+
+// The directories of $PATH, in order: none when PATH is unset, and an empty
+// one (the current directory) for each empty component, so `PATH=` alone
+// searches the current directory, as in zsh.
+vec<str> path_dirs(const ParamTable& params);
 
 }  // namespace jfsh
 

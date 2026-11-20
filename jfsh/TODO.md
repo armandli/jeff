@@ -121,35 +121,89 @@ are an error (B9). `disassemble()` (`src/parser/text.cpp`) backs `tests/parser_t
 
 ### M1. Simple commands
 
-**Done.** Implemented in `src/exec/executor.cpp` (`exec_simple`, `run_external`,
-`find_command`), with tests in `tests/exec_test.cpp`:
+**Done.** Implemented in `src/exec/executor.cpp` (`exec_simple`, `apply_assigns`,
+`run_external`, `find_command`), with tests in `tests/exec_test.cpp`:
 - Words go through quote removal (the only M3 step so far), then dispatch to a builtin
   or an external command.
-- Leading `NAME=value` / `NAME+=value` words (unquoted identifier before the `=`) are
-  assignments:
-  - with no command they set shell parameters through `ParamTable::set_scalar`, which
-    updates the existing parameter wherever it lives, keeps its attributes, refuses
-    readonly parameters, and creates new ones as globals;
-  - before an external command they go only into that child's environment;
-  - before a builtin they last only while it runs. Following zsh rather than POSIX, they
-    persist after a **special** builtin only when `POSIX_BUILTINS` is set.
-- External commands: the `$PATH` search reads the shell's own `PATH` parameter, and an
-  empty component means `.`. Results are cached while `HASH_CMDS` is set, and the cache
-  is dropped whenever `PATH` changes. The command runs with `execve` and an environment
-  from `ParamTable::make_envp()`. A file with no `#!` line runs under `/bin/sh`. Exit
-  statuses: 127 for not found, 126 for not executable, `128+sig` for signalled.
+- Leading `NAME=value` / `NAME+=value` / `NAME[sub]=value` words (unquoted identifier
+  before the `=`) are assignments. As in zsh's addvars, the command's words and
+  redirection targets are expanded first, then each assignment is expanded and made
+  before the next, so `a=1 b=$a` sees `a`:
+  - with no command they set shell parameters through `ParamTable::set_scalar` /
+    `set_array`, which update the existing parameter wherever it lives, keep its
+    attributes, refuse readonly parameters, and create new ones as globals. On an
+    integer or float the value is arithmetic (`i+=1` adds); `a+=x` on an array appends
+    an element;
+  - in front of a command they go into a scope of its own, as a copy of the outer
+    parameter (type and attributes kept, readonly refused), which is popped after it.
+    Before an external command they are made in the child, after its redirections,
+    and exported; arrays are not exported. Before a function they are exported to
+    what it runs. Before a builtin they last only while it runs; following zsh rather
+    than POSIX, they persist after a **special** builtin only when `POSIX_BUILTINS` is
+    set. A readonly name or failed expansion ends the command line, except before an
+    external command, where only that command fails (status 1). The prefix scope is
+    marked as such, so `local`/`typeset` of a new name declares below it; typeset's
+    `name=value` arguments are expanded after the prefix assignments. `a[i]=x` in
+    front of a builtin or function changes the array itself, as in zsh. In front of
+    `exec` with redirections the assignments are temporary; alone, or with only
+    redirections, they stay.
+- External commands: the `$PATH` search reads the shell's own `PATH` parameter, or the
+  one assigned in front of the command. An empty component (and `PATH=` alone) means
+  the current directory, where the name is run as it is; a directory or non-executable
+  entry of that name gives "permission denied". The shell looks the name up (and
+  hashes it) in its own `PATH` even when a `PATH=` prefix sends the child elsewhere.
+  Results from absolute directories are added to the hash while `HASH_CMDS` is set;
+  entries (also `hash name=path`) are used either way. The hash is dropped on any
+  assignment to `PATH`, including `export`/`typeset` ones. `command -p` searches only
+  the default path.
+  The command runs with `execve` and an environment from `ParamTable::make_envp()`. A
+  file with no `#!` line and no NUL in its first bytes runs under `/bin/sh` (also as a
+  pipeline stage, background job, or under `exec`); a missing `#!` interpreter is
+  "bad interpreter". Messages are zsh's `<strerror>: name`; statuses: 127 for not
+  found and other errors, 126 for EACCES/ENOEXEC, `128+sig` for signalled.
 - `$?` (`ExecContext::last_exit`) is updated after every pipeline, and `exit` stops the
   program.
-- `xtrace` prints `PS4` (default `+ `) plus the expanded command, quoted where needed,
-  **before** running it.
+- `xtrace` prints the prompt-expanded `PS4` (initially zsh's `+%N:%i> `, nothing when
+  unset) plus the expanded command, quoted as zsh does (`'…'`, or `$'…'` with control
+  characters), **before** running it, to the stderr from before its redirections.
+  Assignments show their values: `+a=1 +:` before a builtin or function, `+a=1 cmd`
+  before an external one.
+
+**Review fixes** (branch jfsh-m1-review): left-to-right assignments, expanded after
+the words; `a+=x` on an array appends; `PATH=… cmd` searches the new `PATH`; prefix
+assignments keep the parameter's type and attributes and don't export arrays; a
+readonly prefix before a builtin or function ends the line; one exec helper
+(`exec_program`) for the forked, `EF_NOFORK` and `exec` paths with zsh's `/bin/sh`
+fallback, messages and 126/127 statuses; `find_command` goes through `command_hash()`,
+`path_dirs()` is the one `$PATH` splitter (also for `.` and `whence`), an empty `PATH`
+searches `.`, a directory on `$PATH` is 126; the hash is dropped on any `PATH`
+assignment (`ParamTable::path_generation`); xtrace quoting, `PS4` default and placement
+as zsh's. Round 2: temporary assignments before `exec` redirections, `command -p`
+failing when the default path lacks the name, `export`/`typeset PATH=` dropping the
+hash, no trace line for a redirection-only command, parent-side hashing with a `PATH=`
+prefix, `hash` entries used under `NO_HASH_CMDS`, prefix assignments before typeset's
+arguments (prefix scopes, `ParamTable::push_scope(true)`), subscripted prefixes
+persisting, typeset arguments traced as assignments. Round 3: the typeset variants
+(typeset, local, declare, integer, float, private) count as POSIX-special, so their
+prefix assignments stay under `POSIX_BUILTINS`; a failed typeset-argument expansion ends
+the line; one scope guard for every prefix scope of a builtin or function; `typeset -p`
+in a function prints `-g` for a parameter from outside it (a prefix copy keeps the
+original's level); tests for locals and private parameters under a prefix scope.
+Round 4: `command` takes the POSIX-special status away again (prefix assignments before
+`command typeset`/`export` don't stay under `POSIX_BUILTINS`; `builtin` keeps it);
+typeset's arguments are expanded after the command's redirections and prefix
+assignments, in the builtin branch, so `typeset y=${zz?boom} 2>/dev/null` is silent; an
+unset prefix copy is "no such variable" to `typeset -p`; the module is now
+`zsh/param/private`, as in zsh (`zsh/private` stays as an alias).
 
 **Left to other milestones**
-- `PS4` is printed raw; prompt escapes such as zsh's default `+%N:%i> ` need M9.
-- Assigning to an integer or float parameter evaluates the value arithmetically
-  (`i+=1` adds) since M5, for `name=value` words; `read`, `for` and `${x=v}` still
-  store text into such a parameter.
-- Array assignments `a=(x y)` landed with M3; subscripted assignments `a[i]=x` are still
-  to do [parser/assign], [exec/assign].
+- `typeset name` on an existing parameter doesn't print it, so `x=1 typeset x` shows
+  nothing (zsh prints `x=1`); a typeset listing gap, not a prefix one.
+- `$path` is not tied to `$PATH`, so `path=(…)` doesn't change the search: see the M17
+  `typeset -T` item.
+- zsh runs a `#!` script whose interpreter is itself a script by hand; jfsh reports
+  "exec format error".
+- `read`, `for` and `${x=v}` still store text into an integer or float parameter.
 
 ### M2. Pipelines, redirections, lists, background
 
@@ -281,8 +335,9 @@ and `tests/compound_test.cpp` (behaviour, with zsh's output as the expected valu
 - `typeset`, `local`, `declare`, `integer`, `float`, `export` and `readonly` are parsed
   as zsh's reserved-word typeset (`WC_TYPESET`), so `local x=$(cmd)` isn't split and
   `local a=(1 2)` makes an array. The builtins handle `-a -A -i -F/-E -g -l -u -r -x` and
-  `+` to turn attributes off. A new local is set but empty, and keeps the export attribute
-  of the parameter it hides. A builtin with no prefix assignments no longer gets its
+  `+` to turn attributes off. A new local is set but empty. Known difference: it keeps
+  the export attribute of the parameter it hides, so `export y=1; g() { local y=5;
+  printenv y; }` prints 5, where zsh's local is not exported. A builtin with no prefix assignments no longer gets its
   own parameter scope, so `local` lands in the function's scope.
 - `read [-rA] [name…]` (needed by `while read` loops): IFS splitting, with the rest of the
   line in the last name, `$REPLY` with no name, backslash handling without `-r`, and
@@ -1013,7 +1068,7 @@ remaining module, each registered but not auto-loaded (`zmodload NAME`).
 - Data: `zsh/mapfile` (`$mapfile` read / write / `+=` / unset per key,
   keys = regular files in `$PWD`); `zsh/db/gdbm` (`ztie -d db/gdbm -f
   file [-r]`, `zuntie [-u]`, `zgdbmpath`; GDBM when found, else the
-  system ndbm, else stubs); `zsh/private` (`private`, PM_PRIVATE).
+  system ndbm, else stubs); `zsh/param/private` (`private`, PM_PRIVATE; `zsh/private` is an alias).
   (`zsh/regex` was done in M10 polish.)
 - Process and ZLE: `zsh/zpty` (replaces the core "not implemented"
   stub: `-e`, `-b`, `-d`, `-w [-n]`, `-r [-mt] [param [pattern]]`, `-t`,
@@ -1574,7 +1629,8 @@ completion function); the builtins are in `src/builtins/complete.cpp`.
 
 **Builtins**
 - `typeset -T NAME SCALAR[=val] [sep]`: tied scalar/array pair
-  (`PATH`/`path`), separator, two-way updates.
+  (`PATH`/`path`), separator, two-way updates. Until then `path=(…)` doesn't reach
+  the M1 command search, and `PATH=` gives an empty `$path`.
 - `typeset -Z N`, `-L N`, `-R N` padding; `-h` hidden from listing;
   `-t` tagged (per-param tracing).
 - `typeset -n ref=name`: nameref semantics (M19 implements the lookup; this

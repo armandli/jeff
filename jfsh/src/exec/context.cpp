@@ -114,6 +114,9 @@ void install_special_params(ExecContext& ctx) {
       return str(buf);
     },
   });
+
+  // xtrace's prefix starts as zsh's; unset, there is none.
+  if (not params.lookup("PS4")) params.assign("PS4", str("+%N:%i> "));
 }
 
 }  // namespace jfsh

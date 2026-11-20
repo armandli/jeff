@@ -39,7 +39,7 @@ enum ParamFlags : s::uint32_t {
   PM_HIDE      = 0x0000'2000,
   PM_UNSET     = 0x0000'4000,
   PM_EFLOAT    = 0x0000'8000,   // float shown in exponent form (typeset -E)
-  // zsh/private (M11): visible only in the scope that declared it, not to
+  // zsh/param/private (M11): visible only in the scope that declared it, not to
   // the functions that scope calls.
   PM_PRIVATE   = 0x0001'0000,
 };
@@ -133,7 +133,8 @@ struct ParamTable {
   // reader that wants the handlers, not the value.
   optref<Param> lookup_raw(strv name) noexcept;
 
-  // The parameter in the innermost scope only (for `local`).
+  // The parameter in the innermost scope only (for `local`), or in a
+  // command's prefix scope above it.
   optref<Param> lookup_local(strv name) noexcept;
 
   // Create or overwrite in the current scope.
@@ -158,7 +159,8 @@ struct ParamTable {
     vec<str> words,
     bool append = false);
 
-  // Declare local — creates in current scope without setting.
+  // Declare local — creates in the innermost scope that isn't a command's
+  // prefix scope, without setting.
   Param& declare_local(
     str name,
     s::uint32_t flags = PM_SCALAR | PM_UNSET);
@@ -172,7 +174,9 @@ struct ParamTable {
   // readonly parameter; a name that isn't set is fine.
   Result<void> unset(strv name);
 
-  void push_scope();
+  // A `prefix` scope holds the assignments in front of one command:
+  // `local`/`typeset` of a new name declare below it.
+  void push_scope(bool prefix = false);
   void pop_scope();
 
   vec<str> make_envp() const;
@@ -182,10 +186,27 @@ struct ParamTable {
   int current_scope() const noexcept {
     return static_cast<int>(mScopes.size()) - 1;
   }
+  // The innermost scope that isn't a prefix scope.
+  int local_scope() const noexcept;
+  // Whether `p` lives in the innermost scope.
+  bool in_current_scope(const Param& p) const noexcept;
+  // Whether `p` lives in a command's prefix scope.
+  bool in_prefix_scope(const Param& p) const noexcept;
+
+  // Counts assignments to $PATH (and scopes ending with one), even those
+  // that keep its text, so the command hash can be dropped on each, as zsh
+  // does.
+  s::uint64_t path_generation() const noexcept { return mPathGen; }
+  // For a caller that stores into a Param itself (typeset): counts the
+  // assignment to `name`.
+  void note_assigned(strv name) noexcept { if (name == "PATH") ++mPathGen; }
 
 private:
+
   // mScopes[0] = global; mScopes.back() = innermost local
   vec<HashTable<Param>> mScopes;
+  vec<int>              mPrefixScopes;   // indexes of prefix scopes, ascending
+  s::uint64_t           mPathGen = 0;
 };
 
 }  // namespace jfsh

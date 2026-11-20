@@ -131,13 +131,16 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
   }
   p->flags = (p->flags | attrs.on) & ~attrs.off;
   if ((p->flags & PM_UNIQUE) and p->is_array()) p->set(unique(p->array()));
+  if (has_value) ctx.params.note_assigned(name);
   return 0;
 }
 
 // `typeset -p` form: `typeset -i n=3`, `export X=1`.
-str typeset_line(const Param& p) {
+// `global`: shown from a function, a parameter from outside it gets -g.
+str typeset_line(const Param& p, bool global) {
   str flags = param_type_flags(p);
-  str head  = flags == "-x" ? str("export") : "typeset" + (flags.empty() ? str{} : " " + flags);
+  str head  = flags == "-x" ? str("export")
+            : "typeset" + str(global ? " -g" : "") + (flags.empty() ? str{} : " " + flags);
   if (not p.is_set()) return head + " " + p.name;
   return head + " " + p.name + "=" + param_value_text(p);
 }
@@ -180,7 +183,8 @@ int typeset_list(const TypesetAttrs& attrs, const vec<str>& patterns, ExecContex
                      [&](const CompiledPattern& c) { return c.matches(p.name); });
   });
   for (const Param* p : params) {
-    if (attrs.print)            s::printf("%s\n", typeset_line(*p).c_str());
+    if (attrs.print)
+      s::printf("%s\n", typeset_line(*p, p->scope < ctx.params.local_scope()).c_str());
     else if (attrs.names_only)  s::printf("%s%s\n", type_words(*p).c_str(), shell_quote(p->name).c_str());
     else if (attrs.on or attrs.type)
       s::printf("%s=%s\n", shell_quote(p->name).c_str(), param_value_text(*p).c_str());
@@ -255,13 +259,17 @@ int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
   if (attrs.print) {
     for (const auto& name : names) {
       auto p = ctx.params.lookup(name);
+      // A prefix assignment's copy that was unset is gone, as in zsh.
+      if (p and not p->get().is_set() and ctx.params.in_prefix_scope(p->get()))
+        p.reset();
       if (not p) {
         s::fprintf(stderr, "jfsh: %.*s: no such variable: %s\n",
                    static_cast<int>(cmd.size()), cmd.data(), name.c_str());
         rc = 1;
         continue;
       }
-      s::printf("%s\n", typeset_line(p->get()).c_str());
+      bool global = p->get().scope < ctx.params.local_scope();
+      s::printf("%s\n", typeset_line(p->get(), global).c_str());
     }
     return rc;
   }

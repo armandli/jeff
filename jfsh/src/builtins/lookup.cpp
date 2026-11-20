@@ -43,15 +43,9 @@ vec<str> all_in_path(const ExecContext& ctx, const str& name) {
     if (is_executable(name)) out.push_back(name);
     return out;
   }
-  str path_var;
-  if (auto p = ctx.params.lookup("PATH"); p and p->get().is_set()) path_var = p->get().scalar();
-  s::size_t start = 0;
-  while (not path_var.empty() and start <= path_var.size()) {
-    s::size_t end = path_var.find(':', start);
-    if (end == str::npos) end = path_var.size();
-    str dir = path_var.substr(start, end - start);
-    start = end + 1;
-    str candidate = (dir.empty() ? "." : dir) + "/" + name;
+  for (const auto& dir : path_dirs(ctx.params)) {
+    // An empty component is the current directory, named as zsh does.
+    str candidate = dir.empty() ? name : dir + "/" + name;
     if (is_executable(candidate) and s::find(out.begin(), out.end(), candidate) == out.end())
       out.push_back(candidate);
   }

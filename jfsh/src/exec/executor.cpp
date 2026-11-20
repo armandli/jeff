@@ -178,24 +178,18 @@ static Result<void> expand_assignment(Expander& ex, Assignment& a) {
   return {};
 }
 
-// Value an assignment in front of a command gives its name for that command
-// only.  Fails, like a real assignment would, on a readonly parameter.
-static Result<str> prefix_value(const ParamTable& params,
-                                const Assignment& a) {
-  auto existing = params.lookup(a.name);
-  if (existing and existing->get().is_readonly())
-    return s::unexpected(ShellError{ErrorKind::ExecError,
-        "read-only variable: " + a.name});
-  str value = a.value;
-  if (a.array) {
-    value.clear();
-    for (s::size_t i = 0; i < a.elements.size(); ++i) {
-      if (i) value += ' ';
-      value += a.elements[i];
-    }
-  }
-  if (a.append and existing) return existing->get().scalar() + value;
-  return value;
+static str trace_quote(strv w);
+static str trace_assigns(const vec<Assignment>& assigns);
+static int trace_fd(const SavedFds& saved);
+static void write_trace(str line, int fd);
+static bool posix_special(const BuiltinDef& def);
+static bool is_executable_file(const str& path);
+static Result<str> search_path(strv name, const vec<str>& dirs, HashTable<str>* hash);
+
+// zsh's POSIX-special builtins (BINF_PSPECIAL): the special ones and the
+// typeset variants, whose prefix assignments stay under POSIX_BUILTINS.
+static bool posix_special(const BuiltinDef& def) {
+  return def.flags & (BINF_SPECIAL | BINF_TYPESET);
 }
 
 int Executor::exec_simple(vec<str> args,
@@ -212,7 +206,7 @@ int Executor::exec_simple(vec<str> args,
   }
   bool globbing = mCtx.opts.get(OPT_GLOB);
   if (noglob) mCtx.opts.unset(OPT_GLOB);
-  bool expanded = expand_command(args, assigns, redirs, subst_status);
+  bool expanded = expand_command(args, redirs, subst_status);
   if (noglob) mCtx.opts.assign(OPT_GLOB, globbing);
   // A failed expansion (`${x?msg}`, NO_UNSET, `$((1/0))`) ends the command
   // line, as zsh's errflag does: a non-interactive shell exits.
@@ -220,17 +214,30 @@ int Executor::exec_simple(vec<str> args,
     mCtx.aborting = mCtx.abort_line = true;
     return 1;
   }
+  // The prefix scope of a builtin or function, popped when the command is
+  // done.
+  struct ScopeGuard {
+    ParamTable* params = nullptr;
+    ~ScopeGuard() { if (params) params->pop_scope(); }
+  } prefix_scope;
   // typeset's `name=value` arguments: a scalar is passed as `name=value`; an
   // array is passed as `name`, and given its elements once the builtin has
-  // declared it.
+  // declared it.  As in zsh they are expanded once the command's
+  // redirections are applied and the assignments in front of it are made
+  // (`x=1 typeset y=$x`): see finish_typeset below.
   vec<Assignment> typeset_arrays;
-  if (not typeset_args.empty()) {
+  str typeset_traced;   // xtrace shows them as assignments
+  auto expand_typeset_args = [&] {
     Expander ex{*this, mCtx};
     for (auto& a : typeset_args) {
       if (auto r = expand_assignment(ex, a); not r) {
         s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
-        return 1;
+        // As any expansion error, this ends the command line.
+        mCtx.aborting = true;
+        return false;
       }
+      typeset_traced += ' ' + trace_assigns({a});
+      typeset_traced.pop_back();
       if (a.array) {
         args.push_back(a.name);
         typeset_arrays.push_back(s::move(a));
@@ -238,14 +245,14 @@ int Executor::exec_simple(vec<str> args,
         args.push_back(a.name + (a.append ? "+=" : "=") + a.value);
       }
     }
-  }
+    return true;
+  };
   auto psubst = expand_procsubst(args);
   struct PSubstGuard {
     Executor* exec;
     ProcSubstResources* res;
     ~PSubstGuard() { exec->procsubst_release(*res); }
   } psubst_guard{this, &psubst};
-  if (mCtx.opts.xtrace()) trace(args, assigns);
 
   // Precommand modifiers: `builtin` and `command` pick what the name may
   // be; `exec` replaces the shell (or, alone, makes the redirections
@@ -253,6 +260,8 @@ int Executor::exec_simple(vec<str> args,
   enum class Only { Any, Builtin, External } only = Only::Any;
   bool replace = false;
   bool clear_env = false;
+  bool command_p = false;
+  bool via_command = false;   // run through `command`: no longer special
   str  argv0;
   while (not args.empty()) {
     const str& w = args[0];
@@ -263,6 +272,7 @@ int Executor::exec_simple(vec<str> args,
       break;
     }
     if (w == "command" and only == Only::Any) {
+      via_command = true;
       s::size_t i = 1;
       bool lookup = false;
       bool default_path = false;
@@ -281,14 +291,7 @@ int Executor::exec_simple(vec<str> args,
       if (lookup) break;
       args.erase(args.begin(), args.begin() + static_cast<s::ptrdiff_t>(i));
       if (args.empty()) return 0;
-      if (default_path) {
-        // -p: look the name up in the system's default $PATH.
-        mCtx.params.push_scope();
-        mCtx.params.assign("PATH", str("/usr/bin:/bin:/usr/sbin:/sbin"), PM_SCALAR);
-        auto path = find_command(args[0]);
-        mCtx.params.pop_scope();
-        if (path) args[0] = *path;
-      }
+      command_p = default_path;
       only = mCtx.opts.get(OPT_POSIXBUILTINS) ? Only::Any : Only::External;
       continue;
     }
@@ -331,8 +334,42 @@ int Executor::exec_simple(vec<str> args,
     break;
   }
 
+  // xtrace shows the words without the precommand modifiers, and comes
+  // before the command runs.  With assignments in front, it waits until
+  // they are made, so it shows their values.
+  bool tracing = mCtx.opts.xtrace();
+  str  traced;
+  if (tracing) {
+    for (const auto& w : args) {
+      if (not traced.empty()) traced += ' ';
+      traced += trace_quote(w);
+    }
+    if (assigns.empty() and typeset_args.empty() and not args.empty()) trace_text(traced);
+  }
+  const str* child_trace = tracing and not assigns.empty() ? &traced : nullptr;
+  // Expands typeset's arguments and adds them to the trace, which (without
+  // assignments in front) is printed here, to `fd`.
+  auto finish_typeset = [&](int fd) {
+    if (typeset_args.empty()) return true;
+    if (not expand_typeset_args()) return false;
+    traced += typeset_traced;
+    if (tracing and assigns.empty()) trace_text(traced, fd);
+    return true;
+  };
+  // `command -p`: the name is looked up in the system's default $PATH.
+  if (command_p and not args.empty() and args[0].find('/') == str::npos) {
+    vec<str> dirs{"/usr/bin", "/bin", "/usr/sbin", "/sbin"};
+    auto path = search_path(args[0], dirs, nullptr);
+    if (not path) {
+      s::fprintf(stderr, "jfsh: %s\n", path.error().message.c_str());
+      return path.error().kind == ErrorKind::PermissionDenied ? 126 : 127;
+    }
+    args[0] = *path;
+  }
+
   // With no command word the redirections apply to the current shell and
-  // the assignments update shell parameters.  Both happen in-process.
+  // the assignments update shell parameters.  Both happen in-process: the
+  // redirections first, so a failed one assigns nothing, as in zsh.
   if (args.empty()) {
     // SH_NULLCMD / CSH_NULLCMD (M12 Phase 12c): sh and csh refuse a
     // command made of nothing but redirections.  zsh's own default runs
@@ -347,11 +384,23 @@ int Executor::exec_simple(vec<str> args,
     if (not redirs.empty()) {
       s::fflush(nullptr);
       if (not apply_redirects(redirs, saved)) return 1;
-      if (replace) saved.commit();
     }
-    int rc = apply_assigns(assigns);
+    // PS4 is expanded before the assignments, which may change it.
+    str ps4 = tracing ? trace_prompt() : str{};
+    // In front of `exec` with redirections they last only for it, as zsh
+    // has them; alone, or with just redirections, they stay.
+    bool temporary = replace and not redirs.empty() and not assigns.empty();
+    if (temporary) mCtx.params.push_scope(/*prefix=*/true);
+    opt<int> assign_status;
+    int rc = apply_assigns(assigns, temporary ? AssignTo::Prefix : AssignTo::Shell,
+                           assign_status);
+    if (temporary) mCtx.params.pop_scope();
+    if (assign_status) subst_status = assign_status;
+    if (tracing and not assigns.empty())
+      write_trace(ps4 + trace_assigns(assigns), trace_fd(saved));
+    if (replace) saved.commit();
     s::fflush(nullptr);
-    // So does assigning to a readonly parameter.
+    // A failed expansion or a readonly name ends the command line.
     if (rc != 0) mCtx.aborting = true;
     // `x=$(cmd)` has cmd's status.
     if (rc == 0 and subst_status) rc = *subst_status;
@@ -360,14 +409,18 @@ int Executor::exec_simple(vec<str> args,
 
   if (replace) {
     s::fflush(nullptr);
-    if (not redirs.empty()) {
-      SavedFds saved;
-      if (not apply_redirects(redirs, saved)) return 1;
-      saved.commit();
-    }
-    return exec_replace(args, assigns, argv0, clear_env);
+    SavedFds saved;
+    if (not redirs.empty() and not apply_redirects(redirs, saved)) return 1;
+    if (not finish_typeset(trace_fd(saved))) return 1;
+    int rc = exec_replace(args, s::move(assigns), argv0, clear_env, child_trace,
+                          trace_fd(saved));
+    saved.commit();
+    return rc;
   }
-  if (only == Only::External) return run_external(args, assigns, redirs, flags);
+  if (only == Only::External) {
+    if (not finish_typeset(STDERR_FILENO)) return 1;
+    return run_external(args, assigns, redirs, flags, child_trace);
+  }
 
   // Functions come before builtins; an autoloaded one is loaded on its
   // first call.  Aliases were expanded by the parser.
@@ -390,8 +443,10 @@ int Executor::exec_simple(vec<str> args,
     s::fprintf(stderr, "jfsh: no such builtin: %s\n", args[0].c_str());
     return 1;
   }
-  if (fn == mCtx.functions.end() and not defp)
-    return run_external(args, assigns, redirs, flags);
+  if (fn == mCtx.functions.end() and not defp) {
+    if (not finish_typeset(STDERR_FILENO)) return 1;
+    return run_external(args, assigns, redirs, flags, child_trace);
+  }
 
   SavedFds saved;
   if (not redirs.empty()) {
@@ -401,58 +456,60 @@ int Executor::exec_simple(vec<str> args,
     s::fflush(nullptr);
     if (not apply_redirects(redirs, saved)) return 1;
   }
+  // Assignments in front of a function are exported to what it runs.  zsh
+  // keeps those in front of a special builtin (or a typeset variant) only
+  // under POSIX_BUILTINS; otherwise they last while the builtin runs.
+  // Without any, no scope is pushed, so `local` declares in the caller's
+  // scope.
+  bool is_fn  = fn != mCtx.functions.end();
+  bool global = not is_fn and not via_command and posix_special(*defp)
+            and mCtx.opts.get(OPT_POSIXBUILTINS);
+  if (not assigns.empty() and not global) {
+    mCtx.params.push_scope(/*prefix=*/true);
+    prefix_scope.params = &mCtx.params;
+  }
   int rc = 0;
-  if (fn != mCtx.functions.end()) {
-    ProgRef body = fn->second;  // the function may redefine itself
-    // Assignments in front of a function are exported to what it runs.
-    if (not assigns.empty()) rc = push_prefix_assigns(assigns, true);
-    if (rc == 0) rc = call_function(body, args);
-    if (not assigns.empty()) mCtx.params.pop_scope();
-    s::fflush(nullptr);
-    return rc;
+  if (not assigns.empty()) {
+    str ps4 = tracing ? trace_prompt() : str{};
+    opt<int> assign_status;
+    rc = apply_assigns(assigns,
+        global ? AssignTo::Shell : is_fn ? AssignTo::Exported : AssignTo::Prefix,
+        assign_status);
+    // A readonly name in front of a builtin or function ends the command
+    // line, as zsh's errflag does.
+    if (rc != 0) {
+      if (tracing) write_trace(ps4 + trace_assigns(assigns), trace_fd(saved));
+      mCtx.aborting = true;
+      return rc;
+    }
+    if (not finish_typeset(trace_fd(saved))) return 1;
+    // As zsh: PS4 and the assignments, then PS4 again before the words.
+    if (tracing)
+      write_trace(ps4 + trace_assigns(assigns) + trace_prompt() + traced,
+                  trace_fd(saved));
+  } else if (not finish_typeset(trace_fd(saved))) {
+    return 1;
   }
-  // zsh keeps assignments in front of a special builtin only under
-  // POSIX_BUILTINS; otherwise they last while the builtin runs.  Without
-  // any, no scope is pushed, so `local` declares in the caller's scope.
-  bool scoped = not assigns.empty();
-  if ((defp->flags & BINF_SPECIAL) and mCtx.opts.get(OPT_POSIXBUILTINS)) {
-    rc = apply_assigns(assigns);
-    scoped = false;
-  } else if (scoped) {
-    rc = push_prefix_assigns(assigns, false);
-  }
-  if (rc == 0) rc = defp->fn(args, mCtx);
-  // A signal the builtin brought on (`kill -USR1 $$`) is handled before
-  // its status replaces $?, as in zsh.
-  if (mCtx.signals.has_pending()) handle_signals();
-  for (const auto& a : typeset_arrays) {
-    if (rc != 0) break;
-    if (auto r = mCtx.params.set_array(a.name, a.elements, a.append); not r) {
-      s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
-      rc = 1;
+  if (rc == 0) {
+    if (is_fn) {
+      ProgRef body = fn->second;  // the function may redefine itself
+      rc = call_function(body, args);
+    } else {
+      rc = defp->fn(args, mCtx);
+      // A signal the builtin brought on (`kill -USR1 $$`) is handled before
+      // its status replaces $?, as in zsh.
+      if (mCtx.signals.has_pending()) handle_signals();
+      for (const auto& a : typeset_arrays) {
+        if (rc != 0) break;
+        if (auto r = mCtx.params.set_array(a.name, a.elements, a.append); not r) {
+          s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+          rc = 1;
+        }
+      }
     }
   }
-  if (scoped) mCtx.params.pop_scope();
   s::fflush(nullptr);
   return rc;
-}
-
-int Executor::push_prefix_assigns(const vec<Assignment>& assigns,
-                                  bool exported) {
-  mCtx.params.push_scope();
-  for (const auto& a : assigns) {
-    auto value = prefix_value(mCtx.params, a);
-    if (not value) {
-      s::fprintf(stderr, "jfsh: %s\n", value.error().message.c_str());
-      return 1;
-    }
-    auto outer = mCtx.params.lookup(a.name);
-    s::uint32_t attrs = a.array ? PM_ARRAY : PM_SCALAR;
-    if (exported or (outer and outer->get().is_exported())) attrs |= PM_EXPORTED;
-    if (a.array) mCtx.params.assign(a.name, a.elements, attrs);
-    else         mCtx.params.assign(a.name, s::move(*value), attrs);
-  }
-  return 0;
 }
 
 int Executor::exec_list(ExecState& es, ExecFlags flags) {
@@ -751,9 +808,8 @@ int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
   vec<Redirection> redirs;
   while (wc_code(es.peek()) == WC_REDIR) redirs.push_back(fetch_redir(es));
   vec<str>        no_args;
-  vec<Assignment> no_assigns;
   opt<int>        subst_status;
-  if (not expand_command(no_args, no_assigns, redirs, subst_status)) return 1;
+  if (not expand_command(no_args, redirs, subst_status)) return 1;
   SavedFds saved;
   s::fflush(nullptr);
   if (not apply_redirects(redirs, saved)) return 1;
@@ -1902,21 +1958,11 @@ void Executor::procsubst_release(ProcSubstResources& res) noexcept {
   res.tmp_files.clear();
 }
 
-bool Executor::apply_redirects_child(const vec<Redirection>& redirs) {
-  SavedFds throwaway;
-  bool ok = apply_redirects(redirs, throwaway);
-  // The child must not undo the redirections when `throwaway` dies.  Drop
-  // the backup entries so the destructor becomes a no-op.
-  throwaway.entries.clear();
-  return ok;
-}
-
 
 // Word expansion for one simple command (see include/jfsh/exec/subst.h).
 // A redirection target that expands to several words becomes several
 // redirections of the same kind, which MULTIOS then fans out.
 bool Executor::expand_command(vec<str>& args,
-                              vec<Assignment>&  assigns,
                               vec<Redirection>& redirs,
                               opt<int>&         subst_status) {
   Expander ex{*this, mCtx};
@@ -1925,10 +1971,8 @@ bool Executor::expand_command(vec<str>& args,
     subst_status = ex.subst_status();
     return false;
   };
-  // Assignment values are expanded first, then the arguments, then the
-  // redirection targets.
-  for (auto& a : assigns)
-    if (auto r = expand_assignment(ex, a); not r) return fail(r.error());
+  // The arguments are expanded first, then the redirection targets; the
+  // assignments come last, as they are made (apply_assigns).
   auto words = ex.words(args);
   if (not words) return fail(words.error());
   args = s::move(*words);
@@ -2063,36 +2107,95 @@ static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
   return ctx.params.set_array(a.name, s::move(arr));
 }
 
-int Executor::apply_assigns(const vec<Assignment>& assigns) {
-  for (const auto& a : assigns) {
-    if (a.subscript) {
-      if (auto r = assign_element(mCtx, a); not r) {
-        s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
-        return 1;
-      }
-      continue;
-    }
-    auto p = mCtx.params.lookup(a.name);
-    bool numeric = not a.array and p and p->get().is_set()
-               and (p->get().is_integer() or p->get().is_float());
-    auto r = a.array ? mCtx.params.set_array(a.name, a.elements, a.append)
-           : numeric ? set_numeric(mCtx, p->get(), a)
-                     : mCtx.params.set_scalar(a.name, a.value, a.append);
-    if (not r) {
-      s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
-      return 1;
-    }
+// One assignment, expanded: `name=value` on an integer or float is
+// arithmetic, `name+=value` on an array appends an element, as in zsh.
+static Result<void> assign_one(ExecContext& ctx, const Assignment& a) {
+  if (a.subscript) return assign_element(ctx, a);
+  if (a.array) return ctx.params.set_array(a.name, a.elements, a.append);
+  if (auto p = ctx.params.lookup(a.name); p and p->get().is_set()) {
+    Param& old = p->get();
+    if (old.is_integer() or old.is_float()) return set_numeric(ctx, old, a);
+    if (a.append and old.is_array())
+      return ctx.params.set_array(a.name, {a.value}, true);
   }
-  return 0;
+  return ctx.params.set_scalar(a.name, a.value, a.append);
 }
 
-// Quotes a word for xtrace output only when it needs it, as zsh does.
+// In front of a command, `name` is first copied into the command's own
+// scope with the outer parameter's value, type and attributes (not
+// readonly: an assignment to that fails), so assigning to the copy acts
+// as on the original and the original comes back afterwards.
+static Result<void> prefix_param(ParamTable& params, const str& name, bool exported) {
+  auto outer = params.lookup(name);
+  if (outer and outer->get().is_readonly())
+    return s::unexpected(ShellError{ErrorKind::ExecError, "read-only variable: " + name});
+  Param* p = nullptr;
+  if (outer and params.in_current_scope(outer->get())) {
+    p = &outer->get();   // made by an earlier assignment of this command
+  } else if (outer) {
+    const Param& o = outer->get();
+    int level = o.scope;
+    p = &params.assign(name, o.value,
+                       o.flags & ~(PM_READONLY | PM_SPECIAL | PM_PRIVATE | PM_TIED));
+    // It stands for the original, so `typeset -p` in a function says -g
+    // just when it would for that one.
+    p->scope = level;
+  } else {
+    p = &params.assign(name, str{}, PM_SCALAR | PM_UNSET);
+    p->scope = 0;
+  }
+  if (exported) p->flags |= PM_EXPORTED;
+  return {};
+}
+
+int Executor::apply_assigns(vec<Assignment>& assigns, AssignTo to,
+                            opt<int>& subst_status) {
+  Expander ex{*this, mCtx};
+  int rc = 0;
+  for (auto& a : assigns) {
+    auto r = expand_assignment(ex, a);
+    // `a[i]=x` in front of a command changes the parameter itself, as in
+    // zsh (before an external command that is in the child).
+    if (r and to != AssignTo::Shell and not a.subscript)
+      r = prefix_param(mCtx.params, a.name, to == AssignTo::Exported);
+    if (r) r = assign_one(mCtx, a);
+    if (not r) {
+      s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+      rc = 1;
+      break;
+    }
+  }
+  subst_status = ex.subst_status();
+  return rc;
+}
+
+// Quotes a word for xtrace output only when it needs it, as zsh does: in
+// '…', or in $'…' when it has control characters.
 static str trace_quote(strv w) {
   constexpr strv kSafe =
       "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-      "_@%+=:,./-";
-  if (not w.empty() and w.find_first_not_of(kSafe) == strv::npos)
-    return str(w);
+      "_@%+:,./-!";
+  auto safe = [&](char c) {
+    return static_cast<unsigned char>(c) >= 0x80 or kSafe.find(c) != strv::npos;
+  };
+  auto control = [](char c) {
+    auto u = static_cast<unsigned char>(c);
+    return u < 0x20 or u == 0x7f;
+  };
+  if (not w.empty() and s::all_of(w.begin(), w.end(), safe)) return str(w);
+  if (s::any_of(w.begin(), w.end(), control)) {
+    str out = "$'";
+    for (char c : w) {
+      if      (c == '\n')  out += "\\n";
+      else if (c == '\t')  out += "\\t";
+      else if (c == '\'')  out += "\\'";
+      else if (c == '\\')  out += "\\\\";
+      else if (c == 0x7f)  out += "\\C-?";
+      else if (control(c)) out += str("\\C-") + static_cast<char>(c + '@');
+      else                 out += c;
+    }
+    return out + "'";
+  }
   str out = "'";
   for (char c : w) {
     if (c == '\'') out += "'\\''";
@@ -2101,18 +2204,9 @@ static str trace_quote(strv w) {
   return out + "'";
 }
 
-// PS4 goes through prompt expansion; zsh's default is `+%N:%i> `.
-void Executor::trace_text(strv text) {
-  auto ps4 = mCtx.params.lookup("PS4");
-  str line = expand_prompt((ps4 and ps4->get().is_set()) ? ps4->get().scalar() : "+%N:%i> ");
-  s::fprintf(stderr, "%s%.*s\n", line.c_str(), static_cast<int>(text.size()), text.data());
-}
-
-void Executor::trace(const vec<str>& args,
-                     const vec<Assignment>&  assigns) {
+// The assignments as xtrace shows them, each followed by a space.
+static str trace_assigns(const vec<Assignment>& assigns) {
   str line;
-  // As zsh: each assignment is followed by a space, the words are
-  // separated by one.
   for (const auto& a : assigns) {
     str value = trace_quote(a.value);
     if (a.array) {
@@ -2120,15 +2214,42 @@ void Executor::trace(const vec<str>& args,
       for (const auto& e : a.elements) value += ' ' + trace_quote(e);
       value += " )";
     }
-    line += a.name + (a.append ? "+=" : "=") + value + " ";
+    str name = a.subscript ? a.name + "[" + *a.subscript + "]" : a.name;
+    line += name + (a.append ? "+=" : "=") + value + " ";
   }
-  bool first = true;
-  for (const auto& w : args) {
-    if (not first) line += ' ';
-    line += trace_quote(w);
-    first = false;
+  return line;
+}
+
+// xtrace goes to the shell's stderr from before the command's own
+// redirections, as zsh's does.
+static int trace_fd(const SavedFds& saved) {
+  for (const auto& e : saved.entries)
+    if (e.dst == STDERR_FILENO and e.backup >= 0) return e.backup;
+  return STDERR_FILENO;
+}
+
+// PS4 goes through prompt expansion; zsh's initial value is `+%N:%i> `,
+// and an unset PS4 is no prefix.
+str Executor::trace_prompt() {
+  auto ps4 = mCtx.params.lookup("PS4");
+  return (ps4 and ps4->get().is_set()) ? expand_prompt(ps4->get().scalar()) : str{};
+}
+
+void Executor::trace_text(strv text, int fd) {
+  write_trace(trace_prompt() + str(text), fd);
+}
+
+// Writes one xtrace line to `fd`, after anything stdio still holds for
+// stderr.
+static void write_trace(str line, int fd) {
+  line += '\n';
+  s::fflush(stderr);
+  for (s::size_t done = 0; done < line.size();) {
+    auto n = ::write(fd, line.data() + done, line.size() - done);
+    if (n < 0 and errno == EINTR) continue;
+    if (n <= 0) break;
+    done += static_cast<s::size_t>(n);
   }
-  trace_text(line);
 }
 
 vec<str> Executor::builtin_names() const {
@@ -2218,45 +2339,53 @@ static bool is_executable_file(const str& path) {
      and access(path.c_str(), X_OK) == 0;
 }
 
-Result<str> Executor::find_command(strv name) {
-  if (name.find('/') != strv::npos) return str(name);
-
-  str path_var;
-  if (auto p = mCtx.params.lookup("PATH"); p and p->get().is_set())
-    path_var = p->get().scalar();
-  if (path_var != mHashedPath) {
-    mCmdHash.clear();
-    mHashedPath = path_var;
-  }
-  bool hashing = mCtx.opts.get(OPT_HASHCMDS);
-  str key(name);
-  if (hashing) {
-    auto it = mCmdHash.find(key);
-    if (it != mCmdHash.end() and is_executable_file(it->second)) return it->second;
-  }
-
-  // An empty $PATH component means the current directory.  A matching file
-  // that is not executable is remembered, so the error can say why.
-  bool denied = false;
+vec<str> path_dirs(const ParamTable& params) {
+  vec<str> dirs;
+  auto p = params.lookup("PATH");
+  if (not p or not p->get().is_set()) return dirs;
+  str all = p->get().scalar();
   s::size_t start = 0;
-  while (not path_var.empty() and start <= path_var.size()) {
-    s::size_t end = path_var.find(':', start);
-    if (end == str::npos) end = path_var.size();
-    str dir = path_var.substr(start, end - start);
+  for (;;) {
+    s::size_t end = all.find(':', start);
+    if (end == str::npos) end = all.size();
+    dirs.push_back(all.substr(start, end - start));
+    if (end == all.size()) return dirs;
     start = end + 1;
-    str candidate = (dir.empty() ? "." : dir) + "/" + key;
+  }
+}
+
+// Searches the directories `path_var` names for an executable `name`.  An
+// empty or `.` directory runs `name` as it is, as zsh does; only those
+// found through an absolute directory go into `hash`.  An entry of that
+// name that can't be run (a directory, a file without x) makes it
+// PermissionDenied rather than FileNotFound.
+static Result<str> search_path(strv name, const vec<str>& dirs, HashTable<str>* hash) {
+  bool denied = false;
+  for (const auto& dir : dirs) {
+    str candidate = (dir.empty() or dir == ".") ? str(name) : dir + "/" + str(name);
     if (is_executable_file(candidate)) {
-      if (hashing) mCmdHash[key] = candidate;
+      if (hash and dir[0] == '/') (*hash)[str(name)] = candidate;
       return candidate;
     }
     struct stat st{};
-    if (stat(candidate.c_str(), &st) == 0 and S_ISREG(st.st_mode)) denied = true;
+    if (stat(candidate.c_str(), &st) == 0) denied = true;
   }
   if (denied)
     return s::unexpected(ShellError{ErrorKind::PermissionDenied,
-        "permission denied: " + key});
+        "permission denied: " + str(name)});
   return s::unexpected(ShellError{ErrorKind::FileNotFound,
-      "command not found: " + key});
+      "command not found: " + str(name)});
+}
+
+Result<str> Executor::find_command(strv name) {
+  if (name.find('/') != strv::npos) return str(name);
+  // Entries are used even under NO_HASH_CMDS (`hash name=path`); the
+  // option only stops the search adding them.
+  auto& hash = command_hash();
+  if (auto it = hash.find(str(name)); it != hash.end() and is_executable_file(it->second))
+    return it->second;
+  bool hashing = mCtx.opts.get(OPT_HASHCMDS);
+  return search_path(name, path_dirs(mCtx.params), hashing ? &hash : nullptr);
 }
 
 static vec<char*> c_strings(vec<str>& v) {
@@ -2267,78 +2396,86 @@ static vec<char*> c_strings(vec<str>& v) {
   return out;
 }
 
+// strerror() as zsh's %e prints it: lowercased unless it starts with an
+// acronym.
+static str errno_text(int err) {
+  str text = s::strerror(err);
+  if (text.size() > 1 and not s::isupper(static_cast<unsigned char>(text[1])))
+    text[0] = static_cast<char>(s::tolower(static_cast<unsigned char>(text[0])));
+  return text;
+}
+
+// Runs `path` in place of this process, as zsh's zexecve does: a file that
+// is neither a binary (no NUL in its first bytes) nor a `#!` script runs
+// under /bin/sh, and a `#!` line naming a missing interpreter says so.
+// Returns only on failure, after the message, with the status: 126 for a
+// file that can't be run, 127 for anything else.
+static int exec_program(const str& path, vec<str> argv, vec<str>& env,
+                        const str& name) {
+  auto av = c_strings(argv);
+  auto ev = c_strings(env);
+  execve(path.c_str(), av.data(), ev.data());
+  int err = errno;
+  if (err == ENOEXEC or err == ENOENT) {
+    char buf[128];
+    ssize_t n = -1;
+    if (int fd = ::open(path.c_str(), O_RDONLY | O_NOCTTY); fd >= 0) {
+      n = ::read(fd, buf, sizeof buf);
+      ::close(fd);
+    }
+    strv head(buf, n > 0 ? static_cast<s::size_t>(n) : 0);
+    if (head.starts_with("#!")) {
+      if (err == ENOENT) {
+        // The interpreter is the first word of a whole line, as zsh has it.
+        strv interp = head.substr(2);
+        if (auto nl = interp.find('\n'); nl != strv::npos) {
+          interp = interp.substr(0, nl);
+          interp.remove_prefix(s::min(interp.find_first_not_of(' '), interp.size()));
+          interp = interp.substr(0, interp.find_first_of(" \t"));
+        }
+        s::fprintf(stderr, "jfsh: %s: bad interpreter: %.*s: %s\n", path.c_str(),
+                   static_cast<int>(interp.size()), interp.data(),
+                   errno_text(err).c_str());
+        return 127;
+      }
+    } else if (err == ENOEXEC and n >= 0 and head.find('\0') == strv::npos) {
+      vec<str> sh{"sh", path};
+      sh.insert(sh.end(), argv.begin() + 1, argv.end());
+      auto sh_argv = c_strings(sh);
+      execve("/bin/sh", sh_argv.data(), ev.data());
+    }
+  }
+  s::fprintf(stderr, "jfsh: %s: %s\n", errno_text(err).c_str(), name.c_str());
+  return (err == EACCES or err == ENOEXEC) ? 126 : 127;
+}
+
+static bool assigns_path(const vec<Assignment>& assigns) {
+  return s::any_of(assigns.begin(), assigns.end(),
+                   [](const Assignment& a) { return a.name == "PATH"; });
+}
+
 int Executor::run_external(const vec<str>& args,
                            const vec<Assignment>&  assigns,
                            const vec<Redirection>& redirs,
-                           ExecFlags flags) {
-  auto path = find_command(args[0]);
-  if (not path) {
-    s::fprintf(stderr, "jfsh: %s\n", path.error().message.c_str());
-    return path.error().kind == ErrorKind::PermissionDenied ? 126 : 127;
-  }
-
-  // The child's environment is the shell's exported parameters plus the
-  // command's prefix assignments, which are exported to it alone.
-  vec<str> env = mCtx.params.make_envp();
-  for (const auto& a : assigns) {
-    auto value = prefix_value(mCtx.params, a);
-    if (not value) {
-      s::fprintf(stderr, "jfsh: %s\n", value.error().message.c_str());
-      return 1;
-    }
-    str prefix = a.name + "=";
-    s::erase_if(env, [&](const str& e) { return e.starts_with(prefix); });
-    env.push_back(prefix + *value);
-  }
-  vec<str> argv_s = args;
-  auto argv = c_strings(argv_s);
-  auto envp = c_strings(env);
+                           ExecFlags flags,
+                           const str* traced) {
+  // The shell looks the command up (and hashes it) in its own $PATH; with
+  // a PATH= in front the child searches that one instead.
+  opt<Result<str>> found = find_command(args[0]);
+  if (assigns_path(assigns)) found.reset();
 
   // Builtins write through stdio; flush so their output precedes the child's.
   s::fflush(nullptr);
 
   // EF_NOFORK: last command in `-c` string or last stage in a subshell runs
-  // on this process directly.  Redirections are applied in-process; no save
-  // because we will never return.
-  if (flags & EF_NOFORK) {
-    if (not redirs.empty() and not apply_redirects_child(redirs)) _exit(1);
-    execve(path->c_str(), argv.data(), envp.data());
-    int err = errno;
-    const char* name = args[0].c_str();
-    if (err == ENOENT) {
-      s::fprintf(stderr, "jfsh: no such file or directory: %s\n", name);
-      _exit(127);
-    }
-    s::fprintf(stderr, "jfsh: %s: %s\n", name, s::strerror(err));
-    _exit(126);
-  }
+  // on this process directly.
+  if (flags & EF_NOFORK)
+    exec_external_child(args, assigns, redirs, s::move(found), traced);
 
   bool jc = job_control();
   pid_t pid = fork_child(0, true, ChildKind::Other);
   if (pid < 0) return 1;
-  if (pid == 0) {
-    if (not redirs.empty() and not apply_redirects_child(redirs)) _exit(1);
-    execve(path->c_str(), argv.data(), envp.data());
-    int err = errno;
-    if (err == ENOEXEC) {
-      // Neither a binary nor a #! script: run it with /bin/sh, as zsh does.
-      vec<str> sh_s{"/bin/sh", *path};
-      sh_s.insert(sh_s.end(), args.begin() + 1, args.end());
-      auto sh_argv = c_strings(sh_s);
-      execve("/bin/sh", sh_argv.data(), envp.data());
-      err = errno;
-    }
-    const char* name = args[0].c_str();
-    if (err == ENOENT) {
-      s::fprintf(stderr, "jfsh: no such file or directory: %s\n", name);
-      _exit(127);
-    }
-    if (err == EACCES or err == EISDIR or err == EPERM)
-      s::fprintf(stderr, "jfsh: permission denied: %s\n", name);
-    else
-      s::fprintf(stderr, "jfsh: %s: %s\n", name, s::strerror(err));
-    _exit(126);
-  }
+  if (pid == 0) exec_external_child(args, assigns, redirs, s::move(found), traced);
 
   if (jc) {
     int jid = mCtx.jobs.alloc(pid, JOB_PGRP, current_job_text(), false);
@@ -2359,11 +2496,42 @@ int Executor::run_external(const vec<str>& args,
   return 1;
 }
 
+// As in zsh, the child applies the redirections, then makes the
+// assignments, which go into its environment (an array is not exported),
+// then reports a command it can't find.  The redirections' saved fds are
+// close-on-exec, and never restored.
+void Executor::exec_external_child(const vec<str>&         args,
+                                   vec<Assignment>         assigns,
+                                   const vec<Redirection>& redirs,
+                                   opt<Result<str>>        found,
+                                   const str*              traced) {
+  SavedFds saved;
+  if (not redirs.empty() and not apply_redirects(redirs, saved)) _exit(1);
+  if (not assigns.empty()) {
+    mCtx.params.push_scope(/*prefix=*/true);
+    str ps4 = traced ? trace_prompt() : str{};
+    opt<int> subst_status;
+    int rc = apply_assigns(assigns, AssignTo::Exported, subst_status);
+    if (traced) write_trace(ps4 + trace_assigns(assigns) + *traced, trace_fd(saved));
+    if (rc != 0) _exit(rc);
+  }
+  if (not found) found = find_command(args[0]);
+  if (not *found) {
+    s::fprintf(stderr, "jfsh: %s\n", found->error().message.c_str());
+    _exit(found->error().kind == ErrorKind::PermissionDenied ? 126 : 127);
+  }
+  vec<str> env = mCtx.params.make_envp();
+  _exit(exec_program(**found, args, env, args[0]));
+}
+
 // ---- exec, source, autoload, the command hash --------------------------------
 
-int Executor::exec_replace(const vec<str>& args, const vec<Assignment>& assigns,
-                           const str& argv0, bool clear_env) {
+int Executor::exec_replace(const vec<str>& args, vec<Assignment> assigns,
+                           const str& argv0, bool clear_env, const str* traced,
+                           int trace_to) {
+  bool scoped = not assigns.empty();
   auto fail = [&](int rc) {
+    if (scoped) mCtx.params.pop_scope();
     // A shell that can't exec goes on only when interactive.
     if (not mCtx.opts.interactive()) {
       mCtx.exiting  = true;
@@ -2371,27 +2539,24 @@ int Executor::exec_replace(const vec<str>& args, const vec<Assignment>& assigns,
     }
     return rc;
   };
+  if (scoped) {
+    mCtx.params.push_scope(/*prefix=*/true);
+    str ps4 = traced ? trace_prompt() : str{};
+    opt<int> subst_status;
+    int rc = apply_assigns(assigns, AssignTo::Exported, subst_status);
+    if (traced) write_trace(ps4 + trace_assigns(assigns) + *traced, trace_to);
+    if (rc != 0) return fail(rc);
+  }
   auto path = find_command(args[0]);
   if (not path) {
     s::fprintf(stderr, "jfsh: %s\n", path.error().message.c_str());
     return fail(path.error().kind == ErrorKind::PermissionDenied ? 126 : 127);
   }
+  // `exec -c`: an empty environment, without even the assignments.
   vec<str> env = clear_env ? vec<str>{} : mCtx.params.make_envp();
-  for (const auto& a : assigns) {
-    auto value = prefix_value(mCtx.params, a);
-    if (not value) {
-      s::fprintf(stderr, "jfsh: %s\n", value.error().message.c_str());
-      return fail(1);
-    }
-    str prefix = a.name + "=";
-    s::erase_if(env, [&](const str& e) { return e.starts_with(prefix); });
-    env.push_back(prefix + *value);
-  }
   vec<str> argv_s = args;
   if (argv0 == "-")        argv_s[0] = "-" + argv_s[0];
   else if (not argv0.empty()) argv_s[0] = argv0;
-  auto argv = c_strings(argv_s);
-  auto envp = c_strings(env);
   s::fflush(nullptr);
   // The new program starts with the shell's caught signals at their
   // defaults (ignored ones stay ignored); put back if exec fails.
@@ -2405,11 +2570,9 @@ int Executor::exec_replace(const vec<str>& args, const vec<Assignment>& assigns,
     sigemptyset(&dfl.sa_mask);
     if (::sigaction(sig, &dfl, nullptr) == 0) changed.emplace_back(sig, old);
   }
-  execve(path->c_str(), argv.data(), envp.data());
-  int err = errno;
+  int rc = exec_program(*path, s::move(argv_s), env, args[0]);
   for (auto& [sig, old] : changed) ::sigaction(sig, &old, nullptr);
-  s::fprintf(stderr, "jfsh: %s: %s\n", args[0].c_str(), s::strerror(err));
-  return fail(err == ENOENT ? 127 : 126);
+  return fail(rc);
 }
 
 static opt<str> read_file(const str& path) {
@@ -2511,13 +2674,17 @@ bool Executor::load_autoload(const str& name) {
   return false;
 }
 
+// Dropped on any assignment to $PATH (path_generation), or when its text
+// changed some other way.
 HashTable<str>& Executor::command_hash() {
-  str path_var;
-  if (auto p = mCtx.params.lookup("PATH"); p and p->get().is_set())
-    path_var = p->get().scalar();
-  if (path_var != mHashedPath) {
+  auto p = mCtx.params.lookup("PATH");
+  const str* text = p and p->get().is_set() ? s::get_if<str>(&p->get().value) : nullptr;
+  strv path_var = text ? strv(*text) : strv{};
+  s::uint64_t gen = mCtx.params.path_generation();
+  if (gen != mHashedGen or path_var != mHashedPath) {
     mCmdHash.clear();
     mHashedPath = path_var;
+    mHashedGen  = gen;
   }
   return mCmdHash;
 }
@@ -2526,13 +2693,7 @@ void Executor::fill_command_hash() {
   auto& hash = command_hash();
   hash.clear();
   // The first directory in $PATH with a name wins, as for a search.
-  str path_var = mHashedPath;
-  s::size_t start = 0;
-  while (not path_var.empty() and start <= path_var.size()) {
-    s::size_t end = path_var.find(':', start);
-    if (end == str::npos) end = path_var.size();
-    str dir = path_var.substr(start, end - start);
-    start = end + 1;
+  for (const auto& dir : path_dirs(mCtx.params)) {
     if (dir.empty() or dir[0] != '/') continue;   // relative ones aren't hashed
     DIR* d = ::opendir(dir.c_str());
     if (not d) continue;
