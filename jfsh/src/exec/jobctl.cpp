@@ -42,7 +42,12 @@ int wait_foreground_job(ExecContext& ctx, int jid) {
     }
     ctx.jobs.update(pid, status);
   }
-  sig.take_terminal();
+  // Inside the last stage of a pipeline, which runs in the shell, the
+  // terminal goes back to the pipeline's other stages.
+  if (ctx.pipeline_pgid and not j.is_stopped() and ::kill(-ctx.pipeline_pgid, 0) == 0)
+    sig.give_terminal(ctx.pipeline_pgid);
+  else
+    sig.take_terminal();
 
   // $pipestatus: what each stage of the foreground pipeline ended with.
   ctx.pipestatus.clear();

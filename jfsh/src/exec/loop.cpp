@@ -233,6 +233,7 @@ void check_mail(Executor& ex, s::time_t now) {
       // The message is expanded with $_ set to the file.
       ctx.params.assign("_", file, PM_SCALAR);
       Expander expander{ex, ctx};
+      expander.no_process_substitution();
       auto m = expander.scalar(entry.substr(q + 1));
       msg = m ? *m : entry.substr(q + 1);
     }

@@ -2,11 +2,16 @@
 
 #include <cerrno>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
+
+#include <chrono>
 
 #include <jfsh/builtins/builtins.h>
 #include <jfsh/builtins/util.h>
@@ -42,23 +47,65 @@ struct TtyModes {
   }
 };
 
-enum class Got { Char, End, Timeout };
+// Interrupted: Ctrl-C, or a trap that made the shell exit.
+enum class Got : int { Char, End, Timeout, Interrupted };
+
+using Clock = s::chrono::steady_clock;
 
 // One byte from `fd`, waiting at most `timeout` seconds (negative: no
-// limit).
-Got read_byte(int fd, double timeout, char& c) {
+// limit).  With `watch` (a trap is set, or this is the last stage of a
+// pipeline the shell runs itself under job control) the wait also polls
+// the signal self-pipe, so a signal is handled at once
+// (Executor::wait_for_input), with no window before the read: its trap
+// runs (CHLD too), and a stage stopped by Ctrl-Z is continued.  Without a
+// self-pipe (a subshell) a trapped signal's EINTR does the same.  A trap
+// ends a `-t` read as a timeout, as in zsh.  `deadline` is when the
+// timeout ends.  `ready` counts the bytes found waiting (FIONREAD), which
+// are read without polling, as they can't block.
+Got read_byte(ExecContext& ctx, int fd, double timeout, Clock::time_point deadline,
+              bool watch, int& ready, char& c) {
+  auto handle = [&] {
+    bool trapped = ctx.signals.pending_trapped() != 0;
+    if (ctx.executor) ctx.executor->wait_for_input();
+    if (ctx.exiting or ctx.aborting) return Got::Interrupted;
+    return trapped and timeout >= 0 ? Got::Timeout : Got::Char;
+  };
   for (;;) {
-    if (timeout >= 0) {
-      struct pollfd p{fd, POLLIN, 0};
-      int ms = static_cast<int>(s::ceil(timeout * 1000));
-      int n = ::poll(&p, 1, ms);
-      if (n < 0 and errno == EINTR) continue;
+    int wake = watch ? ctx.signals.wake_fd() : -1;
+    int waiting = 0;
+    if (ready > 0) {
+      --ready;
+    } else if ((timeout >= 0 or wake >= 0) and ::ioctl(fd, FIONREAD, &waiting) == 0
+               and waiting > 0) {
+      ready = waiting - 1;
+    } else if (timeout >= 0 or wake >= 0) {
+      struct pollfd p[2]{{fd, POLLIN, 0}, {wake, POLLIN, 0}};
+      int ms = -1;
+      if (timeout >= 0) {
+        auto left = s::chrono::ceil<s::chrono::milliseconds>(deadline - Clock::now());
+        ms = static_cast<int>(s::max<s::int64_t>(left.count(), 0));
+      }
+      int n = ::poll(p, wake >= 0 ? 2 : 1, ms);
+      if ((n < 0 and errno == EINTR)
+          or (n > 0 and wake >= 0 and (p[1].revents & POLLIN) and not p[0].revents)) {
+        if (Got g = handle(); g != Got::Char) return g;
+        continue;
+      }
       if (n == 0) return Got::Timeout;
+      if (::ioctl(fd, FIONREAD, &waiting) == 0 and waiting > 0) ready = waiting - 1;
     }
     ssize_t n = ::read(fd, &c, 1);
-    if (n < 0 and errno == EINTR) continue;
+    if (n < 0 and errno == EINTR) {
+      if (Got g = handle(); g != Got::Char) return g;
+      continue;
+    }
     return n == 1 ? Got::Char : Got::End;
   }
+}
+
+// What `read` returns when Ctrl-C or an exiting trap ended it.
+int interrupted_status(const ExecContext& ctx) {
+  return ctx.aborting ? 128 + SIGINT : 1;
 }
 
 // A number right after the option letter (`-k3`, `-t0.5`), or in the next
@@ -165,31 +212,46 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
   TtyModes modes;
   modes.set(fd, silent, nchars.has_value() or query);
   s::fflush(nullptr);
+  auto deadline = Clock::now() + s::chrono::duration_cast<Clock::duration>(
+                                     s::chrono::duration<double>(timeout < 0 ? 0 : timeout));
+  // A regular file never blocks, so it needs no watching.
+  bool trap_set = false;
+  for (int sig = 1; sig <= MAX_SIG and not trap_set; ++sig)
+    trap_set = ctx.signals.traps().trapped(sig);
+  struct stat st{};
+  bool watch = (trap_set or ctx.pipeline_jid) and ctx.executor
+           and not (::fstat(fd, &st) == 0 and S_ISREG(st.st_mode));
+  int ready = 0;   // bytes known to be waiting on fd (read_byte)
 
   // -q and -k: a fixed number of characters, kept as they are.
   if (query or nchars) {
     s::size_t want = query ? 1 : *nchars;
     str got;
+    bool eof = false;
     while (got.size() < want) {
       char c;
-      Got g = read_byte(fd, timeout, c);
-      if (g != Got::Char) {
-        if (got.empty()) return 1;
+      Got g = read_byte(ctx, fd, timeout, deadline, watch, ready, c);
+      if (g == Got::Interrupted) return interrupted_status(ctx);
+      if (g == Got::Timeout) return 1;
+      if (g == Got::End) {
+        eof = true;
         break;
       }
       got += c;
     }
+    // As in zsh, the end of input still sets the name (`n` for -q, what
+    // was read for -k), with status 2 for -q and 1 for -k.
     str name = names.empty() ? "REPLY" : names[0];
     if (query) {
       bool yes = got == "y" or got == "Y";
       if (auto r = ctx.params.set_scalar(name, yes ? "y" : "n"); not r)
         return builtin_error(cmd, r.error().message);
-      return yes ? 0 : 1;
+      return eof ? 2 : yes ? 0 : 1;
     }
     if (echo_only or echo_too) s::printf("%s\n", got.c_str());
-    if (echo_only) return 0;
+    if (echo_only) return eof ? 1 : 0;
     if (auto r = ctx.params.set_scalar(name, got); not r) return builtin_error(cmd, r.error().message);
-    return 0;
+    return eof ? 1 : 0;
   }
 
   // Characters quoted by a backslash are marked so they don't split.
@@ -198,12 +260,14 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
   bool eof = false;
   for (;;) {
     char c;
-    Got g = read_byte(fd, timeout, c);
+    Got g = read_byte(ctx, fd, timeout, deadline, watch, ready, c);
+    if (g == Got::Interrupted) return interrupted_status(ctx);
     if (g == Got::Timeout) return 1;
     if (g == Got::End) { eof = true; break; }
     if (c == delim) break;
     if (c == '\\' and not raw) {
-      g = read_byte(fd, timeout, c);
+      g = read_byte(ctx, fd, timeout, deadline, watch, ready, c);
+      if (g == Got::Interrupted) return interrupted_status(ctx);
       if (g == Got::Timeout) return 1;
       if (g == Got::End) { eof = true; break; }
       if (c == '\n' and delim == '\n') continue;
@@ -214,7 +278,9 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
     line += c;
     quoted.push_back(false);
   }
-  if (eof and line.empty()) return 1;
+  // At the end of input with nothing read, the names are still set,
+  // empty, as zsh does (status 1).
+  bool nothing = eof and line.empty();
   if (echo_only or echo_too) s::printf("%s\n", line.c_str());
   if (echo_only) return eof ? 1 : 0;
 
@@ -253,6 +319,7 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
   };
   if (array) {
     str name = names.empty() ? "reply" : names[0];
+    if (nothing) fields.emplace_back();   // zsh's array then holds one empty element
     if (auto r = ctx.params.set_array(name, fields); not r) {
       s::fprintf(stderr, "jfsh: read: %s\n", r.error().message.c_str());
       return 1;

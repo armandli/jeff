@@ -207,46 +207,160 @@ unset prefix copy is "no such variable" to `typeset -p`; the module is now
 
 ### M2. Pipelines, redirections, lists, background
 
-**Done.** Implemented in the M2 PR:
-- Pipelines `a | b | c` and `|&` (`WC_PIPE` now encodes `n` plus a per-connector
-  stderr bitmask). All stages fork, dup pipe ends, share one process group, and
-  are collected in order; `PIPEFAIL` picks the worst exit instead of the last.
-  `! pipeline` still comes out of `WC_SUBLIST_NOT`.
-- `&` forks a child that re-enters `exec_sublist`, registers the pid in
-  `JobTable` with `JOB_ASYNC|JOB_NOTIFY`, sets `$!`, and prints `[N] pid` on
-  stderr in interactive shells.
-- Full redirection set (`src/parser/parser.cpp::par_redir`,
-  `src/exec/executor.cpp::apply_redirects`): `<`, `>`, `>>`, `>|`, `<>`, `<<`,
-  `<<-`, `<<<`, `>&N`, `<&N`, `>&-`, `&>`, `&>>`, plus the fd prefix (`2>`,
-  `12<`, `2>&1`). The lexer now bakes digit prefixes into the `TK_REDIR`
-  token's text (bug B10 fixed), recognizes `&>>` and `<&`, and slurps balanced
-  parens for `<(…)` / `>(…)` / `=(…)`.
-- Here-documents: `par_redir` registers the delimiter with
-  `Lexer::register_heredoc` and stores the body in the string table as the
-  `WC_REDIR + WC_STRING` target (since M3 the lexer reads it at the end of the
-  line, see B62).  `<<-` strips leading tabs; quoted delimiters mark the body
-  as literal.
-- `NOCLOBBER`: `>` on an existing file fails with `EEXIST`; `>|` always
-  truncates.
-- fds are saved and restored around builtins via `SavedFds` (RAII).
-- `MULTIOS`: multiple output redirs targeting the same fd fork an in-shell
-  tee helper that reads from a pipe and writes to all targets.
-- Process substitution `<(cmd)`, `>(cmd)`, `=(cmd)`: the parser passes
-  proc-sub tokens through as arguments; `Executor::expand_procsubst` forks
-  subshells, exposes their pipe fds through `/dev/fd/N` (or a tmp path for
-  `=(…)`), and releases the resources after the command finishes.
+**Done.** Implemented in the M2 PR, reworked by the review below:
+- Pipelines `a | b | c` and `|&` (`WC_PIPE` encodes `n` plus a per-connector stderr
+  bitmask). As in zsh every stage but the last forks; the last runs in the shell with
+  its stdin from the last pipe, so `echo x | read v`, `… | while read l` and `echo |
+  f` change the shell, and `echo y | exit 4` exits it. An external command or a
+  subshell there forks into the pipeline's process group and job (`EF_PIPELAST`,
+  `Executor::fork_command`/`wait_command`). The forked stages are always a job, so
+  their statuses survive the SIGCHLD reaper; `$pipestatus` has every stage, and
+  `PIPEFAIL` takes the rightmost failure. `! pipeline` comes out of `WC_SUBLIST_NOT`.
+- `&` forks a child that re-enters `exec_sublist`; a lone pipeline (`a | b &`)
+  instead forks each stage from the shell into one `JOB_ASYNC` job, `$!` is the last
+  stage and an interactive shell prints `[N] pid pid…`, as zsh does.
+- The redirection set (`Parser::par_redir`, `Executor::apply_redirects`): `<`, `>`,
+  `>>`, `<>`, `<<`, `<<-`, `<<<`, `>&N`, `<&N`, `>&-`, `<&-`, `&>`, `&>>`, `>& file`
+  (`&>`), `>>& file` (`&>>`), and the forms that ignore NO_CLOBBER, `>|`, `>!`,
+  `>>|`, `>>!`, `&>|`, `&>!`, `&>>|`, `>&|`, `>&!` (the lexer spells `!` as `|`);
+  the fd prefix is one digit, as in zsh (`2>`, `0<`; `12>f` is the word 12).
+  `N>&file` writes the file to N and 2. A `>&$x` target that is a number dups, `-`
+  closes, anything else is a file; `<&word` is "file number expected", which ends the
+  command line.
+- Redirections are made in order. Files open as zsh's `clobber_open`: under
+  NO_CLOBBER `>` refuses an existing regular file (`file exists: f`) but opens a
+  device or fifo (`>/dev/null`), and an empty one with CLOBBER_EMPTY; `>>` creates
+  nothing unless CLOBBER or APPEND_CREATE. `>&N` refuses the shell's own fds above 9
+  (they are close-on-exec), as zsh does (`N: bad file descriptor`). Errors read as
+  zsh's, after `jfsh: ` (`no such file or directory: f`); a target that expands to
+  nothing fails the command, not the line.
+- `MULTIOS`: the second output redirection to an fd turns it into a pipe to a tee
+  that writes to what the fd went to before and to the new target; it is forked once
+  the redirections are done, or before another redirection reads the fd (`>a 2>&1
+  >b`), and `SavedFds::restore` waits for it, so the next command reads whole files.
+  A pipeline stage's pipe is its first stdout redirection and `|&` a trailing `2>&1`
+  (`EF_STAGEOUT`/`EF_STAGEERR`), so `echo y >c | cat` writes to both and `{ … }
+  2>/dev/null |& cat` sees the errors; `>&2` targets take part too.
+- A command of nothing but redirections runs `$NULLCMD` (`cat`), or `$READNULLCMD`
+  (`more`) for a lone `<file`; `:` under SH_NULLCMD; "redirection with no command"
+  (ending the line) under CSH_NULLCMD, with an empty `$NULLCMD` or after `builtin`,
+  `command`, `noglob`, `-`, `nocorrect`. `NULLCMD`, `READNULLCMD` and `TMPPREFIX`
+  start as in zsh.
+- Here-documents: `par_redir` registers the delimiter with `Lexer::register_heredoc`
+  (the lexer reads the body at the end of the line, B62) after quote removal on it
+  (`'a"b'`, `E\\OF`); any quoting makes the body literal; `<<-` strips leading tabs.
+  The body is written straight into a pipe; one longer than the pipe holds is fed by a
+  forked writer.
+- Process substitution `<(cmd)`, `>(cmd)`, `=(cmd)`: the lexer keeps the command (read
+  as `$(…)` is, past quotes and nested substitutions) in its word, alone or with other
+  text (`--f=<(cmd)`, `<(cmd)x`); the Expander's `Scan` runs it in place
+  (`Executor::procsubst`) when it is unquoted at the word's top level (`=(…)` only at
+  its start), in command words, assignments and typeset arguments, `for`/`foreach`
+  lists, arrays, the `case` subject and a `<<<` target; quoted text and parameter
+  values never are. It gives `/dev/fd/N` (N ≥ 10) or a `$TMPPREFIX…` file; the fd is
+  closed and the file removed once the command (`exec_cmd`/`exec_simple`) is done,
+  after the pipeline for a forked last stage. Without job control `<(…)` and `=(…)`
+  read /dev/null. `< <(cmd)` and `> >(cmd)` are redirections joined to the pipe;
+  `< =(cmd)` reads the file.
+- Pipes, here-document and tee pipes are moved to fds ≥ 10, so pipelines work with
+  the shell's own fd 0 or 1 closed.
 - `EF_NOFORK`: `run_external` honours the flag by `execve`-ing in place.
-- SIGCHLD is handled with a self-pipe.  `SignalManager::init` opens
-  `pipe2(..., O_CLOEXEC|O_NONBLOCK)` and the handler writes one byte; M6 made
-  the pending set atomic and has the executor reap between commands (B22).
+- SIGCHLD is handled with a self-pipe on fds ≥ 10 (`pipe2` with `O_CLOEXEC|O_NONBLOCK`
+  where it exists, `pipe` and `fcntl` on macOS); the handler writes one byte, and the
+  executor reaps between commands (B22).
 - Bug B4 fix: `JobTable::alloc` never returns `id=0` (slot 0 reserved).
 
+**Review fixes** (branch jfsh-m2-review): `<&-` closes fd 0 (it closed stdout);
+process substitution decided by the parser, not by expanded text; the MULTIOS tee
+waited for; NO_CLOBBER for each MULTIOS target, for devices (`>/dev/null`) and for
+`>>` without APPEND_CREATE; one-digit fd prefixes, and `>&N` refusing the shell's own
+fds; the last pipeline stage in the shell; the pipe and `>&N` taking part in MULTIOS,
+and `|&` after the stage's redirections; redirections in order, a failed one reported
+once; the clobber spellings and `>& file`; pipelines with fd 0 or 1 closed; `$!` of a
+background pipeline is its last stage; an empty target fails only the command;
+`$NULLCMD`/`$READNULLCMD` and SH_NULLCMD as `:`; zsh's redirection messages; quote
+removal on here-doc delimiters; here-documents without a fork; `$TMPPREFIX`; `<(…)`
+reading /dev/null; `functions` prints `<&-` and leaves out default fds. Tests in
+`tests/exec_test.cpp` (M2 section), `tests/interactive_test.cpp`
+(`LastPipelineStageRunsInTheShell`) and `tests/lexer_test.cpp` (`ClobberSpellings`);
+the NULLCMD tests in `tests/emulate_test.cpp` now expect zsh's behaviour.
+Round 2: Ctrl-Z on a pipeline whose last stage the shell runs prints "job can't be
+suspended" and continues the stopped stages (`Executor::continue_pipeline_stages`, also
+while `read` blocks, through the signal self-pipe), as zsh; `&|` and `&!` run a list
+in the background without a job (`WC_LIST_DISOWN`); a process substitution inside a
+word (`--f=<(cmd)`, `<(cmd)x`), in an assignment or typeset argument (`x=<(cmd)`), a
+`for`/`foreach` list or an array (`a=(<(cmd))`) runs in place through the Expander
+(only unquoted, at the word's top level), its fd lasting until the command is done;
+`functions` prints `3< <(cmd)` / `> >(cmd)`; `exit` in the last stage doesn't wait
+for the others; `>&N` refuses only fds the shell recorded as its own (by fd and
+inode), so a user's close-on-exec fd above 9 works; `jobs` lists a pipeline a line a
+stage when their states differ, and `wait %N` gives the last stage's status, as zsh.
+Round 3: a process substitution's command ends at its matching `)` past quotes and
+nested substitutions (`<(echo ")")`, `a<(echo ')')b`), in the lexer (`slurp_nested`)
+and the Expander (`find_close`); `read` handles signals while it blocks, so a trap
+runs at once (and, since round 5, ends a `-t` read as zsh does); `case <(cmd) in`, `<<<
+<(cmd)` and `< =(cmd)` (a real file, printed as written) work; an `EF_NOFORK`
+external with an `=(…)` file forks so the file is removed after it.
+Round 4: `read` polls only with a timeout, or for the self-pipe while it is the last
+stage of a pipeline under job control (and never for a regular file); otherwise a
+trapped signal's EINTR has it handle the signals and go on, in subshells too, so
+`while read` without a trap is back at the base speed; at the end of input with nothing read it
+empties its names (an array gets one empty element), as zsh; an `open` that a signal
+interrupts (a fifo waiting for its other end) is retried after handling the signals;
+`$'…\'…'` inside `$(…)`/`<(…)` no longer ends it; an unfinished `<(…`/`>(…`/`=(…`
+is a parse error, and interactively asks for more input.
+Round 5: a signal-interrupted fifo `open` is retried only for an untrapped signal (a
+job ending); a trapped one, Ctrl-C or an exit fails the redirection quietly, so Ctrl-C
+gets the prompt back from `exec 3<fifo`; with a signal trap set, `read` polls the
+self-pipe (race-free, and CHLD traps run too) and a trap ends a `-t` read as a
+timeout, as zsh; Ctrl-C ends `read` with 130; `read -k` at the end of input sets what
+it got (status 1) and `read -q` sets `n` (status 2); `echo`/`print`/`printf` report a
+write error with its own errno (`write error: broken pipe`), writing straight to the
+fd so nothing stays buffered.
+Round 6: when `read` watches the self-pipe (a signal trap is set, or the last stage
+under job control) it asks FIONREAD how many bytes are waiting and reads those without
+polling, so `trap … INT; cat big | while read` costs 0.8-0.9 s for 200000 lines (zsh
+1.05 s, no trap 0.7 s) instead of 1.85 s; output a builtin left in stdio for a fd that
+fails to take it (`type echo >&-`) is dropped when the redirections are undone
+(`SavedFds::restore`), not written to the restored stdout; tests for the write errors.
+
 **Left to other milestones**
-- The builtin `wait` lands as a minimal version (pid list or no args);
-  full `%jobid`, `-n`, `-f` wait for M6.
-- Expansion inside here-doc bodies and command substitution landed with M3.
-- With MULTIOS, zsh concatenates several input redirections to one fd
-  (`cat <a <b`); jfsh still lets the last one win.
+- Errors carry no line number (`jfsh: …` where zsh says `zsh:4: …`), as everywhere
+  in jfsh.
+- With MULTIOS, zsh concatenates several input redirections to one fd (`cat <a <b`,
+  `>o <a <a`); jfsh lets the last one win.
+- Under NO_MULTIOS zsh doesn't glob a redirection target (non-interactive) and writes
+  to `*.t` literally; jfsh globs and reports "ambiguous redirect".
+- Job control with the last stage in the shell: a foreground command run there joins
+  the pipeline's process group; when it is suspended it becomes a job of its own
+  beside the pipeline's (zsh makes them one job). A builtin other than `read` that
+  blocks there (`… | cat`-like builtins) notices a stopped stage only when it
+  returns. A pipeline's forked stages are also a (foreground) job without job
+  control, in the table only while the pipeline runs.
+- Two process substitutions next to each other (`<(a)<(b)`) are two words; zsh makes
+  them one.
+- Comments, here-documents and `case` patterns inside `<(…)` or `$(…)`
+  (`<(echo a # x )⏎…)`, `<(cat <<E⏎a ) b⏎E⏎)`, `<(case x in x) echo y;; esac)`): the
+  lexer counts parentheses (past quotes and substitutions) instead of parsing the
+  command, so a `)` there ends it early (M3's command-substitution lexing). An
+  unfinished `<(…` inside a word (`--f=<(cmd`) is text, not a parse error.
+- With a signal trap set, or under job control in the last stage of a pipeline,
+  `read` checks FIONREAD (and polls when nothing is waiting) once per `read`, so such
+  a `while read` loop is about 15-25% slower than without (still faster than zsh).
+- `echo x >&-` (also `print`, `printf`) is silent with status 0 in zsh; jfsh reports
+  `write error: bad file descriptor` with status 1.
+- With SIGPIPE ignored when the shell starts, zsh's `( … )` pipeline stage still dies
+  of SIGPIPE (`(sleep .3; echo b) | true` gives `$pipestatus` `141 0`); jfsh's keeps
+  it ignored, reports `write error: broken pipe` and gives `1 0` (signal setup in
+  subshells, M6).
+- With MULTIOS, `cat < =(echo a) <<< b` reads both in zsh; jfsh reads the last one
+  (the input-concatenation item above).
+- A MULTIOS tee forked for an external command is the command's child, not the
+  shell's, so the shell doesn't wait for it (zsh doesn't either).
+- The `wait` builtin's `%jobid`, `-n`, `-f` came with M6. `$(<file)` and `{fd}>file`
+  belong to other milestones.
+- `wait $!` after `cmd1 && cmd2 &` and `! cmd &` differ from zsh (zsh reports the pid
+  as not a child, and ignores the `!`).
 
 ### M3. Word expansion [exec/expand], [subst/*]
 
@@ -499,8 +613,8 @@ output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
 **Left**
 - zsh turns the rest of a loop whose command was suspended into a suspended job of its
   own; jfsh ends the command line instead.
-- A background pipeline is one process (the forked shell) in the job table, so
-  `jobs -l` shows one pid where zsh lists each stage.
+- A CHLD trap runs for the stages of a foreground pipeline (`trap … CHLD; (sleep
+  0.3; echo a) | cat`); zsh's doesn't.
 - TRAPS_ASYNC, POSIX_TRAPS, POSIX_JOBS, AUTO_CONTINUE and AUTO_RESUME are not
   implemented; neither are `suspend`, `time` (JOB_TIMED) or `$ZSH_SUBSHELL`.
 - A non-interactive shell keeps finished background jobs in its table until `jobs` or
@@ -579,6 +693,8 @@ expected output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
 - `typeset -T`, `-Z`/`-L`/`-R` padding, `-h`, `-t`; `emulate -l`; `autoload -X`;
   `read -z -c -l -n -p`; `print -z` and `-p`; `fc -p/-P`; `hash -d` (named directories,
   no table yet).
+- `. ./fifo` / `source` of a fifo is refused ("no such file or directory"); zsh reads
+  it.
 - A command that runs in a forked pipeline stage hashes its path in the child, so
   HASH_CMDS doesn't remember it in the shell.
 - zsh errors in special builtins (`set -o nosuch`, `unset readonly`) exit a
@@ -1131,10 +1247,10 @@ Already in place: zsh's full option table (M7) with each emulation's defaults.
   trap-frame plumbing (`push_trap_frame` / `pop_trap_frame(restore)`)
   carries it with a one-line change at the call site.
 - `SH_NULLCMD` / `CSH_NULLCMD`: a command made of nothing but
-  redirections (`> f`, `< f`) now reports "redirection with no command"
-  and returns 1 when either option is on.  Under default zsh the
-  redirection still applies to the current shell as before.  Automatic
-  under `emulate sh` and `emulate ksh` (both set `SH_NULLCMD`).
+  redirections (`> f`, `< f`) reports "redirection with no command"
+  when either option is on.  (The M2 review made this zsh's: SH_NULLCMD
+  runs `:`, CSH_NULLCMD is the error, and by default `$NULLCMD` runs.)
+  Automatic under `emulate sh` and `emulate ksh` (both set `SH_NULLCMD`).
 - 7 new tests in `tests/emulate_test.cpp` cover the zsh default (trap
   survives function return; redirect-only command is accepted), the
   POSIX_TRAPS path, the LOCAL_TRAPS path (as a consistency check), and
@@ -1327,8 +1443,9 @@ expansion list, leaving globbing for the next phases.
   part of the body (`{ … } > log` as its one command) and apply on every
   call; `functions f` prints them after the closing brace.
 - `f() {}` and `function g {}` define functions with an empty body.
-- `< <(cmd)`, `> >(cmd)`, `2> >(cmd)` and `< =(cmd)`: a process
-  substitution as a redirection target joins the fd to the pipe.
+- `< <(cmd)`, `> >(cmd)` and `2> >(cmd)`: a process substitution as a
+  redirection target joins the fd to the pipe.  (Since the M2 review
+  `< =(cmd)` reads the file.)
 - `( … )` that is a pipeline stage or a lone background job runs in that
   already-forked child (EF_NOFORK) instead of forking again; its EXIT
   trap still runs.
@@ -1957,7 +2074,7 @@ Severity:
 | B3 | `StringInputSource`/`FileInputSource::unget(-1)` are no-ops; regression test `Lexer.TrailingOperatorAtEofTerminates`. |
 | B4 | M2: `JobTable::find_free_slot` reserves slot 0 so the first `alloc` returns id 1. |
 | B9 | `Parser::parse` fails on leftover tokens and on an empty error message. |
-| B10 | M2: the lexer bakes digit fd prefixes into the `TK_REDIR` token (`2>`, `12<`, `2>&1`). |
+| B10 | M2: the lexer bakes the one-digit fd prefix into the `TK_REDIR` token (`2>`, `0<`, `2>&1`); `12>f` is the word 12 and `>f`, as in zsh. |
 | B11 | M4: `{ … }` is a brace group run in the current shell; function definitions are `name ()` / `function name`. |
 | B12 | External commands use `execve` with `make_envp()`, which now emits each name once with its innermost value. |
 | B22 | M2/M6: one handler for every caught signal sets a bit in a lock-free atomic pending set and writes a byte to the self-pipe; the executor drains it, reaps and runs traps between commands (`Executor::handle_signals`). |

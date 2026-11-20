@@ -318,6 +318,29 @@ TEST(Echo, EscapesAndOptions) {
             "a\\tb\na\tb\n");
 }
 
+// A failed write is reported with its own errno, lowercased as zsh's, and
+// status 1; nothing stays buffered to come out later.  Output keeps its
+// order with what other commands write.  (zsh is silent, status 0, for a
+// closed stdout: see TODO.md M2.)
+TEST(Echo, WriteErrors) {
+  Shell sh;
+  for (str cmd : {"echo", "print", "printf"}) {
+    auto r = sh.run(cmd + " x >&-; echo st=$?");
+    EXPECT_EQ(r.err, "jfsh: " + cmd + ": write error: bad file descriptor\n");
+    EXPECT_EQ(r.out, "st=1\n");
+  }
+  auto r = sh.run("(trap '' PIPE; sleep 0.2; echo a) | true");
+  EXPECT_NE(r.err.find("write error: broken pipe"), str::npos) << r.err;
+  // Output a builtin buffered for a closed fd is dropped, as zsh's.
+  r = sh.run("type echo >&-; pwd >&-; echo y");
+  EXPECT_EQ(r.out, "y\n");
+  TempDir dir;
+  str f = (dir.path / "f").string();
+  EXPECT_EQ(out(sh, "{ echo -n a; printf b; print -n c; /bin/echo d; type echo; echo e; } > " + f
+                    + "; cat " + f),
+            "abcd\necho is a shell builtin\ne\n");
+}
+
 TEST(Print, Options) {
   Shell sh;
   EXPECT_EQ(out(sh, "print -r 'a\\tb'; print 'a\\tb'"), "a\\tb\na\tb\n");
@@ -367,6 +390,25 @@ TEST(Printf, ArgumentsAndQuoting) {
 }
 
 // ---- read -----------------------------------------------------------------------
+
+// At the end of input with nothing read, `read` still empties its names
+// (status 1), as zsh; a timeout leaves them.
+TEST(Read, EndOfInputEmptiesTheNames) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=5; read x </dev/null; echo \"[$x] $?\"; a=1 b=2; read a b </dev/null; "
+                    "echo \"[$a][$b]\"; REPLY=r; read </dev/null; echo \"[$REPLY]\""),
+            "[] 1\n[][]\n[]\n");
+  EXPECT_EQ(out(sh, "arr=(1 2); read -A arr </dev/null; echo \"${#arr} [$arr]\"; "
+                    "z=9; read -d: z </dev/null; echo \"z[$z]\"; "
+                    "seq 1 3 | while read x; do :; done; echo \"[$x]\""),
+            "1 []\nz[]\n[]\n");
+  EXPECT_EQ(out(sh, "t=9; sleep 1 | { read -t 0.2 t; echo \"t[$t] $?\"; }"), "t[9] 1\n");
+  // -k gives what it got, -q `n` with status 2.
+  EXPECT_EQ(out(sh, "k=z; read -u0 -k 3 k </dev/null; echo \"st=$? [$k]\"; "
+                    "printf ab | { k=z; read -u0 -k 3 k; echo \"st=$? [$k]\"; }; "
+                    "k=z; read -u0 -q k </dev/null; echo \"st=$? [$k]\""),
+            "st=1 []\nst=1 [ab]\nst=2 [n]\n");
+}
 
 TEST(Read, MoreOptions) {
   Shell sh;
@@ -450,8 +492,24 @@ TEST(Exec, LowFdsAreTheUsers) {
   // again after the command.
   auto [o2, rc2] = run_binary("exec 3>&-; cat 3<<<a <&3; echo x >&3");
   EXPECT_EQ(o2.substr(0, 2), "a\n");
-  EXPECT_NE(o2.find("Bad file descriptor"), str::npos) << o2;
+  EXPECT_NE(o2.find("jfsh: 3: bad file descriptor"), str::npos) << o2;
   EXPECT_EQ(rc2, 1);
+}
+
+// A trap runs while `read` blocks, not once it returns.
+TEST(Read, TrapsRunWhileItBlocks) {
+  TempDir dir;
+  str f = (dir.path / "f").string();
+  auto [o, rc] = run_binary("trap \"echo T >" + f + "\" USR1; { kill -USR1 $$; sleep 0.5; "
+                            "[[ -e " + f + " ]] && echo seen; } | { read x; echo got $x; }");
+  EXPECT_EQ(o, "got seen\n");
+  EXPECT_EQ(rc, 0);
+  // A trap ends `read -t` as a timeout would, as zsh.
+  auto [o2, rc2] = run_binary("zmodload zsh/datetime; t=$EPOCHREALTIME; trap : USR1; "
+                              "(sleep 0.3; kill -USR1 $$) & "
+                              "{ read -t 2 x; echo rc=$? $(( EPOCHREALTIME - t < 1 )); } "
+                              "< <(sleep 3)");
+  EXPECT_EQ(o2, "rc=1 1\n");
 }
 
 TEST(Exec, ReplacesTheProcess) {

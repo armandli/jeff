@@ -175,7 +175,9 @@ struct Lexer {
 protected:
   LexToken read_token();
   LexToken read_token_raw();
-  LexToken read_word(int first_char);
+  // `prefix` is word text already read (a process substitution that
+  // more of the word follows).
+  LexToken read_word(int first_char, str prefix = {});
   LexToken read_redir(int first_char);
   LexToken read_heredoc_delimiter();
   LexToken newline_token();

@@ -55,6 +55,13 @@ s::size_t find_close(strv w, s::size_t open) {
   for (s::size_t i = open + 1; i < w.size(); ++i) {
     char ch = w[i];
     if (ch == '\\') { ++i; continue; }
+    if (ch == '$' and i + 1 < w.size() and w[i + 1] == '\'' and o != '[') {
+      // $'…', where `\'` doesn't end it.
+      for (i += 2; i < w.size() and w[i] != '\''; ++i)
+        if (w[i] == '\\') ++i;
+      if (i >= w.size()) return strv::npos;
+      continue;
+    }
     if (ch == '\'' and o != '[') {
       auto e = w.find('\'', i + 1);
       if (e == strv::npos) return e;
@@ -318,6 +325,9 @@ struct Scan {
   // Unquoted parameter values are pattern text, as in a subscript flag's
   // pattern: ${a[(r)$p]}.
   bool glob_values = false;
+  // Scanning a word as written (not the inside of ${…}): an unquoted
+  // `<(…)` / `>(…)`, or `=(…)` at its start, is a process substitution.
+  bool top = false;
 
   Scan(Expander& e, Mode m) : ex{e}, mode{m} {}
 
@@ -466,6 +476,17 @@ struct Scan {
       if (c == '$' or c == '`') {
         if (auto r = substitution(w, i, dq); not r) return r;
         continue;
+      }
+      if (top and not dq and i + 1 < w.size() and w[i + 1] == '('
+          and (c == '<' or c == '>' or (c == '=' and i == 0))
+          and ex.process_substitution()) {
+        // The command runs to the matching `)`, past quotes and nested
+        // substitutions; without one, this is text.
+        if (s::size_t j = find_close(w, i + 1); j != strv::npos) {
+          put(strv(ex.exec().procsubst(c, w.substr(i + 2, j - i - 2))), true);
+          i = j + 1;
+          continue;
+        }
       }
       put(c, dq);
       ++i;
@@ -2105,13 +2126,8 @@ Result<vec<str>> Expander::words(const vec<str>& words) {
   vec<str> out;
   auto& opts = mCtx.opts;
   for (const auto& w : words) {
-    // Process substitution is handled by the executor.
-    if (w.size() >= 3 and w.back() == ')'
-        and (w.starts_with("<(") or w.starts_with(">(") or w.starts_with("=("))) {
-      out.push_back(w);
-      continue;
-    }
     Scan scan{*this, Mode::Word};
+    scan.top = true;
     if (auto r = scan.scan(w); not r) return s::unexpected(r.error());
 
     vec<Field> fields;
@@ -2152,6 +2168,7 @@ Result<vec<str>> Expander::words(const vec<str>& words) {
 
 Result<str> Expander::scalar(strv word, bool assignment) {
   Scan scan{*this, Mode::Scalar};
+  scan.top = true;
   if (auto r = scan.scan(word); not r) return s::unexpected(r.error());
   Field all;
   for (s::size_t k = 0; k < scan.fields.size(); ++k) {
@@ -2171,7 +2188,10 @@ Result<vec<str>> Expander::array_elements(strv src) {
     auto tok = lex.next_token();
     if (tok.is_eof()) break;
     if (tok.is_newline()) continue;
-    if (tok.type != TokType::TK_WORD and tok.type < TokType::TK_IF)
+    // `(<(cmd))`: a process substitution as an element.
+    bool procsubst = tok.type == TokType::TK_REDIR and tok.text.size() > 2
+                 and tok.text[1] == '(' and tok.text.back() == ')';
+    if (tok.type != TokType::TK_WORD and tok.type < TokType::TK_IF and not procsubst)
       return s::unexpected(ShellError{ErrorKind::ParseError,
           "parse error near `" + tok.text + "'"});
     raw.push_back(s::move(tok.text));

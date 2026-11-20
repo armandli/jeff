@@ -78,11 +78,23 @@ TEST(Lexer, Redirections) {
 }
 
 TEST(Lexer, RedirectionsFdPrefixAndNewOps) {
+  // As in zsh only one digit is an fd: `12<in` is the word 12 and `<`.
   auto toks = lex_all("a 2>out 12<in &>>errlog <&0 >&-");
   vec<str> redirs;
   for (const auto& t : toks)
     if (t.type == TokType::TK_REDIR) redirs.push_back(t.text);
-  EXPECT_EQ(redirs, (vec<str>{"2>", "12<", "&>>", "<&", ">&"}));
+  EXPECT_EQ(redirs, (vec<str>{"2>", "<", "&>>", "<&", ">&"}));
+}
+
+// The spellings that ignore NO_CLOBBER end in `|` or `!`, which the token
+// spells `|`; `>>&` is `&>>`.
+TEST(Lexer, ClobberSpellings) {
+  auto toks = lex_all("a >!x >>!x >>|x &>|x &>!x &>>!x >&|x >&!x >>&x >>&|x >-");
+  vec<str> redirs;
+  for (const auto& t : toks)
+    if (t.type == TokType::TK_REDIR) redirs.push_back(t.text);
+  EXPECT_EQ(redirs, (vec<str>{">|", ">>|", ">>|", "&>|", "&>|", "&>>|", ">&|", ">&|",
+                              ">>&", ">>&|", ">"}));
 }
 
 TEST(Lexer, ProcessSubstitutionKeepsBalancedParens) {

@@ -117,6 +117,11 @@ void install_special_params(ExecContext& ctx) {
 
   // xtrace's prefix starts as zsh's; unset, there is none.
   if (not params.lookup("PS4")) params.assign("PS4", str("+%N:%i> "));
+  // What a command of nothing but redirections runs, and where `=(…)`
+  // puts its files, as zsh starts them.
+  if (not params.lookup("NULLCMD"))     params.assign("NULLCMD", str("cat"));
+  if (not params.lookup("READNULLCMD")) params.assign("READNULLCMD", str("more"));
+  if (not params.lookup("TMPPREFIX"))   params.assign("TMPPREFIX", str("/tmp/zsh"));
 }
 
 }  // namespace jfsh

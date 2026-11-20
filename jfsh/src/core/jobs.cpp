@@ -251,12 +251,25 @@ static str pad9(str s) {
 str JobTable::format(const Job& j, bool long_format, bool pgid_only) const {
   char mark = j.job_id == mCurrent ? '+' : j.job_id == mPrevious ? '-' : ' ';
   str prefix = "[" + s::to_string(j.job_id) + "]  " + mark + " ";
-  if (not long_format and not pgid_only)
-    return prefix + pad9(j.status_text()) + "  " + j.text;
-
   bool per_proc = j.procs.size() > 1
                and s::all_of(j.procs.begin(), j.procs.end(),
                              [](const Process& p) { return not p.text.empty(); });
+  // As zsh's printjob: a pipeline whose processes differ in state gets a
+  // line for each, also in the short format, with the states padded alike.
+  bool differ = per_proc
+            and s::any_of(j.procs.begin(), j.procs.end(), [&](const Process& p) {
+                  return proc_status_text(p) != proc_status_text(j.procs.front());
+                });
+  s::size_t width = 9;
+  if (differ)
+    for (const auto& p : j.procs) width = s::max(width, proc_status_text(p).size());
+  auto pad = [&](str t) {
+    if (t.size() < width) t.append(width - t.size(), ' ');
+    return t;
+  };
+  if (not long_format and not pgid_only and not differ)
+    return prefix + pad9(j.status_text()) + "  " + j.text;
+
   if (not per_proc) {
     Pid pid = pgid_only or j.procs.empty() ? j.pgid : j.procs.front().pid;
     return prefix + s::to_string(pid) + " " + pad9(j.status_text()) + "  " + j.text;
@@ -267,9 +280,9 @@ str JobTable::format(const Job& j, bool long_format, bool pgid_only) const {
     const auto& p = j.procs[i];
     if (i > 0) out += '\n';
     out += i == 0 ? prefix : str(prefix.size(), ' ');
-    if (pgid_only) out += i == 0 ? pgid_field : str(pgid_field.size(), ' ');
-    else           out += s::to_string(p.pid) + " ";
-    out += pad9(proc_status_text(p)) + "  " + p.text;
+    if (pgid_only)        out += i == 0 ? pgid_field : str(pgid_field.size(), ' ');
+    else if (long_format) out += s::to_string(p.pid) + " ";
+    out += pad(proc_status_text(p)) + "  " + p.text;
     if (i + 1 < j.procs.size()) out += " | ";
   }
   return out;
