@@ -1256,6 +1256,51 @@ expansion list, leaving globbing for the next phases.
 
 ### M14. Compound short forms, PCRE `=~`, `BASH_REMATCH` [parser/short], [builtins/cond]
 
+**Done** (branch `jfsh-m14-short-forms`):
+- `if cond { … } elif cond { … } else { … }` with no `fi`, mixed with
+  the long form (`if a; then b; elif c { d }`), and the single-command
+  form `if [[ … ]] cmd`.  As in zsh, `{` right after a command word is an
+  argument (`echo {` prints `{`), so `if true {` and `while false {` stay
+  parse errors while `if [[ … ]] {` / `until (( … )) {` work; `}` always
+  closes.  The loop short forms (`while`/`until`/`for`/`for ((;;))`/
+  `select`/`repeat` with `{ }` or one command, `for x in a b; cmd`)
+  already parsed and are now under test.
+- `foreach name… (words) … end` and `foreach name… in words; … end`;
+  `foreach` and `end` are reserved words (`end` alone is a parse error,
+  as in zsh).
+- `f() { … } > log` / `function f { … } 2>&1`: the redirections become
+  part of the body (`{ … } > log` as its one command) and apply on every
+  call; `functions f` prints them after the closing brace.
+- `f() {}` and `function g {}` define functions with an empty body.
+- `< <(cmd)`, `> >(cmd)`, `2> >(cmd)` and `< =(cmd)`: a process
+  substitution as a redirection target joins the fd to the pipe.
+- `( … )` that is a pipeline stage or a lone background job runs in that
+  already-forked child (EF_NOFORK) instead of forking again; its EXIT
+  trap still runs.
+- `[[ s =~ re ]]` under `REMATCH_PCRE` loads `zsh/pcre` and matches with
+  PCRE2 (a bad pattern is a false test); `-pcre-match` now sets
+  `$MBEGIN`/`$MEND`/`$mbegin`/`$mend` too.  Without the option it stays a
+  POSIX ERE.
+- `BASH_REMATCH`: a match fills `$BASH_REMATCH` (whole match, then the
+  groups) and leaves `$MATCH`/`$match`/`$MBEGIN`… as they were; a failed
+  match leaves `$BASH_REMATCH` alone.
+- `[[ -n ]]` (an unquoted `-word` alone) is "unknown condition: -n",
+  status 2, and ends a non-interactive shell like zsh; `[[ $x ]]` with
+  `x=-n` and `[[ "-n" ]]` remain string tests.  An expansion error inside
+  `[[ ]]` now also ends the command line.
+- xtrace prints `[[ … ]]` with the evaluated part of the condition
+  (operands expanded and quoted, short-circuited branches left out) and
+  `(( … ))` with its substitutions done.
+- `test` / `[` with `<` / `>` and `test -o option` were already in place
+  (zsh 5.9 itself rejects them; jfsh keeps the POSIX 2024 behaviour).
+- `-pcre-match` / `-regex-match` were already wired through the module
+  condition table.
+- 13 new tests in `tests/compound_test.cpp`, 9 in `tests/cond_test.cpp`.
+
+**Left**
+- xtrace of `=~` prints `lhs =~ rhs`; zsh prints its internal
+  `-regex-match` / `-pcre-match` form.
+
 **Short compound forms**
 - `if [[ … ]] { … }` / `if cond { … }` with `{ } else { } elif cond { }`.
 - `while cond { … }`, `until cond { … }`, `for name (words) { … }`,

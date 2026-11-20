@@ -287,6 +287,10 @@ protected:
   int exec_subsh   (ExecState& es, WordCode head, ExecFlags);
   int exec_funcdef (ExecState& es, WordCode head);
   int exec_cond    (ExecState& es, WordCode head);
+  int exec_cond_node(ExecState& es, WordCode head);
+  // `[[ s =~ re ]]`: PCRE under REMATCH_PCRE, else a POSIX ERE; with
+  // BASH_REMATCH the match goes to $BASH_REMATCH alone.
+  int cond_rematch(const str& lhs, const str& re);
   int exec_arith   (ExecState& es, WordCode head);
   int exec_always  (ExecState& es, WordCode head);
 
@@ -352,6 +356,8 @@ protected:
   void trace(
     const vec<str>&        args,
     const vec<Assignment>& assigns);
+  // One xtrace line: PS4, then `text`.
+  void trace_text(strv text);
 
 public:
   bool is_builtin(strv name) const noexcept;
@@ -387,6 +393,7 @@ private:
   int            mTrapDepth  = 0;     // traps being run
   int            mStringDepth = 0;   // nested exec_string calls
   bool           mExitTrapRan = false;
+  str*           mCondTrace   = nullptr;   // xtrace text of the [[ ]] being run
   HashTable<str> mCmdHash;     // command name → resolved path
   str            mHashedPath;  // $PATH the hash was built against
   uptr<Zle>              mOwnZle;

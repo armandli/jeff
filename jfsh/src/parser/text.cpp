@@ -675,7 +675,29 @@ str sublist_text(const CompiledProgram& prog, s::size_t pc) {
 
 namespace jfsh {
 
+// A body that is one `{ … } redirs` command: what `f() { … } redirs`
+// compiles to (Parser::wrap_body_redirs).
+static bool redirected_body(const CompiledProgram& body) {
+  const auto& p = body.prog;
+  if (p.size() < 6 or wc_code(p[0]) != WC_LIST
+      or not (wc_list_flags(p[0]) & WC_LIST_END)
+      or 1 + wc_list_skip(p[0]) + 1 != p.size()
+      or wc_code(p[1]) != WC_SUBLIST or wc_sublist_flags(p[1]) != WC_SUBLIST_END
+      or wc_code(p[2]) != WC_PIPE or wc_pipe_count(p[2]) != 1)
+    return false;
+  s::size_t pc = 3;
+  while (pc < p.size() and wc_code(p[pc]) == WC_REDIR) pc += 2;
+  return pc > 3 and pc < p.size() and wc_code(p[pc]) == WC_CURSH;
+}
+
 str function_text(strv names, const CompiledProgram& body) {
+  if (redirected_body(body)) {
+    Pretty pr{body, 0, {}, {}};
+    pr.out = str(names) + " () ";
+    pr.body(0);
+    pr.flush_docs();
+    return pr.out;
+  }
   Pretty pr{body, 0, {}, {}};
   pr.out = str(names) + " () {\n\t";
   pr.body(1);

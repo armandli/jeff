@@ -1129,12 +1129,12 @@ int Executor::exec_repeat(ExecState& es, WordCode head) {
 }
 
 // subsh := WC_SUBSH(0, skip) body, run in a forked copy of the shell.
-// TODO(exec/subsh): with EF_NOFORK (already in a child, e.g. a pipeline
-//   stage) the body could run without another fork.
-int Executor::exec_subsh(ExecState& es, WordCode head, ExecFlags) {
+// With EF_NOFORK (already in a child of its own: a pipeline stage, a lone
+// background job) the body runs in that child without another fork.
+int Executor::exec_subsh(ExecState& es, WordCode head, ExecFlags flags) {
   s::size_t end = es.pc + wc_cmd_skip(head);
   bool jc = job_control();
-  pid_t pid = fork_child(0, true, ChildKind::Subshell);
+  pid_t pid = (flags & EF_NOFORK) ? 0 : fork_child(0, true, ChildKind::Subshell);
   if (pid < 0) {
     es.pc = end;
     return 1;
@@ -1211,36 +1211,87 @@ int Executor::exec_funcdef(ExecState& es, WordCode head) {
 // no such option; `&&` and `||` stop at an error.  Operands are expanded
 // without splitting or globbing; the right side of = == != is a pattern,
 // of =~ an extended regex, and -eq … -ge compare arithmetic expressions.
+static str trace_quote(strv w);
+
+// Under XTRACE the parts of the condition that were evaluated are
+// collected (operands expanded) and printed as one `[[ … ]]` line.
 int Executor::exec_cond(ExecState& es, WordCode head) {
+  if (mCondTrace or not mCtx.opts.xtrace()) return exec_cond_node(es, head);
+  str text;
+  mCondTrace = &text;
+  int rc = exec_cond_node(es, head);
+  mCondTrace = nullptr;
+  trace_text("[[ " + text + " ]]");
+  return rc;
+}
+
+// The right side of = == != as xtrace shows it: the pattern, with blanks
+// escaped.
+static str trace_pattern(strv pat) {
+  str out;
+  for (char c : pat) {
+    if (c == ' ' or c == '\t') out += '\\';
+    out += c;
+  }
+  return out.empty() ? str("''") : out;
+}
+
+// `-x` alone, unquoted: zsh reads it as a condition missing its operand.
+static bool looks_like_cond_op(strv w) noexcept {
+  if (w.size() < 2 or w[0] != '-' or not s::isalpha(static_cast<unsigned char>(w[1])))
+    return false;
+  return s::all_of(w.begin() + 1, w.end(), [](char c) {
+    return s::isalnum(static_cast<unsigned char>(c)) or c == '-';
+  });
+}
+
+int Executor::exec_cond_node(ExecState& es, WordCode head) {
   s::size_t end = es.pc + wc_cmd_skip(head);
   Expander ex{*this, mCtx};
   auto finish = [&](int rc) {
     es.pc = end;
     return rc;
   };
+  // A failed expansion ends the command line, as for a simple command.
   auto fail = [&](const ShellError& e) {
     s::fprintf(stderr, "jfsh: %s\n", e.message.c_str());
+    mCtx.aborting = true;
     return finish(1);
   };
+  auto note = [&](strv s) { if (mCondTrace) *mCondTrace += s; };
   switch (wc_cmd_type(head)) {
     case WC_COND_NOT: {
+      note("! ");
       int rc = exec_cond(es, es.fetch());
       return finish(rc < 2 ? 1 - rc : rc);
     }
     case WC_COND_AND: case WC_COND_OR: {
+      bool is_and = wc_cmd_type(head) == WC_COND_AND;
       int rc = exec_cond(es, es.fetch());
-      if (rc == (wc_cmd_type(head) == WC_COND_AND ? 0 : 1)) rc = exec_cond(es, es.fetch());
+      if (rc == (is_and ? 0 : 1)) {
+        note(is_and ? " && " : " || ");
+        rc = exec_cond(es, es.fetch());
+      }
       return finish(rc);
     }
     case WC_COND_STR: {
-      auto word = ex.scalar(es.fetch_str());
+      strv raw = es.fetch_str();
+      if (looks_like_cond_op(raw)) {
+        s::fprintf(stderr, "jfsh: unknown condition: %.*s\n",
+                   static_cast<int>(raw.size()), raw.data());
+        mCtx.aborting = true;
+        return finish(2);
+      }
+      auto word = ex.scalar(raw);
       if (not word) return fail(word.error());
+      note(trace_quote(*word));
       return finish(word->empty() ? 1 : 0);
     }
     case WC_COND_UNARY: {
       str op(es.fetch_str());
       auto arg = ex.scalar(es.fetch_str());
       if (not arg) return fail(arg.error());
+      note(op + " " + trace_quote(*arg));
       return finish(cond_unary(op, *arg, mCtx, ""));
     }
     default: break;
@@ -1249,6 +1300,7 @@ int Executor::exec_cond(ExecState& es, WordCode head) {
   strv lhs_word = es.fetch_str();
   strv rhs_word = es.fetch_str();
   if (cond_is_numeric(op)) {
+    note(str(lhs_word) + " " + op + " " + str(rhs_word));
     auto l = ex.math(lhs_word);
     if (not l) return fail(l.error());
     auto r = ex.math(rhs_word);
@@ -1263,12 +1315,14 @@ int Executor::exec_cond(ExecState& es, WordCode head) {
   if (op == "=" or op == "==" or op == "!=") {
     auto pat = ex.pattern(rhs_word);
     if (not pat) return fail(pat.error());
+    note(trace_quote(*lhs) + " " + op + " " + trace_pattern(*pat));
     bool match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob()).matches(*lhs);
     return finish(match == (op != "!=") ? 0 : 1);
   }
   auto rhs = ex.scalar(rhs_word);
   if (not rhs) return fail(rhs.error());
-  if (op == "=~") return finish(cond_regex(*lhs, *rhs, mCtx, ""));
+  note(trace_quote(*lhs) + " " + op + " " + trace_quote(*rhs));
+  if (op == "=~") return finish(cond_rematch(*lhs, *rhs));
   if (op == "<")  return finish(*lhs < *rhs ? 0 : 1);
   if (op == ">")  return finish(*lhs > *rhs ? 0 : 1);
   if (op == "-nt" or op == "-ot" or op == "-ef") return finish(cond_file_binary(op, *lhs, *rhs));
@@ -1290,9 +1344,80 @@ int Executor::exec_cond(ExecState& es, WordCode head) {
 
 // arith := WC_ARITH(0, 1) WC_STRING(expr).  Status 0 when the value is
 // non-zero, 1 when it is zero, 2 on an error.
+int Executor::cond_rematch(const str& lhs, const str& re) {
+  static constexpr const char* MATCH_PARAMS[] = {
+    "MATCH", "MBEGIN", "MEND", "match", "mbegin", "mend",
+  };
+  bool bash = mCtx.opts.get(OPT_BASHREMATCH);
+  // With BASH_REMATCH the matchers' $MATCH / $match are put back after.
+  struct Saved {
+    bool     set = false, array = false, integer = false;
+    str      scalar;
+    vec<str> arr;
+  };
+  vec<Saved> saved;
+  if (bash)
+    for (const char* name : MATCH_PARAMS) {
+      Saved sv;
+      if (auto p = mCtx.params.lookup(name); p and p->get().is_set()) {
+        const Param& prm = p->get();
+        sv.set     = true;
+        sv.array   = prm.is_array();
+        sv.integer = prm.is_integer();
+        if (sv.array) sv.arr = prm.array();
+        else          sv.scalar = prm.scalar();
+      }
+      saved.push_back(s::move(sv));
+    }
+  int rc;
+  const CondDef* pcre = nullptr;
+  if (mCtx.opts.get(OPT_REMATCHPCRE)) {
+    pcre = mCtx.modules.find_cond("-pcre-match");
+    if (not pcre and mCtx.modules.load("zsh/pcre", &mCtx))
+      pcre = mCtx.modules.find_cond("-pcre-match");
+  }
+  if (pcre) {
+    rc = pcre->fn(lhs, re, mCtx);
+    if (rc == 2) rc = 1;   // a bad pattern is a false test, as for an ERE
+  } else {
+    rc = cond_regex(lhs, re, mCtx, "");
+  }
+  if (not bash) return rc;
+  if (rc == 0) {
+    vec<str> all;
+    if (auto m = mCtx.params.lookup("MATCH")) all.push_back(m->get().scalar());
+    if (auto m = mCtx.params.lookup("match"); m and m->get().is_array())
+      for (auto& e : m->get().array()) all.push_back(e);
+    (void)mCtx.params.set_array("BASH_REMATCH", s::move(all));
+  }
+  for (s::size_t k = 0; k < saved.size(); ++k) {
+    const char* name = MATCH_PARAMS[k];
+    auto& sv = saved[k];
+    if (not sv.set) {
+      (void)mCtx.params.unset(name);
+    } else if (sv.array) {
+      (void)mCtx.params.set_array(name, s::move(sv.arr));
+    } else {
+      (void)mCtx.params.set_scalar(name, sv.scalar);
+      if (sv.integer)
+        mCtx.params.lookup(name)->get().set(s::strtoll(sv.scalar.c_str(), nullptr, 10));
+    }
+  }
+  return rc;
+}
+
 int Executor::exec_arith(ExecState& es, WordCode) {
   Expander ex{*this, mCtx};
-  auto v = ex.math(es.fetch_str());
+  strv expr = es.fetch_str();
+  str traced;
+  if (mCtx.opts.xtrace()) {
+    // zsh shows the expression with its substitutions done.
+    auto t = ex.heredoc(expr);
+    traced = t ? *t : str(expr);
+    trace_text("(( " + traced + " ))");
+    expr = traced;
+  }
+  auto v = ex.math(expr);
   if (not v) {
     s::fprintf(stderr, "jfsh: %s\n", v.error().message.c_str());
     return 2;
@@ -1975,10 +2100,15 @@ static str trace_quote(strv w) {
 }
 
 // PS4 goes through prompt expansion; zsh's default is `+%N:%i> `.
-void Executor::trace(const vec<str>& args,
-                     const vec<Assignment>&  assigns) {
+void Executor::trace_text(strv text) {
   auto ps4 = mCtx.params.lookup("PS4");
   str line = expand_prompt((ps4 and ps4->get().is_set()) ? ps4->get().scalar() : "+%N:%i> ");
+  s::fprintf(stderr, "%s%.*s\n", line.c_str(), static_cast<int>(text.size()), text.data());
+}
+
+void Executor::trace(const vec<str>& args,
+                     const vec<Assignment>&  assigns) {
+  str line;
   // As zsh: each assignment is followed by a space, the words are
   // separated by one.
   for (const auto& a : assigns) {
@@ -1996,7 +2126,7 @@ void Executor::trace(const vec<str>& args,
     line += trace_quote(w);
     first = false;
   }
-  s::fprintf(stderr, "%s\n", line.c_str());
+  trace_text(line);
 }
 
 vec<str> Executor::builtin_names() const {

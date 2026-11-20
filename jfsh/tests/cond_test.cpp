@@ -226,5 +226,78 @@ TEST(Test, Files) {
             "0101010");
 }
 
+// ---- M14: =~ under REMATCH_PCRE and BASH_REMATCH, [[ -n ]], xtrace --------
+
+TEST(CondM14, RegexSetsMatchArrays) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=abc; [[ $x =~ '(b)(c)' ]] && echo $MATCH $match $MBEGIN $MEND $mbegin $mend"),
+            "bc b c 2 3 2 3 2 3\n");
+}
+
+TEST(CondM14, BashRematchLeavesMatchAlone) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "MATCH=old; setopt bashrematch; [[ abc =~ '(b)(x)?' ]] && "
+                    "print -l -- \"${BASH_REMATCH[@]}\" \"M=$MATCH\" \"m=$match\" ${#BASH_REMATCH}"),
+            "b\nb\n\nM=old\nm=\n3\n");
+}
+
+TEST(CondM14, BashRematchUntouchedOnFailure) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "setopt bashrematch; BASH_REMATCH=(q); [[ abc =~ z ]]; echo $? $BASH_REMATCH"),
+            "1 q\n");
+}
+
+bool have_pcre(Shell& sh) {
+  return sh.run("zmodload zsh/pcre && pcre_compile x").rc == 0;
+}
+
+TEST(CondM14, RematchPcreUsesPcre) {
+  Shell sh;
+  if (not have_pcre(sh)) GTEST_SKIP() << "built without PCRE2";
+  Shell fresh;
+  // The option loads zsh/pcre itself.
+  EXPECT_EQ(out(fresh, "setopt rematchpcre; [[ abc =~ 'b(?=c)' ]] && echo $MATCH $MBEGIN $MEND"),
+            "b 2 2\n");
+  EXPECT_EQ(out(fresh, "setopt rematchpcre; [[ abc =~ '(b)(c)' ]] && echo $match $mbegin $mend"),
+            "b c 2 3 2 3\n");
+  EXPECT_EQ(out(fresh, "setopt rematchpcre bashrematch; [[ abc =~ '(b)(c)' ]] && echo $BASH_REMATCH"),
+            "bc b c\n");
+}
+
+TEST(CondM14, RematchPcreBadPatternIsFalse) {
+  Shell sh;
+  if (not have_pcre(sh)) GTEST_SKIP() << "built without PCRE2";
+  auto r = sh.run("setopt rematchpcre; [[ abc =~ '(b' ]]; echo $?");
+  EXPECT_EQ(r.out, "1\n");
+}
+
+TEST(CondM14, LoneUnaryOperatorIsUnknownCondition) {
+  Shell sh;
+  auto r = sh.run("echo a; [[ -n ]]; echo b");
+  EXPECT_EQ(r.out, "a\n");
+  EXPECT_EQ(r.rc, 2);
+  EXPECT_NE(r.err.find("unknown condition: -n"), str::npos);
+  EXPECT_EQ(sh.run("[[ -n || 1 ]]").rc, 2);
+}
+
+TEST(CondM14, QuotedOrExpandedDashWordIsAString) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=-n; [[ $x ]]; echo $?; [[ \"-n\" ]]; echo $?; [[ -n -n ]]; echo $?"),
+            "0\n0\n0\n");
+}
+
+TEST(CondM14, XtraceShowsEvaluatedCondition) {
+  Shell sh;
+  auto r = sh.run("x=1 y='a b'; PS4='+> '; setopt xtrace; "
+                  "[[ $x == 1 && -n $y ]]; [[ ! -z $x || $y = a* ]]; [[ 1 == 2 && -n x ]]");
+  EXPECT_EQ(r.err, "+> [[ 1 == 1 && -n 'a b' ]]\n+> [[ ! -z 1 ]]\n+> [[ 1 == 2 ]]\n");
+}
+
+TEST(CondM14, XtraceShowsArithmetic) {
+  Shell sh;
+  auto r = sh.run("x=1; PS4='+> '; setopt xtrace; (( x + $x ))");
+  EXPECT_EQ(r.err, "+> ((  x + 1  ))\n");
+}
+
 }  // namespace
 }  // namespace jfsh
