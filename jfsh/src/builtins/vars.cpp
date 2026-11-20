@@ -131,6 +131,7 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
   }
   p->flags = (p->flags | attrs.on) & ~attrs.off;
   if ((p->flags & PM_UNIQUE) and p->is_array()) p->set(unique(p->array()));
+  if (has_value) ctx.params.note_assigned(name);
   return 0;
 }
 

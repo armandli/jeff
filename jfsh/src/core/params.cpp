@@ -76,7 +76,7 @@ optref<Param> ParamTable::lookup_raw(strv name) noexcept {
   for (int i = static_cast<int>(mScopes.size()) - 1; i >= 0; --i) {
     auto it = mScopes[static_cast<s::size_t>(i)].find(str(name));
     if (it != mScopes[static_cast<s::size_t>(i)].end()) {
-      if (hidden_private(it->second, i, current_scope())) continue;
+      if (hidden_private(it->second, i, local_scope())) continue;
       return s::ref(it->second);
     }
   }
@@ -98,13 +98,22 @@ optref<const Param> ParamTable::lookup(strv name) const noexcept {
 
 optref<Param> ParamTable::lookup_local(strv name) noexcept {
   if (mScopes.empty()) return s::nullopt;
-  auto it = mScopes.back().find(str(name));
-  if (it == mScopes.back().end()) return s::nullopt;
-  return s::ref(it->second);
+  for (int i = current_scope(); i >= local_scope(); --i) {
+    auto& scope = mScopes[static_cast<s::size_t>(i)];
+    if (auto it = scope.find(str(name)); it != scope.end()) return s::ref(it->second);
+  }
+  return s::nullopt;
+}
+
+int ParamTable::local_scope() const noexcept {
+  int i = current_scope();
+  for (auto it = mPrefixScopes.rbegin(); it != mPrefixScopes.rend() and *it == i; ++it) --i;
+  return i;
 }
 
 Param& ParamTable::assign(
     str name, ParamValue value, s::uint32_t flags) {
+  note_assigned(name);
   if (mScopes.empty()) mScopes.emplace_back();
   auto& scope = mScopes.back();
   auto& p = scope[name];
@@ -117,6 +126,7 @@ Param& ParamTable::assign(
 
 Result<void> ParamTable::set_scalar(
     strv name, str value, bool append) {
+  note_assigned(name);
   if (auto existing = lookup(name)) {
     Param& p = existing->get();
     if (p.is_readonly())
@@ -146,6 +156,7 @@ Result<void> ParamTable::set_scalar(
 
 Result<void> ParamTable::set_array(
     strv name, vec<str> words, bool append) {
+  note_assigned(name);
   if (auto existing = lookup(name)) {
     Param& p = existing->get();
     if (p.is_readonly())
@@ -198,12 +209,13 @@ Result<void> ParamTable::set_array(
 }
 
 Param& ParamTable::declare_local(str name, s::uint32_t flags) {
+  note_assigned(name);
   if (mScopes.empty()) mScopes.emplace_back();
-  auto& scope = mScopes.back();
+  auto& scope = mScopes[static_cast<s::size_t>(local_scope())];
   auto& p = scope[name];
   p.name  = name;
   p.flags = flags;
-  p.scope = current_scope();
+  p.scope = local_scope();
   return p;
 }
 
@@ -226,11 +238,12 @@ Result<void> ParamTable::unset_element(strv name, const str& key) {
 }
 
 Result<void> ParamTable::unset(strv name) {
+  note_assigned(name);
   for (int i = static_cast<int>(mScopes.size()) - 1; i >= 0; --i) {
     auto& scope = mScopes[static_cast<s::size_t>(i)];
     auto it = scope.find(str(name));
     if (it == scope.end()) continue;
-    if (hidden_private(it->second, i, current_scope())) continue;
+    if (hidden_private(it->second, i, local_scope())) continue;
     if (it->second.is_readonly())
       return s::unexpected(ShellError{ErrorKind::ExecError,
           "read-only variable: " + str(name)});
@@ -247,13 +260,18 @@ Result<void> ParamTable::unset(strv name) {
 }
 
 // mScopes[0] is the global scope and is never popped.
-void ParamTable::push_scope() {
+void ParamTable::push_scope(bool prefix) {
   if (mScopes.empty()) mScopes.emplace_back();
   mScopes.emplace_back();
+  if (prefix) mPrefixScopes.push_back(current_scope());
 }
 
 void ParamTable::pop_scope() {
-  if (mScopes.size() > 1) mScopes.pop_back();
+  if (mScopes.size() <= 1) return;
+  if (mScopes.back().contains("PATH")) note_assigned("PATH");
+  if (not mPrefixScopes.empty() and mPrefixScopes.back() == current_scope())
+    mPrefixScopes.pop_back();
+  mScopes.pop_back();
 }
 
 // The innermost definition of a name decides whether, and with which value,
@@ -273,7 +291,7 @@ void ParamTable::for_each(func<void(const Param&)> fn) const {
   HashTable<const Param*> seen;
   for (int i = static_cast<int>(mScopes.size()) - 1; i >= 0; --i) {
     for (auto const& [name, p] : mScopes[static_cast<s::size_t>(i)]) {
-      if (hidden_private(p, i, current_scope())) continue;
+      if (hidden_private(p, i, local_scope())) continue;
       if (not seen.count(name)) {
         seen[name] = &p;
         refresh(const_cast<Param&>(p));

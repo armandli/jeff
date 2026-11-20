@@ -30,15 +30,8 @@ opt<str> find_sourced(const str& name, bool cwd_first, ExecContext& ctx) {
   if (name.find('/') != str::npos)
     return is_regular_file(name) ? opt<str>{name} : s::nullopt;
   if (cwd_first and is_regular_file(name)) return name;
-  str path_var;
-  if (auto p = ctx.params.lookup("PATH"); p and p->get().is_set()) path_var = p->get().scalar();
-  s::size_t start = 0;
-  while (not path_var.empty() and start <= path_var.size()) {
-    s::size_t end = path_var.find(':', start);
-    if (end == str::npos) end = path_var.size();
-    str dir = path_var.substr(start, end - start);
-    start = end + 1;
-    str candidate = (dir.empty() ? "." : dir) + "/" + name;
+  for (const auto& dir : path_dirs(ctx.params)) {
+    str candidate = dir.empty() ? name : dir + "/" + name;
     if (is_regular_file(candidate)) return candidate;
   }
   return s::nullopt;
