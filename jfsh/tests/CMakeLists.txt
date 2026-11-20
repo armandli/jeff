@@ -25,6 +25,7 @@ add_executable(jfsh_tests
   signals_test.cpp
   startup_test.cpp
   subst_m13_test.cpp
+  subst_m13b_test.cpp
   subst_test.cpp
 )
 target_link_libraries(jfsh_tests PRIVATE

@@ -21,12 +21,9 @@
 #include <jfsh/lexer/input.h>
 #include <jfsh/lexer/lexer.h>
 
-// TODO(subst/param): still missing from ${…}: the subscript flags
-//   ${a[(r)pat]} ${a[(i)pat]}, padding (l:n:) (r:n:), (%) prompt expansion,
-//   (e), (D), (V), (c)/(w) counting, ${^x} / RC_EXPAND_PARAM, ${x:#pat}
-//   array filtering, :s/x/y/ and :& modifiers, and KSH_ARRAYS indexing.
-// TODO(subst/errexit): a failed ${x?} or ${x:?} makes a non-interactive
-//   zsh exit; jfsh only fails the command.
+// TODO(subst/param): still missing from ${…}: named directories for (D)
+//   (M17), the (g), (S), (B)/(E)/(N) match-position flags, and subscript
+//   flags on the left of an assignment (`a[(i)x]=y`).
 
 namespace jfsh {
 
@@ -183,6 +180,7 @@ struct Field {
   vec<bool> lit;
   bool quoted   = false;   // had quotes, so it survives being empty
   bool empty_at = false;   // an empty "$@" landed here
+  bool dropped  = false;   // ${^x} of an empty array: the word goes away
 
   void put(char c, bool l) { text += c; lit.push_back(l); }
   void put(strv s, bool l) { for (char c : s) put(c, l); }
@@ -224,10 +222,22 @@ struct Value {
   bool     array = false;
   vec<str> arr;
   str              scalar;
+  // The words of a ${x:-word} operand with their quoting kept, so that
+  // unquoted pattern characters in `word` still glob.  Only used while
+  // the value's text is still exactly these words.
+  vec<Field> words;
 
   vec<str> list() const {
     if (array) return arr;
     return {scalar};
+  }
+  bool words_current() const {
+    if (words.empty()) return false;
+    auto l = list();
+    if (l.size() != words.size()) return false;
+    for (s::size_t k = 0; k < l.size(); ++k)
+      if (l[k] != words[k].text) return false;
+    return true;
   }
   void make_scalar(str s) { array = false; scalar = s::move(s); arr.clear(); }
   void make_array(vec<str> a) { array = true; arr = s::move(a); scalar.clear(); }
@@ -250,7 +260,50 @@ struct ParamFlags {
   bool count_w = false;        // (w): count words (after split)
   bool dirabbr = false;        // (D): abbreviate $HOME as ~ in result
   bool match_mode = false;     // (M): invert `:#pat` filter to keep matches
+  // M13 Phase 13b additions:
+  bool prompt  = false;        // (%): prompt-escape expansion
+  bool reeval  = false;        // (e): parameter/command/arith re-expansion
+  struct Pad {
+    bool on = false;
+    str  width;                // arithmetic expression
+    str  fill = " ";           // repeated to fill
+    str  once;                 // put once next to the word
+  };
+  Pad pad_l, pad_r;            // (l:n::fill::once:), (r:n::fill::once:)
 };
+
+constexpr s::size_t NONE = static_cast<s::size_t>(-1);
+
+// Reads the delimited argument that starts at f[i + 1] (`:arg:`, `<arg>`,
+// `(arg)`…), leaving `i` on the closing delimiter.
+opt<str> read_delimited(strv f, s::size_t& i) {
+  if (i + 1 >= f.size()) return s::nullopt;
+  char open = f[++i];
+  char close = open == '(' ? ')' : open == '[' ? ']' : open == '{' ? '}'
+             : open == '<' ? '>' : open;
+  auto e = f.find(close, i + 1);
+  if (e == strv::npos) return s::nullopt;
+  str arg(f.substr(i + 1, e - i - 1));
+  i = e;
+  return arg;
+}
+
+// Pads (or truncates) `s` to `w` columns: on the left for (l), keeping
+// the rightmost characters, on the right for (r), keeping the leftmost.
+// `once` goes next to the word, `fill` repeats in the rest of the room.
+str pad_word(const str& s, s::size_t w, const ParamFlags::Pad& p, bool left) {
+  if (s.size() >= w)
+    return left ? s.substr(s.size() - w) : s.substr(0, w);
+  s::size_t room = w - s.size();
+  str once = p.once;
+  if (once.size() > room)
+    once = left ? once.substr(once.size() - room) : once.substr(0, room);
+  s::size_t n = room - once.size();
+  str fill = p.fill.empty() ? str(" ") : p.fill, rep;
+  while (rep.size() < n) rep += fill;
+  rep = left ? rep.substr(rep.size() - n) : rep.substr(0, n);
+  return left ? rep + once + s : s + once + rep;
+}
 
 enum class Mode : int { Word, Scalar, Heredoc };
 
@@ -259,6 +312,12 @@ struct Scan {
   Mode      mode;
   vec<Field> fields{1};
   bool pending_break = false;
+  // After ${^x}, fields[rc_from..] are the copies of the word, one per
+  // element; text that follows goes onto every one of them.
+  s::size_t rc_from = NONE;
+  // Unquoted parameter values are pattern text, as in a subscript flag's
+  // pattern: ${a[(r)$p]}.
+  bool glob_values = false;
 
   Scan(Expander& e, Mode m) : ex{e}, mode{m} {}
 
@@ -268,16 +327,47 @@ struct Scan {
   Field& cur() {
     if (pending_break) {
       pending_break = false;
+      rc_from = NONE;
       fields.emplace_back();
     }
     return fields.back();
   }
-  void put(char c, bool lit) { cur().put(c, lit); }
-  void put(strv s, bool lit) { cur().put(s, lit); }
+  template <typename T>
+  void put(T x, bool lit) {
+    Field& f = cur();
+    if (rc_from == NONE) { f.put(x, lit); return; }
+    for (s::size_t k = rc_from; k < fields.size(); ++k) fields[k].put(x, lit);
+  }
+  void mark_quoted() {
+    cur().quoted = true;
+    if (rc_from != NONE)
+      for (s::size_t k = rc_from; k < fields.size(); ++k) fields[k].quoted = true;
+  }
   void new_field(bool quoted) {
     pending_break = false;
+    rc_from = NONE;
     fields.emplace_back();
     fields.back().quoted = quoted;
+  }
+  // ${^x}: the word so far is copied once per element, each copy getting
+  // that element; with no elements the word is removed.
+  void rc_splice(const vec<str>& parts, bool lit) {
+    cur();
+    s::size_t from = rc_from == NONE ? fields.size() - 1 : rc_from;
+    vec<Field> base(s::make_move_iterator(fields.begin() + static_cast<s::ptrdiff_t>(from)),
+                    s::make_move_iterator(fields.end()));
+    fields.resize(from);
+    rc_from = from;
+    if (parts.empty()) {
+      fields.emplace_back();
+      fields.back().dropped = true;
+      return;
+    }
+    for (auto& b : base)
+      for (auto& p : parts) {
+        fields.push_back(b);
+        fields.back().put(strv(p), lit);
+      }
   }
   // First part continues the current word; each further part starts one.
   void splice(const vec<str>& parts, bool lit, bool quoted) {
@@ -343,7 +433,7 @@ struct Scan {
           continue;
         }
         if (c == '\'') {
-          cur().quoted = true;
+          mark_quoted();
           auto e = w.find('\'', i + 1);
           if (e == strv::npos) e = w.size();
           put(w.substr(i + 1, e - i - 1), true);
@@ -351,13 +441,13 @@ struct Scan {
           continue;
         }
         if (c == '"') {
-          cur().quoted = true;
+          mark_quoted();
           dq = true;
           ++i;
           continue;
         }
         if (c == '$' and i + 1 < w.size() and w[i + 1] == '\'') {
-          cur().quoted = true;
+          mark_quoted();
           s::size_t e = i + 2;
           while (e < w.size() and w[e] != '\'') e += (w[e] == '\\') ? 2u : 1u;
           put(c_escapes(w.substr(i + 2, s::min(e, w.size()) - i - 2)), true);
@@ -616,15 +706,24 @@ struct Scan {
     for (s::size_t i = 0; i < f.size(); ++i) {
       char c = f[i];
       auto delimited = [&]() -> Result<str> {
-        if (i + 1 >= f.size()) return s::unexpected(subst_error("error in flags"));
-        char open = f[++i];
-        char close = open == '(' ? ')' : open == '[' ? ']' : open == '{' ? '}'
-                   : open == '<' ? '>' : open;
-        auto e = f.find(close, i + 1);
-        if (e == strv::npos) return s::unexpected(subst_error("error in flags"));
-        str arg(f.substr(i + 1, e - i - 1));
-        i = e;
-        return arg;
+        auto a = read_delimited(f, i);
+        if (not a) return s::unexpected(subst_error("error in flags"));
+        return *a;
+      };
+      // (l:n::fill::once:): the optional arguments repeat the delimiter.
+      auto padding = [&](ParamFlags::Pad& p) -> Result<void> {
+        auto w = delimited();
+        if (not w) return s::unexpected(w.error());
+        p.on = true;
+        p.width = *w;
+        char open = f[i - w->size() - 1];
+        for (str* arg : {&p.fill, &p.once}) {
+          if (i + 1 >= f.size() or f[i + 1] != open) break;
+          auto a = delimited();
+          if (not a) return s::unexpected(a.error());
+          *arg = *a;
+        }
+        return {};
       };
       switch (c) {
         case 'U': fl.upper = true;
@@ -652,6 +751,12 @@ struct Scan {
         break; case 'c': fl.count_c = true;
         break; case 'w': fl.count_w = true;
         break; case 'D': fl.dirabbr = true;
+        break; case '%': fl.prompt = true;
+        break; case 'e': fl.reeval = true;
+        break; case 'l':
+          if (auto r = padding(fl.pad_l); not r) return s::unexpected(r.error());
+        break; case 'r':
+          if (auto r = padding(fl.pad_r); not r) return s::unexpected(r.error());
         break; case 'f': fl.split = true; fl.split_sep = "\n";
         break; case 'F': fl.join = true; fl.join_sep = "\n";
         break; case 'j': {
@@ -673,6 +778,10 @@ struct Scan {
     if (fl.escapes) {
       fl.join_sep  = c_escapes(fl.join_sep);
       fl.split_sep = c_escapes(fl.split_sep);
+      for (auto* p : {&fl.pad_l, &fl.pad_r}) {
+        p->fill = c_escapes(p->fill);
+        p->once = c_escapes(p->once);
+      }
     }
     return fl;
   }
@@ -703,10 +812,15 @@ struct Scan {
     Value v;
     v.set = true;
     vec<str> out;
-    for (auto& f : sub.fields)
-      if (not f.text.empty() or f.quoted) out.push_back(f.text);
+    vec<Field> words;
+    for (auto& f : sub.fields) {
+      if (f.dropped or (f.text.empty() and not f.quoted)) continue;
+      out.push_back(f.text);
+      words.push_back(s::move(f));
+    }
     if (out.size() <= 1) v.make_scalar(out.empty() ? "" : out[0]);
     else                 v.make_array(s::move(out));
+    if (mode == Mode::Word and not dq) v.words = s::move(words);
     return v;
   }
 
@@ -749,6 +863,11 @@ struct Scan {
       all = sub == "@";
       if (not v.array and v.set) v.make_array({v.scalar});
       return {};
+    }
+    if (not sub.empty() and sub[0] == '(') {
+      auto e = find_close(sub, 0);
+      if (e == strv::npos) return s::unexpected(subst_error("bad subscript"));
+      return subscript_flags(v, sub.substr(1, e - 1), sub.substr(e + 1), name);
     }
     // Associative arrays are indexed by key.
     if (auto p = ctx().params.lookup(name); p and p->get().is_hash()) {
@@ -814,6 +933,144 @@ struct Scan {
     return {};
   }
 
+  // ${a[(flags)expr]}: (r)/(R) the first/last element matching the
+  // pattern `expr`, (i)/(I) its index; (e) compares exactly; (n:N:) takes
+  // the Nth match, (b:N:) starts the search at N.  On an association (r)
+  // and (R) search the values, (i) and (I) the keys, and (k)/(K) use the
+  // keys as patterns against `expr`.  (w) and (s:sep:) index the words of
+  // a scalar.
+  Result<void> subscript_flags(Value& v, strv flags, strv expr, strv name) {
+    char kind = 0;
+    bool exact = false, words = false;
+    str sep, nth_expr, begin_expr;
+    for (s::size_t k = 0; k < flags.size(); ++k) {
+      char c = flags[k];
+      if (strv("rRiIkK").find(c) != strv::npos) { kind = c; continue; }
+      if (c == 'e') { exact = true; continue; }
+      if (c == 'w') { words = true; continue; }
+      if (c == 'n' or c == 'b' or c == 's') {
+        auto a = read_delimited(flags, k);
+        if (not a) return s::unexpected(subst_error("bad subscript flags"));
+        (c == 'n' ? nth_expr : c == 'b' ? begin_expr : sep) = *a;
+        if (c == 's') words = true;
+        continue;
+      }
+      return s::unexpected(subst_error(str("unknown subscript flag: ") + c));
+    }
+    if (words) {
+      // The words of the scalar, then an ordinary numeric subscript.
+      str s = v.array ? str{} : v.scalar;
+      if (v.array)
+        for (s::size_t k = 0; k < v.arr.size(); ++k) s += (k ? " " : "") + v.arr[k];
+      vec<str> ws;
+      if (sep.empty()) {
+        ws = ifs_split(s, ifs());
+      } else {
+        for (s::size_t b = 0;;) {
+          auto e = s.find(sep, b);
+          ws.push_back(s.substr(b, e == str::npos ? str::npos : e - b));
+          if (e == str::npos) break;
+          b = e + sep.size();
+        }
+      }
+      v.make_array(s::move(ws));
+      if (not kind) {
+        bool all = false;
+        return apply_subscript(v, expr, "", all);
+      }
+    }
+    if (not kind) return s::unexpected(subst_error("bad subscript flags"));
+
+    s::int64_t nth = 1;
+    if (not nth_expr.empty()) {
+      auto n = arith(nth_expr);
+      if (not n) return s::unexpected(n.error());
+      nth = *n;
+    }
+    opt<s::int64_t> begin;
+    if (not begin_expr.empty()) {
+      auto b = arith(begin_expr);
+      if (not b) return s::unexpected(b.error());
+      begin = *b;
+    }
+    // The subscript text: parameter values in it are pattern characters
+    // unless quoted, unlike in ${x#$p}.
+    Scan sub{ex, Mode::Scalar};
+    sub.glob_values = true;
+    if (auto r = sub.scan(expr); not r) return s::unexpected(r.error());
+    str text, pat_text;
+    for (s::size_t k = 0; k < sub.fields.size(); ++k) {
+      if (k) { text += ' '; pat_text += ' '; }
+      text += sub.fields[k].text;
+      pat_text += sub.fields[k].as_pattern();
+    }
+    bool extended = opts().extended_glob();
+    auto pat = CompiledPattern::compile(pat_text, false, extended);
+    auto test = [&](const str& s) { return exact ? s == text : pat.matches(s); };
+
+    // Associations.
+    if (auto p = ctx().params.lookup(name); not name.empty() and p and p->get().is_hash()) {
+      auto h = p->get().hash();
+      vec<str> keys;
+      for (auto& [key, _] : h) keys.push_back(key);
+      s::sort(keys.begin(), keys.end());
+      vec<str> out;
+      for (auto& key : keys) {
+        bool hit = kind == 'k' or kind == 'K'
+            ? (exact ? key == text
+                     : CompiledPattern::compile(key, false, extended).matches(text))
+            : test(kind == 'i' or kind == 'I' ? key : h[key]);
+        if (hit) out.push_back(kind == 'i' or kind == 'I' ? key : h[key]);
+      }
+      if (kind == 'R' or kind == 'I' or kind == 'K') {
+        v.set = true;
+        v.make_array(s::move(out));
+      } else {
+        v.set = not out.empty();
+        v.make_scalar(out.empty() ? str{} : out.front());
+      }
+      return {};
+    }
+
+    // Arrays, and scalars by character position.
+    bool ksh = opts().get(OPT_KSH_ARRAYS);
+    s::int64_t n = static_cast<s::int64_t>(v.array ? v.arr.size() : v.scalar.size());
+    auto hit_at = [&](s::int64_t k) {   // k is 1-based
+      if (v.array) {
+        const str& e = v.arr[static_cast<s::size_t>(k - 1)];
+        return kind == 'k' or kind == 'K'
+            ? CompiledPattern::compile(e, false, extended).matches(text)
+            : test(e);
+      }
+      strv rest = strv(v.scalar).substr(static_cast<s::size_t>(k - 1));
+      return exact ? rest.starts_with(text) : pat.match_prefix(rest, false) != strv::npos;
+    };
+    bool backward = kind == 'R' or kind == 'I' or kind == 'K';
+    s::int64_t from = backward ? n : 1;
+    if (begin) {
+      from = *begin + (ksh ? 1 : 0);
+      if (from < 0) from += n + 1;
+      from = s::clamp<s::int64_t>(from, backward ? 0 : 1, backward ? n : n + 1);
+    }
+    s::int64_t found = 0;
+    s::int64_t left = s::max<s::int64_t>(nth, 1);
+    for (s::int64_t k = from; backward ? k >= 1 : k <= n; k += backward ? -1 : 1)
+      if (hit_at(k) and --left == 0) { found = k; break; }
+
+    if (kind == 'i' or kind == 'I') {
+      s::int64_t idx = found ? found : (kind == 'i' ? n + 1 : 0);
+      if (ksh and idx >= 1) --idx;
+      v.set = true;
+      v.make_scalar(s::to_string(idx));
+      return {};
+    }
+    v.set = found != 0;
+    if (not found)    v.make_scalar("");
+    else if (v.array) v.make_scalar(v.arr[static_cast<s::size_t>(found - 1)]);
+    else              v.make_scalar(v.scalar.substr(static_cast<s::size_t>(found - 1), 1));
+    return {};
+  }
+
   static str modify(str s, char m) {
     switch (m) {
       case 'h': {
@@ -845,12 +1102,12 @@ struct Scan {
         return s;
       case 'q': return quote_backslash(s);
       case 'Q': return remove_quotes(s);
-      case 'a': case 'A': {
+      case 'a': case 'A': case 'P': {
         if (s.empty() or s[0] != '/') {
           char buf[PATH_MAX];
           if (::getcwd(buf, sizeof buf)) s = str(buf) + "/" + s;
         }
-        if (m == 'A') {
+        if (m == 'A' or m == 'P') {
           char buf[PATH_MAX];
           if (::realpath(s.c_str(), buf)) return buf;
         }
@@ -920,11 +1177,11 @@ struct Scan {
   Result<void> param(strv t, bool dq) {
     auto r = param_value(t, dq);
     if (not r) return s::unexpected(r.error());
-    auto& [v, keep_separate, split, glob] = *r;
+    auto& [v, keep_separate, split, glob, rc_expand] = *r;
     if (mode != Mode::Word) {
       // Only a pattern (`case`, `[[ = ]]`) looks at what is literal: there
       // ${~x} and GLOB_SUBST make the value's characters active.
-      bool literal = dq or not glob;
+      bool literal = dq or not (glob or glob_values);
       if (v.array) {
         str joined;
         for (s::size_t k = 0; k < v.arr.size(); ++k) {
@@ -938,7 +1195,10 @@ struct Scan {
       return {};
     }
     if (dq) {
-      if (v.array and keep_separate) {
+      if (v.array and keep_separate and rc_expand) {
+        rc_splice(v.arr, true);
+        mark_quoted();
+      } else if (v.array and keep_separate) {
         if (v.arr.empty()) cur().empty_at = true;
         splice(v.arr, true, true);
       } else if (v.array) {
@@ -954,9 +1214,21 @@ struct Scan {
       return {};
     }
     bool lit = not glob;
+    // ${x:-word}: the operand's own words, so `*` in `word` still globs.
+    rc_expand = rc_expand and v.array;
+    if (not rc_expand and v.words_current()) {
+      for (s::size_t k = 0; k < v.words.size(); ++k) {
+        if (k) new_field(v.words[k].quoted);
+        if (v.words[k].quoted) mark_quoted();
+        if (glob) put(strv(v.words[k].text), false);
+        else for (s::size_t c = 0; c < v.words[k].text.size(); ++c)
+          put(v.words[k].text[c], static_cast<bool>(v.words[k].lit[c]));
+      }
+      return {};
+    }
     if (v.array) {
       vec<str> parts;
-      for (auto& e : v.arr) if (not e.empty()) parts.push_back(e);
+      for (auto& e : v.list()) if (rc_expand or not e.empty()) parts.push_back(e);
       if (split) {
         str sep = ifs();
         vec<str> words;
@@ -964,7 +1236,8 @@ struct Scan {
           for (auto& w : ifs_split(e, sep)) words.push_back(w);
         parts = s::move(words);
       }
-      splice(parts, lit, false);
+      if (rc_expand) rc_splice(parts, lit);
+      else           splice(parts, lit, false);
       return {};
     }
     if (split) splice_split(v.scalar, lit);
@@ -977,6 +1250,7 @@ struct Scan {
     bool  keep_separate = false;   // "$@", "${a[@]}", "${(@)a}"
     bool  split         = false;
     bool  glob          = false;
+    bool  rc_expand     = false;   // ${^x}, RC_EXPAND_PARAM
   };
 
   Result<ParamResult> param_value(strv t, bool dq) {
@@ -994,7 +1268,8 @@ struct Scan {
     bool length = false, plus = false;
     bool eq_split = opts().get(OPT_SHWORDSPLIT);
     bool glob = opts().get(OPT_GLOBSUBST);
-    // Prefix operators: ${=x} ${==x} ${~x} ${~~x} ${^x} ${+x} ${#x}.
+    bool rc_expand = opts().get(OPT_RCEXPANDPARAM);
+    // Prefix operators: ${=x} ${==x} ${~x} ${~~x} ${^x} ${^^x} ${+x} ${#x}.
     while (i + 1 < t.size()) {
       char c = t[i], n = t[i + 1];
       bool subject = is_name_start(n) or is_special_param(n) or n == '$' or n == '"'
@@ -1004,6 +1279,7 @@ struct Scan {
         (c == '=' ? eq_split : glob) = not twice;
         i += twice ? 2 : 1;
       } else if (c == '^') {
+        rc_expand = n != '^';
         i += n == '^' ? 2 : 1;
       } else if (c == '+' and subject) {
         plus = true;
@@ -1251,13 +1527,12 @@ struct Scan {
           cut(static_cast<s::int64_t>(v.scalar.size()), b, e);
           v.make_scalar(v.scalar.substr(static_cast<s::size_t>(b), static_cast<s::size_t>(e - b)));
         }
-      } else if (colon and (strv("htreulqQaAs").find(o) != strv::npos or o == 'g')) {
+      } else if (colon and (strv("htreulqQaAcPs").find(o) != strv::npos or o == 'g')) {
         join_dq();
-        // :h :t :r :e :u :l :q :Q :a :A modifiers, chained (`:t:r`), plus
-        // :s/pat/repl/ (and :gs/pat/repl/ for global), the history-style
-        // substitution modifier (M13 Phase 13a).  Also :& for "repeat the
-        // last :s" and :G as an alias for :g (apply next modifier to every
-        // element already).
+        // :h :t :r :e :u :l :q :Q :a :A :c :P modifiers, chained (`:t:r`),
+        // plus :s/pat/repl/ (and :gs/pat/repl/ for global), the
+        // history-style substitution modifier (M13 Phase 13a), and :& for
+        // "repeat the last :s".
         strv mods = op;
         opt<str> last_pat, last_repl;
         while (mods.size() >= 2 and mods[0] == ':') {
@@ -1298,10 +1573,15 @@ struct Scan {
             });
             continue;
           }
-          if (strv("htreulqQaA").find(m) == strv::npos)
+          if (strv("htreulqQaAcP").find(m) == strv::npos)
             return s::unexpected(
                 subst_error("unrecognized modifier `" + str(1, m) + "'"));
-          each(v, [&](const str& s) { return modify(s, m); });
+          if (m == 'c') {
+            // :c — the command's path, as `=cmd` would give.
+            each(v, [&](const str& s) { return ex.exec().find_command(s).value_or(s); });
+          } else {
+            each(v, [&](const str& s) { return modify(s, m); });
+          }
           mods.remove_prefix(2);
         }
         if (not mods.empty()) return s::unexpected(subst_error("bad substitution"));
@@ -1470,6 +1750,22 @@ struct Scan {
       });
     }
 
+    // (%) — prompt escapes, as `print -P` expands them.
+    if (fl.prompt)
+      each(v, [&](const str& s) { return ex.exec().expand_prompt(s); });
+
+    // (e) — parameter, command and arithmetic expansion of the value, with
+    // quotes left as they are.
+    if (fl.reeval) {
+      opt<ShellError> err;
+      each(v, [&](const str& s) {
+        auto r = err ? Result<str>(s) : expand_scalar(s, Mode::Heredoc);
+        if (not r) { err = r.error(); return s; }
+        return *r;
+      });
+      if (err) return s::unexpected(*err);
+    }
+
     // In double quotes a split result is joined again unless (@) is given.
     if (dq and v.array and not res.keep_separate) {
       str sep = ifs_first(), joined;
@@ -1480,9 +1776,39 @@ struct Scan {
       v.make_scalar(joined);
     }
 
+    // (l:n:) and (r:n:) — padding, after double-quoted joining.  With both
+    // the word is split in the middle and each half padded on its side.
+    if (fl.pad_l.on or fl.pad_r.on) {
+      auto width = [&](const ParamFlags::Pad& p) -> Result<s::size_t> {
+        auto n = arith(p.width);
+        if (not n) return s::unexpected(n.error());
+        return static_cast<s::size_t>(s::max<s::int64_t>(*n, 0));
+      };
+      opt<s::size_t> wl, wr;
+      if (fl.pad_l.on) {
+        auto w = width(fl.pad_l);
+        if (not w) return s::unexpected(w.error());
+        wl = *w;
+      }
+      if (fl.pad_r.on) {
+        auto w = width(fl.pad_r);
+        if (not w) return s::unexpected(w.error());
+        wr = *w;
+      }
+      each(v, [&](const str& s) {
+        if (wl and wr) {
+          s::size_t half = s.size() / 2;
+          return pad_word(s.substr(0, half), *wl, fl.pad_l, true)
+               + pad_word(s.substr(half), *wr, fl.pad_r, false);
+        }
+        return wl ? pad_word(s, *wl, fl.pad_l, true) : pad_word(s, *wr, fl.pad_r, false);
+      });
+    }
+
     res.v     = s::move(v);
     res.split = eq_split;
     res.glob  = glob;
+    res.rc_expand = rc_expand;
     return res;
   }
 
@@ -1790,6 +2116,7 @@ Result<vec<str>> Expander::words(const vec<str>& words) {
 
     vec<Field> fields;
     for (auto& f : scan.fields) {
+      if (f.dropped) continue;
       if (opts.get(OPT_IGNOREBRACES)) fields.push_back(s::move(f));
       else brace_expand(f, opts.get(OPT_BRACECCL), fields);
     }
