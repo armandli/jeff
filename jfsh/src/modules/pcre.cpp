@@ -63,17 +63,30 @@ int cond_pcre_match(const str& lhs, const str& rhs, ExecContext& ctx) {
   if (rc >= 0) {
     PCRE2_SIZE* ov = pcre2_get_ovector_pointer(md);
     str whole(lhs.data() + ov[0], ov[1] - ov[0]);
+    // Character offsets, 1-based, as `=~` gives them.
+    auto chars = [&](PCRE2_SIZE n) {
+      s::int64_t c = 0;
+      for (PCRE2_SIZE i = 0; i < n; ++i)
+        if ((static_cast<unsigned char>(lhs[i]) & 0xC0) != 0x80) ++c;
+      return c;
+    };
     (void)ctx.params.set_scalar("MATCH",      whole);
     (void)ctx.params.set_scalar("PCRE_MATCH", whole);
-    vec<str> captures;
+    (void)ctx.params.set_scalar("MBEGIN", s::to_string(chars(ov[0]) + 1));
+    (void)ctx.params.set_scalar("MEND",   s::to_string(chars(ov[1])));
+    vec<str> captures, mbegin, mend;
     for (int k = 1; k < rc; ++k) {
       PCRE2_SIZE start = ov[2 * k];
       PCRE2_SIZE end   = ov[2 * k + 1];
-      if (start == PCRE2_UNSET) captures.emplace_back();
-      else captures.emplace_back(lhs.data() + start, end - start);
+      bool used = start != PCRE2_UNSET;
+      captures.push_back(used ? str(lhs.data() + start, end - start) : str{});
+      mbegin.push_back(used ? s::to_string(chars(start) + 1) : "-1");
+      mend.push_back(used ? s::to_string(chars(end)) : "-1");
     }
     (void)ctx.params.set_array("match",       captures, false);
     (void)ctx.params.set_array("pcre_match",  captures, false);
+    (void)ctx.params.set_array("mbegin",      s::move(mbegin), false);
+    (void)ctx.params.set_array("mend",        s::move(mend), false);
   }
   pcre2_match_data_free(md);
   pcre2_code_free(code);

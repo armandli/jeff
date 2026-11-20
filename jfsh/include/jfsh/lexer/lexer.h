@@ -46,6 +46,7 @@ enum class TokType : s::uint16_t {
   TK_CASE, TK_ESAC,
   TK_SELECT,
   TK_REPEAT,
+  TK_FOREACH, TK_END,
   TK_FUNCTION,
   TK_TIME,
   TK_COPROC,

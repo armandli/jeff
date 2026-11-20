@@ -25,6 +25,8 @@ static const struct { const char* word; TokType type; } KEYWORDS[] = {
   {"esac",     TokType::TK_ESAC},
   {"select",   TokType::TK_SELECT},
   {"repeat",   TokType::TK_REPEAT},
+  {"foreach",  TokType::TK_FOREACH},
+  {"end",      TokType::TK_END},
   {"function", TokType::TK_FUNCTION},
   {"time",     TokType::TK_TIME},
   {"coproc",   TokType::TK_COPROC},

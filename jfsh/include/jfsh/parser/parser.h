@@ -67,6 +67,7 @@ protected:
   bool par_if();
   bool par_while();
   bool par_for();
+  bool par_foreach();
   bool par_case();
   bool par_select();
   bool par_repeat();
@@ -76,6 +77,7 @@ protected:
   bool par_funcdef_body(vec<str> names);
   // `{ list }`, or any single command (`f() echo hi`).
   bool par_function_body();
+  bool wrap_body_redirs(s::size_t start);
   bool par_cond();
   bool par_cond_or();
   bool par_cond_and();

@@ -359,5 +359,100 @@ TEST(Compound, MultiLineScript) {
             "11\n13\n");
 }
 
+// ---- M14: short forms, foreach, function redirections -----------------------
+// Expected output is what zsh 5.9 prints for the same text in a script file.
+
+TEST(CompoundM14, IfShortFormWithBraces) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "if [[ 1 == 1 ]] { echo yes }"), "yes\n");
+  EXPECT_EQ(out(sh, "if (( 0 )) {\n  echo a\n}\necho z"), "z\n");
+}
+
+TEST(CompoundM14, IfShortFormElifElse) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "if [[ 1 == 2 ]] { echo a } elif [[ 1 == 1 ]] { echo b } else { echo c }"),
+            "b\n");
+  EXPECT_EQ(out(sh, "if [[ 1 == 2 ]] { echo a } else { echo c }\necho z"), "c\nz\n");
+}
+
+TEST(CompoundM14, IfLongFormWithShortElif) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "if false; then echo a; elif [[ x == x ]] { echo b }\necho z"), "b\nz\n");
+}
+
+TEST(CompoundM14, IfShortFormSingleCommand) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "if [[ 1 == 1 ]] echo hm"), "hm\n");
+  EXPECT_EQ(out(sh, "if [[ 1 == 2 ]] echo hm; echo after"), "after\n");
+}
+
+TEST(CompoundM14, BraceAfterCommandWordIsAnArgument) {
+  Shell sh;
+  // As in zsh: `if true {` passes `{` to true, so the `if` is incomplete.
+  EXPECT_NE(sh.run("if true { echo yes }").rc, 0);
+  EXPECT_EQ(out(sh, "echo {; echo { a b"), "{\n{ a b\n");
+}
+
+TEST(CompoundM14, ShortLoopForms) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "i=0; until (( i >= 2 )) { echo $i; (( i++ )) }"), "0\n1\n");
+  EXPECT_EQ(out(sh, "for x (a b) { echo $x }"), "a\nb\n");
+  EXPECT_EQ(out(sh, "for x in a b; echo $x"), "a\nb\n");
+  EXPECT_EQ(out(sh, "repeat 2 { echo r }"), "r\nr\n");
+  EXPECT_EQ(out(sh, "for ((i=0;i<2;i++)) echo $i"), "0\n1\n");
+}
+
+TEST(CompoundM14, Foreach) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "foreach x (a b); echo $x; end"), "a\nb\n");
+  EXPECT_EQ(out(sh, "foreach x (a b)\necho $x\nend"), "a\nb\n");
+  EXPECT_EQ(out(sh, "foreach x y in a b c d; echo $x-$y; end"), "a-b\nc-d\n");
+}
+
+TEST(CompoundM14, EndIsReservedInCommandPosition) {
+  Shell sh;
+  EXPECT_NE(sh.run("end").rc, 0);
+  EXPECT_EQ(out(sh, "echo end; for x in end; do echo $x; done"), "end\nend\n");
+}
+
+TEST(CompoundM14, FunctionDefinitionRedirectionsApplyOnEachCall) {
+  Shell sh;
+  TempDir dir;
+  str f = (dir.path / "o").string();
+  EXPECT_EQ(out(sh, "g() { echo one; echo two } > " + f + "; g; g; cat " + f),
+            "one\ntwo\n");
+  EXPECT_EQ(out(sh, "h() { echo e >&2 } 2>&1; h 2>/dev/null"), "e\n");
+}
+
+TEST(CompoundM14, FunctionWithRedirectionsPrintsThem) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "f() { echo body } > /dev/null; functions f"),
+            "f () {\n\techo body\n} > /dev/null\n");
+}
+
+TEST(CompoundM14, EmptyBraceBodyIsAFunction) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "f() {}; f; echo rc=$?; whence -w f"), "rc=0\nf: function\n");
+  EXPECT_EQ(out(sh, "function g {} ; g; echo ok"), "ok\n");
+}
+
+TEST(CompoundM14, ProcessSubstitutionAsRedirectionTarget) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "cat < <(echo ps)"), "ps\n");
+  EXPECT_EQ(out(sh, "while read l; do echo got $l; done < <(printf 'a\\nb\\n')"),
+            "got a\ngot b\n");
+}
+
+TEST(CompoundM14, SubshellInPipelineRunsInTheStageProcess) {
+  Shell sh;
+  // The grandparent of a command run inside `( … )` is the shell itself
+  // when the subshell needs no fork of its own.
+  EXPECT_EQ(out(sh, "( : ; sh -c 'ps -o ppid= -p $PPID' ) | tr -d ' ' | "
+                    "{ read p; [[ $p == $$ ]] && echo nofork }"),
+            "nofork\n");
+  EXPECT_EQ(out(sh, "( trap 'echo sub' EXIT; echo in ) | cat; echo out"),
+            "in\nsub\nout\n");
+}
+
 }  // namespace
 }  // namespace jfsh

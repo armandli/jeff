@@ -11,7 +11,7 @@
 //   $pcre_match   — array of captured groups (1-based)
 //
 // Also arms `[[ string -pcre-match pattern ]]` as a module condition,
-// though the `[[ ]]` wiring for arbitrary module conds lands with M14.
+// which `[[ s =~ re ]]` uses under REMATCH_PCRE (loading the module).
 
 #include <jfsh/modules/module.h>
 
