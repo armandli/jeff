@@ -4,7 +4,7 @@
 #include <jfsh/core/aliases.h>
 #include <jfsh/exec/executor.h>
 
-// zsh/private (M11): `private`, a `local` that the functions it calls
+// zsh/param/private (M11): `private`, a `local` that the functions it calls
 // can't see, as zsh's Src/Modules/param_private.c.  The parameter table
 // does the hiding (PM_PRIVATE, see ParamTable::lookup_raw); this builtin
 // declares the parameters through `local` and marks them.
@@ -39,10 +39,12 @@ int builtin_private(vec<str>& args, ExecContext& ctx) {
 }  // namespace
 
 void register_private_module(ModuleManager& mm) {
-  mm.register_builtin_module("zsh/private", [](ModuleFeatures& out, ExecContext&) {
-    out.builtins.push_back(BuiltinDef{"private", builtin_private, BINF_NONE, 0});
+  mm.register_builtin_module("zsh/param/private", [](ModuleFeatures& out, ExecContext&) {
+    out.builtins.push_back(BuiltinDef{"private", builtin_private, BINF_TYPESET, 0});
     out.feature_names = {"b:private"};
   });
+  // jfsh's earlier name for it.
+  mm.add_alias("zsh/private", "zsh/param/private");
 }
 
 }  // namespace jfsh

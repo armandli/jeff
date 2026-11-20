@@ -183,7 +183,18 @@ failing when the default path lacks the name, `export`/`typeset PATH=` dropping 
 hash, no trace line for a redirection-only command, parent-side hashing with a `PATH=`
 prefix, `hash` entries used under `NO_HASH_CMDS`, prefix assignments before typeset's
 arguments (prefix scopes, `ParamTable::push_scope(true)`), subscripted prefixes
-persisting, typeset arguments traced as assignments.
+persisting, typeset arguments traced as assignments. Round 3: the typeset variants
+(typeset, local, declare, integer, float, private) count as POSIX-special, so their
+prefix assignments stay under `POSIX_BUILTINS`; a failed typeset-argument expansion ends
+the line; one scope guard for every prefix scope of a builtin or function; `typeset -p`
+in a function prints `-g` for a parameter from outside it (a prefix copy keeps the
+original's level); tests for locals and private parameters under a prefix scope.
+Round 4: `command` takes the POSIX-special status away again (prefix assignments before
+`command typeset`/`export` don't stay under `POSIX_BUILTINS`; `builtin` keeps it);
+typeset's arguments are expanded after the command's redirections and prefix
+assignments, in the builtin branch, so `typeset y=${zz?boom} 2>/dev/null` is silent; an
+unset prefix copy is "no such variable" to `typeset -p`; the module is now
+`zsh/param/private`, as in zsh (`zsh/private` stays as an alias).
 
 **Left to other milestones**
 - `typeset name` on an existing parameter doesn't print it, so `x=1 typeset x` shows
@@ -324,8 +335,9 @@ and `tests/compound_test.cpp` (behaviour, with zsh's output as the expected valu
 - `typeset`, `local`, `declare`, `integer`, `float`, `export` and `readonly` are parsed
   as zsh's reserved-word typeset (`WC_TYPESET`), so `local x=$(cmd)` isn't split and
   `local a=(1 2)` makes an array. The builtins handle `-a -A -i -F/-E -g -l -u -r -x` and
-  `+` to turn attributes off. A new local is set but empty, and keeps the export attribute
-  of the parameter it hides. A builtin with no prefix assignments no longer gets its
+  `+` to turn attributes off. A new local is set but empty. Known difference: it keeps
+  the export attribute of the parameter it hides, so `export y=1; g() { local y=5;
+  printenv y; }` prints 5, where zsh's local is not exported. A builtin with no prefix assignments no longer gets its
   own parameter scope, so `local` lands in the function's scope.
 - `read [-rA] [name…]` (needed by `while read` loops): IFS splitting, with the rest of the
   line in the last name, `$REPLY` with no name, backslash handling without `-r`, and
@@ -1056,7 +1068,7 @@ remaining module, each registered but not auto-loaded (`zmodload NAME`).
 - Data: `zsh/mapfile` (`$mapfile` read / write / `+=` / unset per key,
   keys = regular files in `$PWD`); `zsh/db/gdbm` (`ztie -d db/gdbm -f
   file [-r]`, `zuntie [-u]`, `zgdbmpath`; GDBM when found, else the
-  system ndbm, else stubs); `zsh/private` (`private`, PM_PRIVATE).
+  system ndbm, else stubs); `zsh/param/private` (`private`, PM_PRIVATE; `zsh/private` is an alias).
   (`zsh/regex` was done in M10 polish.)
 - Process and ZLE: `zsh/zpty` (replaces the core "not implemented"
   stub: `-e`, `-b`, `-d`, `-w [-n]`, `-r [-mt] [param [pattern]]`, `-t`,

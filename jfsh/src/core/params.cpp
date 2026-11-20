@@ -66,7 +66,7 @@ static void refresh(Param& p) noexcept {
   --depth;
 }
 
-// A private parameter (zsh/private) is seen only from the scope that
+// A private parameter (zsh/param/private) is seen only from the scope that
 // declared it: a function it calls looks straight through to the outer one.
 static bool hidden_private(const Param& p, int scope, int current) noexcept {
   return (p.flags & PM_PRIVATE) and scope != current;
@@ -103,6 +103,20 @@ optref<Param> ParamTable::lookup_local(strv name) noexcept {
     if (auto it = scope.find(str(name)); it != scope.end()) return s::ref(it->second);
   }
   return s::nullopt;
+}
+
+bool ParamTable::in_current_scope(const Param& p) const noexcept {
+  if (mScopes.empty()) return false;
+  auto it = mScopes.back().find(p.name);
+  return it != mScopes.back().end() and &it->second == &p;
+}
+
+bool ParamTable::in_prefix_scope(const Param& p) const noexcept {
+  for (int i : mPrefixScopes) {
+    const auto& scope = mScopes[static_cast<s::size_t>(i)];
+    if (auto it = scope.find(p.name); it != scope.end() and &it->second == &p) return true;
+  }
+  return false;
 }
 
 int ParamTable::local_scope() const noexcept {

@@ -215,6 +215,82 @@ TEST(Exec, PrefixAssignmentsComeBeforeTypesetArguments) {
             "[1] [1]\n");
 }
 
+// The typeset variants are POSIX-special in zsh: under POSIX_BUILTINS the
+// assignments in front of them stay.
+TEST(Exec, PrefixAssignmentsBeforeTypesetPersistUnderPosixBuiltins) {
+  Shell sh;
+  EXPECT_EQ(sh.run("setopt posixbuiltins; x=1 typeset q; y=1 local r; z=1 declare t;"
+                   " echo \"[$x$y$z]\"").out, "[111]\n");
+  EXPECT_EQ(sh.run("setopt posixbuiltins; unset x y; x=1 typeset y=$x; echo \"[$x$y]\"").out,
+            "[11]\n");
+  EXPECT_EQ(sh.run("zmodload zsh/param/private; setopt posixbuiltins; unset x;"
+                   " f() { x=1 private q; echo \"[$x]\"; }; f").out, "[1]\n");
+}
+
+// `command` takes away the special status; `builtin` doesn't.
+TEST(Exec, CommandMakesASpecialBuiltinOrdinary) {
+  Shell sh;
+  EXPECT_EQ(sh.run("setopt posixbuiltins; unset x x2 x3 y; x=1 command typeset q;"
+                   " x2=1 command export q2; x3=1 command typeset y=$x3;"
+                   " echo \"[$x$x2$x3$y]\"").out, "[]\n");
+  EXPECT_EQ(sh.run("setopt posixbuiltins; unset x; x=1 builtin export q; echo \"[$x]\"").out,
+            "[1]\n");
+}
+
+// typeset's arguments are expanded after the command's redirections.
+TEST(Exec, TypesetArgumentsExpandAfterRedirections) {
+  Shell sh;
+  auto r = sh.run("x=1 typeset y=${zz?boom} 2>/dev/null; echo after");
+  EXPECT_EQ(r.out, "");
+  EXPECT_EQ(r.err, "");
+  r = sh.run("f() { x=1 local y=${zz?boom} 2>/dev/null; echo in; }; f; echo out");
+  EXPECT_EQ(r.out, "");
+  EXPECT_EQ(r.err, "");
+}
+
+// An unset prefix copy is gone for typeset -p.
+TEST(Exec, UnsetPrefixCopyIsNoSuchVariable) {
+  Shell sh;
+  auto r = sh.run("unset x; f() { unset x; typeset -p x; echo rc=$?; }; x=1 f");
+  EXPECT_EQ(r.out, "rc=1\n");
+  EXPECT_EQ(r.err, "jfsh: typeset: no such variable: x\n");
+  EXPECT_EQ(sh.run("y=0; h() { unset y; typeset -p y; echo rc=$?; }; y=1 h 2>/dev/null").out,
+            "rc=1\n");
+}
+
+// A failed expansion in a typeset argument ends the command line.
+TEST(Exec, FailedTypesetArgumentExpansionEndsTheLine) {
+  Shell sh;
+  auto r = sh.run("x=1 typeset y=${zz?boom}; echo after");
+  EXPECT_EQ(r.out, "");
+  EXPECT_EQ(r.err, "jfsh: zz: boom\n");
+  EXPECT_EQ(sh.run("f() { typeset y=${zz?boom}; echo in; }; f; echo out").out, "");
+}
+
+// local/typeset in a function or eval run with prefix assignments declare
+// in the function, not in the prefix scope; a private parameter is seen
+// through a prefix scope but not by a function called from it.
+TEST(Exec, LocalsUnderAPrefixScope) {
+  Shell sh;
+  EXPECT_EQ(sh.run("f() { local y=L; typeset z=Z; echo $x$y$z; }; x=1 f;"
+                   " echo \"[$x$y$z]\"").out, "1LZ\n[]\n");
+  EXPECT_EQ(sh.run("f() { x=1 eval 'local w=2'; echo \"[$w]\"; }; f").out, "[2]\n");
+  EXPECT_EQ(sh.run("f() { zmodload zsh/param/private; private p=1; x=2 eval 'echo \"[$p]\"';"
+                   " x=2 g; }; g() { echo \"g[$p]\"; }; f").out, "[1]\ng[]\n");
+}
+
+// In a function, typeset -p shows a parameter from outside it with -g; a
+// prefix copy counts as the parameter it stands for.
+TEST(Exec, TypesetPrintMarksOuterParametersGlobal) {
+  Shell sh;
+  EXPECT_EQ(sh.run("unset x; f() { x=1 typeset -p x; }; f").out, "typeset -g x=1\n");
+  EXPECT_EQ(sh.run("x=1; f() { typeset -p x; }; f").out, "typeset -g x=1\n");
+  EXPECT_EQ(sh.run("f() { local y=2; y=3 typeset -p y; }; f").out, "typeset y=3\n");
+  EXPECT_EQ(sh.run("integer i=3; f() { i=7 typeset -p i; }; f").out, "typeset -g -i i=7\n");
+  EXPECT_EQ(sh.run("export E=1; f() { typeset -p E; }; f").out, "export E=1\n");
+  EXPECT_EQ(sh.run("unset x; x=1 typeset -p x").out, "typeset x=1\n");
+}
+
 // `a[i]=x` in front of a builtin or function changes the parameter itself;
 // in front of an external command (made in the child) it doesn't.
 TEST(Exec, SubscriptedPrefixAssignmentPersists) {

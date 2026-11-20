@@ -1,6 +1,6 @@
 // Tests for M11 Phase 11b: the rest of the specialized modules
 // (zsh/net/tcp, zsh/zftp, zsh/termcap, zsh/terminfo, zsh/curses,
-// zsh/nearcolor, zsh/mapfile, zsh/db/gdbm, zsh/private, zsh/zpty,
+// zsh/nearcolor, zsh/mapfile, zsh/db/gdbm, zsh/param/private, zsh/zpty,
 // zsh/zprof, zsh/attr, zsh/cap, zsh/compctl, zsh/clone, zsh/watch,
 // zsh/newuser; zsh/deltochar is in editor_test.cpp) and the core support
 // they needed: subscripted assignment and per-element parameter handlers.
@@ -420,13 +420,13 @@ TEST(ModulesM11, ZtieRejectsOtherTypes) {
 }
 
 // ---------------------------------------------------------------------------
-// zsh/private
+// zsh/param/private
 // ---------------------------------------------------------------------------
 
 TEST(ModulesM11, PrivateHiddenFromCallees) {
   Shell sh;
   auto r = sh.run(
-      "zmodload zsh/private\n"
+      "zmodload zsh/param/private\n"
       "p=outer\n"
       "g() { print -r -- g:$p; p=set-by-g }\n"
       "f() { private p=inner; g; print -r -- f:$p }\n"
@@ -438,7 +438,7 @@ TEST(ModulesM11, PrivateHiddenFromCallees) {
 TEST(ModulesM11, PrivateArraysAndCalleeLocals) {
   Shell sh;
   auto r = sh.run(
-      "zmodload zsh/private\n"
+      "zmodload zsh/param/private\n"
       "g() { local a=(g); print -r -- g:$a }\n"
       "f() { private a=(1 2 3); g; print -r -- f:$#a }\n"
       "f; print -r -- top:${a-unset}");

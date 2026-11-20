@@ -39,7 +39,7 @@ enum ParamFlags : s::uint32_t {
   PM_HIDE      = 0x0000'2000,
   PM_UNSET     = 0x0000'4000,
   PM_EFLOAT    = 0x0000'8000,   // float shown in exponent form (typeset -E)
-  // zsh/private (M11): visible only in the scope that declared it, not to
+  // zsh/param/private (M11): visible only in the scope that declared it, not to
   // the functions that scope calls.
   PM_PRIVATE   = 0x0001'0000,
 };
@@ -186,6 +186,10 @@ struct ParamTable {
   }
   // The innermost scope that isn't a prefix scope.
   int local_scope() const noexcept;
+  // Whether `p` lives in the innermost scope.
+  bool in_current_scope(const Param& p) const noexcept;
+  // Whether `p` lives in a command's prefix scope.
+  bool in_prefix_scope(const Param& p) const noexcept;
 
   // Counts assignments to $PATH (and scopes ending with one), even those
   // that keep its text, so the command hash can be dropped on each, as zsh

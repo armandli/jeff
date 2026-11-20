@@ -182,8 +182,15 @@ static str trace_quote(strv w);
 static str trace_assigns(const vec<Assignment>& assigns);
 static int trace_fd(const SavedFds& saved);
 static void write_trace(str line, int fd);
+static bool posix_special(const BuiltinDef& def);
 static bool is_executable_file(const str& path);
 static Result<str> search_path(strv name, const vec<str>& dirs, HashTable<str>* hash);
+
+// zsh's POSIX-special builtins (BINF_PSPECIAL): the special ones and the
+// typeset variants, whose prefix assignments stay under POSIX_BUILTINS.
+static bool posix_special(const BuiltinDef& def) {
+  return def.flags & (BINF_SPECIAL | BINF_TYPESET);
+}
 
 int Executor::exec_simple(vec<str> args,
                           vec<Assignment>  assigns,
@@ -207,47 +214,27 @@ int Executor::exec_simple(vec<str> args,
     mCtx.aborting = true;
     return 1;
   }
-  // zsh makes the assignments in front of typeset and its variants before
-  // it expands their `name=value` arguments (`x=1 typeset y=$x`); they
-  // last while it runs (persist, for a special one, under POSIX_BUILTINS).
+  // The prefix scope of a builtin or function, popped when the command is
+  // done.
   struct ScopeGuard {
     ParamTable* params = nullptr;
     ~ScopeGuard() { if (params) params->pop_scope(); }
-  } typeset_scope;
-  bool assigned = false;
-  str  assigned_ps4;
-  if (not typeset_args.empty() and not assigns.empty()) {
-    auto word = s::find_if(args.begin(), args.end(), [](const str& w) {
-      return w != "builtin" and w != "command" and w != "exec" and w != "-"
-         and w != "nocorrect";
-    });
-    auto def = word == args.end() ? s::nullopt : Builtins.find(*word);
-    bool global = def and (def->get().flags & BINF_SPECIAL)
-              and mCtx.opts.get(OPT_POSIXBUILTINS);
-    if (mCtx.opts.xtrace()) assigned_ps4 = trace_prompt();
-    if (not global) {
-      mCtx.params.push_scope(/*prefix=*/true);
-      typeset_scope.params = &mCtx.params;
-    }
-    opt<int> assign_status;
-    if (apply_assigns(assigns, global ? AssignTo::Shell : AssignTo::Prefix,
-                      assign_status) != 0) {
-      mCtx.aborting = true;
-      return 1;
-    }
-    assigned = true;
-  }
+  } prefix_scope;
   // typeset's `name=value` arguments: a scalar is passed as `name=value`; an
   // array is passed as `name`, and given its elements once the builtin has
-  // declared it.
+  // declared it.  As in zsh they are expanded once the command's
+  // redirections are applied and the assignments in front of it are made
+  // (`x=1 typeset y=$x`): see finish_typeset below.
   vec<Assignment> typeset_arrays;
   str typeset_traced;   // xtrace shows them as assignments
-  if (not typeset_args.empty()) {
+  auto expand_typeset_args = [&] {
     Expander ex{*this, mCtx};
     for (auto& a : typeset_args) {
       if (auto r = expand_assignment(ex, a); not r) {
         s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
-        return 1;
+        // As any expansion error, this ends the command line.
+        mCtx.aborting = true;
+        return false;
       }
       typeset_traced += ' ' + trace_assigns({a});
       typeset_traced.pop_back();
@@ -258,7 +245,8 @@ int Executor::exec_simple(vec<str> args,
         args.push_back(a.name + (a.append ? "+=" : "=") + a.value);
       }
     }
-  }
+    return true;
+  };
   auto psubst = expand_procsubst(args);
   struct PSubstGuard {
     Executor* exec;
@@ -273,6 +261,7 @@ int Executor::exec_simple(vec<str> args,
   bool replace = false;
   bool clear_env = false;
   bool command_p = false;
+  bool via_command = false;   // run through `command`: no longer special
   str  argv0;
   while (not args.empty()) {
     const str& w = args[0];
@@ -283,6 +272,7 @@ int Executor::exec_simple(vec<str> args,
       break;
     }
     if (w == "command" and only == Only::Any) {
+      via_command = true;
       s::size_t i = 1;
       bool lookup = false;
       bool default_path = false;
@@ -350,14 +340,22 @@ int Executor::exec_simple(vec<str> args,
   bool tracing = mCtx.opts.xtrace();
   str  traced;
   if (tracing) {
-    for (s::size_t i = 0; i + typeset_args.size() < args.size(); ++i) {
+    for (const auto& w : args) {
       if (not traced.empty()) traced += ' ';
-      traced += trace_quote(args[i]);
+      traced += trace_quote(w);
     }
-    traced += typeset_traced;
-    if (assigns.empty() and not args.empty()) trace_text(traced);
+    if (assigns.empty() and typeset_args.empty() and not args.empty()) trace_text(traced);
   }
   const str* child_trace = tracing and not assigns.empty() ? &traced : nullptr;
+  // Expands typeset's arguments and adds them to the trace, which (without
+  // assignments in front) is printed here, to `fd`.
+  auto finish_typeset = [&](int fd) {
+    if (typeset_args.empty()) return true;
+    if (not expand_typeset_args()) return false;
+    traced += typeset_traced;
+    if (tracing and assigns.empty()) trace_text(traced, fd);
+    return true;
+  };
   // `command -p`: the name is looked up in the system's default $PATH.
   if (command_p and not args.empty() and args[0].find('/') == str::npos) {
     vec<str> dirs{"/usr/bin", "/bin", "/usr/sbin", "/sbin"};
@@ -413,16 +411,16 @@ int Executor::exec_simple(vec<str> args,
     s::fflush(nullptr);
     SavedFds saved;
     if (not redirs.empty() and not apply_redirects(redirs, saved)) return 1;
-    if (assigned) assigns.clear();
+    if (not finish_typeset(trace_fd(saved))) return 1;
     int rc = exec_replace(args, s::move(assigns), argv0, clear_env, child_trace,
                           trace_fd(saved));
     saved.commit();
     return rc;
   }
-  if (assigned and only == Only::External)
-    return run_external(args, {}, redirs, flags, nullptr);
-  if (only == Only::External)
+  if (only == Only::External) {
+    if (not finish_typeset(STDERR_FILENO)) return 1;
     return run_external(args, assigns, redirs, flags, child_trace);
+  }
 
   // Functions come before builtins; an autoloaded one is loaded on its
   // first call.  Aliases were expanded by the parser.
@@ -445,9 +443,10 @@ int Executor::exec_simple(vec<str> args,
     s::fprintf(stderr, "jfsh: no such builtin: %s\n", args[0].c_str());
     return 1;
   }
-  if (fn == mCtx.functions.end() and not defp)
-    return run_external(args, assigned ? vec<Assignment>{} : assigns, redirs, flags,
-                        assigned ? nullptr : child_trace);
+  if (fn == mCtx.functions.end() and not defp) {
+    if (not finish_typeset(STDERR_FILENO)) return 1;
+    return run_external(args, assigns, redirs, flags, child_trace);
+  }
 
   SavedFds saved;
   if (not redirs.empty()) {
@@ -458,29 +457,38 @@ int Executor::exec_simple(vec<str> args,
     if (not apply_redirects(redirs, saved)) return 1;
   }
   // Assignments in front of a function are exported to what it runs.  zsh
-  // keeps those in front of a special builtin only under POSIX_BUILTINS;
-  // otherwise they last while the builtin runs.  Without any, no scope is
-  // pushed, so `local` declares in the caller's scope.
+  // keeps those in front of a special builtin (or a typeset variant) only
+  // under POSIX_BUILTINS; otherwise they last while the builtin runs.
+  // Without any, no scope is pushed, so `local` declares in the caller's
+  // scope.
   bool is_fn  = fn != mCtx.functions.end();
-  bool global = not is_fn and (defp->flags & BINF_SPECIAL)
+  bool global = not is_fn and not via_command and posix_special(*defp)
             and mCtx.opts.get(OPT_POSIXBUILTINS);
-  bool scoped = not assigns.empty() and not global and not assigned;
-  if (scoped) mCtx.params.push_scope(/*prefix=*/true);
+  if (not assigns.empty() and not global) {
+    mCtx.params.push_scope(/*prefix=*/true);
+    prefix_scope.params = &mCtx.params;
+  }
   int rc = 0;
   if (not assigns.empty()) {
-    str ps4 = assigned ? assigned_ps4 : tracing ? trace_prompt() : str{};
+    str ps4 = tracing ? trace_prompt() : str{};
     opt<int> assign_status;
-    if (not assigned)
-      rc = apply_assigns(assigns,
-          global ? AssignTo::Shell : is_fn ? AssignTo::Exported : AssignTo::Prefix,
-          assign_status);
+    rc = apply_assigns(assigns,
+        global ? AssignTo::Shell : is_fn ? AssignTo::Exported : AssignTo::Prefix,
+        assign_status);
+    // A readonly name in front of a builtin or function ends the command
+    // line, as zsh's errflag does.
+    if (rc != 0) {
+      if (tracing) write_trace(ps4 + trace_assigns(assigns), trace_fd(saved));
+      mCtx.aborting = true;
+      return rc;
+    }
+    if (not finish_typeset(trace_fd(saved))) return 1;
     // As zsh: PS4 and the assignments, then PS4 again before the words.
     if (tracing)
       write_trace(ps4 + trace_assigns(assigns) + trace_prompt() + traced,
                   trace_fd(saved));
-    // A readonly name in front of a builtin or function ends the command
-    // line, as zsh's errflag does.
-    if (rc != 0) mCtx.aborting = true;
+  } else if (not finish_typeset(trace_fd(saved))) {
+    return 1;
   }
   if (rc == 0) {
     if (is_fn) {
@@ -500,7 +508,6 @@ int Executor::exec_simple(vec<str> args,
       }
     }
   }
-  if (scoped) mCtx.params.pop_scope();
   s::fflush(nullptr);
   return rc;
 }
@@ -2121,14 +2128,19 @@ static Result<void> prefix_param(ParamTable& params, const str& name, bool expor
   if (outer and outer->get().is_readonly())
     return s::unexpected(ShellError{ErrorKind::ExecError, "read-only variable: " + name});
   Param* p = nullptr;
-  if (outer and outer->get().scope == params.current_scope()) {
+  if (outer and params.in_current_scope(outer->get())) {
     p = &outer->get();   // made by an earlier assignment of this command
   } else if (outer) {
     const Param& o = outer->get();
+    int level = o.scope;
     p = &params.assign(name, o.value,
                        o.flags & ~(PM_READONLY | PM_SPECIAL | PM_PRIVATE | PM_TIED));
+    // It stands for the original, so `typeset -p` in a function says -g
+    // just when it would for that one.
+    p->scope = level;
   } else {
     p = &params.assign(name, str{}, PM_SCALAR | PM_UNSET);
+    p->scope = 0;
   }
   if (exported) p->flags |= PM_EXPORTED;
   return {};

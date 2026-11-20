@@ -1,6 +1,6 @@
 #ifndef JFSH_MODULES_PRIVATE_H
 #define JFSH_MODULES_PRIVATE_H
-// jfsh/modules/private.h — the `zsh/private` module (M11).
+// jfsh/modules/private.h — the `zsh/param/private` module (M11).
 //
 // Contributes `private [typeset options] name[=value]…`: a local
 // parameter seen only by the function that declared it, not by the
