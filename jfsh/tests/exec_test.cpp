@@ -1064,7 +1064,7 @@ TEST(Exec, FifoOpenSurvivesAJobEnding) {
   TempDir dir;
   str d = dir.path.string();
   EXPECT_EQ(out(sh, "(cd " + d + " || exit; mkfifo f; sleep 0.1 & (sleep 0.4; cat f) & "
-                    "echo hi > f; echo rc=$?; wait)"),
+                    "echo hi > f; s=$?; wait; echo rc=$s)"),
             "hi\nrc=0\n");
   EXPECT_EQ(out(sh, "(cd " + d + " || exit; sleep 0.1 & (sleep 0.4; echo w > f) & "
                     "while read l; do echo \"<$l>\"; done < f; wait)"),
