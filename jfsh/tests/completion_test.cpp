@@ -337,7 +337,7 @@ TEST(Compadd, MatchingAndQuoting) {
   EXPECT_EQ(t.var("got"), "2 1");
   t.sh.run("f5() { compadd -F '(*bar fox)' foo foobar fox }");
   EXPECT_EQ(t.run("x f" + CX + "5"), "x foo");
-  // -M is phase 15b: parsed and ignored.
+  // Several -M add up.
   t.widget("6", "complete-word", "f6");
   t.sh.run("f6() { compadd -M 'm:{a-z}={A-Z}' -M 'r:|=*' foo }");
   EXPECT_EQ(t.run("x f" + CX + "6"), "x foo");

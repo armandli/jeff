@@ -95,6 +95,7 @@ add_library(jfsh_builtins STATIC
   src/modules/mathfunc.cpp
   src/modules/parameter.cpp
   src/modules/zutil.cpp
+  src/modules/computil.cpp
   src/modules/system.cpp
   src/modules/files.cpp
   src/modules/stat.cpp
@@ -213,6 +214,7 @@ add_library(jfsh_editor STATIC
   src/editor/keymap.cpp
   src/editor/vi.cpp
   src/editor/completion.cpp
+  src/editor/compmatch.cpp
   src/editor/refresh.cpp
 )
 target_include_directories(jfsh_editor PUBLIC include)

@@ -1350,6 +1350,25 @@ int Executor::exec_cond_node(ExecState& es, WordCode head) {
       note(op + " " + trace_quote(*arg));
       return finish(cond_unary(op, *arg, mCtx, ""));
     }
+    case WC_COND_MOD: {
+      str op(es.fetch_str());
+      vec<str> args;
+      for (WordCode k = 1; k < wc_cmd_skip(head); ++k) {
+        // Patterns keep their quoting, as zsh hands them over tokenized.
+        auto arg = ex.pattern(es.fetch_str());
+        if (not arg) return fail(arg.error());
+        args.push_back(s::move(*arg));
+      }
+      note(op);
+      for (const auto& a : args) note(" " + trace_quote(a));
+      int rc = cond_completion(op, args, mCtx);
+      if (rc < 0) {
+        s::fprintf(stderr, "jfsh: unknown condition: %s\n", op.c_str());
+        rc = 2;
+      }
+      if (rc > 1) mCtx.aborting = mCtx.abort_line = true;
+      return finish(rc);
+    }
     default: break;
   }
   str op(es.fetch_str());

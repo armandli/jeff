@@ -635,8 +635,8 @@ str strip_quotes(strv w) {
 
 str CompState::text(const CompCandidate& m) const {
   bool at_start = m.ipre.empty() and m.apre.empty() and m.hpre.empty();
-  return m.ipre + m.apre + m.hpre + (m.raw ? m.word : quoted(m.word, at_start)) + m.hsuf
-       + m.asuf + m.isuf;
+  str w = not m.qword.empty() ? m.qword : m.raw ? m.word : quoted(m.word, at_start);
+  return m.ipre + m.apre + m.hpre + w + m.hsuf + m.asuf + m.isuf;
 }
 
 int CompState::add(const CompAddSpec& spec, const vec<str>& list, vec<bool>* matched,
@@ -652,10 +652,46 @@ int CompState::add(const CompAddSpec& spec, const vec<str>& list, vec<bool>* mat
   if (g == groups.size() and not matched)
     groups.push_back(CompGroup{spec.group, sorted, dups, spec.by_match, {}, {}});
 
-  // A -P prefix already on the line is not matched.
-  str lpre = prefix;
-  const str& lsuf = suffix;
-  lpre.erase(0, common_prefix_len(spec.apre, lpre));
+  // The call's matchers apply to its words.
+  MatchRun& mr = *run;
+  mr.begin_add(spec.matcher, nmatches());
+  struct EndAdd {
+    MatchRun& m;
+    ~EndAdd() { m.end_add(); }
+  } end_add{mr};
+  bool domatch = not spec.no_match;
+  if (not matched and (not list.empty() or spec.empties or spec.all)) {
+    if (domatch) mr.hasmatched = true;
+    else         mr.hasunmatched = true;
+  }
+
+  str lpre = prefix, lsuf = suffix;
+  Cline *pline = nullptr, *sline = nullptr;
+  bool none = false;   // -p or -s doesn't match: no word does
+  if (domatch) {
+    if (qiprefix.size() + iprefix.size() + lpre.size() != orig_lpre
+        or qisuffix.size() + isuffix.size() + lsuf.size() != orig_lsuf)
+      lenchanged = true;
+    // A -P prefix already on the line (or the line a start of it) is not
+    // matched.
+    s::size_t k = common_prefix_len(spec.apre, lpre);
+    if (not spec.apre.empty() and (k == spec.apre.size() or k == lpre.size())) lpre.erase(0, k);
+    // -p and -s are matched with the line as far as it goes.
+    if (const str& h = spec.hpre; not h.empty()) {
+      int ml = mr.match_part(lpre, h, false, &pline);
+      if (ml >= 0)                                               lpre.erase(0, s::size_t(ml));
+      else if (lpre.size() <= h.size() and h.starts_with(lpre)) lpre.clear();
+      else if (lpre.size() > h.size() and lpre.starts_with(h))  lpre.erase(0, h.size());
+      else                                                       none = true;
+    }
+    if (const str& h = spec.hsuf; not h.empty()) {
+      int ml = mr.match_part(lsuf, h, true, &sline);
+      s::size_t cut = ml >= 0 ? s::size_t(ml) : h.size();
+      if (ml >= 0 or (lsuf.size() > h.size() and lsuf.ends_with(h))) lsuf.resize(lsuf.size() - cut);
+      else if (lsuf.size() <= h.size() and h.ends_with(lsuf))        lsuf.clear();
+      else                                                           none = true;
+    }
+  }
   vec<CompiledPattern> ignore;
   for (const auto& p : spec.ignore) ignore.push_back(CompiledPattern::compile(p));
 
@@ -676,11 +712,19 @@ int CompState::add(const CompAddSpec& spec, const vec<str>& list, vec<bool>* mat
   bool accept_exact = rec_exact or (exact_key != keys.end() and not exact_key->second.empty());
 
   int added = 0;
-  for (s::size_t i = 0; i < list.size(); ++i) {
+  for (s::size_t i = 0; i < list.size() and not none; ++i) {
     const str& w = list[i];
-    str m = spec.hpre + (spec.raw ? w : quoted(w, spec.hpre.empty())) + spec.hsuf;
-    bool ok = spec.no_match
-           or (m.size() >= lpre.size() + lsuf.size() and m.starts_with(lpre) and m.ends_with(lsuf));
+    str qw = spec.raw ? w : quoted(w, spec.hpre.empty());
+    Cline* lc = nullptr;
+    bool isexact = false;
+    opt<str> ms;
+    if (domatch) {
+      ms = mr.comp_match(lpre, lsuf, qw, &lc, &isexact);
+    } else {
+      ms = qw;
+      lc = mr.plain(qw);
+    }
+    bool ok = ms.has_value();
     if (ok and s::any_of(ignore.begin(), ignore.end(),
                          [&](const CompiledPattern& p) { return p.matches(w); })) {
       ++ignored;
@@ -688,12 +732,13 @@ int CompState::add(const CompAddSpec& spec, const vec<str>& list, vec<bool>* mat
     }
     if (matched) {
       matched->push_back(ok);
-      if (ok and internal) internal->push_back(m);
+      if (ok and internal) internal->push_back(*ms);
       continue;
     }
     if (not ok) continue;
     CompCandidate c;
     c.word    = w;
+    if (*ms != qw) c.qword = *ms;
     c.display = i < spec.display.size() ? spec.display[i] : str{};
     c.ipre    = (spec.no_match ? str{} : iprefix) + spec.ipre;
     c.apre    = spec.apre;
@@ -719,7 +764,10 @@ int CompState::add(const CompAddSpec& spec, const vec<str>& list, vec<bool>* mat
     }
     c.remove_chars = spec.remove_chars;
     c.remove_func  = spec.remove_func;
-    c.exact        = accept_exact and m == prefix + suffix;
+    c.exact        = accept_exact and isexact;
+    // Every match goes into the unambiguous string, duplicates too.
+    mr.add(lc, qiprefix, c.ipre, c.apre, c.hpre, pline, c.hsuf, sline, c.isuf, qisuffix);
+    mr.minmlen = s::min(mr.minmlen, static_cast<int>(ms->size() + c.hpre.size() + c.hsuf.size()));
     ++added;
     if (not duplicate(c)) matches.push_back(s::move(c));
   }
@@ -752,28 +800,8 @@ int CompState::add(const CompAddSpec& spec, const vec<str>& list, vec<bool>* mat
 
 s::int64_t CompState::nmatches() const { return static_cast<s::int64_t>(matches.size()); }
 
-str CompState::unambiguous(s::size_t* cursor) const {
-  vec<str> pre, post;
-  for (const auto& m : matches) {
-    if (m.empty or m.all) continue;
-    bool at_start = m.ipre.empty() and m.apre.empty() and m.hpre.empty();
-    pre.push_back(m.ipre + m.apre + m.hpre + (m.raw ? m.word : quoted(m.word, at_start)));
-    post.push_back(m.hsuf + m.isuf);
-  }
-  if (cursor) *cursor = 0;
-  if (pre.empty()) return {};
-  str u = common_prefix_of(pre);
-  s::size_t at = u.size();
-  bool same_pre  = s::all_of(pre.begin(), pre.end(), [&](const str& p) { return p == pre[0]; });
-  bool same_post = s::all_of(post.begin(), post.end(), [&](const str& p) { return p == post[0]; });
-  if (same_pre) {
-    u += same_post ? post[0] : common_prefix_of(post);
-    at = u.size();
-  } else if (same_post) {
-    u += post[0];
-  }
-  if (cursor) *cursor = at;
-  return u;
+str CompState::unambiguous(s::size_t* cursor, vec<s::size_t>* positions) const {
+  return run->unambiguous(cursor, positions);
 }
 
 bool CompState::accepts_exact() const {
@@ -784,7 +812,8 @@ opt<str> CompState::exact_string() const {
   str line = prefix + suffix;
   for (const auto& m : matches) {
     if (m.empty or m.all) continue;
-    if (m.hpre + (m.raw ? m.word : quoted(m.word, m.hpre.empty())) + m.hsuf == line) return m.word;
+    str w = not m.qword.empty() ? m.qword : m.raw ? m.word : quoted(m.word, m.hpre.empty());
+    if (m.hpre + w + m.hsuf == line) return m.word;
   }
   return s::nullopt;
 }
@@ -799,21 +828,25 @@ bool CompState::readonly_key(strv key) {
 opt<str> CompState::get(const str& key) const {
   if (key == "nmatches") return s::to_string(nmatches());
   if (key == "ignored")  return s::to_string(ignored);
-  // As it goes into the line, after the word's open quote.
-  bool none = s::none_of(matches.begin(), matches.end(),
-                         [](const CompCandidate& m) { return not m.empty and not m.all; });
-  if (key == "unambiguous") return none ? str{} : qiprefix + unambiguous();
+  if (key == "unambiguous") return unambiguous();
   if (key == "unambiguous_cursor") {
     s::size_t at = 0;
     unambiguous(&at);
-    return s::to_string((none ? 0 : qiprefix.size()) + at + 1);
+    return s::to_string(at + 1);
+  }
+  if (key == "unambiguous_positions") {
+    vec<s::size_t> at;
+    unambiguous(nullptr, &at);
+    str out;
+    for (auto p : at) out += (out.empty() ? "" : ":") + s::to_string(p);
+    return out;
   }
   if (key == "quote") return quote ? opt<str>(str(1, quote)) : s::nullopt;
   if (key == "quoting") {
     if (not quote) return s::nullopt;
     return str(quote == '\'' ? "single" : quote == '"' ? "double" : "backtick");
   }
-  if (key == "unambiguous_positions" or key == "insert_positions") return str{};
+  if (key == "insert_positions") return str{};
   if (key == "exact_string") {
     if (auto e = exact_string()) return e;
   }
@@ -907,6 +940,8 @@ CompState CompletionEngine::make_state(const CompContext& ctx, const CompRequest
 CompletionResult CompletionEngine::run_function(const CompContext& ctx, const str& fn,
                                                 const CompRequest& req) {
   CompState st = make_state(ctx, req);
+  st.orig_lpre = st.qiprefix.size() + st.iprefix.size() + st.prefix.size();
+  st.orig_lsuf = st.qisuffix.size() + st.isuffix.size() + st.suffix.size();
   if (auto p = mParams.lookup("COLUMNS"); p and p->get().is_set())
     st.columns = s::atoi(p->get().scalar().c_str());
   CompState* outer = mState;
@@ -920,7 +955,18 @@ CompletionResult CompletionEngine::run_function(const CompContext& ctx, const st
   r.start    = s::min(ctx.comp_start + st.qiprefix.size(), ctx.word_end);
   r.end      = s::max(r.start, ctx.word_end - s::min(st.qisuffix.size(), ctx.word_end));
   r.prefix   = st.prefix;
-  r.unambiguous = st.unambiguous(&r.unambiguous_cursor);
+  // The unambiguous string replaces the word between its quotes.
+  s::size_t at = 0;
+  str u = st.unambiguous(&at);
+  r.keep_word = u.size() < ctx.word_end - ctx.comp_start and not st.lenchanged
+            and not st.run->hasunmatched;
+  if (u.starts_with(st.qiprefix)) {
+    u.erase(0, st.qiprefix.size());
+    at = at >= st.qiprefix.size() ? at - st.qiprefix.size() : 0;
+  }
+  if (not st.qisuffix.empty() and u.ends_with(st.qisuffix)) u.resize(u.size() - st.qisuffix.size());
+  r.unambiguous        = s::move(u);
+  r.unambiguous_cursor = s::min(at, r.unambiguous.size());
   for (const auto& [k, v] : st.view()) r.keys[k] = v;
 
   // The matches in listing order: group by group, each sorted unless it
@@ -981,8 +1027,8 @@ str menu_text(const CompletionResult& r, const CompCandidate& m) {
     return out;
   }
   bool at_start = m.ipre.empty() and m.apre.empty() and m.hpre.empty();
-  str text = m.ipre + m.apre + m.hpre + (m.raw ? m.word : comp_quote(m.word, r.quote, at_start))
-           + m.hsuf + m.asuf + m.isuf;
+  str w = not m.qword.empty() ? m.qword : m.raw ? m.word : comp_quote(m.word, r.quote, at_start);
+  str text = m.ipre + m.apre + m.hpre + w + m.hsuf + m.asuf + m.isuf;
   if (m.suffix == "/" or m.suffix == "}") text += m.suffix;
   return text;
 }
@@ -1393,10 +1439,13 @@ bool Editor::apply_completion(CompletionResult& r, bool reverse) {
     mMenuEnd    = mBuf.cursor;
     mMenuActive = true;
     started_menu = true;
-  } else if (r.unambiguous != before) {
+  } else if (r.unambiguous != before and not r.keep_word) {
     mBuf.text.replace(r.start, r.end - r.start, r.unambiguous);
     mBuf.cursor = r.start + s::min(r.unambiguous_cursor, r.unambiguous.size());
     inserted = true;
+  } else if (r.function and r.unambiguous == before and not r.keep_word) {
+    // The same text: the cursor still goes where the matches differ.
+    mBuf.cursor = r.start + s::min(r.unambiguous_cursor, r.unambiguous.size());
   }
 
   // Listing, as $compstate[list] says.

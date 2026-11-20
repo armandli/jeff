@@ -259,6 +259,8 @@ inline constexpr WordCode WC_COND_OR     = 2u;
 inline constexpr WordCode WC_COND_UNARY  = 3u;
 inline constexpr WordCode WC_COND_BINARY = 4u;
 inline constexpr WordCode WC_COND_STR    = 5u;
+// -NAME args…: a module's prefix condition (-prefix, -between, …).
+inline constexpr WordCode WC_COND_MOD    = 6u;
 
 inline constexpr WordCode WC_FUNCDEF_NAMED = 0u;
 inline constexpr WordCode WC_FUNCDEF_ANON  = 1u;

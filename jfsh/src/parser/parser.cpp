@@ -907,6 +907,21 @@ bool Parser::par_cond_primary() {
       return false;
     }
     mLex.consume();
+    if (w1.size() > 2) {
+      // `-NAME -x word`: zsh reads -x as an infix condition, which isn't
+      // one here.
+      if (w2.size() > 1 and w2[0] == '-' and at_cond_word()) return error_near(mLex.peek());
+      // -NAME arg…: a condition a module defines, with its arguments.
+      vec<str> args{s::move(w2)};
+      while (at_cond_word()) {
+        args.push_back(mLex.peek().text);
+        mLex.consume();
+      }
+      emit(make_wc_cmd(WC_COND, WC_COND_MOD, static_cast<WordCode>(args.size() + 1)));
+      emit_str(s::move(w1));
+      for (auto& a : args) emit_str(s::move(a));
+      return true;
+    }
     emit(make_wc_cmd(WC_COND, WC_COND_UNARY, 2));
     emit_str(s::move(w1));
     emit_str(s::move(w2));
