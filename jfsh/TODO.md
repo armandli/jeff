@@ -1195,22 +1195,42 @@ depend on.
 - 27 new tests in `tests/subst_m13_test.cpp` cover filter / (V) / (#) /
   (c) / (w) / (D) / :s / :gs / :& and their interplay with `:t`.
 
-**Expansion**
-- `${^x}` / `RC_EXPAND_PARAM`: array in a word becomes "prefix $x_i suffix"
-  for each element; `${^^x}` also splits on `$IFS`.
-- `${x:#pat}` and `${(M)x:#pat}`: filter array elements by pattern (match /
-  non-match).
-- Subscript flags `[(r)pat]`, `[(R)pat]`, `[(i)pat]`, `[(I)pat]`, `[(e)]`,
-  `[(n)]` (numeric order), `[(b)n]`.
-- Padding flags `(l:n::s::f:)`, `(r:n::s::f:)`.
-- `(%)` prompt-escape expansion; `(e)` evaluate as a shell expression;
-  `(D)` abbreviate home-relative paths; `(V)` make non-printables visible;
-  `(c)`/`(w)` count characters / words; `(#)` arithmetic evaluate each
-  element; `:s/x/y/`, `:s|x|y|`, `:gs/x/y/`, `:&` (repeat), `:G` (all),
-  `:x` (quote-remove).
-- A failed `${x?}` in a non-interactive shell exits the shell (subst/errexit).
-- In `${x:-word}`, unquoted pattern characters in `word` glob (subst/glob).
-- `KSH_ARRAYS` indexing (tied to M12).
+**Phase 13b — done** (branch `jfsh-m13b-expansion`): the rest of the
+expansion list, leaving globbing for the next phases.
+- **`${^x}` / `${^^x}` / `RC_EXPAND_PARAM`** — the word around an array
+  is copied once per element (after `${=x}` splitting), two `^` arrays
+  in one word make the cartesian product, an empty array removes the
+  word, and `"${^a[@]}"` distributes inside double quotes too (a plain
+  `"${^a}"` still joins, as in zsh).  `${^^x}` turns the option off.
+- **Subscript flags** `[(r)pat]` `[(R)pat]` `[(i)pat]` `[(I)pat]`, with
+  `(e)` exact matching, `(n:N:)` Nth match and `(b:N:)` begin-at; on a
+  scalar they search character positions; on an association `(r)`/`(R)`
+  search values, `(i)`/`(I)` keys, and `(k)`/`(K)` use the keys as
+  patterns; `(w)` / `(s:sep:)` index words of a scalar.  Unquoted
+  parameter values in the subscript are pattern text (`${a[(r)$p]}`),
+  quoted ones literal.  `(i)` honours `KSH_ARRAYS`.
+- **Padding** `(l:n::fill::once:)` / `(r:n::fill::once:)`: width is
+  arithmetic, any delimiter (including `<…>` pairs), truncation keeps
+  the rightmost (l) or leftmost (r) characters, multi-character fill
+  aligned as zsh does, both flags together centre the word.  Applied
+  after double-quoted joining.
+- **`(%)`** prompt-escape expansion through `Executor::expand_prompt`;
+  **`(e)`** re-expands parameters, command and arithmetic substitutions
+  in the value, leaving quotes alone.
+- **`:c`** (command path) and **`:P`** (physical path) modifiers.  `:x`
+  and `:G` are history-only in zsh (it reports "unrecognized modifier"
+  in `${…}`), so they stay out.
+- **`${x:-word}` globbing**: the operand's words keep their quoting, so
+  `${x:-*.md}` globs while `${x:-$y}` and `${x:-"*.md"}` do not.  Also
+  for `:+` and `:=`.
+- **Failed `${x?}`** already ended a non-interactive shell (subshells
+  only end themselves); the stale TODO is gone and tests pin it.
+- 37 new tests in `tests/subst_m13b_test.cpp`.
+
+**Expansion** (left after 13b)
+- Subscript flags on the left of an assignment: `a[(i)x]=y`, `h[(r)v]=…`.
+- `(g)`, `(S)`, `(B)`/`(E)`/`(N)` match-position flags; named directories
+  for `(D)` and `(%)`'s `%~` (M17).
 
 **Glob**
 - Globbing flags `(#i)` (case-insensitive subpattern), `(#l)` (letter-case-
