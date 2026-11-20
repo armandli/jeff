@@ -254,7 +254,7 @@ int wait_job(ExecContext& ctx, int jid) {
   if (not found) return 127;
   int rc = found->get().is_stopped()
          ? 128 + found->get().procs.front().stop_sig
-         : found->get().exit_status(ctx.opts.get(OPT_PIPEFAIL));
+         : found->get().exit_status();   // the last process's, as zsh's wait
   drop_if_done(ctx, jid);
   return rc;
 }

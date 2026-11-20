@@ -68,8 +68,9 @@ str disassemble(const CompiledProgram& prog) {
     switch (op) {
       case WC_LIST: {
         WordCode f = wc_list_flags(w);
-        out += ' ' + flag_names({{f & WC_LIST_ASYNC, "async"},
-                                 {f & WC_LIST_END,   "end"}});
+        out += ' ' + flag_names({{f & WC_LIST_ASYNC,  "async"},
+                                 {f & WC_LIST_DISOWN, "disown"},
+                                 {f & WC_LIST_END,    "end"}});
         out += " skip=" + s::to_string(wc_list_skip(w));
       }
       break; case WC_SUBLIST: {
@@ -130,6 +131,31 @@ str disassemble(const CompiledProgram& prog) {
 
 namespace {
 
+// A redirection's fd as zsh prints it: not when it is the operator's
+// default (0 for those that read, 1 for the rest).
+str fd_text(WordCode w) {
+  if (not wc_redir_has_fd(w)) return {};
+  int fd = wc_redir_fd(w);
+  switch (wc_redir_type(w)) {
+    case REDIR_READ: case REDIR_READWRITE: case REDIR_HEREDOC:
+    case REDIR_HEREDOCD: case REDIR_HERESTR: case REDIR_IN_DUP:
+    case REDIR_PROC_IN:
+      if (fd == 0) return {};
+    break; case REDIR_CLOSE:
+    break; default:
+      if (fd == 1) return {};
+  }
+  return s::to_string(fd);
+}
+
+// `<&-` or `>&-` (the target holds which), with the fd unless it is that
+// operator's default, as zsh prints them.
+str close_text(const str& fd, const str& target) {
+  bool in = target == "<";
+  if (fd == (in ? "0" : "1")) return in ? "<&-" : ">&-";
+  return fd + (in ? "<&-" : ">&-");
+}
+
 struct Decompiler {
   const CompiledProgram& p;
   s::size_t              pc;
@@ -163,7 +189,8 @@ struct Decompiler {
       pc = end;
       if (not out.empty()) out += out.ends_with('&') ? " " : "; ";
       out += s;
-      if (wc_list_flags(w) & WC_LIST_ASYNC) out += " &";
+      if (wc_list_flags(w) & WC_LIST_ASYNC)
+        out += (wc_list_flags(w) & WC_LIST_DISOWN) ? " &|" : " &";
     }
     if (wc_code(peek()) == WC_END) ++pc;
     return out;
@@ -207,7 +234,7 @@ struct Decompiler {
     WordCode    w      = fetch();
     str target = next_str();
     RedirType t      = wc_redir_type(w);
-    str       fd     = wc_redir_has_fd(w) ? s::to_string(wc_redir_fd(w)) : "";
+    str       fd     = fd_text(w);
     switch (t) {
       case REDIR_READ:       return fd + "< " + target;
       case REDIR_WRITE:      return fd + "> " + target;
@@ -219,12 +246,14 @@ struct Decompiler {
       case REDIR_CLOBBER:    return fd + ">| " + target;
       case REDIR_MERGE:      return fd + ">&" + target;
       case REDIR_MERGEOUT:   return "&> " + target;
-      case REDIR_PROC_IN:    return "<(" + target + ")";
-      case REDIR_PROC_OUT:   return ">(" + target + ")";
-      case REDIR_PROC_EQ:    return "=(" + target + ")";
-      case REDIR_CLOSE:      return fd + ">&-";
+      case REDIR_PROC_IN:    return fd + "< <(" + target + ")";
+      case REDIR_PROC_OUT:   return fd + "> >(" + target + ")";
+      case REDIR_CLOSE:      return close_text(fd, target);
       case REDIR_IN_DUP:     return fd + "<&" + target;
       case REDIR_APPEND_ERR: return "&>> " + target;
+      case REDIR_APPEND_CLOBBER:     return fd + ">>| " + target;
+      case REDIR_MERGEOUT_CLOBBER:   return "&>| " + target;
+      case REDIR_APPEND_ERR_CLOBBER: return "&>>| " + target;
       default:               return target;
     }
   }
@@ -417,7 +446,8 @@ struct Pretty {
       if (not first) nl(ind);
       sublist(ind);
       pc = end;
-      if (wc_list_flags(w) & WC_LIST_ASYNC) out += " &";
+      if (wc_list_flags(w) & WC_LIST_ASYNC)
+        out += (wc_list_flags(w) & WC_LIST_DISOWN) ? " &|" : " &";
       first = false;
     }
     if (wc_code(peek()) == WC_END) ++pc;
@@ -450,7 +480,7 @@ struct Pretty {
     WordCode  w      = fetch();
     str       target = next_str();
     RedirType t      = wc_redir_type(w);
-    str       fd     = wc_redir_has_fd(w) ? s::to_string(wc_redir_fd(w)) : "";
+    str       fd     = fd_text(w);
     switch (t) {
       case REDIR_READ:       return fd + "< " + target;
       case REDIR_WRITE:      return fd + "> " + target;
@@ -462,12 +492,14 @@ struct Pretty {
       case REDIR_CLOBBER:    return fd + ">| " + target;
       case REDIR_MERGE:      return fd + ">&" + target;
       case REDIR_MERGEOUT:   return "&> " + target;
-      case REDIR_PROC_IN:    return "<(" + target + ")";
-      case REDIR_PROC_OUT:   return ">(" + target + ")";
-      case REDIR_PROC_EQ:    return "=(" + target + ")";
-      case REDIR_CLOSE:      return fd + ">&-";
+      case REDIR_PROC_IN:    return fd + "< <(" + target + ")";
+      case REDIR_PROC_OUT:   return fd + "> >(" + target + ")";
+      case REDIR_CLOSE:      return close_text(fd, target);
       case REDIR_IN_DUP:     return fd + "<&" + target;
       case REDIR_APPEND_ERR: return "&>> " + target;
+      case REDIR_APPEND_CLOBBER:     return fd + ">>| " + target;
+      case REDIR_MERGEOUT_CLOBBER:   return "&>| " + target;
+      case REDIR_APPEND_ERR_CLOBBER: return "&>>| " + target;
       default:               return target;
     }
   }

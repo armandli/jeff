@@ -130,17 +130,17 @@ bool write_all(int fd, strv data) {
   return true;
 }
 
+// Written straight to the fd, after what stdio holds, so that a failure
+// is reported with this write's own errno (not an error a failed flush
+// left on stdout), and nothing stays buffered to come out later.
 int emit(strv cmd, int fd, strv data) {
-  if (fd == STDOUT_FILENO) {
-    s::fwrite(data.data(), 1, data.size(), stdout);
-    if (s::ferror(stdout)) {
-      s::clearerr(stdout);
-      return builtin_error(cmd, "write error: " + str(s::strerror(errno)));
-    }
-    return 0;
-  }
-  if (not write_all(fd, data)) return builtin_error(cmd, "write error: " + str(s::strerror(errno)));
-  return 0;
+  s::clearerr(stdout);
+  if (write_all(fd, data)) return 0;
+  // strerror() lowercased, as zsh's %e prints it.
+  str text = s::strerror(errno);
+  if (text.size() > 1 and not s::isupper(static_cast<unsigned char>(text[1])))
+    text[0] = static_cast<char>(s::tolower(static_cast<unsigned char>(text[0])));
+  return builtin_error(cmd, "write error: " + text);
 }
 
 // ---- printf -----------------------------------------------------------------

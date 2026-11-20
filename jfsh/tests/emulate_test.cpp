@@ -437,35 +437,43 @@ TEST(Emulate, LocalTrapsAlsoConfinesTrap) {
 
 TEST(Emulate, ZshRedirectionWithNoCommandIsOk) {
   Shell sh;
-  // zsh's default lets `> f` by itself redirect the shell's own stdout.
-  // The test just verifies it doesn't error out of jfsh.
-  auto r = sh.run("( > /tmp/jfsh_null_test_$$ ); echo $?");
+  // zsh's default runs $NULLCMD (cat) on `> f` by itself.
+  auto r = sh.run("echo hi | > /tmp/jfsh_null_test_$$; echo $?; cat /tmp/jfsh_null_test_$$");
   EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "0\n");
+  EXPECT_EQ(r.out, "0\nhi\n");
   // Clean up (the subshell created the file).
   std::remove(("/tmp/jfsh_null_test_" + std::to_string(::getpid())).c_str());
 }
 
-TEST(Emulate, ShNullCmdRejectsRedirectOnlyCommand) {
+// SH_NULLCMD (on under sh and ksh emulation) runs `:` for a command of
+// nothing but redirections; CSH_NULLCMD refuses it, which ends the
+// command line, as zsh does.
+TEST(Emulate, ShNullCmdRunsColonForRedirectOnlyCommand) {
   Shell sh;
-  auto r = sh.run("emulate sh; > /tmp/jfsh_shnull_$$ 2>&1 || echo refused");
+  TempDir dir;
+  str f = (dir.path / "f").string();
+  auto r = sh.run("emulate sh; echo hi | > " + f + " || echo refused; cat " + f);
   EXPECT_EQ(r.rc, 0);
-  EXPECT_NE(r.out.find("refused"), std::string::npos);
+  EXPECT_EQ(r.out, "");
 }
 
 TEST(Emulate, CshNullCmdRejectsRedirectOnlyCommand) {
   Shell sh;
-  auto r = sh.run("setopt cshnullcmd; > /tmp/jfsh_cshnull_$$ 2>&1 || echo refused");
+  auto r = sh.run("setopt cshnullcmd; (> /tmp/jfsh_cshnull_$$ 2>&1) || echo refused; echo after");
   EXPECT_EQ(r.rc, 0);
-  EXPECT_NE(r.out.find("refused"), std::string::npos);
+  EXPECT_EQ(r.out, "refused\nafter\n");
+  EXPECT_EQ(r.err, "jfsh: redirection with no command\n");
+  r = sh.run("setopt cshnullcmd; > /dev/null || echo refused; echo not-here");
+  EXPECT_EQ(r.rc, 1);
+  EXPECT_EQ(r.out, "");
 }
 
-TEST(Emulate, EmulateKshAlsoEnablesNullCmdError) {
+TEST(Emulate, EmulateKshAlsoRunsColonForNullCmd) {
   Shell sh;
   // ksh emulation has SH_NULLCMD on by default.
-  auto r = sh.run("emulate ksh; > /tmp/jfsh_kshnull_$$ 2>&1 || echo refused");
+  auto r = sh.run("emulate ksh; echo hi | > /dev/null || echo refused");
   EXPECT_EQ(r.rc, 0);
-  EXPECT_NE(r.out.find("refused"), std::string::npos);
+  EXPECT_EQ(r.out, "");
 }
 
 TEST(Emulate, EmulateZshRevertsNullCmdBehaviour) {
@@ -473,9 +481,9 @@ TEST(Emulate, EmulateZshRevertsNullCmdBehaviour) {
   auto r = sh.run(
       "emulate sh\n"
       "emulate zsh\n"
-      "( > /tmp/jfsh_rev_$$ ); echo $?");
+      "echo hi | > /tmp/jfsh_rev_$$; echo $?; cat /tmp/jfsh_rev_$$");
   EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "0\n");
+  EXPECT_EQ(r.out, "0\nhi\n");
   std::remove(("/tmp/jfsh_rev_" + std::to_string(::getpid())).c_str());
 }
 

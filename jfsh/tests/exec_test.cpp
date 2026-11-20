@@ -595,15 +595,18 @@ TEST(Exec, ThreeStagePipeline) {
   Shell sh;
   auto r = sh.run("echo abc | tr a-z A-Z | tr A-Z 0-9");
   EXPECT_EQ(r.rc, 0);
+  EXPECT_EQ(r.out, "012\n");
 }
 
-TEST(Exec, PipefailReflectsFirstFailingStage) {
+TEST(Exec, PipefailTakesTheRightmostFailure) {
   Shell sh;
   auto r = sh.run("false | true");
   EXPECT_EQ(r.rc, 0);  // without pipefail, last stage wins
+  EXPECT_EQ(sh.run("(exit 3) | (exit 2) | true; echo $? $pipestatus").out, "0 3 2 0\n");
   sh.opts.set(OPT_PIPEFAIL);
   r = sh.run("false | true");
   EXPECT_EQ(r.rc, 1);
+  EXPECT_EQ(sh.run("(exit 3) | (exit 2) | true; echo $? $pipestatus").out, "2 3 2 0\n");
 }
 
 TEST(Exec, PipelineStderrMerge) {
@@ -744,26 +747,385 @@ TEST(Exec, WaitBuiltinCollectsBackgroundExit) {
   EXPECT_EQ(r.rc, 0);
 }
 
+// The tee is waited for: the next command reads both files whole.
 TEST(Exec, MultiosTeesToBothTargets) {
   Shell sh;
   TempDir dir;
-  sh.opts.set(OPT_MULTIOS);
-  auto a = (dir.path / "a").string();
-  auto b = (dir.path / "b").string();
-  auto r = sh.run("echo x > " + a + " > " + b);
-  EXPECT_EQ(r.rc, 0);
-  // The tee helper runs asynchronously; give it a moment to flush and
-  // exit so both target files have their data on disk.
-  for (int i = 0; i < 50; ++i) {
-    s::ifstream fa{a}, fb{b};
-    str va((s::istreambuf_iterator<char>(fa)),
-           s::istreambuf_iterator<char>());
-    str vb((s::istreambuf_iterator<char>(fb)),
-           s::istreambuf_iterator<char>());
-    if (va == "x\n" and vb == "x\n") return;
-    usleep(10'000);
-  }
-  FAIL() << "multios did not deliver x\\n to both targets";
+  str d = dir.path.string();
+  auto r = sh.run("(cd " + d + " && for i in {1..100}; do "
+                  "echo x$i >a >b; read v <a; read w <b; "
+                  "[[ $v == x$i && $w == x$i ]] || ((bad++)); done; echo bad=$bad)");
+  EXPECT_EQ(r.out, "bad=\n");
+  // A builtin with a forked tee for its output, and a function.
+  r = sh.run("(cd " + d + " && f() { echo in-f; }; f >c >d; cat c d)");
+  EXPECT_EQ(r.out, "in-f\nin-f\n");
+}
+
+str out(Shell& sh, strv src) { return sh.run(src).out; }
+
+// Runs `jfsh -c src`, whose own fds are its own (unlike this test
+// process's), with stderr merged.
+s::pair<str, int> run_jfsh(strv src) {
+  str cmd = str(JFSH_BINARY) + " --norouter -f -c '" + str(src) + "' 2>&1 </dev/null";
+  s::FILE* p = ::popen(cmd.c_str(), "r");
+  if (not p) return {"", -1};
+  str o;
+  char buf[256];
+  while (s::fgets(buf, sizeof buf, p)) o += buf;
+  int st = ::pclose(p);
+  return {o, WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st)};
+}
+
+// `<&-` closes stdin, `>&-` stdout, and `N>&-` fd N.
+TEST(Exec, CloseOperatorsCloseTheirOwnFd) {
+  Shell sh;
+  auto r = sh.run("cat <&-; echo rc=$?");
+  EXPECT_EQ(r.out, "rc=1\n");
+  EXPECT_NE(r.err.find("stdin"), str::npos) << r.err;
+  EXPECT_EQ(out(sh, "(exec <&-; echo still-here $?)"), "still-here 0\n");
+  r = sh.run("(exec 3>&1; echo to3 >&3; exec 3>&-; echo x >&3; echo rc=$?)");
+  EXPECT_EQ(r.out, "to3\nrc=1\n");
+  EXPECT_EQ(r.err, "jfsh: 3: bad file descriptor\n");
+  EXPECT_EQ(out(sh, "f() { cat <&-; echo 3<&- 2>&-; }; functions f"),
+            "f () {\n\tcat <&-\n\techo 3<&- 2>&-\n}\n");
+}
+
+// Only what the parser saw as `<(…)`, `>(…)` or `=(…)` is a process
+// substitution: not quoted text, nor a parameter's value.
+TEST(Exec, ProcessSubstitutionOnlyFromTheParser) {
+  Shell sh;
+  TempDir dir;
+  str d = dir.path.string();
+  EXPECT_EQ(out(sh, "(cd " + d + " && x=\">(touch pwned)\"; echo $x; "
+                    "echo \"<(echo hi)\" '=(x)'; ls)"),
+            ">(touch pwned)\n<(echo hi) =(x)\n");
+  EXPECT_EQ(out(sh, "cat <(echo a) =(echo b); echo <(true) | grep -c '^/dev/fd/[0-9]*$'"),
+            "a\nb\n1\n");
+}
+
+// =(…) names its file after $TMPPREFIX and removes it after the command;
+// <(…) and =(…) read nothing from the command's stdin.
+TEST(Exec, ProcessSubstitutionFilesAndStdin) {
+  Shell sh;
+  TempDir dir;
+  str d = dir.path.string();
+  EXPECT_EQ(out(sh, "TMPPREFIX=" + d + "/zz; f=$(echo =(true)); "
+                    "echo ${#f} $((${#f} - ${#TMPPREFIX})); "
+                    "[[ $f == " + d + "/zz* && ! -e $f ]] && echo gone"),
+            s::to_string(d.size() + 9) + " 6\ngone\n");
+  EXPECT_EQ(out(sh, "echo x | cat <(cat); echo y | cat =(cat); echo end"), "end\n");
+  // As the last stage of a pipeline, the file outlives the forked command.
+  EXPECT_EQ(out(sh, "echo y | cat =(echo q)"), "q\n");
+}
+
+// As in zsh, the fd in front of a redirection is one digit; `12>f` is the
+// argument 12.  `>&N` refuses the shell's own fds (above 9).
+TEST(Exec, FdPrefixIsOneDigit) {
+  Shell sh;
+  TempDir dir;
+  str d = dir.path.string();
+  EXPECT_EQ(out(sh, "(cd " + d + " && echo y 12>f; cat f)"), "y 12\n");
+  auto [o, rc] = run_jfsh("echo x >&11; echo rc=$?; echo y >&12; echo rc=$?; "
+                          "/usr/bin/true; echo survived");
+  EXPECT_EQ(o, "jfsh: 11: bad file descriptor\nrc=1\njfsh: 12: bad file descriptor\nrc=1\n"
+               "survived\n");
+  EXPECT_EQ(rc, 0);
+  auto r = sh.run("echo c >&99999999999; echo rc=$?");
+  EXPECT_EQ(r.err, "jfsh: 1215752191: bad file descriptor\n");
+  EXPECT_EQ(r.out, "rc=1\n");
+}
+
+// The redirection errors read as zsh's; a target that expands to nothing
+// fails the command, not the command line.
+TEST(Exec, RedirectionErrors) {
+  Shell sh;
+  auto r = sh.run("cat </nonexistent; echo rc=$?; echo b >/nonexistent/dir/x; echo rc=$?");
+  EXPECT_EQ(r.err, "jfsh: no such file or directory: /nonexistent\n"
+                   "jfsh: no such file or directory: /nonexistent/dir/x\n");
+  EXPECT_EQ(r.out, "rc=1\nrc=1\n");
+  r = sh.run("echo x >$nothing; echo rc=$?; echo end");
+  EXPECT_EQ(r.err, "jfsh: no such file or directory: \n");
+  EXPECT_EQ(r.out, "rc=1\nend\n");
+  r = sh.run("x=o; echo x <&$x; echo not-here");
+  EXPECT_EQ(r.err, "jfsh: file number expected\n");
+  EXPECT_EQ(r.out, "");
+  EXPECT_EQ(r.rc, 1);
+}
+
+// NO_CLOBBER: `>` refuses an existing regular file but opens a device;
+// `>>` creates nothing unless APPEND_CREATE; `>!`, `>|`, `>>!`, `>>|`,
+// `&>|`, `>&|` force it.  `>& file` and `>>& file` are `&>` and `&>>`.
+TEST(Exec, NoClobberAndItsOverrides) {
+  Shell sh;
+  TempDir dir;
+  str d = dir.path.string();
+  auto r = sh.run("(cd " + d + " && setopt noclobber; echo a >in; echo b >in; echo rc=$?; "
+                  "echo c >/dev/null; echo rc=$?; echo d >>missing; echo rc=$?; "
+                  "echo e >!in; echo f >>!in; echo g >>|in; cat in; echo h &>|in; echo i >>!new; "
+                  "cat in new; echo j >&|in; echo k >& o2; echo l >>& o2; cat in o2; "
+                  "setopt appendcreate; echo m >>made; cat made)");
+  EXPECT_EQ(r.out, "rc=1\nrc=0\nrc=1\ne\nf\ng\nh\ni\nj\nk\nl\nm\n");
+  EXPECT_EQ(r.err, "jfsh: file exists: in\njfsh: no such file or directory: missing\n");
+  // Also for each target of a MULTIOS group.
+  r = sh.run("(cd " + d + " && setopt noclobber; echo n >in >b2; echo rc=$?; cat in; ls b2)");
+  EXPECT_EQ(r.out, "rc=1\nj\n");
+  EXPECT_EQ(r.err, "jfsh: file exists: in\nls: b2: No such file or directory\n");
+}
+
+// The last stage of a pipeline runs in the shell, as in zsh.
+TEST(Exec, LastPipelineStageRunsInTheShell) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "echo x | read v; echo v=$v"), "v=x\n");
+  EXPECT_EQ(out(sh, "printf 'a\\nb\\n' | while read l; do n=$((n+1)); done; echo n=$n"), "n=2\n");
+  EXPECT_EQ(out(sh, "f() { g=1; cat; }; echo in | f; echo g=$g"), "in\ng=1\n");
+  auto r = sh.run("echo y | exit 4; echo after");
+  EXPECT_EQ(r.out, "");
+  EXPECT_EQ(r.rc, 4);
+  // An external last stage is waited for with the others.
+  EXPECT_EQ(out(sh, "echo a | cat; echo b | (cat; exit 3); echo $? $pipestatus"), "a\nb\n3 0 3\n");
+}
+
+// The pipe is the stage's first stdout redirection, so under MULTIOS a
+// `>file` adds to it, and `|&` is a `2>&1` after the stage's own.
+TEST(Exec, PipeTakesPartInMultios) {
+  Shell sh;
+  TempDir dir;
+  str d = dir.path.string();
+  EXPECT_EQ(out(sh, "(cd " + d + " && echo y >c | cat; echo --; cat c)"), "y\n--\ny\n");
+  EXPECT_EQ(out(sh, "{ echo e >&2 } 2>/dev/null |& sed s/^/P:/"), "P:e\n");
+  EXPECT_EQ(out(sh, "{ echo o } >/dev/null |& sed s/^/Q:/"), "Q:o\n");
+  auto r = sh.run("(cd " + d + " && echo m >f >&2; cat f)");
+  EXPECT_EQ(r.out, "m\n");
+  EXPECT_EQ(r.err, "m\n");
+  sh.opts.unset(OPT_MULTIOS);
+  EXPECT_EQ(out(sh, "(cd " + d + " && echo z >c | cat; echo --; cat c)"), "--\nz\n");
+}
+
+// Redirections are made in order: `2>&1` copies fd 1 as it is then.  A
+// failed one stops the command, once.
+TEST(Exec, RedirectionsApplyInOrder) {
+  Shell sh;
+  TempDir dir;
+  str d = dir.path.string();
+  EXPECT_EQ(out(sh, "(cd " + d + " && { echo out; echo err >&2 } >a 2>&1 >b; "
+                    "sort a; echo --; cat b)"),
+            "err\nout\n--\nout\n");
+  auto r = sh.run("(cd " + d + " && echo r >g >/nonexist/x >h; echo rc=$?; cat g; ls h)");
+  EXPECT_EQ(r.out, "rc=1\n");
+  EXPECT_EQ(r.err, "jfsh: no such file or directory: /nonexist/x\n"
+                   "ls: h: No such file or directory\n");
+  EXPECT_EQ(out(sh, "(cd " + d + " && echo rw 1<>rwf; cat rwf; { echo g; echo h >&2 } &>both; "
+                    "{ echo i } &>>both; cat both)"),
+            "rw\ng\nh\ni\n");
+}
+
+// Pipelines work with the shell's own stdin or stdout closed.
+TEST(Exec, PipelineWithAStdFdClosed) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "(exec 0>&-; echo hi | cat)"), "hi\n");
+  EXPECT_EQ(sh.run("(exec 1>&-; echo hi | cat >&2)").err, "hi\n");
+}
+
+// `a | b &` forks the stages from the shell: $! is the last one, and
+// killing it ends the job.
+TEST(Exec, BackgroundPipelineBangIsTheLastStage) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "sleep 0.1 | (exit 3) & wait $!; echo $?"), "3\n");
+  EXPECT_EQ(out(sh, "true | sleep 5 & p=$!; kill $p; wait $p; echo $?"), "143\n");
+  EXPECT_EQ(out(sh, "sleep 5 | sleep 5 & ps -o comm= -p $! | grep -c sleep; kill %1; wait"), "1\n");
+}
+
+// A command of nothing but redirections runs $NULLCMD, or $READNULLCMD
+// for a lone `<file`; with a precommand modifier it is an error.
+TEST(Exec, NullCommand) {
+  Shell sh;
+  TempDir dir;
+  str d = dir.path.string();
+  EXPECT_EQ(out(sh, "(cd " + d + " && echo data >in; <in; >out2 <in; cat out2; "
+                    "echo hi | >f; cat f; "
+                    "READNULLCMD=rev; <in)"),
+            "data\ndata\nhi\natad\n");
+  EXPECT_EQ(out(sh, "(cd " + d + " && NULLCMD=false; >g; echo rc=$?; x=1 >h; echo x=$x; ls g h)"),
+            "rc=1\nx=1\ng\nh\n");
+  auto r = sh.run("(cd " + d + " && command >f2; echo not-here)");
+  EXPECT_EQ(r.err, "jfsh: redirection with no command\n");
+  EXPECT_EQ(r.out, "");
+  r = sh.run("(cd " + d + " && NULLCMD=; >f3; echo not-here)");
+  EXPECT_EQ(r.err, "jfsh: redirection with no command\n");
+  r = sh.run("(cd " + d + " && setopt shnullcmd xtrace; >f4 </dev/null; cat f4)");
+  EXPECT_EQ(r.err, "+jfsh:1> :\n+jfsh:1> cat f4\n");
+}
+
+// A quoted here-document delimiter goes through quote removal.
+TEST(Exec, HeredocDelimiterQuoteRemoval) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "cat <<'a\"b'\nbody $x\na\"b\necho next"), "body $x\nnext\n");
+  EXPECT_EQ(out(sh, "cat <<E\\\\OF\nb2 $x\nE\\OF\necho next"), "b2 $x\nnext\n");
+  EXPECT_EQ(out(sh, "x=v; cat <<\"E\\\"Q\"\nlit $x\nE\"Q\ncat <<E\"\"F\nlit2 $x\nEF"),
+            "lit $x\nlit2 $x\n");
+}
+
+// Here-documents in a pipeline, in a function, and longer than a pipe
+// holds.
+TEST(Exec, HeredocsInPipelinesAndFunctions) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "f() { cat <<E\nin func $1\nE\n}; f arg | tr a-z A-Z"), "IN FUNC ARG\n");
+  EXPECT_EQ(out(sh, "cat <<E | tr a-z A-Z\npiped\nE"), "PIPED\n");
+  str big(200000, 'x');
+  EXPECT_EQ(out(sh, "cat <<E | wc -c | tr -d ' '\n" + big + "\nE"), "200001\n");
+  EXPECT_EQ(out(sh, "read -r v <<< \"$(printf '%.0sy' {1..70000})\"; echo ${#v}"), "70000\n");
+}
+
+// A process substitution inside a word, in an assignment, a `for` list
+// or an array runs in place; its fd lasts as long as the command.
+TEST(Exec, ProcessSubstitutionInsideWords) {
+  Shell sh;
+  auto masked = [&](strv src) {
+    str o = out(sh, src);
+    str r;
+    for (s::size_t i = 0; i < o.size(); ++i) {
+      if (o.compare(i, 8, "/dev/fd/") == 0) {
+        r += "/dev/fd/N";
+        i += 8;
+        while (i < o.size() and s::isdigit(static_cast<unsigned char>(o[i]))) ++i;
+        --i;
+      } else {
+        r += o[i];
+      }
+    }
+    return r;
+  };
+  EXPECT_EQ(masked("echo --f=<(true); echo <(echo a)x; echo a<(true)b; x=w; echo $x<(true)"),
+            "--f=/dev/fd/N\n/dev/fd/Nx\na/dev/fd/Nb\nw/dev/fd/N\n");
+  EXPECT_EQ(masked("x=<(echo hi); echo $x; typeset y=<(true); echo $y; z=e=<(true); echo $z; "
+                   "f() { local q=<(echo L); echo $q; }; f"),
+            "/dev/fd/N\n/dev/fd/N\ne=/dev/fd/N\n/dev/fd/N\n");
+  EXPECT_EQ(out(sh, "for f in <(echo a) <(echo b); do cat $f; done; "
+                    "foreach g (<(echo c)) cat $g; end"),
+            "a\nb\nc\n");
+  EXPECT_EQ(masked("arr=(x <(echo c) y); echo ${#arr} $arr[2]"), "3 /dev/fd/N\n");
+  // Quoted or expanded, it is text.
+  EXPECT_EQ(out(sh, "x='<(echo hi)'; echo $x \"a<(b)\" \\<\\(c\\) ${v:-'<(d)'}"),
+            "<(echo hi) a<(b) <(c) <(d)\n");
+  EXPECT_EQ(out(sh, "f() { cat 3< <(echo q) > >(cat) }; functions f"),
+            "f () {\n\tcat 3< <(echo q) > >(cat)\n}\n");
+}
+
+// A process substitution's command ends at its own `)`, past quotes and
+// nested substitutions; it works as the `case` subject, a `<<<` target and
+// `< =(…)`.
+TEST(Exec, ProcessSubstitutionEndsAtItsOwnParen) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "cat <(echo \")\"); cat < <(echo \")\"); cat <(echo ')'; echo second); "
+                    "cat <(echo \"(\")"),
+            ")\n)\n)\nsecond\n(\n");
+  EXPECT_EQ(out(sh, "echo a<(echo ')')b | sed 's/[0-9]//g'; cat <(echo $(echo \")\"))"),
+            "a/dev/fd/b\n)\n");
+  EXPECT_EQ(out(sh, "case <(true) in /dev/fd/*) echo fd;; esac; "
+                    "cat <<<<(echo q) | sed 's/[0-9]//g'"),
+            "fd\n/dev/fd/\n");
+  EXPECT_EQ(out(sh, "f() { cat < =(echo hi) }; functions f; f"),
+            "f () {\n\tcat < =(echo hi)\n}\nhi\n");
+}
+
+// A trap runs while `read` blocks, in a subshell too (where the shell's
+// signal self-pipe is closed).
+TEST(Exec, TrapRunsWhileReadBlocksInASubshell) {
+  auto [o, rc] = run_jfsh("zmodload zsh/datetime; s=$EPOCHREALTIME; "
+                          "( trap \"echo trap \\$(( EPOCHREALTIME - s < 1 )); exit 0\" USR1; "
+                          "sh -c \"sleep 0.3; kill -USR1 \\$PPID\" & "
+                          "read y < <(sleep 2; echo late); echo \"got $y\" ); echo end");
+  EXPECT_EQ(o, "trap 1\nend\n");
+  EXPECT_EQ(rc, 0);
+}
+
+// A CHLD trap runs while `read` blocks; a trap ends `read -t` as a
+// timeout; a trapped signal makes a blocked fifo open fail, quietly.
+TEST(Exec, TrapsInterruptReadAndFifoOpens) {
+  auto [o, rc] = run_jfsh("zmodload zsh/datetime; s=$EPOCHREALTIME; "
+                          "trap \"echo chld \\$((EPOCHREALTIME-s<0.5))\" CHLD; sleep 0.2 & "
+                          "read x < <(sleep 1; echo hi); echo $x");
+  EXPECT_EQ(o, "chld 1\nhi\n");
+  auto [o2, rc2] = run_jfsh("trap \"echo T\" USR1; /bin/sh -c \"sleep 0.3; kill -USR1 \\$PPID\" & "
+                            "read -t 2 y < <(sleep 1; echo data); echo A st=$? y=$y");
+  EXPECT_EQ(o2, "T\nA st=1 y=\n");
+  TempDir dir;
+  str f = (dir.path / "ff").string();
+  auto [o3, rc3] = run_jfsh("trap \"echo usr1\" USR1; me=$$; mkfifo " + f + "; "
+                            "( sleep 0.3; kill -USR1 $me ) & read y < " + f
+                            + "; echo st=$? y=$y; wait");
+  EXPECT_EQ(o3, "usr1\nst=1 y=\n");
+}
+
+// Opening a fifo waits for its other end; a job that ends meanwhile
+// doesn't make the open fail.
+TEST(Exec, FifoOpenSurvivesAJobEnding) {
+  Shell sh;
+  TempDir dir;
+  str d = dir.path.string();
+  EXPECT_EQ(out(sh, "(cd " + d + " || exit; mkfifo f; sleep 0.1 & (sleep 0.4; cat f) & "
+                    "echo hi > f; echo rc=$?; wait)"),
+            "hi\nrc=0\n");
+  EXPECT_EQ(out(sh, "(cd " + d + " || exit; sleep 0.1 & (sleep 0.4; echo w > f) & "
+                    "while read l; do echo \"<$l>\"; done < f; wait)"),
+            "<w>\n");
+  EXPECT_EQ(out(sh, "(cd " + d + " || exit; sleep 0.1 & (sleep 0.4; echo w > f) & "
+                    "exec 3< f; read l <&3; echo \"<$l>\"; wait)"),
+            "<w>\n");
+}
+
+// A `$'…'` with `\'` inside a substitution doesn't end it early; an
+// unfinished `<(` is a parse error.
+TEST(Exec, ProcessSubstitutionBodiesAndErrors) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "cat <(echo $'a\\')b'); echo $(echo $'c\\')d'); echo \"$(echo $'x\\'')\""),
+            "a')b\nc')d\nx'\n");
+  auto r = sh.run("cat <(echo hi");
+  EXPECT_EQ(r.err, "jfsh:1: parse error near `<(echo hi'\n");
+  EXPECT_EQ(r.rc, 1);
+}
+
+// `&|` and `&!` run in the background without making a job.
+TEST(Exec, DisownedBackgroundList) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "true &| echo y"), "y\n");
+  auto r = sh.run("(exit 3) &! p=$!; [[ $p == <-> ]] && echo pid; jobs; wait $p; echo w=$?");
+  EXPECT_EQ(r.out, "pid\nw=127\n");
+  EXPECT_NE(r.err.find("is not a child of this shell"), str::npos) << r.err;
+  EXPECT_EQ(out(sh, "true | true &|; jobs; echo end"), "end\n");
+  EXPECT_EQ(out(sh, "f() { sleep 1 &|; a | b &! }; functions f"),
+            "f () {\n\tsleep 1 &|\n\ta | b &|\n}\n");
+}
+
+// `exit` as the last stage leaves at once, without waiting for the
+// other stages.
+TEST(Exec, ExitInTheLastStageDoesNotWait) {
+  Shell sh;
+  TempDir dir;
+  str f = (dir.path / "f").string();
+  EXPECT_EQ(out(sh, "( (sleep 0.5; echo x >" + f + ") | exit 4 ); echo $?; [[ -e " + f
+                    + " ]] || echo not-waited"),
+            "4\nnot-waited\n");
+}
+
+// `>&N` refuses only the shell's own fds: a user's close-on-exec fd above 9
+// is fine.
+TEST(Exec, DupOfAUsersCloexecFd) {
+  Shell sh;
+  TempDir dir;
+  str d = dir.path.string();
+  EXPECT_EQ(out(sh, "(cd " + d + " && zmodload zsh/system; for i in {1..9}; do "
+                    "sysopen -w -o create,cloexec -u g out$i; done; "
+                    "echo hi >&$g; echo rc=$?; cat out9)"),
+            "rc=0\nhi\n");
+}
+
+// `wait %N` gives the last process's status, PIPEFAIL or not, as zsh's.
+TEST(Exec, WaitForAPipelineJob) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "setopt pipefail; (exit 3) | true & wait %1; echo $?; "
+                    "true | (exit 4) & wait %1; echo $?"),
+            "0\n4\n");
 }
 
 TEST(Exec, ParseErrorReportsTheLineAndRunsNothing) {

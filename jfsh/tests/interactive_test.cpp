@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <poll.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -212,6 +213,85 @@ TEST(Interactive, PipelinesAreOneJob) {
   EXPECT_TRUE(sh.expect(" suspended  cat")) << sh.out;
   sh.line("kill %1");
   EXPECT_TRUE(sh.expect("[1]  + terminated  sleep 30 | cat")) << sh.out;
+}
+
+// The last stage runs in the shell; a command it runs joins the
+// pipeline's process group, so `cat` keeps reading the terminal.  A
+// background pipeline lists every pid.
+TEST(Interactive, LastPipelineStageRunsInTheShell) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("echo x | read v; echo v=$v");
+  EXPECT_TRUE(sh.expect("v=x\r\n")) << sh.out;
+  sh.line("cat | while read l; do /bin/echo got $l; done");
+  sh.send("hi\n");
+  EXPECT_TRUE(sh.expect("got hi\r\n")) << sh.out;
+  sh.send("there\n");
+  EXPECT_TRUE(sh.expect("got there\r\n")) << sh.out;
+  sh.send("\x04");
+  sh.line("echo after");
+  EXPECT_TRUE(sh.expect("after\r\n")) << sh.out;
+  sh.line("sleep 30 | sleep 30 &");
+  EXPECT_TRUE(sh.expect("[1] ")) << sh.out;
+  sh.line("jobs -l");
+  EXPECT_TRUE(sh.expect(" running    sleep 30 | \r\n")) << sh.out;
+  EXPECT_TRUE(sh.expect(" running    sleep 30\r\n")) << sh.out;
+  sh.line("kill %1");
+  EXPECT_TRUE(sh.expect("[1]  + terminated  sleep 30 | sleep 30")) << sh.out;
+}
+
+// Ctrl-Z can't suspend a pipeline whose last stage the shell runs: as
+// zsh, it says so and continues the stopped stage.
+TEST(Interactive, PipelineWithTheLastStageInTheShellCantBeSuspended) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("sleep 1 | while read l; do :; done; echo after");
+  ASSERT_TRUE(sh.key_until("\x1a", "jfsh: job can't be suspended")) << sh.out;
+  EXPECT_TRUE(sh.expect("after\r\n")) << sh.out;
+}
+
+// A background pipeline whose stages differ in state is listed a line a
+// stage, as zsh's printjob does.
+TEST(Interactive, JobsListsStagesInDifferentStates) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("sleep 0.1 | sleep 30 &");
+  ASSERT_TRUE(sh.expect("[1] ")) << sh.out;
+  std::this_thread::sleep_for(500ms);
+  sh.line("jobs");
+  EXPECT_TRUE(sh.expect("[1]  + done       sleep 0.1 | \r\n"
+                        "       running    sleep 30\r\n")) << sh.out;
+  sh.line("kill %1");
+  EXPECT_TRUE(sh.expect("[1]  + done        sleep 0.1 | \r\n"
+                        "       terminated  sleep 30")) << sh.out;
+}
+
+// Ctrl-C ends an open of a fifo nobody writes to, and a `read` (status
+// 130), and the prompt comes back.
+TEST(Interactive, CtrlCEndsFifoOpensAndReads) {
+  char tmpl[] = "/tmp/jfsh_fifo_XXXXXX";
+  std::string dir = ::mkdtemp(tmpl);
+  std::string fifo = dir + "/ff";
+  ASSERT_EQ(::mkfifo(fifo.c_str(), 0600), 0);
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("exec 3<" + fifo);
+  std::this_thread::sleep_for(300ms);
+  sh.send("\x03");
+  sh.line("echo after1 $?");
+  EXPECT_TRUE(sh.expect("after1 1\r\n")) << sh.out;
+  sh.line("read x < " + fifo);
+  std::this_thread::sleep_for(300ms);
+  sh.send("\x03");
+  sh.line("echo after2 $?");
+  EXPECT_TRUE(sh.expect("after2 1\r\n")) << sh.out;
+  sh.line("read x < <(sleep 100)");
+  std::this_thread::sleep_for(300ms);
+  sh.send("\x03");
+  sh.line("echo after3 $?");
+  EXPECT_TRUE(sh.expect("after3 130\r\n")) << sh.out;
+  ::unlink(fifo.c_str());
+  ::rmdir(dir.c_str());
 }
 
 TEST(Interactive, SuspendingACommandInALoopGivesThePromptBack) {

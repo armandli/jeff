@@ -36,6 +36,16 @@ enum ExecFlags : s::uint32_t {
   EF_DASH    = 1 << 2,  // - prefix: login shell argv[0]
   EF_NOFORK  = 1 << 3,  // exec instead of fork (last cmd in subshell)
   EF_COPROC  = 1 << 4,  // set up coprocess pipes
+  // The last stage of a pipeline, run from the shell: a command that forks
+  // joins the pipeline's job, and exec_pline waits for it.
+  EF_PIPELAST = 1 << 5,
+  // A pipeline stage's own redirections: fd 1 already goes to the pipe,
+  // so under MULTIOS a `>file` adds to it (EF_STAGEOUT); `|&` adds a
+  // `2>&1` after them (EF_STAGEERR).
+  EF_STAGEOUT = 1 << 6,
+  EF_STAGEERR = 1 << 7,
+  // With EF_ASYNC: `&|` / `&!`, not made a job.
+  EF_DISOWN   = 1 << 8,
 };
 
 struct Executor;
@@ -97,6 +107,11 @@ struct ExecContext {
   // other shell exits.
   bool aborting    = false;
   bool hangup      = false; // SIGHUP reached an interactive shell
+  // Under job control, the process group of a pipeline whose last stage
+  // runs in the shell: it keeps the terminal while that stage runs, so a
+  // foreground job started there gives the terminal back to it.
+  Pid  pipeline_pgid = 0;
+  int  pipeline_jid  = 0;   // … and the job of its forked stages
   // ERR_EXIT, ERR_RETURN and ZERR are off while this is positive: in the
   // conditions of if/while/until, after `!`, and in all but the last
   // pipeline of a && / || chain.
@@ -166,7 +181,7 @@ struct Assignment {
 
 // A single redirection decoded from the bytecode.  `fd == -1` means the
 // user did not write an explicit fd prefix; the executor picks the default
-// for `type` (0 for reads, 1 for writes, 2 for stderr merges).
+// for `type` (0 for the operators that read, 1 for the rest).
 struct Redirection {
   RedirType type    = REDIR_READ;
   int       fd      = -1;
@@ -183,24 +198,27 @@ struct SavedFds {
   SavedFds(const SavedFds&)            = delete;
   SavedFds& operator=(const SavedFds&) = delete;
   SavedFds(SavedFds&& other) noexcept
-    : entries(s::move(other.entries)), fail(other.fail) {
+    : entries(s::move(other.entries)), tees(s::move(other.tees)), fail(other.fail) {
     other.entries.clear();
+    other.tees.clear();
   }
   SavedFds& operator=(SavedFds&&) noexcept;
   ~SavedFds() { restore(); }
 
   // Duplicate `dst` into a new high fd (CLOEXEC) if not already saved, so
   // the destructor can restore it with dup2.  If `dst` was closed, records
-  // that fact and reopens with /dev/null → dst on restore so later
-  // close(2)s see a valid fd in the slot.
+  // that fact, and restore closes it again.
   void save(int dst);
+  // Puts the fds back, then waits for the MULTIOS tees, which see the end
+  // of their input once the fds writing to them are closed.
   void restore() noexcept;
   // Keeps the redirections: forgets the saved fds instead of restoring them
-  // (`exec >file`).
+  // (`exec >file`); the tees go on running.
   void commit() noexcept;
 
   struct Entry { int dst; int backup; };
   vec<Entry> entries;
+  vec<Pid>   tees;     // MULTIOS helpers forked for these redirections
   bool fail = false;
 };
 
@@ -252,6 +270,15 @@ struct Executor {
   void handle_signals();
   // Runs the trap for `sig` (a real or pseudo-signal), keeping $?.
   void run_trap(int sig);
+  // While the shell runs the last stage of a pipeline under job control,
+  // the other stages can't be suspended without it: when one was stopped
+  // (Ctrl-Z), says so and continues them, as zsh does.
+  void continue_pipeline_stages();
+  // For a builtin blocked reading (`read`): called when the signal
+  // self-pipe (SignalManager::wake_fd) is readable; handles the signals
+  // (traps, reaping, continuing stopped pipeline stages) as between
+  // commands.
+  void wait_for_input();
   // Runs the EXIT trap once, as the shell exits with `status`; returns the
   // status to exit with (the trap may call `exit`).
   int  run_exit_trap(int status);
@@ -331,27 +358,34 @@ protected:
     vec<Assignment>         assigns,
     const vec<Redirection>& redirs,
     opt<Result<str>>        found,
-    const str*              traced);
-  // Apply `redirs` in the current process, remembering originals in `saved`
-  // so they can be restored.  Returns true on success.
+    const str*              traced,
+    ExecFlags               flags);
+  // Forks the process of a command that runs in one of its own (an
+  // external command, a subshell).  As the last stage of a pipeline
+  // (EF_PIPELAST) it joins the pipeline's process group.
+  pid_t fork_command(ExecFlags flags, ChildKind kind);
+  // Waits for the command fork_command started and returns its status; as
+  // the last stage of a pipeline, leaves it to exec_pline (status 0).
+  int   wait_command(pid_t pid);
+  // Apply `redirs` in order in the current process, remembering originals
+  // in `saved` so they can be restored.  Under MULTIOS several outputs to
+  // one fd go through a tee.  `flags` may hold EF_STAGEOUT/EF_STAGEERR.
+  // Prints the error and returns false when one fails.
   bool apply_redirects(const vec<Redirection>& redirs,
-                       SavedFds& saved);
+                       SavedFds& saved, ExecFlags flags = EF_NONE);
   // Process-substitution helpers.  <(cmd) → read-end fd; >(cmd) → write-end fd.
   // =(cmd) → path to a tmp file.  All fork a subshell internally.
   int procsubst_in (strv src);
   int procsubst_out(strv src);
   str procsubst_eq (strv src);
-  // Resolve any `<(cmd)`, `>(cmd)`, `=(cmd)` tokens in `args` to actual paths
-  // by forking the inner subshell and recording the parent fd that the child
-  // will inherit.  Pipe-backed fds are kept open until the caller invokes
-  // `procsubst_release` so the outer command can see /dev/fd/N; `=(cmd)`
-  // creates a tmp file that must also be unlinked afterwards.
+  // What the process substitutions among a command's words left behind:
+  // the fds behind their /dev/fd/N paths, kept open while the command
+  // runs, and the files of `=(cmd)`, removed afterwards.
   struct ProcSubstResources {
     vec<int> open_fds;
     vec<str> tmp_files;
   };
-  ProcSubstResources expand_procsubst(vec<str>& args);
-  void               procsubst_release(ProcSubstResources& res) noexcept;
+  void procsubst_release(ProcSubstResources& res) noexcept;
   // Expands the words, then the redirection targets, of a simple command
   // in place (src/exec/subst.cpp does the work); the assignments wait for
   // apply_assigns.  Prints the error and returns false when an expansion
@@ -375,6 +409,10 @@ protected:
   void trace_text(strv text, int fd = 2);
 
 public:
+  // Runs a process substitution met in a word (`kind` is `<`, `>` or
+  // `=`) and returns its path; its fd or file lasts until the command
+  // that expanded it is done.
+  str  procsubst(char kind, strv body);
   bool is_builtin(strv name) const noexcept;
   int  call_builtin(
     strv name,
@@ -399,10 +437,26 @@ public:
   ExecContext& context() noexcept { return mCtx; }
 
 private:
+  // The pid a pipeline's last stage got when it forked (EF_PIPELAST), and
+  // the `=(…)` files to remove once it is done.
+  struct PipeLast {
+    pid_t    pid = -1;
+    vec<str> tmp_files{};
+  };
+
   ExecContext& mCtx;
   // The pipeline exec_pline is running, for current_job_text().
   const CompiledProgram* mPipeProg = nullptr;
   s::size_t              mPipePc   = 0;
+  PipeLast*              mPipeLast = nullptr;
+  // Where the process substitutions of the command being expanded go, and
+  // those made outside any command.
+  ProcSubstResources*    mPsubst = nullptr;
+  ProcSubstResources     mLooseSubst;
+  // Under job control, the process group fork_child put its last child
+  // in, for its job.
+  Pid                    mChildPgid = 0;
+
   s::array<bool, TRAP_TABLE_SIZE> mInTrap{};
   int            mTrapDepth  = 0;     // traps being run
   int            mStringDepth = 0;   // nested exec_string calls

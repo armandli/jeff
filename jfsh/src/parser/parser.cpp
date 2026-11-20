@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 
 #include <algorithm>
 #include <memory>
@@ -169,6 +170,10 @@ static bool is_procsubst(strv text) noexcept {
           or text.starts_with("=("));
 }
 
+bool Parser::at_list_word() const noexcept {
+  return at_word() or (at(TokType::TK_REDIR) and is_procsubst(mLex.peek().text));
+}
+
 // Tokens that end a list: end of input, or the closing word of whatever
 // compound command the list is the body of.
 bool Parser::at_list_terminator() const noexcept {
@@ -230,7 +235,10 @@ bool Parser::par_list1() {
       return true;
     }
     if (at(TokType::TK_SEMI) or at(TokType::TK_AMP) or at(TokType::TK_NEWLINE)) {
-      if (at(TokType::TK_AMP)) flags |= WC_LIST_ASYNC;
+      if (at(TokType::TK_AMP)) {
+        flags |= WC_LIST_ASYNC;
+        if (mLex.peek().text != "&") flags |= WC_LIST_DISOWN;
+      }
       mLex.consume();
       // `cmd & ;` is allowed, as in zsh.
       if ((flags & WC_LIST_ASYNC) and at(TokType::TK_SEMI)) mLex.consume();
@@ -563,7 +571,7 @@ bool Parser::par_for_words(s::size_t head, WordCode op) {
   WordCode type = WC_FOR_IN;
   vec<str> values;
   if (eat(TokType::TK_IN)) {
-    while (at_word()) {
+    while (at_list_word()) {
       values.push_back(mLex.peek().text);
       mLex.consume();
     }
@@ -571,7 +579,7 @@ bool Parser::par_for_words(s::size_t head, WordCode op) {
       return error_near(mLex.peek());
   } else if (eat(TokType::TK_LPAREN)) {
     for (skip_newlines(); not eat(TokType::TK_RPAREN); skip_newlines()) {
-      if (not at_word()) return error_near(mLex.peek());
+      if (not at_list_word()) return error_near(mLex.peek());
       values.push_back(mLex.peek().text);
       mLex.consume();
     }
@@ -599,13 +607,13 @@ bool Parser::par_foreach() {
   if (names.empty()) return error_near(mLex.peek());
   vec<str> values;
   if (eat(TokType::TK_IN)) {
-    while (at_word() and not at(TokType::TK_END)) {
+    while (at_list_word() and not at(TokType::TK_END)) {
       values.push_back(mLex.peek().text);
       mLex.consume();
     }
   } else if (eat(TokType::TK_LPAREN)) {
     for (skip_newlines(); not eat(TokType::TK_RPAREN); skip_newlines()) {
-      if (not at_word()) return error_near(mLex.peek());
+      if (not at_list_word()) return error_near(mLex.peek());
       values.push_back(mLex.peek().text);
       mLex.consume();
     }
@@ -664,7 +672,7 @@ bool Parser::par_for() {
 // arm  := WC_CASE(BREAK|FALL|TESTNEXT, skip) words(patterns) body
 bool Parser::par_case() {
   mLex.consume();  // case
-  if (not at_word()) return error_near(mLex.peek());
+  if (not at_list_word()) return error_near(mLex.peek());
   str subject = mLex.peek().text;
   mLex.consume();
   skip_newlines();
@@ -970,63 +978,81 @@ static bool op_to_redir_type(strv op, RedirType& out) noexcept {
   if (op == ">&")  { out = REDIR_MERGE;      return true; }
   if (op == "<&")  { out = REDIR_IN_DUP;     return true; }
   if (op == "&>")  { out = REDIR_MERGEOUT;   return true; }
-  if (op == "&>>") { out = REDIR_APPEND_ERR; return true; }
-  if (op == "<(")  { out = REDIR_PROC_IN;    return true; }
-  if (op == ">(")  { out = REDIR_PROC_OUT;   return true; }
-  if (op == "=(")  { out = REDIR_PROC_EQ;    return true; }
+  if (op == "&>>" or op == ">>&") { out = REDIR_APPEND_ERR; return true; }
+  if (op == ">>|") { out = REDIR_APPEND_CLOBBER; return true; }
+  if (op == "&>|" or op == ">&|") { out = REDIR_MERGEOUT_CLOBBER; return true; }
+  if (op == "&>>|" or op == ">>&|") { out = REDIR_APPEND_ERR_CLOBBER; return true; }
   return false;
 }
 
-// Strip one layer of outer quotes from a here-doc delimiter and report
-// whether any were present.  `'EOF'` → ("EOF", true); `EOF` → ("EOF", false).
+// Quote removal on a here-doc delimiter, reporting whether any quoting
+// was there (which makes the body literal).  Inside '…' everything is
+// literal; inside "…" a backslash escapes only " $ ` and \; elsewhere
+// it escapes any character.  `'EOF'` → EOF, `E\\OF` → E\OF.
 static str heredoc_unquote(strv raw, bool& quoted) {
   str out;
   quoted = false;
+  char in = 0;   // the quote we are inside of, if any
   for (s::size_t i = 0; i < raw.size(); ++i) {
     char c = raw[i];
-    if (c == '\'' or c == '"' or c == '\\') { quoted = true; continue; }
-    out += c;
+    if (in == '\'') {
+      if (c == '\'') in = 0;
+      else            out += c;
+    } else if (c == '\\' and i + 1 < raw.size()
+               and (in != '"' or s::strchr("\"$`\\", raw[i + 1]))) {
+      quoted = true;
+      out += raw[++i];
+    } else if (in == '"') {
+      if (c == '"') in = 0;
+      else          out += c;
+    } else if (c == '\'' or c == '"') {
+      quoted = true;
+      in = c;
+    } else {
+      out += c;
+    }
   }
   return out;
 }
 
 bool Parser::par_redir() {
+  // (A process substitution in its own place is a word: par_simple and
+  // par_trailing_redirs take it before calling this.)
   LexToken op_tok = mLex.next_token();
-  // Process substitution tokens look like `<(cmd)` / `>(cmd)` / `=(cmd)` —
-  // the lexer already slurped the balanced parens into text, so recognize
-  // them by prefix before invoking the general operator table.
-  if (is_procsubst(op_tok.text)) {
-    RedirType type =
-        op_tok.text[0] == '<' ? REDIR_PROC_IN :
-        op_tok.text[0] == '>' ? REDIR_PROC_OUT : REDIR_PROC_EQ;
-    str body =
-        op_tok.text.substr(2, op_tok.text.size() - 3);  // strip `<(` and `)`
-    emit(make_wc_redir(type, -1));
-    emit_str(s::move(body));
-    return true;
+  // `<(cmd` that the input ends inside.
+  if (op_tok.text.size() >= 2 and op_tok.text[1] == '(') {
+    error("parse error near `" + op_tok.text + "'");
+    return false;
   }
-
   auto [fd, op] = split_redir_token(op_tok.text);
   RedirType type;
   if (not op_to_redir_type(op, type))
     return unsupported("redirection `" + op_tok.text + "'");
 
-  // REDIR_CLOSE is >&- with no target.
+  // `>&-` and `<&-` close the fd, 1 and 0 by default.
   if (type == REDIR_MERGE or type == REDIR_IN_DUP) {
     const auto& tgt = mLex.peek();
     if (tgt.type == TokType::TK_WORD and tgt.text == "-") {
       mLex.consume();
+      bool in = type == REDIR_IN_DUP;
+      if (fd < 0) fd = in ? 0 : 1;
       emit(make_wc_redir(REDIR_CLOSE, fd));
-      emit_str("");
+      emit_str(in ? "<" : ">");   // how it was written, for the text
       return true;
     }
   }
 
   // `< <(cmd)`, `2> >(cmd)`: a process substitution as the target joins
-  // the given fd to the command's pipe.  (`< =(cmd)` reads its output as
-  // well.)
+  // the given fd to the command's pipe.  `< =(cmd)` reads its file, and
+  // `<<< <(cmd)` gives its path, both as a word the expansion runs.
   if (mLex.peek().type == TokType::TK_REDIR and is_procsubst(mLex.peek().text)) {
     const str& t = mLex.peek().text;
+    if (type == REDIR_HERESTR or (type == REDIR_READ and t[0] == '=')) {
+      emit(make_wc_redir(type, fd));
+      emit_str(t);
+      mLex.consume();
+      return true;
+    }
     bool out = type == REDIR_WRITE or type == REDIR_APPEND or type == REDIR_CLOBBER;
     bool in  = type == REDIR_READ;
     if (not (in or out) or (out and t[0] != '>') or (in and t[0] == '>')) {

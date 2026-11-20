@@ -82,26 +82,13 @@ const sptr<const vec<str>>& LexInput::current_aliases() const noexcept {
   return mPushed.empty() ? none : mPushed.back().names;
 }
 
-// Scoop balanced parentheses so `<(…)`, `>(…)` and `=(…)` become a single
-// TK_REDIR token whose text holds the entire substitution source.
-static void slurp_balanced_paren(InputSource& src, str& text) {
-  int depth = 1;
-  for (;;) {
-    int c = src.next_char();
-    if (c == -1) break;
-    text += static_cast<char>(c);
-    if (c == '(') ++depth;
-    else if (c == ')') { if (--depth == 0) break; }
-  }
-}
-
 // Characters that end an unquoted word.
 static bool is_word_break(int c) noexcept {
   return c == ' ' or c == '\t' or c == '\n' or c == ';' or c == '&'
       or c == '|' or c == '(' or c == ')' or c == '<' or c == '>';
 }
 
-static void slurp_nested(InputSource& src, str& text, char open,
+static bool slurp_nested(InputSource& src, str& text, char open,
                          char close);
 
 // Appends a backquoted command substitution up to and including its closing
@@ -145,14 +132,15 @@ static void slurp_dquote(InputSource& src, str& text) {
 // Appends text up to and including the `close` that balances an `open` the
 // caller has already consumed.  Quotes, backslashes, backquotes and nested
 // `$(…)`/`${…}` are tracked so their contents can't close it early.
-static void slurp_nested(InputSource& src, str& text, char open,
+// False when the input ends first.
+static bool slurp_nested(InputSource& src, str& text, char open,
                          char close) {
   int depth = 1;
   for (int c; (c = src.next_char()) != -1;) {
     text += static_cast<char>(c);
     if (c == '\\') {
       int n = src.next_char();
-      if (n == -1) return;
+      if (n == -1) return false;
       text += static_cast<char>(n);
     } else if (c == '\'') {
       for (int q; (q = src.next_char()) != -1;) {
@@ -168,15 +156,28 @@ static void slurp_nested(InputSource& src, str& text, char open,
       if ((n == '(' or n == '{') and n != open) {
         text += static_cast<char>(n);
         slurp_nested(src, text, static_cast<char>(n), n == '(' ? ')' : '}');
+      } else if (n == '\'') {
+        // $'…', where `\'` doesn't end it.
+        text += '\'';
+        for (int q; (q = src.next_char()) != -1;) {
+          text += static_cast<char>(q);
+          if (q == '\'') break;
+          if (q == '\\') {
+            int e = src.next_char();
+            if (e == -1) break;
+            text += static_cast<char>(e);
+          }
+        }
       } else {
         src.unget(n);
       }
     } else if (c == open) {
       ++depth;
     } else if (c == close and --depth == 0) {
-      return;
+      return true;
     }
   }
+  return false;
 }
 
 // After a `<` inside a word: reads the rest of a zsh numeric glob `<lo-hi>`
@@ -352,6 +353,8 @@ LexToken Lexer::read_token_raw() {
         if (n == '&') return {TokType::TK_AMPAMP,   "&&", mSrc.line()};
         if (n == '(') return {TokType::TK_AMPPAREN, "&(", mSrc.line()};
         if (n == '>') { mSrc.unget(n); return read_redir('&'); }
+        // `&|` and `&!` run the list in the background, disowned.
+        if (n == '|' or n == '!') return {TokType::TK_AMP, n == '|' ? "&|" : "&!", mSrc.line()};
         mSrc.unget(n);
         return {TokType::TK_AMP, "&", mSrc.line()};
       }
@@ -396,7 +399,15 @@ LexToken Lexer::read_token_raw() {
         mSrc.unget(n);
         if ((mFlags & LEX_COND) and (n == -1 or n == ' ' or n == '\t' or n == '\n'))
           return {TokType::TK_WORD, str(1, static_cast<char>(c)), mSrc.line()};
-        return read_redir(c);
+        LexToken tok = read_redir(c);
+        // A process substitution with more of the word after it
+        // (`<(cmd)x`) is a word.
+        if (tok.text.size() > 2 and tok.text[1] == '(') {
+          int after = mSrc.next_char();
+          if (after != -1 and not is_word_break(after)) return read_word(after, s::move(tok.text));
+          mSrc.unget(after);
+        }
+        return tok;
       }
       default:  return read_word(c);
     }
@@ -471,31 +482,53 @@ opt<str> Lexer::read_cond_pattern() {
   return text;
 }
 
-LexToken Lexer::read_word(int first_char) {
-  str text;
+LexToken Lexer::read_word(int first_char, str prefix) {
+  str  text      = s::move(prefix);
   int  c         = first_char;
   int  ln        = mSrc.line();
   bool in_single = false;
   bool in_double = false;
   bool all_digits_so_far =
-      s::isdigit(static_cast<unsigned char>(first_char)) != 0;
+      text.empty() and s::isdigit(static_cast<unsigned char>(first_char)) != 0;
   for (;;) {
     if (c == -1) break;
     if (not in_single and not in_double) {
-      // Fd prefix: `2>`, `12<foo` etc.  When the word so far is all ASCII
-      // digits and the next character is a redirection operator, hand the
-      // whole lot over to read_redir and bake the fd into the token text.
-      if (all_digits_so_far and not text.empty() and not (mFlags & LEX_COND)
+      // Fd prefix: `2>`, `0<foo` etc.  When the word so far is one digit
+      // and the next character is a redirection operator, hand the whole
+      // lot over to read_redir and bake the fd into the token text.  As in
+      // zsh, `12>f` is the word `12` and a redirection.
+      if (all_digits_so_far and text.size() == 1 and not (mFlags & LEX_COND)
           and (c == '<' or c == '>')) {
         LexToken redir = read_redir(c);
         redir.text = text + redir.text;
         return redir;
       }
-      // `=(` at the start of a word is zsh's =(cmd) substitution.
+      // `=(` at the start of a word is zsh's =(cmd) substitution: a token
+      // of its own, unless more of the word follows (`=(cmd)x`).
       if (text == "=" and c == '(') {
-        str body = "=(";
-        slurp_balanced_paren(mSrc, body);
-        return {TokType::TK_REDIR, body, ln};
+        text += '(';
+        if (not slurp_nested(mSrc, text, '(', ')')) mIncomplete = true;
+        c = mSrc.next_char();
+        if (c == -1 or is_word_break(c)) {
+          mSrc.unget(c);
+          return {TokType::TK_REDIR, text, ln};
+        }
+        all_digits_so_far = false;
+        continue;
+      }
+      // `<(…)` or `>(…)` after other text is a process substitution in
+      // the word (`--file=<(cmd)`), which the expansion runs in place.
+      if ((c == '<' or c == '>') and not text.empty() and not (mFlags & LEX_COND)) {
+        int n = mSrc.next_char();
+        if (n == '(') {
+          text += static_cast<char>(c);
+          text += '(';
+          if (not slurp_nested(mSrc, text, '(', ')')) mIncomplete = true;
+          all_digits_so_far = false;
+          c = mSrc.next_char();
+          continue;
+        }
+        mSrc.unget(n);
       }
       // `name=(…)` is an array assignment, and inside a word `(…)` is a
       // glob group or qualifier (`*.(c|h)`, `*(.)`).  `name()` is left
@@ -587,30 +620,41 @@ LexToken Lexer::read_word(int first_char) {
   return {TokType::TK_WORD, text, ln};
 }
 
+// The operators: `<`, `<<`, `<<-`, `<<<`, `<>`, `<&`, `<(…)`, `>`, `>>`,
+// `>&`, `>>&`, `>(…)`, `&>` and `&>>`.  Those that write may end in `|` or
+// `!` (`>|`, `>>!`, `&>|`, `>&!`), which ignores NO_CLOBBER; the token
+// spells both `|`.
 LexToken Lexer::read_redir(int first_char) {
   str text(1, static_cast<char>(first_char));
-  int c = mSrc.next_char();
-  if (c != -1) {
-    text += static_cast<char>(c);
-    if (text == "<<") {
-      int n = mSrc.next_char();
-      if      (n == '-') text += '-';
-      else if (n == '<') text += '<';
-      else               mSrc.unget(n);
-    } else if (text == "&>") {
-      int n = mSrc.next_char();
-      if (n == '>') text += '>';
-      else          mSrc.unget(n);
-    } else if (text == "<(" or text == ">(") {
-      slurp_balanced_paren(mSrc, text);
-    } else if (text == ">>" or text == ">|" or text == ">&"
-               or text == "<>" or text == "<&") {
-      // ok
-    } else if (c != '>' and c != '<' and c != '|'
-               and c != '&' and c != '-') {
-      mSrc.unget(c);
-      text = text.substr(0, 1);
+  auto take = [&](char want) {
+    int n = mSrc.next_char();
+    if (n == want) { text += want; return true; }
+    mSrc.unget(n);
+    return false;
+  };
+  auto clobber = [&] {
+    int n = mSrc.next_char();
+    if (n == '|' or n == '!') text += '|';
+    else                      mSrc.unget(n);
+  };
+  if (first_char == '&') {
+    take('>');
+    take('>');
+    clobber();
+  } else if (first_char == '<') {
+    if (take('<')) {
+      if (not take('-')) take('<');
+    } else if (not take('>') and not take('&') and take('(')) {
+      if (not slurp_nested(mSrc, text, '(', ')')) mIncomplete = true;
     }
+  } else if (take('(')) {
+    if (not slurp_nested(mSrc, text, '(', ')')) mIncomplete = true;
+  } else if (take('>')) {
+    take('&');
+    clobber();
+  } else {
+    take('&');
+    clobber();
   }
   return {TokType::TK_REDIR, text, mSrc.line()};
 }

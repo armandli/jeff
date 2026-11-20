@@ -129,6 +129,8 @@ protected:
   bool   at_list_terminator() const noexcept;
   // A word, or a reserved word used as one (`for x in do done`).
   bool   at_word() const noexcept;
+  // A word of a `for` list: a process substitution is one too.
+  bool   at_list_word() const noexcept;
   bool   expect(TokType t);                     // eat it, or a parse error
   void   skip_newlines() {
     while (at(TokType::TK_NEWLINE)) mLex.consume();

@@ -67,7 +67,8 @@ enum WCOpcode : WordCode {
 //
 //   program  := list* WC_END
 //   list     := WC_LIST(flags, skip)     sublist
-//                 flags: WC_LIST_ASYNC (`&`), WC_LIST_END (last list element)
+//                 flags: WC_LIST_ASYNC (`&`), WC_LIST_DISOWN (`&|`, `&!`),
+//                 WC_LIST_END (last list element)
 //                 skip:  words in the sublist chain that follows
 //   sublist  := WC_SUBLIST(flags, skip)  pipeline  [sublist]
 //                 flags: connector to the NEXT element (WC_SUBLIST_END, _AND,
@@ -142,9 +143,10 @@ enum WCOpcode : WordCode {
 // (src/exec/subst.cpp).
 // ---------------------------------------------------------------------------
 
-inline constexpr WordCode WC_LIST_ASYNC = 1u;  // & (background)
-inline constexpr WordCode WC_LIST_END   = 2u;  // last in list
-inline constexpr int      WC_LIST_FLAG_BITS = 2;
+inline constexpr WordCode WC_LIST_ASYNC  = 1u;  // & (background)
+inline constexpr WordCode WC_LIST_END    = 2u;  // last in list
+inline constexpr WordCode WC_LIST_DISOWN = 4u;  // &| or &! (with ASYNC)
+inline constexpr int      WC_LIST_FLAG_BITS = 3;
 
 inline constexpr WordCode WC_SUBLIST_END  = 0u;
 inline constexpr WordCode WC_SUBLIST_AND  = 1u;    // &&
@@ -190,9 +192,12 @@ enum RedirType : WordCode {
   REDIR_PROC_IN     = 10,  // <(cmd)  process substitution
   REDIR_PROC_OUT    = 11,  // >(cmd)
   REDIR_PROC_EQ     = 12,  // =(cmd)  zsh-specific
-  REDIR_CLOSE       = 13,  // >&-
+  REDIR_CLOSE       = 13,  // >&- or <&- (the target says which)
   REDIR_IN_DUP      = 14,  // <&N
-  REDIR_APPEND_ERR  = 15,  // &>>
+  REDIR_APPEND_ERR  = 15,  // &>> or >>&
+  REDIR_APPEND_CLOBBER     = 16,  // >>| or >>!
+  REDIR_MERGEOUT_CLOBBER   = 17,  // &>| &>! >&| >&!
+  REDIR_APPEND_ERR_CLOBBER = 18,  // &>>| >>&|
   REDIR_TYPE_MAX,
 };
 

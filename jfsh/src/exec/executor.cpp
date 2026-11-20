@@ -13,6 +13,9 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <unistd.h>
+#if not defined(__APPLE__) and not defined(__FreeBSD__)
+#include <stdio_ext.h>
+#endif
 
 #include <algorithm>
 #include <tuple>
@@ -179,12 +182,64 @@ static Result<void> expand_assignment(Expander& ex, Assignment& a) {
 }
 
 static str trace_quote(strv w);
+static str errno_text(int err);
 static str trace_assigns(const vec<Assignment>& assigns);
 static int trace_fd(const SavedFds& saved);
 static void write_trace(str line, int fd);
 static bool posix_special(const BuiltinDef& def);
 static bool is_executable_file(const str& path);
 static Result<str> search_path(strv name, const vec<str>& dirs, HashTable<str>* hash);
+
+// The fds above 9 that the shell opened for itself (pipes, saved fds),
+// with the file each was open on, so that a number reused for something
+// else no longer counts: `>&N` refuses them, as zsh refuses its own.
+static umap<int, s::pair<dev_t, ino_t>> ShellFds;
+
+static void note_shell_fd(int fd) {
+  struct stat st{};
+  if (fd >= 10 and ::fstat(fd, &st) == 0) ShellFds[fd] = {st.st_dev, st.st_ino};
+}
+
+static void forget_shell_fd(int fd) { ShellFds.erase(fd); }
+
+static bool is_shell_fd(int fd) {
+  auto it = ShellFds.find(fd);
+  struct stat st{};
+  return it != ShellFds.end() and ::fstat(fd, &st) == 0
+     and it->second == s::pair{st.st_dev, st.st_ino};
+}
+
+// Moves `fd` to a number ≥ 10, close-on-exec, out of the way of the fds
+// redirections and pipeline stages name.  Returns the new fd, or -1 (with
+// errno, and `fd` closed).
+static int move_high(int fd) {
+  if (fd < 0) return fd;
+  if (fd >= 10) {
+    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    note_shell_fd(fd);
+    return fd;
+  }
+  int high = ::fcntl(fd, F_DUPFD_CLOEXEC, 10);
+  int err  = errno;
+  ::close(fd);
+  note_shell_fd(high);
+  errno = err;
+  return high;
+}
+
+// pipe(), with both ends moved by move_high: when the shell's own fd 0 or
+// 1 is closed, pipe() hands out that number, and a stage's dup2 onto it
+// would then lose the other end.
+static bool pipe_high(int p[2]) {
+  int raw[2];
+  if (::pipe(raw) != 0) return false;
+  p[0] = move_high(raw[0]);
+  p[1] = move_high(raw[1]);
+  if (p[0] >= 0 and p[1] >= 0) return true;
+  if (p[0] >= 0) ::close(p[0]);
+  if (p[1] >= 0) ::close(p[1]);
+  return false;
+}
 
 // zsh's POSIX-special builtins (BINF_PSPECIAL): the special ones and the
 // typeset variants, whose prefix assignments stay under POSIX_BUILTINS.
@@ -206,6 +261,27 @@ int Executor::exec_simple(vec<str> args,
   }
   bool globbing = mCtx.opts.get(OPT_GLOB);
   if (noglob) mCtx.opts.unset(OPT_GLOB);
+  // The process substitutions' fds and files last as long as the command:
+  // as the last stage of a pipeline, a forked one's `=(…)` files wait
+  // until exec_pline has waited for it.
+  ProcSubstResources psubst;
+  struct PSubstGuard {
+    ~PSubstGuard() {
+      exec->mPsubst = outer;
+      PipeLast* last = exec->mPipeLast;
+      if (pipe_last and last and last->pid > 0) {
+        last->tmp_files.insert(last->tmp_files.end(), res->tmp_files.begin(),
+                               res->tmp_files.end());
+        res->tmp_files.clear();
+      }
+      exec->procsubst_release(*res);
+    }
+
+    Executor* exec;
+    ProcSubstResources* res;
+    ProcSubstResources* outer;
+    bool pipe_last;
+  } psubst_guard{this, &psubst, s::exchange(mPsubst, &psubst), (flags & EF_PIPELAST) != 0};
   bool expanded = expand_command(args, redirs, subst_status);
   if (noglob) mCtx.opts.assign(OPT_GLOB, globbing);
   // A failed expansion (`${x?msg}`, NO_UNSET, `$((1/0))`) ends the command
@@ -247,17 +323,13 @@ int Executor::exec_simple(vec<str> args,
     }
     return true;
   };
-  auto psubst = expand_procsubst(args);
-  struct PSubstGuard {
-    Executor* exec;
-    ProcSubstResources* res;
-    ~PSubstGuard() { exec->procsubst_release(*res); }
-  } psubst_guard{this, &psubst};
 
   // Precommand modifiers: `builtin` and `command` pick what the name may
   // be; `exec` replaces the shell (or, alone, makes the redirections
   // permanent); `-` and `nocorrect` change nothing here.
   enum class Only { Any, Builtin, External } only = Only::Any;
+  bool prefixed = noglob;   // after a precommand modifier other than exec
+  bool bare_prefix = false; // `builtin` or `command` with nothing after it
   bool replace = false;
   bool clear_env = false;
   bool command_p = false;
@@ -267,12 +339,15 @@ int Executor::exec_simple(vec<str> args,
     const str& w = args[0];
     if (w == "builtin" and only == Only::Any) {
       args.erase(args.begin());
-      if (args.empty()) return 0;
+      prefixed = true;
+      bare_prefix = args.empty();
+      if (bare_prefix) break;
       only = Only::Builtin;
       break;
     }
     if (w == "command" and only == Only::Any) {
       via_command = true;
+      prefixed = true;
       s::size_t i = 1;
       bool lookup = false;
       bool default_path = false;
@@ -290,7 +365,8 @@ int Executor::exec_simple(vec<str> args,
       // `command -v name`: describe it, as whence does.
       if (lookup) break;
       args.erase(args.begin(), args.begin() + static_cast<s::ptrdiff_t>(i));
-      if (args.empty()) return 0;
+      bare_prefix = args.empty();
+      if (bare_prefix) break;
       command_p = default_path;
       only = mCtx.opts.get(OPT_POSIXBUILTINS) ? Only::Any : Only::External;
       continue;
@@ -329,10 +405,35 @@ int Executor::exec_simple(vec<str> args,
     if (w == "-" or w == "nocorrect") {
       if (w == "-") argv0 = "-";
       args.erase(args.begin());
+      prefixed = true;
       continue;
     }
     break;
   }
+  // A command of nothing but redirections runs $NULLCMD (cat) with them,
+  // or $READNULLCMD (more) for a lone `<file`; under SH_NULLCMD it is `:`.
+  // With CSH_NULLCMD, an empty $NULLCMD or after a precommand modifier it
+  // is an error, which ends the command line, as in zsh.
+  if (args.empty() and not redirs.empty() and assigns.empty() and not replace) {
+    auto param = [&](strv name) {
+      auto p = mCtx.params.lookup(name);
+      return p and p->get().is_set() ? p->get().scalar() : str{};
+    };
+    str nullcmd = param("NULLCMD");
+    str readnullcmd = param("READNULLCMD");
+    if (prefixed or mCtx.opts.get(OPT_CSHNULLCMD) or nullcmd.empty()) {
+      s::fprintf(stderr, "jfsh: redirection with no command\n");
+      mCtx.aborting = true;
+      return 1;
+    }
+    if (mCtx.opts.get(OPT_SHNULLCMD))
+      args.emplace_back(":");
+    else if (not readnullcmd.empty() and redirs.size() == 1 and redirs[0].type == REDIR_READ)
+      args.push_back(s::move(readnullcmd));
+    else
+      args.push_back(s::move(nullcmd));
+  }
+  if (bare_prefix) return 0;
 
   // xtrace shows the words without the precommand modifiers, and comes
   // before the command runs.  With assignments in front, it waits until
@@ -367,23 +468,15 @@ int Executor::exec_simple(vec<str> args,
     args[0] = *path;
   }
 
-  // With no command word the redirections apply to the current shell and
-  // the assignments update shell parameters.  Both happen in-process: the
-  // redirections first, so a failed one assigns nothing, as in zsh.
+  // With no command word (`exec` alone, or assignments) the redirections
+  // apply to the current shell and the assignments update shell
+  // parameters.  Both happen in-process: the redirections first, so a
+  // failed one assigns nothing, as in zsh.
   if (args.empty()) {
-    // SH_NULLCMD / CSH_NULLCMD (M12 Phase 12c): sh and csh refuse a
-    // command made of nothing but redirections.  zsh's own default runs
-    // $NULLCMD; jfsh's redirect-against-the-shell semantics stand in
-    // until the full $NULLCMD plumbing lands.
-    if (not redirs.empty()
-        and (mCtx.opts.get(OPT_SHNULLCMD) or mCtx.opts.get(OPT_CSHNULLCMD))) {
-      s::fprintf(stderr, "jfsh: redirection with no command\n");
-      return 1;
-    }
     SavedFds saved;
     if (not redirs.empty()) {
       s::fflush(nullptr);
-      if (not apply_redirects(redirs, saved)) return 1;
+      if (not apply_redirects(redirs, saved, flags)) return 1;
     }
     // PS4 is expanded before the assignments, which may change it.
     str ps4 = tracing ? trace_prompt() : str{};
@@ -410,7 +503,7 @@ int Executor::exec_simple(vec<str> args,
   if (replace) {
     s::fflush(nullptr);
     SavedFds saved;
-    if (not redirs.empty() and not apply_redirects(redirs, saved)) return 1;
+    if (not redirs.empty() and not apply_redirects(redirs, saved, flags)) return 1;
     if (not finish_typeset(trace_fd(saved))) return 1;
     int rc = exec_replace(args, s::move(assigns), argv0, clear_env, child_trace,
                           trace_fd(saved));
@@ -454,7 +547,7 @@ int Executor::exec_simple(vec<str> args,
     // rewire them; otherwise the output lands in the wrong place after
     // SavedFds restores (bug: stdio buffers survive dup2).
     s::fflush(nullptr);
-    if (not apply_redirects(redirs, saved)) return 1;
+    if (not apply_redirects(redirs, saved, flags)) return 1;
   }
   // Assignments in front of a function are exported to what it runs.  zsh
   // keeps those in front of a special builtin (or a typeset variant) only
@@ -523,11 +616,23 @@ int Executor::exec_list(ExecState& es, ExecFlags flags) {
     if (interrupted()) return mCtx.exiting ? mCtx.exit_val : rc;
     if (wc_list_flags(w) & WC_LIST_ASYNC) {
       bool        jc   = job_control();
+      // `&|` / `&!`: in the background, but not a job of the shell's.
+      bool        disown = wc_list_flags(w) & WC_LIST_DISOWN;
       // A lone pipeline (no && || !) is exec'd by the child itself, so the
       // job's pid is the command's own.
       WordCode    sl   = es.peek();
       bool        lone = (wc_sublist_flags(sl) & (WC_SUBLIST_TYPE | WC_SUBLIST_NOT))
                          == WC_SUBLIST_END;
+      // A lone pipeline's stages are forked straight from the shell, so
+      // $! is the last one, as in zsh.
+      if (lone and wc_pipe_count(es.prog->prog[es.pc + 1]) > 1) {
+        ++es.pc;
+        exec_pline(es, static_cast<ExecFlags>(EF_ASYNC | (disown ? +EF_DISOWN : 0)));
+        rc = mCtx.last_exit = 0;
+        es.pc = end;
+        if (mCtx.exiting) return mCtx.exit_val;
+        continue;
+      }
       str text = sublist_text(*es.prog, es.pc);
       pid_t pid = fork_child(0, false, ChildKind::Other);
       if (pid < 0) {
@@ -547,6 +652,9 @@ int Executor::exec_list(ExecState& es, ExecFlags flags) {
         if (mCtx.exiting) child_rc = mCtx.exit_val;
         s::fflush(nullptr);
         _exit(child_rc);
+      } else if (disown) {
+        mCtx.last_bg_pid = pid;
+        rc = mCtx.last_exit = 0;
       } else {
         int jid = mCtx.jobs.alloc(pid, JOB_ASYNC | JOB_NOTIFY | (jc ? +JOB_PGRP : 0),
                                   text);
@@ -650,6 +758,12 @@ int Executor::exec_sublist(ExecState& es, ExecFlags flags) {
   }
 }
 
+// Runs a pipeline.  As in zsh, every stage but the last is forked and the
+// last runs in the shell, its stdin the last pipe, so `echo x | read v`
+// sets v; an external command or subshell there forks into the
+// pipeline's job (EF_PIPELAST).  In the background (EF_ASYNC, a lone
+// pipeline before `&`) every stage forks from the shell, and $! is the
+// last one.
 int Executor::exec_pline(ExecState& es, ExecFlags flags) {
   s::size_t pipe_pc = es.pc;
   WordCode w     = es.fetch();  // WC_PIPE
@@ -657,7 +771,11 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
   if (n == 0) return 0;
   mPipeProg = es.prog;
   mPipePc   = pipe_pc;
-  if (n == 1) {
+  bool async  = flags & EF_ASYNC;
+  bool disown = flags & EF_DISOWN;
+  flags = static_cast<ExecFlags>(flags & ~(EF_ASYNC | EF_DISOWN | EF_PIPELAST | EF_STAGEOUT
+                                           | EF_STAGEERR));
+  if (n == 1 and not async) {
     int rc = exec_cmd(es, flags);
     mCtx.pipestatus.assign(1, rc);
     return rc;
@@ -666,19 +784,21 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
 
   // Pre-decode every stage's bytecode slice so we can fork them from the
   // parent without re-entering the parser.  Each stage knows its own
-  // start and end pc in the compiled program.
-  struct Stage { s::size_t start; s::size_t end; bool stderr_too; };
+  // start and end pc in the compiled program, and whether it has
+  // redirections of its own.
+  struct Stage { s::size_t start; s::size_t end; bool stderr_too; bool redirected; };
   vec<Stage> stages;
   stages.reserve(n);
   for (s::uint32_t i = 0; i < n; ++i) {
     s::size_t start = es.pc;
+    bool redirected = false;
     // Walk this stage: redirections and assignments, then WC_SIMPLE or
     // WC_TYPESET and its words, or a compound command, which its header's
     // skip jumps over.
     while (es.pc < es.prog->prog.size()) {
       WordCode op = wc_code(es.peek());
       if (op == WC_ASSIGN) { es.pc += 3; }
-      else if (op == WC_REDIR) { es.pc += 2; }
+      else if (op == WC_REDIR) { es.pc += 2; redirected = true; }
       else if (op == WC_SIMPLE) {
         WordCode argc = wc_data(es.fetch());
         es.pc += argc;
@@ -694,90 +814,172 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
         break;
       }
     }
-    stages.push_back({start, es.pc,
-                      i + 1 < n ? wc_pipe_stderr(w, i) : false});
+    stages.push_back({start, es.pc, i + 1 < n ? wc_pipe_stderr(w, i) : false,
+                      redirected});
   }
 
   // Build n-1 pipes.
   vec<int> rfds(n, -1), wfds(n, -1);
+  auto close_pipes = [&] {
+    for (int& fd : rfds) if (fd >= 0) { ::close(fd); fd = -1; }
+    for (int& fd : wfds) if (fd >= 0) { ::close(fd); fd = -1; }
+  };
   for (s::uint32_t i = 0; i + 1 < n; ++i) {
     int p[2];
-    if (::pipe(p) != 0) {
-      s::fprintf(stderr, "jfsh: pipe: %s\n", s::strerror(errno));
-      for (s::uint32_t j = 0; j < i; ++j) { ::close(rfds[j + 1]); ::close(wfds[j]); }
+    if (not pipe_high(p)) {
+      s::fprintf(stderr, "jfsh: pipe: %s\n", errno_text(errno).c_str());
+      close_pipes();
       return 1;
     }
     rfds[i + 1] = p[0];
     wfds[i]     = p[1];
   }
 
-  vec<pid_t> pids(n, -1);
+  s::uint32_t forked = async ? n : n - 1;
+  vec<pid_t> pids;
   pid_t pgid = 0;
-  for (s::uint32_t i = 0; i < n; ++i) {
-    pid_t pid = fork_child(pgid, true, ChildKind::Other);
+  for (s::uint32_t i = 0; i < forked; ++i) {
+    pid_t pid = fork_child(pgid, not async, ChildKind::Other);
     if (pid < 0) {
-      for (int fd : rfds) if (fd >= 0) ::close(fd);
-      for (int fd : wfds) if (fd >= 0) ::close(fd);
+      close_pipes();
       // The stages already started still have to be waited for.
-      for (s::uint32_t j = 0; j < i; ++j) {
+      for (pid_t p : pids) {
         int st;
-        while (::waitpid(pids[j], &st, 0) < 0 and errno == EINTR) {}
+        while (::waitpid(p, &st, 0) < 0 and errno == EINTR) {}
       }
       return 1;
     }
     if (pid == 0) {
-      if (rfds[i] >= 0) { ::dup2(rfds[i], 0); }
+      auto stage_flags = static_cast<ExecFlags>(flags | EF_NOFORK);
+      if (async and jc and mCtx.opts.get(OPT_BGNICE)) {
+        errno = 0;
+        [[maybe_unused]] int r = ::nice(5);
+      }
+      if (async and not jc) {
+        // Without job control a background job must not see Ctrl-C.
+        ::signal(SIGINT,  SIG_IGN);
+        ::signal(SIGQUIT, SIG_IGN);
+      }
+      if (rfds[i] >= 0) ::dup2(rfds[i], 0);
       if (wfds[i] >= 0) {
         ::dup2(wfds[i], 1);
-        if (stages[i].stderr_too) ::dup2(wfds[i], 2);
+        // The pipe takes part in the stage's own redirections (MULTIOS:
+        // `echo x >f | cat` writes to both), and `|&` comes after them.
+        if (stages[i].redirected) {
+          stage_flags = static_cast<ExecFlags>(stage_flags | EF_STAGEOUT
+                                               | (stages[i].stderr_too ? +EF_STAGEERR : 0));
+        } else if (stages[i].stderr_too) {
+          ::dup2(wfds[i], 2);
+        }
       }
-      for (int fd : rfds) if (fd >= 0) ::close(fd);
-      for (int fd : wfds) if (fd >= 0) ::close(fd);
+      close_pipes();
       ExecState se{es.prog, stages[i].start};
-      int rc = exec_cmd(se, static_cast<ExecFlags>(flags | EF_NOFORK));
+      int rc = exec_cmd(se, stage_flags);
       if (mCtx.exiting) rc = mCtx.exit_val;
       s::fflush(nullptr);
       _exit(rc);
     }
-    if (i == 0) pgid = pid;
-    pids[i] = pid;
+    if (i == 0) pgid = jc ? mChildPgid : pid;
+    pids.push_back(pid);
   }
-  for (int fd : rfds) if (fd >= 0) ::close(fd);
-  for (int fd : wfds) if (fd >= 0) ::close(fd);
-
-  if (jc) {
-    auto texts = pipeline_stage_texts(*es.prog, pipe_pc);
-    str text;
-    for (s::size_t i = 0; i < texts.size(); ++i) {
-      if (i) text += wc_pipe_stderr(w, static_cast<s::uint32_t>(i - 1)) ? " |& " : " | ";
-      text += texts[i];
-    }
-    int jid = mCtx.jobs.alloc(pgid, JOB_PGRP, s::move(text), false);
-    for (s::uint32_t i = 0; i < n; ++i) {
-      Process p;
-      p.pid  = pids[i];
-      p.text = i < texts.size() ? texts[i] : str{};
-      mCtx.jobs.add_process(jid, s::move(p));
-    }
-    return wait_foreground_job(mCtx, jid);
-  }
-
-  int last_rc = 0;
-  int worst   = 0;
-  mCtx.pipestatus.clear();
   for (s::uint32_t i = 0; i < n; ++i) {
-    int status = 0;
-    while (::waitpid(pids[i], &status, 0) < 0) {
-      if (errno != EINTR) { worst = 1; break; }
-    }
-    int rc = 0;
-    if (WIFEXITED(status))        rc = WEXITSTATUS(status);
-    else if (WIFSIGNALED(status)) rc = 128 + WTERMSIG(status);
-    if (rc != 0) worst = rc;
-    last_rc = rc;
-    mCtx.pipestatus.push_back(rc);
+    if (wfds[i] >= 0) ::close(wfds[i]);
+    if (rfds[i] >= 0 and (async or i + 1 < n)) ::close(rfds[i]);
   }
-  return mCtx.opts.get(OPT_PIPEFAIL) ? worst : last_rc;
+
+  // The forked stages make a job, so their statuses are recorded however
+  // they are reaped.
+  auto texts = pipeline_stage_texts(*es.prog, pipe_pc);
+  str text;
+  for (s::size_t i = 0; i < texts.size(); ++i) {
+    if (i) text += wc_pipe_stderr(w, static_cast<s::uint32_t>(i - 1)) ? " |& " : " | ";
+    text += texts[i];
+  }
+  auto add_process = [&](int jid, s::size_t i, pid_t pid) {
+    Process p;
+    p.pid    = pid;
+    p.text   = i < texts.size() ? texts[i] : str{};
+    p.status = ProcStatus::Running;
+    mCtx.jobs.add_process(jid, s::move(p));
+  };
+  if (async and disown) {
+    mCtx.last_bg_pid = pids.back();
+    return 0;
+  }
+  if (async) {
+    int jid = mCtx.jobs.alloc(pgid, JOB_ASYNC | JOB_NOTIFY | (jc ? +JOB_PGRP : 0),
+                              s::move(text));
+    for (s::size_t i = 0; i < pids.size(); ++i) add_process(jid, i, pids[i]);
+    mCtx.last_bg_pid = pids.back();
+    if (mCtx.opts.interactive()) {
+      s::fprintf(stderr, "[%d]", jid);
+      for (pid_t p : pids) s::fprintf(stderr, " %d", static_cast<int>(p));
+      s::fprintf(stderr, "\n");
+    }
+    return 0;
+  }
+  int jid = mCtx.jobs.alloc(pgid, jc ? +JOB_PGRP : 0, s::move(text), false);
+  for (s::size_t i = 0; i < pids.size(); ++i) add_process(jid, i, pids[i]);
+
+  // The last stage, in the shell with its stdin from the last pipe.
+  PipeLast last;
+  int last_rc = 0;
+  {
+    SavedFds in;
+    in.save(0);
+    ::dup2(rfds[n - 1], 0);
+    ::close(rfds[n - 1]);
+    PipeLast* outer      = s::exchange(mPipeLast, &last);
+    Pid       outer_pgid = s::exchange(mCtx.pipeline_pgid, jc ? pgid : 0);
+    int       outer_jid  = s::exchange(mCtx.pipeline_jid, jc ? jid : 0);
+    ExecState se{es.prog, stages[n - 1].start};
+    last_rc = exec_cmd(se, static_cast<ExecFlags>((flags & ~EF_NOFORK) | EF_PIPELAST));
+    s::fflush(nullptr);
+    mPipeLast          = outer;
+    mCtx.pipeline_pgid = outer_pgid;
+    mCtx.pipeline_jid  = outer_jid;
+  }
+  // `exit` there doesn't wait for the other stages, as in zsh.
+  if (mCtx.exiting) {
+    mCtx.jobs.remove(jid);
+    return last_rc;
+  }
+  bool in_shell = last.pid < 0;
+  if (not in_shell) add_process(jid, n - 1, last.pid);
+  struct Unlink {
+    ~Unlink() { for (const auto& f : files) ::unlink(f.c_str()); }
+
+    vec<str>& files;
+  } unlink_after{last.tmp_files};
+
+  int rc = 0;
+  if (jc) {
+    rc = wait_foreground_job(mCtx, jid);
+    if (mCtx.jobs.get(jid)) return rc;   // stopped: it stays a job
+  } else if (auto found = mCtx.jobs.get(jid)) {
+    auto& job = found->get();
+    for (auto& p : job.procs) {
+      int status = 0;
+      while (not p.done()) {
+        pid_t got = ::waitpid(p.pid, &status, 0);
+        if (got > 0) {
+          mCtx.jobs.update(got, status);
+        } else if (errno != EINTR) {
+          // Reaped already, as the job's record says.
+          if (not p.done()) p.status = ProcStatus::Done;
+        }
+      }
+    }
+    mCtx.pipestatus.clear();
+    for (const auto& p : job.procs) mCtx.pipestatus.push_back(p.exit_code);
+    mCtx.jobs.remove(jid);
+  }
+  if (in_shell) mCtx.pipestatus.push_back(last_rc);
+  // PIPEFAIL: the rightmost stage that failed.
+  rc = mCtx.pipestatus.back();
+  if (mCtx.opts.get(OPT_PIPEFAIL))
+    for (int st : mCtx.pipestatus) if (st != 0) rc = st;
+  return rc;
 }
 
 // $LINENO for the command at es.pc: its line in the script, -c string,
@@ -794,6 +996,21 @@ static s::uint32_t line_at(const ExecState& es) noexcept {
 int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
   if (es.at_end()) return 0;
   mCtx.lineno = line_at(es);
+  // Process substitutions in the command's words (`for f in <(cmd)`) last
+  // until it is done; those made outside any command go with the
+  // outermost one.
+  ProcSubstResources psubst;
+  struct PSubstScope {
+    ~PSubstScope() {
+      exec->mPsubst = outer;
+      exec->procsubst_release(*res);
+      if (not outer) exec->procsubst_release(exec->mLooseSubst);
+    }
+
+    Executor* exec;
+    ProcSubstResources* res;
+    ProcSubstResources* outer;
+  } psubst_scope{this, &psubst, s::exchange(mPsubst, &psubst)};
   // Redirections in front of a compound command belong to it; a simple
   // command goes on with an assignment or its words.
   s::size_t pc = es.pc;
@@ -812,7 +1029,7 @@ int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
   if (not expand_command(no_args, redirs, subst_status)) return 1;
   SavedFds saved;
   s::fflush(nullptr);
-  if (not apply_redirects(redirs, saved)) return 1;
+  if (not apply_redirects(redirs, saved, flags)) return 1;
   int rc = exec_compound(es, flags);
   s::fflush(nullptr);
   return rc;
@@ -1189,8 +1406,7 @@ int Executor::exec_repeat(ExecState& es, WordCode head) {
 // background job) the body runs in that child without another fork.
 int Executor::exec_subsh(ExecState& es, WordCode head, ExecFlags flags) {
   s::size_t end = es.pc + wc_cmd_skip(head);
-  bool jc = job_control();
-  pid_t pid = (flags & EF_NOFORK) ? 0 : fork_child(0, true, ChildKind::Subshell);
+  pid_t pid = (flags & EF_NOFORK) ? 0 : fork_command(flags, ChildKind::Subshell);
   if (pid < 0) {
     es.pc = end;
     return 1;
@@ -1205,20 +1421,7 @@ int Executor::exec_subsh(ExecState& es, WordCode head, ExecFlags flags) {
     _exit(rc);
   }
   es.pc = end;
-  if (jc) {
-    int jid = mCtx.jobs.alloc(pid, JOB_PGRP, current_job_text(), false);
-    Process p;
-    p.pid = pid;
-    mCtx.jobs.add_process(jid, s::move(p));
-    return wait_foreground_job(mCtx, jid);
-  }
-  int status = 0;
-  while (::waitpid(pid, &status, 0) < 0) {
-    if (errno != EINTR) return 1;
-  }
-  if (WIFEXITED(status))   return WEXITSTATUS(status);
-  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
-  return 1;
+  return wait_command(pid);
 }
 
 // funcdef := WC_FUNCDEF(NAMED, skip) words(names) body: copies the body
@@ -1512,8 +1715,10 @@ SavedFds& SavedFds::operator=(SavedFds&& other) noexcept {
   if (this != &other) {
     restore();
     entries    = s::move(other.entries);
+    tees       = s::move(other.tees);
     fail       = other.fail;
     other.entries.clear();
+    other.tees.clear();
   }
   return *this;
 }
@@ -1527,6 +1732,7 @@ void SavedFds::save(int dst) {
     return;
   }
   if (backup < 0) { fail = true; return; }
+  note_shell_fd(backup);
   entries.push_back({dst, backup});
 }
 
@@ -1534,9 +1740,21 @@ void SavedFds::commit() noexcept {
   for (const auto& e : entries)
     if (e.backup >= 0) ::close(e.backup);
   entries.clear();
+  tees.clear();
 }
 
 void SavedFds::restore() noexcept {
+  // Output a builtin left in stdio goes where it was redirected; when that
+  // fails (`type echo >&-`) it is dropped, not written to the restored fd
+  // later.
+  if (not entries.empty() and s::fflush(stdout) != 0) {
+#if defined(__APPLE__) or defined(__FreeBSD__)
+    ::fpurge(stdout);
+#else
+    ::__fpurge(stdout);
+#endif
+    s::clearerr(stdout);
+  }
   for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
     if (it->backup < 0) {
       ::close(it->dst);
@@ -1546,63 +1764,117 @@ void SavedFds::restore() noexcept {
     }
   }
   entries.clear();
+  // As zsh waits for its multio processes: the next command sees all the
+  // output in the files.
+  for (Pid pid : tees) {
+    int status;
+    while (::waitpid(pid, &status, 0) < 0 and errno == EINTR) {}
+  }
+  tees.clear();
 }
 
-// Default destination fd for a given redirection operator.
+// The fd a redirection operator applies to by default: 0 for those that
+// read, 1 for the rest.
 static int default_fd(RedirType t) noexcept {
   switch (t) {
     case REDIR_READ: case REDIR_READWRITE: case REDIR_HEREDOC:
     case REDIR_HEREDOCD: case REDIR_HERESTR: case REDIR_IN_DUP:
     case REDIR_PROC_IN:
       return 0;
-    break; case REDIR_WRITE: case REDIR_APPEND: case REDIR_CLOBBER:
-    case REDIR_MERGE: case REDIR_CLOSE: case REDIR_PROC_OUT:
-    case REDIR_PROC_EQ:
-      return 1;
-    break; case REDIR_MERGEOUT: case REDIR_APPEND_ERR:
-      return 1;  // dups to both 1 and 2 at apply time
+
     break; default:
       return 1;
   }
 }
 
-// Parse a decimal integer target (`N` or `-` for close).  Returns -1 on
-// error, -2 for the close token `-`.
-static int parse_fd_target(const str& s) {
-  if (s == "-") return -2;
-  if (s.empty()) return -1;
-  char* end = nullptr;
-  long v = s::strtol(s.c_str(), &end, 10);
-  if (end == s.c_str() or *end != '\0' or v < 0 or v > 1023) return -1;
-  return static_cast<int>(v);
+// The fd named by the target of `>&N` / `<&N`, none when it is not a
+// number.  As in zsh, a number too big for an int wraps.
+static opt<int> parse_fd_target(const str& s) {
+  if (s.empty()) return s::nullopt;
+  s::uint64_t v = 0;
+  for (char c : s) {
+    if (not s::isdigit(static_cast<unsigned char>(c))) return s::nullopt;
+    v = v * 10 + static_cast<s::uint64_t>(c - '0');
+  }
+  return static_cast<int>(static_cast<s::uint32_t>(v));
 }
 
-// Pour `body` into a pipe-backed fd suitable for stdin of a child.
-// Uses memfd_create when available, falling back to a pipe + background
-// writer fork so the writer cannot block the caller (bodies fit in one
-// pipe buffer in practice, but a dedicated writer is the simplest
-// general answer).
-static int heredoc_body_fd(strv body) {
-  int pfd[2];
-  if (::pipe(pfd) != 0) return -1;
-  pid_t pid = ::fork();
-  if (pid < 0) { ::close(pfd[0]); ::close(pfd[1]); return -1; }
-  if (pid == 0) {
-    Signals.child_reset(ChildKind::Other);
-    ::close(pfd[0]);
-    ::signal(SIGPIPE, SIG_DFL);
-    const char* p   = body.data();
-    s::size_t n     = body.size();
-    while (n > 0) {
-      ssize_t w = ::write(pfd[1], p, n);
-      if (w < 0) { if (errno == EINTR) continue; _exit(0); }
-      p += w; n -= static_cast<s::size_t>(w);
+// Writes all of `n` bytes; false on an error.
+static bool write_all(int fd, const char* p, s::size_t n) {
+  while (n > 0) {
+    ssize_t w = ::write(fd, p, n);
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      return false;
     }
-    ::close(pfd[1]);
-    _exit(0);
+    p += w;
+    n -= static_cast<s::size_t>(w);
   }
-  ::close(pfd[1]);
-  return pfd[0];
+  return true;
+}
+
+// A pipe whose read end gives `body`, for a here-document or here-string.
+// A body that fits in the pipe is written straight in; the rest of a
+// longer one is fed by a forked writer, so the shell can't block on it.
+static int heredoc_body_fd(strv body) {
+  int p[2];
+  if (not pipe_high(p)) return -1;
+  ::fcntl(p[1], F_SETFL, O_NONBLOCK);
+  const char* data = body.data();
+  s::size_t   left = body.size();
+  while (left > 0) {
+    ssize_t w = ::write(p[1], data, left);
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    data += w;
+    left -= static_cast<s::size_t>(w);
+  }
+  if (left > 0 and errno != EAGAIN) {
+    ::close(p[0]);
+    ::close(p[1]);
+    return -1;
+  }
+  if (left > 0) {
+    ::fcntl(p[1], F_SETFL, 0);
+    s::fflush(nullptr);
+    pid_t pid = ::fork();
+    if (pid < 0) {
+      ::close(p[0]);
+      ::close(p[1]);
+      return -1;
+    }
+    if (pid == 0) {
+      Signals.child_reset(ChildKind::Other);
+      ::close(p[0]);
+      ::signal(SIGPIPE, SIG_DFL);
+      write_all(p[1], data, left);
+      _exit(0);
+    }
+  }
+  ::close(p[1]);
+  return p[0];
+}
+
+// The fd of a process substitution's pipe as the command gets it, as
+// /dev/fd/N: open across exec.
+static int keep_open(int fd) {
+  ::fcntl(fd, F_SETFD, 0);
+  forget_shell_fd(fd);
+  return fd;
+}
+
+// In a process substitution's child: without job control, `<(…)` and
+// `=(…)` read nothing from the command's stdin, as zsh's async subshells
+// do.
+static void stdin_from_null() {
+  int fd = ::open("/dev/null", O_RDONLY);
+  if (fd < 0) return;
+  if (fd != 0) {
+    ::dup2(fd, 0);
+    ::close(fd);
+  }
 }
 
 // Fork a subshell that runs `src` with its stdout piped to a fresh fd.
@@ -1610,28 +1882,32 @@ static int heredoc_body_fd(strv body) {
 // returns -1.  Used for <(cmd).
 int Executor::procsubst_in(strv src) {
   int pfd[2];
-  if (::pipe(pfd) != 0) return -1;
+  if (not pipe_high(pfd)) return -1;
+  s::fflush(nullptr);
   pid_t pid = ::fork();
   if (pid < 0) { ::close(pfd[0]); ::close(pfd[1]); return -1; }
   if (pid == 0) {
+    bool jc = job_control();
     mCtx.signals.child_reset(ChildKind::Other);
     mCtx.jobs.clear();
     ::close(pfd[0]);
     ::dup2(pfd[1], 1);
-    if (pfd[1] != 1) ::close(pfd[1]);
+    ::close(pfd[1]);
+    if (not jc) stdin_from_null();
     int rc = exec_string(src);
     s::fflush(nullptr);
     _exit(rc);
   }
   ::close(pfd[1]);
-  return pfd[0];
+  return keep_open(pfd[0]);
 }
 
 // Fork a subshell that runs `src` with its stdin piped from a fresh fd.
 // Returns the write end for the parent to pass as /dev/fd/N.
 int Executor::procsubst_out(strv src) {
   int pfd[2];
-  if (::pipe(pfd) != 0) return -1;
+  if (not pipe_high(pfd)) return -1;
+  s::fflush(nullptr);
   pid_t pid = ::fork();
   if (pid < 0) { ::close(pfd[0]); ::close(pfd[1]); return -1; }
   if (pid == 0) {
@@ -1639,28 +1915,34 @@ int Executor::procsubst_out(strv src) {
     mCtx.jobs.clear();
     ::close(pfd[1]);
     ::dup2(pfd[0], 0);
-    if (pfd[0] != 0) ::close(pfd[0]);
+    ::close(pfd[0]);
     int rc = exec_string(src);
     s::fflush(nullptr);
     _exit(rc);
   }
   ::close(pfd[0]);
-  return pfd[1];
+  return keep_open(pfd[1]);
 }
 
 // Run `src` with its stdout captured into a fresh temp file and return
-// the file's path.  Used for =(cmd).
+// the file's path, named after $TMPPREFIX as zsh's are.  Used for =(cmd).
 str Executor::procsubst_eq(strv src) {
-  char tmpl[] = "/tmp/jfsh-procsubst-XXXXXX";
-  int fd = ::mkstemp(tmpl);
+  str prefix = "/tmp/zsh";
+  if (auto p = mCtx.params.lookup("TMPPREFIX"); p and p->get().is_set())
+    prefix = p->get().scalar();
+  str tmpl = prefix + "XXXXXX";
+  int fd = move_high(::mkstemp(tmpl.data()));
   if (fd < 0) return {};
+  s::fflush(nullptr);
   pid_t pid = ::fork();
-  if (pid < 0) { ::close(fd); ::unlink(tmpl); return {}; }
+  if (pid < 0) { ::close(fd); ::unlink(tmpl.c_str()); return {}; }
   if (pid == 0) {
+    bool jc = job_control();
     mCtx.signals.child_reset(ChildKind::Other);
     mCtx.jobs.clear();
     ::dup2(fd, 1);
-    if (fd != 1) ::close(fd);
+    ::close(fd);
+    if (not jc) stdin_from_null();
     int rc = exec_string(src);
     s::fflush(nullptr);
     _exit(rc);
@@ -1668,287 +1950,301 @@ str Executor::procsubst_eq(strv src) {
   int status = 0;
   while (::waitpid(pid, &status, 0) < 0 and errno == EINTR) {}
   ::close(fd);
-  return str(tmpl);
+  return tmpl;
 }
 
-// Fork a child that reads lines from `read_fd` and writes each byte to all
-// file descriptors in `out_fds`.  `extra_close` lists fds (typically the
-// pipe's write end) to close in the child so read() can see EOF once the
-// parent releases its writers.
-static int spawn_tee(int read_fd, const vec<int>& out_fds,
-                     int extra_close) {
+// Forks the MULTIOS helper: copies what arrives on `in` to every fd of
+// `outs` until no writer of `in` is left.  Every other fd is closed in
+// it, so it keeps no pipe open.  Returns the pid, or -1.
+static pid_t spawn_tee(int in, const vec<int>& outs) {
+  s::fflush(nullptr);
   pid_t pid = ::fork();
-  if (pid < 0) return -1;
-  if (pid == 0) {
-    Signals.child_reset(ChildKind::Other);
-    if (extra_close >= 0) ::close(extra_close);
-    char buf[4096];
-    for (;;) {
-      ssize_t n = ::read(read_fd, buf, sizeof buf);
-      if (n <= 0) break;
-      for (int fd : out_fds) {
-        const char* p = buf;
-        ssize_t left = n;
-        while (left > 0) {
-          ssize_t w = ::write(fd, p, static_cast<s::size_t>(left));
-          if (w < 0) { if (errno == EINTR) continue; break; }
-          p += w; left -= w;
-        }
-      }
-    }
-    _exit(0);
+  if (pid != 0) return pid;
+  Signals.child_reset(ChildKind::Other);
+  long top = ::sysconf(_SC_OPEN_MAX);
+  if (top < 0 or top > 4096) top = 4096;
+  for (int fd = 0; fd < top; ++fd)
+    if (fd != in and s::find(outs.begin(), outs.end(), fd) == outs.end()) ::close(fd);
+  char buf[4096];
+  for (;;) {
+    ssize_t n = ::read(in, buf, sizeof buf);
+    if (n < 0 and errno == EINTR) continue;
+    if (n <= 0) break;
+    for (int fd : outs) write_all(fd, buf, static_cast<s::size_t>(n));
   }
-  return 0;
+  _exit(0);
 }
 
-// Identify output-side write redirections (REDIR_WRITE / APPEND / CLOBBER /
-// READWRITE / MERGEOUT / APPEND_ERR) that share a destination fd.  When
-// MULTIOS is on, a pipe + tee helper is attached so each target gets the
-// data; when off, only the last redirection for each fd wins.  Returns the
-// indices of redirs that have been consumed by the MULTIOS path (so the
-// main loop skips them).
-static vec<s::size_t> multios_merge(
-    const vec<Redirection>& redirs,
-    SavedFds& saved,
-    bool multios_on) {
-  vec<s::size_t> consumed;
-  if (not multios_on) return consumed;
-
-  auto is_output_file = [](RedirType t) noexcept {
-    return t == REDIR_WRITE or t == REDIR_APPEND
-        or t == REDIR_CLOBBER or t == REDIR_MERGEOUT
-        or t == REDIR_APPEND_ERR;
-  };
-  auto default_for = [](RedirType t) noexcept { return t == REDIR_APPEND_ERR
-      or t == REDIR_MERGEOUT ? 1 : 1; };
-
-  // Group by destination fd.
-  umap<int, vec<s::size_t>> by_fd;
-  for (s::size_t i = 0; i < redirs.size(); ++i) {
-    const auto& r = redirs[i];
-    if (not is_output_file(r.type)) continue;
-    int dst = r.fd >= 0 ? r.fd : default_for(r.type);
-    by_fd[dst].push_back(i);
+// Opens the file of a redirection that writes, as zsh does.  Without
+// CLOBBER (and not forced by `>|`), `>` creates the file but opens an
+// existing one only when it is not a regular file (a device, a fifo) or,
+// with CLOBBER_EMPTY, an empty one; `>>` creates nothing unless
+// APPEND_CREATE is set.  -1 with errno on failure.
+static int open_output(const OptionState& opts, const str& path, bool append,
+                       bool force) {
+  int  base    = O_WRONLY | O_NOCTTY | O_CLOEXEC;
+  bool clobber = force or opts.get(OPT_CLOBBER);
+  if (append) {
+    if (clobber or opts.get(OPT_APPENDCREATE)) base |= O_CREAT;
+    return ::open(path.c_str(), base | O_APPEND, 0666);
   }
+  if (clobber) return ::open(path.c_str(), base | O_CREAT | O_TRUNC, 0666);
+  int fd = ::open(path.c_str(), base | O_CREAT | O_EXCL, 0666);
+  if (fd >= 0) return fd;
+  int err = errno;
+  fd = ::open(path.c_str(), base);
+  if (fd >= 0) {
+    struct stat st{};
+    if (::fstat(fd, &st) == 0
+        and (not S_ISREG(st.st_mode) or (opts.get(OPT_CLOBBEREMPTY) and st.st_size == 0)))
+      return fd;
+    ::close(fd);
+  }
+  errno = err;
+  return -1;
+}
 
-  for (auto& [dst, idxs] : by_fd) {
-    if (idxs.size() < 2) continue;  // no MULTIOS trigger with one target
-    vec<int> fds;
-    for (auto i : idxs) {
-      const auto& r = redirs[i];
-      int flags = (r.type == REDIR_APPEND or r.type == REDIR_APPEND_ERR)
-          ? (O_WRONLY | O_CREAT | O_APPEND)
-          : (O_WRONLY | O_CREAT | O_TRUNC);
-      if (r.type == REDIR_WRITE
-          or r.type == REDIR_MERGEOUT) {
-        // Honour NOCLOBBER even in a MULTIOS chain.
-      }
-      int fd = ::open(r.target.c_str(), flags, 0666);
-      if (fd < 0) {
-        s::fprintf(stderr, "jfsh: %s: %s\n",
-                   r.target.c_str(), s::strerror(errno));
-        for (int f : fds) ::close(f);
-        return {};  // MULTIOS fails loud
-      }
-      fds.push_back(fd);
+// The redirections are made in order, as zsh's execcmd does.  Under
+// MULTIOS the second output redirection to an fd splits it: the fd
+// becomes a pipe to a tee that writes to what the fd went to before and
+// to the new target, and later ones add targets.  The tee is forked once
+// the redirections are done, or before another redirection reads from
+// the fd (`>a 2>&1 >b`: the error output goes to a only).
+bool Executor::apply_redirects(const vec<Redirection>& redirs,
+                               SavedFds& saved, ExecFlags flags) {
+  bool multios = mCtx.opts.get(OPT_MULTIOS);
+  // fds with an output redirection: once split, the tee's targets and the
+  // read end of its pipe.
+  struct Stream { vec<int> outs; int in = -1; };
+  s::map<int, Stream> streams;
+  // In a pipeline stage, the pipe is fd 1's first output, and `|&` is a
+  // `2>&1` after the command's own redirections.
+  if ((flags & EF_STAGEOUT) and multios) streams[1];
+  vec<Redirection> stage_err;
+  if (flags & EF_STAGEERR) stage_err.push_back({REDIR_MERGE, 2, "1"});
+
+  // Forks the tee of fd's stream, if it was split.
+  auto finish = [&](int fd) {
+    auto it = streams.find(fd);
+    if (it == streams.end() or it->second.in < 0) return true;
+    Stream& m = it->second;
+    pid_t pid = spawn_tee(m.in, m.outs);
+    ::close(m.in);
+    for (int o : m.outs) ::close(o);
+    m = Stream{};
+    if (pid < 0) {
+      s::fprintf(stderr, "jfsh: fork failed: %s\n", errno_text(errno).c_str());
+      return false;
     }
-    int p[2];
-    if (::pipe(p) != 0) { for (int f : fds) ::close(f); return {}; }
-    if (spawn_tee(p[0], fds, p[1]) < 0) {
-      ::close(p[0]); ::close(p[1]);
-      for (int f : fds) ::close(f);
-      return {};
+    saved.tees.push_back(pid);
+    return true;
+  };
+  // A failed redirection drops the streams not yet handed to a tee.
+  auto abandon = [&] {
+    for (auto& [fd, m] : streams) {
+      if (m.in >= 0) ::close(m.in);
+      for (int o : m.outs) ::close(o);
     }
-    ::close(p[0]);
-    for (int f : fds) ::close(f);
-    saved.save(dst);
-    ::dup2(p[1], dst);
-    // If MULTIOS covers both stdout and stderr (from &>), also dup it to 2.
-    for (auto i : idxs) {
-      if (redirs[i].type == REDIR_MERGEOUT
-          or redirs[i].type == REDIR_APPEND_ERR) {
-        saved.save(2);
-        ::dup2(p[1], 2);
+    return false;
+  };
+  auto report = [&](const str& what) {
+    s::fprintf(stderr, "jfsh: %s: %s\n", errno_text(errno).c_str(), what.c_str());
+    return abandon();
+  };
+  // Opening a fifo blocks until the other end is opened, and a signal
+  // interrupts it.  As zsh does, the signal is handled and, for one
+  // without a trap (a job ending), the open tried again; a trapped one,
+  // Ctrl-C or an exit makes the redirection fail without a message.
+  bool interrupted = false;
+  auto retry = [&](auto open) {
+    int fd;
+    while ((fd = open()) < 0 and errno == EINTR) {
+      bool trapped = mCtx.signals.pending_trapped() != 0;
+      handle_signals();
+      if (trapped or mCtx.exiting or mCtx.aborting) {
+        interrupted = true;
+        errno = EINTR;
         break;
       }
     }
-    ::close(p[1]);
-    for (auto i : idxs) consumed.push_back(i);
-  }
-  return consumed;
-}
-
-bool Executor::apply_redirects(const vec<Redirection>& redirs,
-                               SavedFds& saved) {
-  auto consumed = multios_merge(redirs, saved,
-                                mCtx.opts.get(OPT_MULTIOS));
-  s::sort(consumed.begin(), consumed.end());
-  auto is_consumed = [&](s::size_t i) {
-    return s::binary_search(consumed.begin(), consumed.end(), i);
+    return fd;
   };
-  for (s::size_t idx = 0; idx < redirs.size(); ++idx) {
-    if (is_consumed(idx)) continue;
-    const auto& r = redirs[idx];
-    int dst = r.fd >= 0 ? r.fd : default_fd(r.type);
-
-    auto dup_into = [&](int src_fd) -> bool {
-      // A new fd that landed on dst itself (dst was closed: `3<<<x`) is
-      // moved off first, so dst is saved as closed, not as the new fd.
-      if (src_fd == dst) {
-        int moved = ::fcntl(src_fd, F_DUPFD_CLOEXEC, 10);
-        ::close(src_fd);
-        if (moved < 0) {
-          s::fprintf(stderr, "jfsh: dup: %s\n", s::strerror(errno));
-          return false;
+  auto failed_open = [&](const str& what) {
+    return interrupted ? abandon() : report(what);
+  };
+  // Makes the new `fd` the command's `dst`; an output joins dst's stream.
+  auto place = [&](int fd, int dst, bool output) {
+    fd = move_high(fd);
+    if (fd < 0) return report("dup");
+    auto it = streams.find(dst);
+    if (output and it != streams.end()) {
+      Stream& m = it->second;
+      if (m.in < 0) {
+        int p[2];
+        if (not pipe_high(p)) {
+          ::close(fd);
+          return report("pipe");
         }
-        src_fd = moved;
+        int cur = ::fcntl(dst, F_DUPFD_CLOEXEC, 10);
+        if (cur >= 0) m.outs.push_back(cur);
+        m.in = p[0];
+        saved.save(dst);
+        ::dup2(p[1], dst);
+        ::close(p[1]);
       }
-      saved.save(dst);
-      if (::dup2(src_fd, dst) < 0) {
-        s::fprintf(stderr, "jfsh: dup2: %s\n", s::strerror(errno));
-        return false;
-      }
-      ::close(src_fd);
+      m.outs.push_back(fd);
       return true;
-    };
+    }
+    if (not finish(dst)) {
+      ::close(fd);
+      return abandon();
+    }
+    streams.erase(dst);
+    saved.save(dst);
+    int rc = ::dup2(fd, dst);
+    ::close(fd);
+    if (rc < 0) return report("dup2");
+    if (output and multios) streams[dst];
+    return true;
+  };
+  // `N>&M` and `N<&M`: M, which must not be one of the shell's own fds,
+  // is duplicated onto N.
+  auto dup_fd = [&](int src, int dst, bool output) {
+    if (not finish(src)) return abandon();
+    const auto& sig = mCtx.signals;
+    bool user = src >= 0 and not is_shell_fd(src) and src != sig.wake_fd()
+            and src != sig.self_pipe_write_fd() and src != sig.tty_fd();
+    errno = EBADF;
+    int fd = user ? ::fcntl(src, F_DUPFD_CLOEXEC, 10) : -1;
+    if (fd < 0) {
+      s::fprintf(stderr, "jfsh: %d: %s\n", src, errno_text(errno).c_str());
+      return abandon();
+    }
+    return place(fd, dst, output);
+  };
+  auto close_fd = [&](int dst) {
+    if (not finish(dst)) return abandon();
+    streams.erase(dst);
+    saved.save(dst);
+    ::close(dst);
+    return true;
+  };
+  // `&>file`, `>&file`, `N>&file`: the file goes to N (1 by default) and
+  // to 2.
+  auto both = [&](const Redirection& r, int dst, bool append, bool force) {
+    int fd = retry([&] { return open_output(mCtx.opts, r.target, append, force); });
+    if (fd < 0) return failed_open(r.target);
+    int fd2 = ::fcntl(fd, F_DUPFD_CLOEXEC, 10);
+    if (fd2 < 0) {
+      ::close(fd);
+      return report("dup");
+    }
+    if (not place(fd, dst, true)) {
+      ::close(fd2);
+      return false;
+    }
+    return place(fd2, 2, true);
+  };
 
+  auto apply = [&](const Redirection& r) {
+    int dst = r.fd >= 0 ? r.fd : default_fd(r.type);
     switch (r.type) {
       case REDIR_READ: {
-        int fd = ::open(r.target.c_str(), O_RDONLY);
-        if (fd < 0) {
-          s::fprintf(stderr, "jfsh: %s: %s\n",
-                     r.target.c_str(), s::strerror(errno));
-          return false;
-        }
-        if (not dup_into(fd)) return false;
+        int fd = retry([&] { return ::open(r.target.c_str(), O_RDONLY | O_NOCTTY | O_CLOEXEC); });
+        if (fd < 0) return failed_open(r.target);
+        return place(fd, dst, false);
       }
-      break; case REDIR_WRITE: case REDIR_CLOBBER: {
-        int flags = O_WRONLY | O_CREAT | O_TRUNC;
-        if (r.type == REDIR_WRITE and mCtx.opts.get(OPT_CLOBBER) == false)
-          flags = O_WRONLY | O_CREAT | O_EXCL;
-        int fd = ::open(r.target.c_str(), flags, 0666);
-        if (fd < 0) {
-          s::fprintf(stderr, "jfsh: %s: %s\n",
-                     r.target.c_str(), s::strerror(errno));
-          return false;
-        }
-        if (not dup_into(fd)) return false;
-      }
-      break; case REDIR_APPEND: {
-        int fd = ::open(r.target.c_str(),
-                        O_WRONLY | O_CREAT | O_APPEND, 0666);
-        if (fd < 0) {
-          s::fprintf(stderr, "jfsh: %s: %s\n",
-                     r.target.c_str(), s::strerror(errno));
-          return false;
-        }
-        if (not dup_into(fd)) return false;
-      }
+
       break; case REDIR_READWRITE: {
-        int fd = ::open(r.target.c_str(), O_RDWR | O_CREAT, 0666);
-        if (fd < 0) {
-          s::fprintf(stderr, "jfsh: %s: %s\n",
-                     r.target.c_str(), s::strerror(errno));
-          return false;
-        }
-        if (not dup_into(fd)) return false;
+        int fd = retry([&] {
+          return ::open(r.target.c_str(), O_RDWR | O_CREAT | O_NOCTTY | O_CLOEXEC, 0666);
+        });
+        if (fd < 0) return failed_open(r.target);
+        return place(fd, dst, false);
       }
-      break; case REDIR_MERGEOUT: case REDIR_APPEND_ERR: {
-        int flags = (r.type == REDIR_APPEND_ERR)
-            ? (O_WRONLY | O_CREAT | O_APPEND)
-            : (O_WRONLY | O_CREAT | O_TRUNC);
-        int fd = ::open(r.target.c_str(), flags, 0666);
-        if (fd < 0) {
-          s::fprintf(stderr, "jfsh: %s: %s\n",
-                     r.target.c_str(), s::strerror(errno));
-          return false;
-        }
-        saved.save(1);
-        saved.save(2);
-        if (::dup2(fd, 1) < 0 or ::dup2(fd, 2) < 0) {
-          s::fprintf(stderr, "jfsh: dup2: %s\n", s::strerror(errno));
-          ::close(fd);
-          return false;
-        }
-        ::close(fd);
+
+      break; case REDIR_WRITE: case REDIR_CLOBBER:
+      case REDIR_APPEND: case REDIR_APPEND_CLOBBER: {
+        bool append = r.type == REDIR_APPEND or r.type == REDIR_APPEND_CLOBBER;
+        bool force  = r.type == REDIR_CLOBBER or r.type == REDIR_APPEND_CLOBBER;
+        int fd = retry([&] { return open_output(mCtx.opts, r.target, append, force); });
+        if (fd < 0) return failed_open(r.target);
+        return place(fd, dst, true);
       }
+
+      break; case REDIR_MERGEOUT:
+        return both(r, dst, false, false);
+
+      break; case REDIR_MERGEOUT_CLOBBER:
+        return both(r, dst, false, true);
+
+      break; case REDIR_APPEND_ERR:
+        return both(r, dst, true, false);
+
+      break; case REDIR_APPEND_ERR_CLOBBER:
+        return both(r, dst, true, true);
+
       break; case REDIR_MERGE: case REDIR_IN_DUP: {
-        int src = parse_fd_target(r.target);
-        if (src == -2) {  // `>&-` or `<&-` closes
-          saved.save(dst);
-          ::close(dst);
-          break;
-        }
-        if (src < 0) {
-          s::fprintf(stderr, "jfsh: %s: bad fd\n", r.target.c_str());
-          return false;
-        }
-        saved.save(dst);
-        if (::dup2(src, dst) < 0) {
-          s::fprintf(stderr, "jfsh: dup2: %s\n", s::strerror(errno));
-          return false;
-        }
+        bool output = r.type == REDIR_MERGE;
+        if (r.target == "-") return close_fd(dst);
+        if (auto src = parse_fd_target(r.target)) return dup_fd(*src, dst, output);
+        // `>&file` writes the file, as `&>file`.
+        if (output) return both(r, dst, false, false);
+        s::fprintf(stderr, "jfsh: file number expected\n");
+        mCtx.aborting = true;
+        return abandon();
       }
-      break; case REDIR_CLOSE: {
-        saved.save(dst);
-        ::close(dst);
-      }
+
+      break; case REDIR_CLOSE:
+        return close_fd(dst);
+
       break; case REDIR_HEREDOC: case REDIR_HEREDOCD: case REDIR_HERESTR: {
         str body = r.target;
         if (r.type == REDIR_HERESTR) body += '\n';
         int fd = heredoc_body_fd(body);
-        if (fd < 0) return false;
-        if (not dup_into(fd)) return false;
+        if (fd < 0) return report("here document");
+        return place(fd, dst, false);
       }
+
       break; case REDIR_PROC_IN: {
         int fd = procsubst_in(r.target);
-        if (fd < 0) return false;
-        if (not dup_into(fd)) return false;
+        if (fd < 0) return report("process substitution");
+        return place(fd, dst, false);
       }
+
       break; case REDIR_PROC_OUT: {
         int fd = procsubst_out(r.target);
-        if (fd < 0) return false;
-        if (not dup_into(fd)) return false;
+        if (fd < 0) return report("process substitution");
+        return place(fd, dst, true);
       }
-      break; case REDIR_PROC_EQ:
-        // =(cmd) is a filename substitution, not a redirection target.
-        // Falls out here with no apply (callers that want its path use
-        // procsubst_eq on the word side).
+
       break; default:
         s::fprintf(stderr, "jfsh: redirection type %d not supported\n",
                    static_cast<int>(r.type));
-        return false;
+        return abandon();
     }
-  }
+    return false;
+  };
+  for (const auto& r : redirs)
+    if (not apply(r)) return false;
+  for (const auto& r : stage_err)
+    if (not apply(r)) return false;
+  for (auto& [fd, m] : streams)
+    if (not finish(fd)) return abandon();
   return not saved.fail;
 }
 
-Executor::ProcSubstResources Executor::expand_procsubst(
-    vec<str>& args) {
-  ProcSubstResources res;
-  for (auto& a : args) {
-    if (a.size() < 3 or a.back() != ')') continue;
-    strv prefix(a.data(), 2);
-    if (prefix != "<(" and prefix != ">(" and prefix != "=(") continue;
-    str body = a.substr(2, a.size() - 3);
-    if (prefix == "<(") {
-      int fd = procsubst_in(body);
-      if (fd < 0) { a.clear(); continue; }
-      res.open_fds.push_back(fd);
-      a = "/dev/fd/" + s::to_string(fd);
-    } else if (prefix == ">(") {
-      int fd = procsubst_out(body);
-      if (fd < 0) { a.clear(); continue; }
-      res.open_fds.push_back(fd);
-      a = "/dev/fd/" + s::to_string(fd);
-    } else {
-      str path = procsubst_eq(body);
-      if (path.empty()) { a.clear(); continue; }
-      res.tmp_files.push_back(path);
-      a = path;
-    }
+str Executor::procsubst(char kind, strv body) {
+  ProcSubstResources& res = mPsubst ? *mPsubst : mLooseSubst;
+  if (kind == '=') {
+    str path = procsubst_eq(body);
+    if (not path.empty()) res.tmp_files.push_back(path);
+    return path;
   }
-  return res;
+  int fd = kind == '<' ? procsubst_in(body) : procsubst_out(body);
+  if (fd < 0) return {};
+  res.open_fds.push_back(fd);
+  return "/dev/fd/" + s::to_string(fd);
 }
 
 void Executor::procsubst_release(ProcSubstResources& res) noexcept {
@@ -1995,15 +2291,14 @@ bool Executor::expand_command(vec<str>& args,
         out.push_back(s::move(r));
       }
       break; case REDIR_CLOSE: case REDIR_PROC_IN: case REDIR_PROC_OUT:
-      case REDIR_PROC_EQ:
         out.push_back(s::move(r));
       break; default: {
         str word = r.target;
         auto targets = ex.words({r.target});
         if (not targets) return fail(targets.error());
-        if (targets->empty())
-          return fail(ShellError{ErrorKind::ExecError,
-              "no such file or directory: " + word});
+        // No words at all is a file with an empty name, which fails to
+        // open as zsh's does: the command fails, the line goes on.
+        if (targets->empty()) targets->emplace_back();
         if (targets->size() > 1 and not mCtx.opts.get(OPT_MULTIOS))
           return fail(ShellError{ErrorKind::ExecError, "ambiguous redirect: " + word});
         for (auto& t : *targets) {
@@ -2466,17 +2761,32 @@ int Executor::run_external(const vec<str>& args,
   s::fflush(nullptr);
 
   // EF_NOFORK: last command in `-c` string or last stage in a subshell runs
-  // on this process directly.
-  if (flags & EF_NOFORK)
-    exec_external_child(args, assigns, redirs, s::move(found), traced);
+  // on this process directly, unless an `=(…)` file has to be removed once
+  // it is done.
+  bool tmp_files = mPsubst and not mPsubst->tmp_files.empty();
+  if ((flags & EF_NOFORK) and not tmp_files)
+    exec_external_child(args, assigns, redirs, s::move(found), traced, flags);
 
-  bool jc = job_control();
-  pid_t pid = fork_child(0, true, ChildKind::Other);
+  pid_t pid = fork_command(flags, ChildKind::Other);
   if (pid < 0) return 1;
-  if (pid == 0) exec_external_child(args, assigns, redirs, s::move(found), traced);
+  if (pid == 0) exec_external_child(args, assigns, redirs, s::move(found), traced, flags);
+  return wait_command(pid);
+}
 
-  if (jc) {
-    int jid = mCtx.jobs.alloc(pid, JOB_PGRP, current_job_text(), false);
+// As the last stage of a pipeline, fork_child puts the child in the
+// pipeline's process group (ExecContext::pipeline_pgid).
+pid_t Executor::fork_command(ExecFlags flags, ChildKind kind) {
+  PipeLast* last = (flags & EF_PIPELAST) ? mPipeLast : nullptr;
+  pid_t pid = fork_child(0, true, kind);
+  if (pid > 0 and last) last->pid = pid;
+  return pid;
+}
+
+int Executor::wait_command(pid_t pid) {
+  if (mPipeLast and mPipeLast->pid == pid) return 0;
+  if (job_control()) {
+    Pid pgid = mChildPgid > 0 ? mChildPgid : pid;
+    int jid = mCtx.jobs.alloc(pgid, JOB_PGRP, current_job_text(), false);
     Process p;
     p.pid = pid;
     mCtx.jobs.add_process(jid, s::move(p));
@@ -2502,9 +2812,10 @@ void Executor::exec_external_child(const vec<str>&         args,
                                    vec<Assignment>         assigns,
                                    const vec<Redirection>& redirs,
                                    opt<Result<str>>        found,
-                                   const str*              traced) {
+                                   const str*              traced,
+                                   ExecFlags               flags) {
   SavedFds saved;
-  if (not redirs.empty() and not apply_redirects(redirs, saved)) _exit(1);
+  if (not redirs.empty() and not apply_redirects(redirs, saved, flags)) _exit(1);
   if (not assigns.empty()) {
     mCtx.params.push_scope(/*prefix=*/true);
     str ps4 = traced ? trace_prompt() : str{};
@@ -2724,18 +3035,30 @@ pid_t Executor::fork_child(Pid pgid, bool foreground, ChildKind kind) {
     s::fprintf(stderr, "jfsh: fork failed: %s\n", s::strerror(err));
     return -1;
   }
+  // In the last stage of a pipeline that the shell runs itself, a
+  // foreground job joins the pipeline's group, which has the terminal.
+  if (jc and pgid == 0 and foreground) pgid = mCtx.pipeline_pgid;
   if (pid == 0) {
     if (jc) {
       // Both sides set the group, so neither can run ahead of the other.
-      ::setpgid(0, pgid);
-      if (foreground) mCtx.signals.give_terminal(pgid ? pgid : ::getpid());
+      // A group whose processes are all gone can't be joined: then the
+      // child starts one of its own.
+      if (::setpgid(0, pgid) != 0) ::setpgid(0, 0);
+      if (foreground) mCtx.signals.give_terminal(::getpgrp());
     }
     mCtx.signals.child_reset(kind);
     mCtx.jobs.clear();
+    mCtx.pipeline_pgid = 0;
+    mCtx.pipeline_jid  = 0;
     ::sigprocmask(SIG_SETMASK, &old, nullptr);
     return 0;
   }
-  if (jc) ::setpgid(pid, pgid ? pgid : pid);
+  mChildPgid = 0;
+  if (jc) {
+    if (::setpgid(pid, pgid ? pgid : pid) != 0 and pgid) ::setpgid(pid, pid);
+    mChildPgid = ::getpgid(pid);
+    if (mChildPgid <= 0) mChildPgid = pgid ? pgid : pid;
+  }
   ::sigprocmask(SIG_SETMASK, &old, nullptr);
   return pid;
 }
@@ -2781,7 +3104,10 @@ void Executor::handle_signals() {
   auto has  = [&](int sig) {
     return sig < 64 ? (bits[0] >> sig) & 1 : (bits[1] >> (sig - 64)) & 1;
   };
-  if (has(SIGCHLD)) mCtx.signals.reap(mCtx.jobs);
+  if (has(SIGCHLD)) {
+    mCtx.signals.reap(mCtx.jobs);
+    continue_pipeline_stages();
+  }
   if (has(SIGWINCH)) update_window_size();
   for (int sig = 1; sig <= MAX_SIG; ++sig) {
     if (not has(sig)) continue;
@@ -2795,6 +3121,25 @@ void Executor::handle_signals() {
       mCtx.exit_val = 128 + SIGHUP;
     }
   }
+}
+
+void Executor::continue_pipeline_stages() {
+  if (not mCtx.pipeline_jid or mCtx.aborting) return;
+  auto found = mCtx.jobs.get(mCtx.pipeline_jid);
+  if (not found) return;
+  Job& j = found->get();
+  if (s::none_of(j.procs.begin(), j.procs.end(), [](const Process& p) { return p.stopped(); }))
+    return;
+  s::fprintf(stderr, "jfsh: job can't be suspended\n");
+  s::fflush(stderr);
+  (void)SignalManager::kill_job(j.pgid, SIGCONT);
+  j.continued();
+  j.flags &= ~JOB_CHANGED;
+}
+
+void Executor::wait_for_input() {
+  mCtx.signals.dispatch_pending(mCtx.jobs);   // drains the self-pipe
+  handle_signals();
 }
 
 void Executor::run_trap(int sig) {

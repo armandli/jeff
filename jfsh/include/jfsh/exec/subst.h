@@ -39,12 +39,20 @@ struct Expander {
     : mExec{exec}, mCtx{ctx} {}
 
   // Command arguments: every step, so one word may become several or none.
+  // An unquoted `<(cmd)` or `>(cmd)` in the word as written, or `=(cmd)`
+  // at its start, is a process substitution (Executor::procsubst); one
+  // in quotes or in a parameter's value never is.
   Result<vec<str>> words(const vec<str>& words);
 
   // A word that stays one word: assignment values, here-strings, `>&N`
   // targets.  No splitting, braces or globbing; arrays are joined with
   // spaces.  With `assignment`, `~` also expands after `=` and `:`.
+  // Process substitutions run as for words().
   Result<str> scalar(strv word, bool assignment = false);
+
+  // Text that isn't a word of the script ($mailpath messages): no process
+  // substitution.
+  void no_process_substitution() noexcept { mProcSubst = false; }
 
   // The elements of `name=(…)`: `src` is the text between the parentheses,
   // split into shell words that are then expanded like arguments.
@@ -71,11 +79,13 @@ struct Expander {
   Executor&    exec() noexcept { return mExec; }
   ExecContext& ctx()  noexcept { return mCtx; }
   void         note_subst_status(int rc) noexcept { mSubstStatus = rc; }
+  bool         process_substitution() const noexcept { return mProcSubst; }
 
 private:
   Executor&    mExec;
   ExecContext& mCtx;
   opt<int>     mSubstStatus;
+  bool         mProcSubst = true;
 };
 
 // Removes one level of shell quoting ('…', "…", $'…', backslash) from `w`
