@@ -1,3 +1,5 @@
+#include <clocale>
+
 #include <gtest/gtest.h>
 
 #include <jfsh/core/aliases.h>
@@ -33,7 +35,10 @@ TEST(GlobPatternMatch, BracketExpressions) {
   EXPECT_TRUE(pattern_match("[]x]", "]"));
   EXPECT_TRUE(pattern_match("[[:digit:][:upper:]]?", "Qz"));
   EXPECT_FALSE(pattern_match("[[:digit:]]", "a"));
-  EXPECT_TRUE(pattern_match("[A-Z]", "q", /*case_insensitive=*/true));
+  // As in zsh, case-insensitive matching (NO_CASE_GLOB, (#i)) leaves
+  // brackets alone.
+  EXPECT_FALSE(pattern_match("[A-Z]", "q", /*case_insensitive=*/true));
+  EXPECT_TRUE(pattern_match("[^a]", "A", /*case_insensitive=*/true));
 }
 
 TEST(GlobPatternMatch, EscapesAreLiteral) {
@@ -159,6 +164,185 @@ TEST(GlobHasGlobChars, DetectsUnescapedMetacharacters) {
 
 TEST(GlobUnescape, RemovesBackslashes) {
   EXPECT_EQ(glob_unescape("a\\*b\\\\c"), "a*b\\c");
+}
+
+// M13 Phase 13c.1: zsh 5.9's semantics; expected values are zsh's.
+
+// A UTF-8 LC_CTYPE for one test, for towlower() and friends.
+struct Utf8Ctype {
+  Utf8Ctype() : saved{s::setlocale(LC_CTYPE, nullptr)} {
+    for (const char* name : {"en_US.UTF-8", "C.UTF-8", "en_US.utf8"})
+      if (s::setlocale(LC_CTYPE, name)) { ok = true; break; }
+  }
+  ~Utf8Ctype() { s::setlocale(LC_CTYPE, saved.c_str()); }
+
+  str  saved;
+  bool ok = false;
+};
+
+CompiledPattern ext(strv p, bool mb = false) {
+  return CompiledPattern::compile(p, false, true, mb);
+}
+
+using Span = s::pair<s::size_t, s::size_t>;
+
+TEST(GlobPattern13c, CaretAnywhere) {
+  EXPECT_TRUE(ext("a^x").matches("ab"));
+  EXPECT_TRUE(ext("*^b").matches("ab"));
+  EXPECT_TRUE(ext("(#b)^x").matches("ab"));
+  EXPECT_TRUE(ext("(#i)^x").matches("ab"));
+  EXPECT_FALSE(ext("(#i)^x").matches("X"));
+  // `^` negates up to the next `|`, `)` or `~`.
+  auto first = ext("^a|b");
+  EXPECT_FALSE(first.matches("a"));
+  EXPECT_TRUE(first.matches("b"));
+  EXPECT_TRUE(first.matches("c"));
+  auto second = ext("a|^b");
+  EXPECT_TRUE(second.matches("a"));
+  EXPECT_FALSE(second.matches("b"));
+  EXPECT_TRUE(second.matches("c"));
+  for (strv x : {"a", "b", "c"}) EXPECT_FALSE(ext("a~^b").matches(x)) << x;
+  EXPECT_TRUE(ext("^").matches("x"));
+  EXPECT_FALSE(ext("^").matches(""));
+  EXPECT_TRUE(ext("^^a").matches("a"));
+  EXPECT_FALSE(ext("^^a").matches("b"));
+  EXPECT_EQ(ext("a^b").match_prefix("ab", false), 1u);
+  // Without EXTENDED_GLOB it is a character.
+  EXPECT_TRUE(CompiledPattern::compile("a^x").matches("a^x"));
+}
+
+TEST(GlobPattern13c, FirstFoundEnd) {
+  // The longest form is where zsh's greedy search first gets to the end
+  // of the pattern; the shortest keeps its meaning.
+  EXPECT_EQ(ext("(a|aa)").match_prefix("aaa", true), 1u);
+  EXPECT_EQ(ext("(aa|a)").match_prefix("aaa", true), 2u);
+  EXPECT_EQ(ext("(a|ab)").match_prefix("abc", true), 1u);
+  EXPECT_EQ(ext("*(a|ab)").match_prefix("abab", true), 3u);
+  EXPECT_EQ(ext("*(a|ab)").match_prefix("abab", false), 1u);
+  EXPECT_EQ(ext("(a|aa)#").match_prefix("aaab", true), 3u);
+  EXPECT_EQ(ext("x").match_prefix("abc", true), str::npos);
+  PatternMatch pm;
+  EXPECT_EQ(ext("(#b)(a|ab)(b|)").match_prefix("abab", true, &pm), 2u);
+  EXPECT_EQ(pm.groups, (vec<Span>{{0, 1}, {1, 2}}));
+  EXPECT_EQ(ext("(#b)(*)(b|bc)").match_prefix("abcabc", true, &pm), 5u);
+  EXPECT_EQ(pm.groups, (vec<Span>{{0, 4}, {4, 5}}));
+  // From a position, with (#s) and (#e) at the ends of the whole text,
+  // which `notstart` and `notend` turn off.
+  EXPECT_EQ(ext("(#s)a").match_prefix("aa", 1, true), str::npos);
+  EXPECT_EQ(ext("a(#e)|a").match_prefix("aa", 1, true), 1u);
+  PrefixSearch notend{false, true}, notstart{true, false};
+  EXPECT_EQ(ext("(#e)").match_prefix("aa", 2, true, nullptr, &notend), str::npos);
+  EXPECT_EQ(ext("(#s)").match_prefix("aa", 0, true, nullptr, &notstart), str::npos);
+}
+
+TEST(GlobPattern13c, BadPatterns) {
+  for (strv p : {"(#X)ab", "(#c2)a", "(#a)ac", "(#a255)a", "#a", "a###", "*#", "*##", "*(#c2)",
+                 "a(#cx)", "a(#c2", "a#(#c2)", "a(#i)(#c2)", "(#ic2)a", "(#se)a", "(#s)#",
+                 "(#i", "^#", "a|#", "a|(#X)", "a~(#X)", "(#i)(#X)a"}) {
+    auto pat = ext(p);
+    EXPECT_TRUE(pat.bad()) << p;
+    EXPECT_FALSE(pat.matches("a")) << p;
+    EXPECT_EQ(pat.match_prefix("ab", true), str::npos) << p;
+  }
+  for (strv p : {"(#a254)a", "(#)a", "(#q.)a", "a(#c,2)", "(#a 1)a", "(#ia1)a", "(#s)a"}) {
+    auto pat = ext(p);
+    EXPECT_FALSE(pat.bad()) << p;
+    EXPECT_TRUE(pat.matches("a")) << p;
+  }
+  // Only EXTENDED_GLOB has globbing flags.
+  EXPECT_FALSE(CompiledPattern::compile("(#X)ab").bad());
+}
+
+TEST(GlobPattern13c, CaseFlags) {
+  Utf8Ctype loc;
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  // "\xc3\x89" is É, "\xc3\xa9" é.
+  EXPECT_TRUE(ext("(#i)\xc3\xa9", true).matches("\xc3\x89"));
+  EXPECT_TRUE(ext("(#i)\xc3\x89", true).matches("\xc3\xa9"));
+  EXPECT_TRUE(ext("(#l)\xc3\xa9", true).matches("\xc3\x89"));
+  EXPECT_FALSE(ext("(#l)\xc3\x89", true).matches("\xc3\xa9"));
+  EXPECT_TRUE(ext("(#i)\xc3\xa9#", true).matches("\xc3\x89\xc3\x89"));
+  EXPECT_FALSE(ext("(#i)[a]").matches("A"));
+  EXPECT_FALSE(ext("(#i)[a-z]").matches("A"));
+  EXPECT_FALSE(ext("(#l)[A]").matches("a"));
+  EXPECT_FALSE(ext("(#i)[\xc3\xa9]", true).matches("\xc3\x89"));
+  EXPECT_TRUE(ext("(#i)[^a]").matches("A"));
+  EXPECT_FALSE(CompiledPattern::compile("[a]*", true).matches("ABD"));
+  EXPECT_TRUE(CompiledPattern::compile("a*", true).matches("ABD"));
+}
+
+TEST(GlobPattern13c, EmptyRepeats) {
+  PatternMatch pm;
+  ASSERT_TRUE(ext("(#b)(|a)##b").matches("b", &pm));
+  EXPECT_EQ(pm.groups, (vec<Span>{{0, 0}}));
+  ASSERT_TRUE(ext("(#b)a(x|)#").matches("a", &pm));
+  EXPECT_EQ(pm.groups, (vec<Span>{{1, 1}}));
+  ASSERT_TRUE(ext("(#b)(a|b|)#").matches("ab", &pm));
+  EXPECT_EQ(pm.groups, (vec<Span>{{2, 2}}));
+  ASSERT_TRUE(ext("(#b)(|a)(#c2,3)b").matches("ab", &pm));
+  EXPECT_EQ(pm.groups, (vec<Span>{{1, 1}}));
+  EXPECT_TRUE(ext("(#a1)(|a)##b").matches("b"));
+  EXPECT_EQ(ext("(|a##)").match_prefix("aaa", true), 0u);
+}
+
+TEST(GlobPattern13c, CountedRepeatsAgree) {
+  // The set matcher accepts these; zsh's counter, which the backtracker
+  // copies, does not, and the backtracker decides.
+  EXPECT_FALSE(ext("(?|cb)(#c1,2)").matches("cba"));
+  EXPECT_FALSE(ext("(#b)(?|cb)(#c1,2)").matches("cba"));
+  EXPECT_EQ(ext("(?|cb)(#c1,2)").match_prefix("cba", true), 2u);
+  EXPECT_EQ(ext("(?|cb)(#c1,2)").match_prefix("cba", false), 1u);
+  EXPECT_FALSE(ext("(b(a|ba)#)(#c2)").matches("babaa"));
+  PatternMatch pm;
+  ASSERT_TRUE(ext("(#b)(*b(a|ba)#)(#c2)").matches("babaa", &pm));
+  EXPECT_EQ(pm.groups, (vec<Span>{{1, 5}, {4, 5}}));
+}
+
+TEST(GlobPattern13c, NineGroups) {
+  PatternMatch pm;
+  ASSERT_TRUE(ext("(#b)(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)").matches("abcdefghijk", &pm));
+  ASSERT_EQ(pm.groups.size(), 9u);
+  EXPECT_EQ(pm.groups[8], (Span{8, 9}));
+  EXPECT_TRUE(ext("(#b)(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)").backrefs());
+}
+
+TEST(GlobPattern13c, BytesAndCharacters) {
+  // é is \xc3\xa9; a byte of it alone in the pattern is no character.
+  EXPECT_FALSE(ext("(#b)\xc3(*)\xa9", true).matches("\xc3\xa9"));
+  EXPECT_FALSE(ext("(|\xc3)\xa9", true).matches("\xc3\xa9"));
+  EXPECT_TRUE(ext("\xc3\xa9", true).matches("\xc3\xa9"));
+  // zsh's `*` (or x#) before literal text that ends a branch compares that
+  // text with the last bytes of a whole match.
+  EXPECT_TRUE(ext("(|\xc3)?#\xa9", true).matches("\xc3\xa9"));
+  EXPECT_TRUE(ext("*\xa9", true).matches("\xc3\xa9"));
+  EXPECT_TRUE(ext("x|*\xa9", true).matches("\xc3\xa9"));
+  EXPECT_FALSE(ext("(*\xa9)", true).matches("\xc3\xa9"));
+  EXPECT_FALSE(ext("*\xa9~x", true).matches("\xc3\xa9"));
+  EXPECT_EQ(ext("*\xa9", true).match_prefix("\xc3\xa9", true), str::npos);
+  // Without MULTIBYTE everything is bytes.
+  EXPECT_TRUE(ext("(|\xc3)\xa9", false).matches("\xc3\xa9"));
+}
+
+TEST(GlobPattern13c, LongSubjects) {
+  // One-character repeats run in a loop, so their groups are found on
+  // subjects far longer than the backtracker could recurse through.
+  str big(200000, 'a');
+  PatternMatch pm;
+  ASSERT_TRUE(ext("(#b)(a#)").matches(big, &pm));
+  EXPECT_EQ(pm.groups, (vec<Span>{{0, big.size()}}));
+  EXPECT_EQ(ext("a#").match_prefix(big, true), big.size());
+  // Where the backtracker gives up, the longest end.
+  EXPECT_EQ(ext("(a|b)#").match_prefix(big, true), big.size());
+  // A search that turns exponential gives up too.
+  str some(2000, 'a');
+  EXPECT_EQ(ext("*a*a*a*c|a*").match_prefix(some, true), some.size());
+}
+
+// Policy: exclusions follow the documented set semantics (see
+// Pattern13c.ExclusionsFollowSetSemantics); zsh fails here.
+TEST(GlobPattern13c, ExclusionsFollowSetSemantics) {
+  EXPECT_TRUE(ext("(b|ba)~b").matches("ba"));
+  EXPECT_TRUE(ext("(ba|b)~b").matches("ba"));
 }
 
 }  // namespace

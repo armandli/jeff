@@ -1658,49 +1658,150 @@ Policy decisions:
   exclusion at the first point its backtracking reaches it, so
   `[[ ba = (b|ba)~b ]]` fails in zsh and matches in jfsh. That order has
   no linear-time form. Tests pin the jfsh result, with a comment naming
-  the zsh difference.
+  the zsh difference.  zsh compiles `^x` as `*~x`, so `^` falls under the
+  same policy.
 - **The `(S)` + `(#s)`/`(#e)` quirks** (`x=abc; ${(SB)x#(#e)}` is `1` in
   zsh) are pinned the same way unless 13c.1 finds their cause in zsh's
-  getmatch and they come out of the same rule.
+  getmatch and they come out of the same rule.  (13c.1 found it: they come
+  from igetmatch's structure and its stale PAT_NOTSTART/PAT_NOTEND, and
+  are now copied.)
 - **`(#aN)` stays on a backtracker.** A linear form (NFA states × error
   count) is possible, but matching zsh's exact error placement and
   capture order is risky, and `(#a)` is rare and used on short input.
 
-**13c.1 — zsh semantics on the current matchers**
-- **`^` anywhere under EXTENDED_GLOB.** `^` negates the rest of its
-  branch, up to `|`, `)` or `~`: `a^x`, `*^b`, `(#i)^*.txt`, `a|^b`,
-  `a~^b`. Compile it as a one-alternative negated group. Compile the
-  top level as one Group node too, so `Impl::negate`/`excludes` and
-  their special cases go; `^a|b` then negates only the first branch.
-- **First-found end for `##`, `/`, `//`, `(S)##`, `(S)%%`.**
-  `match_prefix(longest=true)` returns the end that zsh's greedy
-  left-to-right search reaches first with the end unanchored:
-  `x=aaa; ${x##(a|aa)}` is `aa`, `${x//(a|aa)/Z}` is `ZZZ`. The
-  shortest form keeps its meaning. Until 13c.2 this runs on the
-  backtracker in an unanchored-end mode, and `set_prefix` answers only
-  the shortest form.
-- **Character positions.** Under MULTIBYTE, `$mbegin`, `$mend`,
-  `$MBEGIN` and `$MEND` count characters. `PatternMatch` stays in bytes.
-- **Case flags on non-ASCII.** Under MULTIBYTE a non-ASCII literal is one
-  code-point node folded with `towlower`, so `(#i)é` matches `É`.
-  Brackets are not folded, as in zsh 5.9: `[[ A = (#i)[a] ]]` fails and
-  `[[ A = (#i)[^a] ]]` matches. Check NO_CASE_GLOB filename matching
-  against zsh before deciding whether it keeps class folding.
-- **Repeats of something that can match empty.** `(|a)##`, `(x|)#`: an
-  iteration that ends where it began finishes the repeat with its groups
-  kept, counting toward `min`. Both matchers agree:
-  `[[ b = (#b)(|a)##b ]]` gives `$mbegin $mend` = `1 0`, and
-  `[[ ab = (#b)(a|b|)# ]]` gives `$match` empty, `3 2`.
-- **At most 9 `(#b)` groups**, as zsh.
-- **Bad globbing flags** (`(#X)`, `(#c2)` with nothing before it, `(#a)`
-  with no number) are "bad pattern". `compile` reports the error and
-  callers turn it into `ErrorKind::BadPattern`.
-- **A literal `|` in a `${x#…}`/`${x/…}` operand is text.** Only `$~var`
-  makes alternatives: `x=ab; ${x/a|b/Z}` is `ab`.
-- **Bytes and characters.** A byte literal that ends mid-character
-  matches the same way in both matchers (`[[ é = (#b)\xc3(*)\xa9 ]]`
-  fails, as zsh), and the single-character repeat fast path keeps
-  mid-character starts (`(|\xc3)?#\xa9`).
+**13c.1 — done** (branch `jfsh-pattern-vm`): zsh semantics on the current
+matchers.
+- **`^` anywhere under EXTENDED_GLOB** negates the rest of its branch, up to
+  `|`, `)` or `~` (`a^x`, `*^b`, `(#i)^*.txt`, `a|^b`, `a~^b`), as a
+  one-alternative negated Group.  The top level is one Group too, so
+  `Impl::negate`/`excludes` are gone.
+- **First-found end.** `match_prefix(longest)` runs the backtracker with
+  the end left open and returns the end zsh's greedy search reaches first;
+  the set matcher still filters out subjects with no match and gives the
+  shortest end.  The backtracker gives up (`deep`) on a stack nearly used
+  up or after 2^22 + 16·(n+1)·(pattern size) steps, and then the longest
+  end is used; a `PrefixSearch`, kept by the caller for one search (one
+  ${x//…}), remembers a give-up on steps so later positions do not pay it
+  again.  Known stopgap divergence for 13c.2 to remove:
+  `x=${(l:300::a:)}c${(l:300::a:)}; ${#${x##*a*a*a(c|ca)}}` is 300 in zsh,
+  299 in jfsh (the budget runs out and the longest end is taken).
+- **zsh's igetmatch.** `get_match`/`substitute` go through one
+  `find_match`, shaped as igetmatch: (S)% and (S)%% scan for the nth start
+  from the end; (S)#'s empty match at the end is reported at the start
+  (${(SB)x#(#e)} is 1); a shortest search leaves (#e) failing after it and
+  (S)% looks for its shortest with the (#s) and the character index of the
+  last start scanned, and % retries the empty match at the end with the
+  (#s) of the last start (so on one character (#s) matches there) — the
+  stale PAT_NOTEND/PAT_NOTSTART and ioff, so the (S) quirks of the policy
+  above come out of the same rule; zsh's tries at the end take the byte
+  length as their index; (B)/(E)/(N)/(M)/(R) join with spaces even when
+  empty.  `${x#…}`, `${x%…}` and `${x:#…}` now set $match/$MATCH for
+  (#b)/(#m), as zsh does.
+- **Character positions.** $mbegin/$mend/$MBEGIN/$MEND count characters
+  (`set_match_params` takes the start's character index);
+  `PatternMatch` stays in bytes.
+- **Case flags on non-ASCII.** Under MULTIBYTE a literal is one code point
+  compared with zsh's CHARMATCH (towlower/towupper); brackets are never
+  folded, for (#i), (#l) and NO_CASE_GLOB alike (zsh's filename generation
+  checked: `setopt nocaseglob; print [a]*` lists `abc`, not `ABD`).
+  `GlobPatternMatch.BracketExpressions` pinned the old folding and now pins
+  zsh's.
+- **Repeats** as zsh runs them: one-character x#/x## in a loop (no
+  recursion per character, so (#b)(a#) on 200k gives its group); complex
+  x# with zsh's P_WBRANCH marks (while the outermost x# on a node tries a
+  repeat, a repeat is tried from a position once, so an empty repeat ends
+  it with its groups kept and nested repeats stay polynomial; the marks
+  are dropped before the outermost one tries what follows, kept in a
+  per-node hash set); (#cN,M) with P_COUNT's per-node start, stale values
+  included.  The stale start makes zsh reject matches the set matcher
+  finds (`[[ cba = (?|cb)(#c1,2) ]]` fails), so with a (#cN,M)
+  (`Impl::counted`) the backtracker decides and the set matcher only
+  filters; when the backtracker gives up the set matcher's answer stands.
+  x#'s node takes its operand's case flags.
+- **At most 9 (#b) groups.**  Flags of exclusions, as zsh: at the top
+  level a `~` exclusion and the text after `^` start with the flags their
+  branch ends with (so `(#b)*~(aaa)` has a group), inside a group with the
+  group's flags (`((#i)a~A|b)` matches `a`); both without (#aN).  A `~`
+  right after leading flags excludes (`(#i)~a` matches the empty string).
+- **Bad patterns**: unknown flags, (#a) without a number or over 254,
+  (#s)/(#e) not alone, (#c) not right after a piece, `#` with nothing to
+  repeat, `*#`, `x###`, an unclosed `(#`.  `CompiledPattern::bad()`;
+  [[ ]] fails with status 2, `case` with 0, ${…} (and `:s` with
+  HIST_SUBST_PATTERN) with 1, globbing with 1 (or the word as is under
+  NO_BAD_PATTERN), each ending the command line.
+- **`|` in operands**: written outside parentheses in ${x#…}, ${x/…} or a
+  HIST_SUBST_PATTERN `:s` it is text; one from $~var alternates.
+- **Bytes**: a pattern byte that starts no character matches only such a
+  byte; zsh's anchored `*`/x# before final literal text compares that text
+  with the last bytes of the subject (`(|\xc3)?#\xa9` matches é,
+  `(|\xc3)\xa9` does not), copied as `TailLiteral`.
+- Filename generation compiles each segment once, not once per
+  directory.  `SubstReview.DeepNestingFailsCleanly` no longer pins the
+  depth where the stack runs out.
+- (#cN,M) reads its numbers as zstrtol: blanks (and newlines) and a sign
+  may come first, a lone sign is 0, a negative M is no limit and a
+  negative N is 0.
+- Tests: `Pattern13c.*` (18) in `tests/subst_test.cpp`,
+  `GlobPattern13c.*` (10) in `tests/glob_test.cpp`, expected values from
+  zsh 5.9; `ExclusionsFollowSetSemantics` pins the policy divergence.
+- Random differential tests against zsh (lines that differ, before 13c.1
+  → after): review gen.py 3 seeds × 3000 per mode, plain 116 → 48, (#b)
+  2929 → 97, (#b) without `^`/`~` 1049 → 0, genb 616 → 43; review2
+  gen3.py without `^`/`~`, 11 seeds × 3000: 30532 → 0; gen5.py ((#c)),
+  seeds 1-5 × 4000: 1840 → 0.  gen3.py with `^`/`~` still differs (with
+  $match reset per case, 75-104 lines per seed), and every such case has
+  `^` or `~`.  zsh tests an exclusion only after the rest of the pattern
+  has matched, and keeps per-invocation sync marks that attempts rejected
+  later (by that exclusion or an inner one, `^` being zsh's `*~`) leave
+  behind: `[[ ba = (b|ba)~b ]]` and `((^)#~b)` on anything fail in zsh;
+  `${x##(#b)(^ac)(#c1,2)}` on `ac` takes one repeat in zsh, two in jfsh
+  (not reduced further).  The policy keeps set semantics.
+
+Left after 13c.1:
+- zsh drops MULTIBYTE in top-level alternatives after the first
+  (`[[ é = a|? ]]` fails in zsh); not copied.
+- An unclosed `(` or `[` in [[ ]] or ${x#…} is text in jfsh, "bad pattern"
+  in zsh (`x='a(b'; ${x%%(*}`).
+- `^x` after many starts costs the set matcher O(n²) (13c.2's shared
+  sub-runs); the backtracker's step budget is a stopgap until the VM.
+- (#aN) prefix matches still try every length (13c.3).
+- Unrelated, seen in the differential test: zsh's ${(qq)a} of an empty
+  array is `''`, jfsh's is nothing.
+- Flags leaking past (#cN,M) are copied (`Node::leaks`): when a further
+  repeat of a one-branch group fails, the case flags zsh last set while
+  trying it stay on for the literals that follow with no flag change of
+  their own (`[[ aB = ((#i)A)(#c1,2)b ]]` matches), through enclosing
+  groups that change no flags themselves.  The places that set flags are
+  the changes in the counted group's branch and in one-branch groups
+  inside it, and the ends of those that changed flags, which put them
+  back; the backtracker notes the last one it passes.  The set matcher
+  cannot follow, so the backtracker decides such patterns
+  (`Impl::leaky`).  A group with a `~` puts its flags back, as zsh's
+  exclusion does.  An approximation: zsh's leaked flags also reach
+  earlier literals that an enclosing repeat or alternative runs again
+  (`[[ AbA = (B|((#i)A)(#c1,2))# ]]` is 0 in zsh, 1 in jfsh); jfsh applies
+  the leak only to literals after the count.  Missed leaks: a flag group
+  under `##` or an inner (#c) in the counted branch
+  (`[[ aB = (((#i)A)##)(#c1,2)b ]]` and `(((#i)A)(#c1))(#c1,2)b` are 0 in
+  zsh, 1 in jfsh), and with (#aN) (13c.3: `((#a1)(#i)A)(#c1,2)b` is zsh 0
+  / jfsh 1 on aB, zsh 1 / jfsh 0 on aaB).  gen6 (review3, 3 seeds ×
+  3000) differs now in the mid-literal (#I) below, in s3 #2735 (the
+  enclosing-repeat case) and in $match left over from it (#2736, #2737).
+- When the backtracker gives up on a leaky pattern, the set matcher's
+  answer, which ignores the leak, stands:
+  `x=${(l:20000::a:)}b; [[ $x = ((#i)A)(#c1,200000)B ]]` is 0 in zsh, 1
+  in jfsh.  13c.2's VM removes this.
+- Not copied: zsh drops the text after a mid-literal `(#I)` when no case
+  flag is on, so `[[ Ba = B(#I)a ]]` fails and `[[ B = B(#I)a ]]` matches.
+- HIST_SUBST_PATTERN: `x=ab; print ${x:s/\*/Z/}` gives `Z` in zsh and `ab`
+  in jfsh.
+- An error inside `eval` (a bad pattern, `[[ -n ]]`) ends the whole command
+  line in jfsh; zsh ends only the eval (`eval '[[ a = (#X) ]]'; echo
+  after=$?` prints after=2).  Not a local fix: jfsh's `aborting` covers
+  both such errors and those that must still end the shell (`${x?}`).
+- A leading `(#i)` in a glob does not reach later path segments
+  (`print -l (#i)*/*.txt`, `(#i)**/*.txt`): each segment is its own
+  pattern.
 
 **13c.2 — one priority-ordered Pike VM for every pattern without (#aN)**
 - Replace `SetMatcher` and `fill_groups` with a Pike VM whose threads
@@ -1723,6 +1824,8 @@ Policy decisions:
   `*(^*(^*(^*b)))c` stays polynomial of low degree, not O(n^(k+1)).
 - The backtracker stays for `(#aN)` and, in tests and the differential
   tester, as an oracle the VM is compared against.
+- The set matcher is quadratic in a large (#cN,M) maximum
+  (`(a|b)(#c1,300000)` on 200k); the VM's counter must not be.
 
 **13c.3 — `(#aN)` to zsh's rules**
 - Errors only on literals: `?`, `[…]` and `<lo-hi>` match exactly.
@@ -1747,6 +1850,8 @@ Policy decisions:
 - One `range_ends()` helper for the saturating digit scan.
 - Style (format-cpp): blank lines between `break; case` blocks;
   `parse_flags` takes its flags by value and returns them.
+- (S) shortest searches cost about 2.7× base: at each start the
+  first-found search runs before the shortest one.
 - A benchmark test set with time bounds: 30 KB `${x//a/b}`,
   `(#b)(*)x(*)(*)(*)y(*)` at N=200, nested `^` after `*`, `(#a1)` on 8 KB.
 

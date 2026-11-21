@@ -693,21 +693,30 @@ TEST(SubstReview, DeepNestingFailsCleanly) {
     str some = str(1100, '(') + "a" + str(1100, ')');
     EXPECT_EQ(out(sh, "p='" + some + "'; [[ a == $~p ]] && echo yes"), "yes\n");
   }
-  // On a 1 MB stack the same nesting, deeper, fails with an error.
+  // On a 1 MB stack moderate nesting works and very deep nesting fails
+  // cleanly with an error, wherever the stack runs out.
   test::on_stack(1 << 20, [&] {
     Shell sh;
-    auto r = sh.run("x=a; echo " + nest("${", "}", 5000, "x"));
-    EXPECT_EQ(r.err, "jfsh: substitutions nested too deeply\n");
-    r = sh.run("x=a; echo " + nest("\"${", "}\"", 5000, "x"));
-    EXPECT_EQ(r.err, "jfsh: substitutions nested too deeply\n");
-    str ao(5000, '('), ac(5000, ')');
+    auto clean = [](const test::Run& r) {
+      return r.err == "jfsh: substitutions nested too deeply\n"
+          or r.err == "jfsh: stack overflow\n";
+    };
+    EXPECT_EQ(out(sh, "x=a; echo " + nest("${", "}", 200, "x")), "a\n");
+    EXPECT_EQ(out(sh, "x=a; echo " + nest("\"${", "}\"", 200, "x")), "a\n");
+    EXPECT_EQ(out(sh, "echo " + nest("$((", "))", 200, "1")), "1\n");
+    constexpr int deep = 100000;
+    auto r = sh.run("x=a; echo " + nest("${", "}", deep, "x"));
+    EXPECT_TRUE(clean(r)) << r.err;
+    r = sh.run("x=a; echo " + nest("\"${", "}\"", deep, "x"));
+    EXPECT_TRUE(clean(r)) << r.err;
+    str ao(deep, '('), ac(deep, ')');
     r = sh.run("x='" + ao + "1" + ac + "'; echo $((x))");
-    EXPECT_EQ(r.err, "jfsh: stack overflow\n");
-    r = sh.run("echo " + nest("$((", "))", 5000, "1"));
-    EXPECT_EQ(r.err, "jfsh: substitutions nested too deeply\n");
+    EXPECT_TRUE(clean(r)) << r.err;
+    r = sh.run("echo " + nest("$((", "))", deep, "1"));
+    EXPECT_TRUE(clean(r)) << r.err;
     // A pattern nested past the stack is literal text as a whole.
-    str deep = str(5000, '(') + "a" + str(5000, ')');
-    EXPECT_EQ(out(sh, "p='" + deep + "'; [[ a == $~p ]] || echo no; [[ $p == $~p ]] && echo self"),
+    str pat = str(deep, '(') + "a" + str(deep, ')');
+    EXPECT_EQ(out(sh, "p='" + pat + "'; [[ a == $~p ]] || echo no; [[ $p == $~p ]] && echo self"),
               "no\nself\n");
     str braces = nest("{a,", "}", 5000, "b");
     r = sh.run("echo " + braces + " | wc -c");
@@ -1325,6 +1334,367 @@ TEST(Subst15c, TrailingTildeIsLiteral) {
   EXPECT_EQ(out(sh, cd + "touch foo.c bar.c; echo x~y x~y~ x~y~z foo.c~y *.c~foo*)"),
             "x~y x~y~ x~y~z foo.c~y bar.c\n");
   EXPECT_EQ(sh.run(cd + "echo foo.c~f*)").err, "jfsh: no matches found: foo.c~f*\n");
+}
+
+// M13 Phase 13c.1: the pattern matcher follows zsh 5.9; expected values
+// are zsh's.
+
+// ##, / and // take the end zsh's greedy search reaches first, with the
+// end left open, not the longest.
+TEST(Pattern13c, FirstFoundEnd) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "x=aaa; print -r -- ${x##(a|aa)} ${x/(a|aa)/Z} ${x//(a|aa)/Z}"),
+            "aa Zaa ZZZ\n");
+  EXPECT_EQ(out(sh, "x=abc; print -r -- ${x##(a|ab)} ${x/(#m)(a|ab)/<$MATCH>}"), "bc <a>bc\n");
+  EXPECT_EQ(out(sh, "x=abab; print -r -- \"${x##*(a|ab)}|${(M)x##*(a|ab)}\""), "b|aba\n");
+  EXPECT_EQ(out(sh, "x=baaa; print -r -- ${x//(|a##)/Z} ${x/(|a##)/Z}"), "ZbZaZaZa Zbaaa\n");
+  EXPECT_EQ(out(sh, "x=aaa; print -r -- ${(S)x##(a|aa)} ${(SM)x##(a|aa)} ${(S)x%%(a|aa)} "
+                    "${(SM)x%%(a|aa)} ${(SM)x%(a|aa)} ${(M)x%%(a|aa)}"),
+            "aa a aa a a aa\n");
+  EXPECT_EQ(out(sh, "x=abcabc; print -r -- ${x##(#b)(*)(b|bc)} $match ${x/(b|bc)/Z} "
+                    "${x//(b|bc)/Z} ${(S)x/(b|bc)/Z}"),
+            "c abca b aZcabc aZcaZc aZcabc\n");
+  EXPECT_EQ(out(sh, "x=aaab; print -r -- ${x##(a|aa)#} ${x/(a|aa)#/Z}; "
+                    "x=1234x; print -r -- ${x##<1-200>} ${x//<1-20>/Z}"),
+            "b Zb\n4x ZZZx\n");
+  EXPECT_EQ(out(sh, "x=abab; print -r -- ${x##(#b)(a|ab)(b|)} $match / $mbegin / $mend"),
+            "ab a b / 1 2 / 1 2\n");
+}
+
+// Under EXTENDED_GLOB `^` negates the rest of its branch wherever it is.
+TEST(Pattern13c, CaretAnywhere) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "[[ ab = (#b)^x ]] && [[ ab = (#i)^x ]] && [[ ab = a^x ]] && "
+                    "[[ ab = *^b ]] && print yes"),
+            "yes\n");
+  EXPECT_EQ(out(sh, "x=ab; print -r -- ${x#a^b}"), "b\n");
+  EXPECT_EQ(out(sh, "for p in '^a|b' 'a|^b' 'a~^b'; do for s in a b c; do "
+                    "[[ $s = $~p ]] && print -rn -- $s; done; print -r -- \" $p\"; done"),
+            "bc ^a|b\nac a|^b\n a~^b\n");
+  EXPECT_EQ(out(sh, "[[ x = ^ ]] && print 1; [[ '' = ^ ]] || print 2; [[ ab = a^ ]] && print 3; "
+                    "[[ a = a^ ]] || print 4; [[ a = ^^a ]] && print 5; [[ b = ^^a ]] || print 6"),
+            "1\n2\n3\n4\n5\n6\n");
+  EXPECT_EQ(out(sh, "[[ b = (^a|b) ]] && print 1; [[ c = (x|^a) ]] && print 2; "
+                    "[[ a = (x|^a) ]] || print 3; [[ xy = x(^a|b) ]] && print 4; "
+                    "[[ ab = ^a~b ]] || print 5; [[ c = ^a~b ]] && print 6"),
+            "1\n2\n3\n4\n6\n");
+  EXPECT_EQ(out(sh, "x=abc; print -r -- \"${x#a^c}|${x##a^c}|${x%^c}|${x%%^c}|${x/^b/Z}\""),
+            "bc||abc||Z\n");
+  EXPECT_EQ(out(sh, "[[ AB = (#i)a^b ]] || print 1; [[ AC = (#i)a^b ]] && print 2; "
+                    "[[ aB = a(#i)^b ]] || print 3"),
+            "1\n2\n3\n");
+}
+
+TEST(Pattern13c, CaretAndCaseInGlobs) {
+  Shell sh;
+  TempDir dir;
+  str cd = "(cd " + dir.path.string() + "; ";
+  EXPECT_EQ(out(sh, cd + "touch a.txt b.TXT c.c; setopt extendedglob; print (#i)^*.txt)"),
+            "c.c\n");
+  // NO_CASE_GLOB folds literals but, as in zsh, not brackets.
+  TempDir mixed;
+  str cd2 = "(cd " + mixed.path.string() + "; touch abc ABD Abe xyz; setopt nocaseglob; ";
+  EXPECT_EQ(out(sh, cd2 + "print -- [a]*; print -- *bd a?e; print -- [^a]*; print -- *[d-e])"),
+            "abc\nABD Abe\nABD Abe xyz\nAbe\n");
+}
+
+// Under MULTIBYTE $mbegin, $mend, $MBEGIN and $MEND count characters.
+TEST(Pattern13c, CharacterPositions) {
+  Utf8Locale loc{LC_CTYPE};
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "[[ éXé = (#b)(*)X(*) ]] && print -r -- $mbegin / $mend"), "1 3 / 1 3\n");
+  EXPECT_EQ(out(sh, "x=aéb; print -r -- ${x/(#m)é/<$MATCH $MBEGIN $MEND>}"), "a<é 2 2>b\n");
+  EXPECT_EQ(out(sh, "x=éaé; print -r -- ${x//(#m)?/<$MBEGIN-$MEND>}"), "<1-1><2-2><3-3>\n");
+  EXPECT_EQ(out(sh, "x=ééa; print -r -- ${x#(#b)(é)} $mbegin $mend ${x%(#b)(a)} $mbegin $mend "
+                    "${(S)x%(#b)(é)} $mbegin $mend"),
+            "éa 1 1 éé 3 3 éa 2 2\n");
+  EXPECT_EQ(out(sh, "setopt ksharrays; [[ éXé = (#b)(*)X(*) ]] && print -r -- ${mbegin[@]} / "
+                    "${mend[@]}; x=aéb; print -r -- ${x/(#m)b/<$MBEGIN $MEND>}"),
+            "0 2 / 0 2\naé<2 2>\n");
+}
+
+// (#i) and (#l) fold non-ASCII literals; brackets are not folded.
+TEST(Pattern13c, CaseFlags) {
+  Utf8Locale loc{LC_CTYPE};
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "[[ É = (#i)é ]] && [[ é = (#i)É ]] && [[ É = (#l)é ]] && "
+                    "[[ ÉÉ = (#i)é# ]] && print yes"),
+            "yes\n");
+  EXPECT_EQ(out(sh, "[[ A = (#i)[a] ]] || [[ A = (#i)[a-z] ]] || [[ a = (#l)[A] ]] || "
+                    "[[ É = (#i)[é] ]] || print no"),
+            "no\n");
+  EXPECT_EQ(out(sh, "[[ A = (#i)[^a] ]] && print yes"), "yes\n");
+  EXPECT_EQ(out(sh, "[[ Ä = (#i)ä ]] && print 1; [[ ä = (#l)Ä ]] || print 2; "
+                    "[[ ÄÖ = (#i)äö ]] && print 3; [[ É = (#i)[[:lower:]] ]] || print 4; "
+                    "[[ x = (#i)[X] ]] || print 5"),
+            "1\n2\n3\n4\n5\n");
+  EXPECT_EQ(out(sh, "[[ AB = (#l)ab ]] && print 1; [[ Ab = (#l)aB ]] || print 2"), "1\n2\n");
+}
+
+// A repeat that matches nothing ends the repeat, its groups kept.
+TEST(Pattern13c, EmptyRepeats) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "[[ b = (#b)(|a)##b ]] && print -r -- $mbegin $mend"), "1 0\n");
+  EXPECT_EQ(out(sh, "[[ a = (#b)a(x|)# ]] && print -r -- $mbegin $mend"), "2 1\n");
+  EXPECT_EQ(out(sh, "[[ ab = (#b)(a|b|)# ]] && print -r -- \"<$match>\" $mbegin $mend"),
+            "<> 3 2\n");
+  EXPECT_EQ(out(sh, "[[ b = (#a1)(|a)##b ]] && print yes"), "yes\n");
+  EXPECT_EQ(out(sh, "[[ ab = (#b)(a|)#b ]] && print -r -- \"<$match>\" $mbegin $mend; "
+                    "[[ aab = (#b)(a|)##b ]] && print -r -- \"<$match>\" $mbegin $mend"),
+            "<> 2 1\n<> 3 2\n");
+  EXPECT_EQ(out(sh, "[[ ab = (#b)(|a)(#c1,3)b ]] && print -r -- \"<$match>\" $mbegin $mend; "
+                    "[[ ab = (#b)(|a)(#c2,3)b ]] && print -r -- \"<$match>\" $mbegin $mend"),
+            "<> 2 1\n<> 2 1\n");
+  EXPECT_EQ(out(sh, "[[ aaa = (#b)(a#)# ]] && print -r -- \"<$match>\" $mbegin $mend; "
+                    "[[ '' = (#b)(a|)# ]] && print -r -- \"<$match>\" $mbegin $mend; "
+                    "[[ '' = (#b)(a|)## ]] && print -r -- \"<$match>\" $mbegin $mend"),
+            "<> 4 3\n<> 1 0\n<> 1 0\n");
+  EXPECT_EQ(out(sh, "x=aaa; print -r -- ${x//(|a)/Z} ${x//(a|)/Z} ${x//a#/Z}"),
+            "ZaZaZa ZZZ Z\n");
+}
+
+TEST(Pattern13c, NineGroups) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "[[ abcdefghijk = (#b)(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k) ]] && "
+                    "print -r -- $#match $match"),
+            "9 a b c d e f g h i\n");
+  EXPECT_EQ(out(sh, "[[ abcdefghij = (#b)(a)(b)(c)(d)(e)(f)(g)(h)(i)(j) ]] && "
+                    "print -r -- $#match $match[9] $mbegin[9] $#mbegin"),
+            "9 i 9 9\n");
+}
+
+// A pattern zsh cannot compile is "bad pattern": [[ ]] fails with status
+// 2, case with 0, an expansion with 1, and the command line ends.
+TEST(Pattern13c, BadPatterns) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  auto bad = [&](strv cmd, strv err, int rc) {
+    auto r = sh.run(cmd);
+    EXPECT_EQ(r.out, "") << cmd;
+    EXPECT_EQ(r.err, err) << cmd;
+    EXPECT_EQ(r.rc, rc) << cmd;
+  };
+  bad("[[ ab = (#X)ab ]]; print after", "jfsh: bad pattern: (#X)ab\n", 2);
+  bad("[[ a = (#c2)a ]]; print after", "jfsh: bad pattern: (#c2)a\n", 2);
+  bad("[[ ac = (#a)ac ]] || print no; print after", "jfsh: bad pattern: (#a)ac\n", 2);
+  bad("x=ab; y=${x#(#X)a}; print after", "jfsh: bad pattern: (#X)a\n", 1);
+  bad("x=ab; print ${x/(#X)\\*/b}; print after", "jfsh: bad pattern: (#X)*\n", 1);
+  bad("case ab in (#X)ab) print y;; esac; print after", "jfsh: bad pattern: (#X)ab\n", 0);
+  bad("print (#X)*", "jfsh: bad pattern: (#X)*\n", 1);
+  bad("setopt histsubstpattern; x=abc; print ${x:s/(#X)b/Z/}", "jfsh: bad pattern: (#X)b\n", 1);
+  for (strv p : {"(#a255)a", "#a", "a###", "*#", "*(#c2)", "a(#cx)", "a#(#c2)", "a(#i)(#c2)",
+                 "(#se)a", "(#i", "^#", "a|(#X)", "a~(#X)"})
+    bad("p='" + str(p) + "'; [[ a = $~p ]]", "jfsh: bad pattern: " + str(p) + "\n", 2);
+  EXPECT_EQ(out(sh, "for p in '(#a254)a' '(#)a' '(#q.)a' 'a(#c,2)' '(#a 1)a' '(#ia1)a'; do "
+                    "[[ a = $~p ]]; print -n $?; done; print"),
+            "000000\n");
+  EXPECT_EQ(out(sh, "setopt nobadpattern; print (#X)*"), "(#X)*\n");
+  sh.opts.unset(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "[[ ab = (#X)ab ]]; print $?"), "1\n");
+}
+
+// In ${x#…} ${x/…} and :s, a `|` written outside parentheses is text;
+// one from $~var separates alternatives.
+TEST(Pattern13c, BarInOperands) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=ab; print -r -- ${x/a|b/Z} ${x#a|b} ${x//(a|b)/Z} \"${x/a|b/Z}\""),
+            "ab ab ZZ ab\n");
+  EXPECT_EQ(out(sh, "x='a|b'; print -r -- ${x/a|b/Z} ${x#a|} ${x:#a|b}; p='b|a'; x=ab; "
+                    "print -r -- ${x//$~p/Z} ${x//$p/Z}"),
+            "Z b\nZZ ab\n");
+  EXPECT_EQ(out(sh, "x=ab; print -r -- ${x/a\\|b/Z}; x='a|b'; "
+                    "print -r -- ${x/a\\|b/Z} ${x/\"a|b\"/Z} ${x/'|'/Z}"),
+            "ab\nZ Z aZb\n");
+  EXPECT_EQ(out(sh, "setopt histsubstpattern; x=abcb; print -r -- ${x:s/b|c/Z/} ${x:s/(b|c)/Z/}"),
+            "abcb aZcb\n");
+}
+
+// A byte that is no character matches only such a byte, and literals
+// compare characters; zsh's `*` before final literal text compares bytes.
+TEST(Pattern13c, Bytes) {
+  Utf8Locale loc{LC_CTYPE};
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "a=$'\\xc3' b=$'\\xa9'; [[ é = (#b)$a(*)$b ]] || print 1; "
+                    "[[ é = (|$a)?#$b ]] && print 2; [[ é = (|$a)$b ]] || print 3; "
+                    "[[ é = $a$b ]] && print 4; [[ é = *$b ]] && print 5; "
+                    "[[ é = (*$b) ]] || print 6"),
+            "1\n2\n3\n4\n5\n6\n");
+  EXPECT_EQ(out(sh, "b=$'\\xa9'; x=é; print -r -- \"${x%*$b}|${x#*$b}|${x%%$b}\""), "|é|é\n");
+}
+
+// zsh's getmatch, quirks included: (S) finds an empty match at the end
+// first and reports it at the start, its search for a shortest match
+// leaves (#e) (and in (S)% (#s)) failing, and (B) (E) (N) (M) (R) join
+// with spaces.  # % and :# set $match and $MATCH too.
+TEST(Pattern13c, GetmatchQuirks) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "x=abc; print -r -- ${(SB)x#(#e)} ${(S)x/(#e)/Z} ${x/(#e)/Z} "
+                    "${(SM)x#c#(#e)}. ${(SB)x#c#(#e)}"),
+            "1 Zabc abcZ . 1\n");
+  EXPECT_EQ(out(sh, "x=abaa; print -r -- ${(S)x//(b|(#e))/Z} ${x//(b|(#e))/Z}"), "aZaa aZaaZ\n");
+  EXPECT_EQ(out(sh, "x=bb; print -r -- ${(S)x%(#s)**}. ${(S)x%(#s)b}. ${(SM)x%(#s)b*}"),
+            ". b. bb\n");
+  EXPECT_EQ(out(sh, "x=abc; print -r -- ${x%c#}. ${(I:2:)x%c#}. ${(MB)x%%x#}; "
+                    "print -r -- \"${(MR)x#a}|${(MBEN)x#b}|${(BE)x#z}|${(MR)x#z}|\""),
+            "abc. ab.  4\na bc| 1 1 0|1 1| abc|\n");
+  EXPECT_EQ(out(sh, "x=abab; : ${x#(#b)(a)}; print -r -- $match $mbegin; : ${x%(#b)(?)}; "
+                    "print -r -- $match $mbegin; : ${x##(#m)a*}; print -r -- $MATCH $MBEGIN $MEND; "
+                    ": ${x:#(#b)(a)*}; print -r -- $match"),
+            "a 1\nb 4\nabab 1 4\na\n");
+}
+
+// (#cN,M) runs as zsh's counter, which keeps where the last repeat began
+// as attempts fail; the backtracker decides such matches, so the set
+// matcher only filters.
+TEST(Pattern13c, CountedRepeats) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "[[ babaa = (#b)(*b(a|ba)#)(#c2) ]] && print -r -- y $match $mbegin"),
+            "y abaa a 2 5\n");
+  EXPECT_EQ(out(sh, "[[ cba = (?|cb)(#c1,2) ]] || print no; [[ cba = (#b)(?|cb)(#c1,2) ]] || "
+                    "print no; x=cba; print -r -- ${x%%(?|cb)(#c1,2)} ${x##(?|cb)(#c1,2)}."),
+            "no\nno\nc a.\n");
+  EXPECT_EQ(out(sh, "[[ babaa = (b(a|ba)#)(#c2) ]] || print no; "
+                    "[[ babaa = (*b(a|x)#)(#c2) ]] && print yes"),
+            "no\nyes\n");
+  EXPECT_EQ(out(sh, "[[ bab = (#b)(*b(a|ba)#)(#c2) ]] && print -r -- $mbegin; "
+                    "[[ ab = (#b)(|a)(#c2,3)b ]] && print -r -- $mbegin $mend"),
+            "3 2\n2 1\n");
+}
+
+// zsh's flags leak past (#cN,M): when a further repeat of a one-branch
+// group fails after the branch changed the case flags, nothing puts them
+// back, so they stay on for what follows.
+TEST(Pattern13c, FlagsLeakPastCounts) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "for p in '((#i)A)(#c1,2)b' '((#i)A)(#c0,2)b' '((#l)a)(#c1,2)b' "
+                    "'((#i)A)(#c1,2)bc' 'a((#i)A)(#c1,2)b' '((#i)A)(#c1)b' '(y|(#i)A)(#c1,2)b' "
+                    "'((#i)A)#b' '((#i)A(#I))(#c1,2)b' '((#i)A)(#c1,2)[b]'; do "
+                    "[[ aB = $~p ]] && print -n y || print -n n; done; print"),
+            "yyynnnnnyn\n");
+  EXPECT_EQ(out(sh, "[[ aBC = ((#i)A)(#c1,2)bc ]] && print y; x=bAbaaB; "
+                    "print -r -- ${x//((#i)A)(#c0,2)b/Z}; "
+                    "[[ xaB = (?(#i)A)(#c1,2)b ]] && print y2; "
+                    "[[ xaB = (x(#i)A)(#c1,2)b ]] || print n3"),
+            "y\nZZaZ\ny2\nn3\n");
+  // Through enclosing groups that change no flags themselves, and from
+  // a one-branch group inside the counted one.
+  EXPECT_EQ(out(sh, "for t in 'aB (((#i)A)(#c1,2))b' 'aB (((#i)A)(#c1,2)|x)b' "
+                    "'aB (x|((#i)A)(#c1,2))b' 'aBc (((#i)A)(#c1,2)b)C' 'aBB ((((#i)A)(#c1,2))b)b' "
+                    "'aB (((#i)A)(#c1,2))#b' 'aB (((#i)A))(#c1,2)b'; do s=${t% *} p=${t#* }; "
+                    "[[ $s = $~p ]]; print -n $?; done; print"),
+            "0000000\n");
+  // A branch with an exclusion puts its flags back.
+  EXPECT_EQ(out(sh, "for t in 'aB ((#i)A~x)(#c1,2)b' 'AB ((#i)A~x)(#c1,2)b' "
+                    "'aB (((#i)A~x))(#c1,2)b' 'aB (((#i)A)~x)(#c1,2)b'; do s=${t% *} p=${t#* }; "
+                    "[[ $s = $~p ]]; print -n $?; done; print"),
+            "1111\n");
+  EXPECT_EQ(out(sh, "x=BBbbB; print -r -- ${x##(((#i)A)(#c0,3))b}; "
+                    "x=BabBbb; print -r -- ${x//(b|(?b(#i)A)(#c0,3))(b)#/Z}"),
+            "BbbB\nZBZaZZ\n");
+}
+
+// (#cN,M) reads its numbers as zsh's zstrtol: blanks and a sign may come
+// first, and a negative one is no limit.
+TEST(Pattern13c, CountSyntax) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "for p in 'a(#c 1)' 'a(#c-1)' 'a(#c+1)' 'a(#c1,-1)' 'a(#c-1,2)' 'a(#c 1, 2)' "
+                    "'a(#c,-1)'; do for s in '' a aa aaa; do [[ $s = $~p ]] && print -n y || "
+                    "print -n n; done; print -n ' '; done; print"),
+            "nynn yyyy nynn nyyy yyyn nyyn yyyy \n");
+  // A lone sign is 0; a sign before a blank or another sign is bad.
+  EXPECT_EQ(out(sh, "[[ B = (a)(#c-)B ]]; print -n $?; [[ B = (a)(#c+)B ]]; print -n $?; "
+                    "[[ aaB = (a)(#c-,2)B ]]; print -n $?; [[ aB = (a)(#c1,-)B ]]; print -n $?; "
+                    "[[ aaB = (a)(#c1,+)B ]]; print $?"),
+            "00011\n");
+  for (strv p : {"(a)(#c- 1,2)", "(a)(#c--1,2)"}) {
+    auto r = sh.run("p='" + str(p) + "'; [[ a = $~p ]]");
+    EXPECT_EQ(r.err, "jfsh: bad pattern: " + str(p) + "\n");
+  }
+}
+
+// Giving up on one element of an array does not change the others.
+TEST(Pattern13c, SearchStateIsPerCall) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "h=${(l:300::a:)}c${(l:300::a:)}; a=(aaaca $h aaaca); "
+                    "r=(${a##*a*a*a(c|ca)}); print -r -- \"<$r[1]> <$r[3]>\""),
+            "<a> <a>\n");
+  // A stopgap until 13c.2: the backtracker gives up on the middle one and
+  // takes the longest end; zsh prints 300.
+  EXPECT_EQ(out(sh, "x=${(l:300::a:)}c${(l:300::a:)}; print ${#${x##*a*a*a(c|ca)}}"), "299\n");
+}
+
+// Inside a group, `~` exclusions and the text after `^` start with the
+// group's flags; at the top level with those their branch ends with.
+TEST(Pattern13c, FlagsOfExclusions) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "for p in '((#i)^A)' '((#i)a~A|b)' 'x((#i)a~A)' '(x(#i)^A)' '(#i)^A' "
+                    "'x(#i)a~A' '((#i)a(#I)~A)'; do for s in a A b B xa xA x; do "
+                    "[[ $s = $~p ]] && print -rn -- \"$s \"; done; print -r -- \"| $p\"; done"),
+            "a b B xa xA x | ((#i)^A)\na b | ((#i)a~A|b)\nxa | x((#i)a~A)\nxa x | (x(#i)^A)\n"
+            "b B xa xA x | (#i)^A\nxa xA | x(#i)a~A\na | ((#i)a(#I)~A)\n");
+  // A `~` after leading flags excludes.
+  EXPECT_EQ(out(sh, "p='(#i)~a'; [[ '' = $~p ]] && print 1; p='(#)~a'; [[ '' = $~p ]] && print 2; "
+                    "[[ a = $~p ]] || print 3"),
+            "1\n2\n3\n");
+}
+
+TEST(Pattern13c, MultibyteQuirks) {
+  Utf8Locale loc{LC_CTYPE};
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  // x#'s flags are its operand's: (#i)x#k compares `k` with the last byte
+  // of the Kelvin sign.
+  EXPECT_EQ(out(sh, "k=$'\\u212a'; [[ x$k = (#i)x#k ]] || print 1; [[ $k = (#i)k ]] && print 2"),
+            "1\n2\n");
+  // zsh's (S)% gives its shortest match the character index of the end,
+  // and % tries the empty match at the end of one character with (#s) on.
+  EXPECT_EQ(out(sh, "x=abcabc; : ${(S)x%(#m)b*}; print -r -- $MBEGIN $MEND; x=aébcabc; "
+                    ": ${(S)x%(#m)b*}; print -r -- $MBEGIN; x=abcabc; : ${(S)x%(#b)(b)*}; "
+                    "print -r -- $mbegin"),
+            "7 7\n8\n7\n");
+  EXPECT_EQ(out(sh, "x=b; print -r -- ${(B)x%(#s)}; x=é; print -r -- ${(B)x%(#s)}; "
+                    ": ${x%(#m)(#s)}; print -r -- \"<$MATCH>\" $MBEGIN; "
+                    "x=ab; print -r -- ${(B)x%(#s)}"),
+            "2\n2\n<> 2\n1\n");
+}
+
+// Policy: `~` and `^` follow the documented set semantics, an exclusion
+// tested where its branch ends.  zsh tests it after the rest of the
+// pattern matched, where earlier attempts may already have marked the
+// positions, so its results differ; those are noted with each.
+TEST(Pattern13c, ExclusionsFollowSetSemantics) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  // zsh prints only yes2.
+  EXPECT_EQ(out(sh, "[[ ba = (b|ba)~b ]] && print yes; [[ ba = (ba|b)~b ]] && print yes2"),
+            "yes\nyes2\n");
+  // zsh: b / 1 1.
+  EXPECT_EQ(out(sh, "[[ b = (#b)(*~b|^ba)# ]] && print -r -- $match / $mbegin $mend"),
+            "/ 2 1\n");
+  // zsh: aba.
+  EXPECT_EQ(out(sh, "x=aba; print -r -- ${x%(b|b#|ba*)~b#()(#c0,1)}"), "a\n");
+  // zsh matches nothing: an attempt that an inner exclusion (the `^`)
+  // rejected has already marked the outer exclusion's positions.
+  EXPECT_EQ(out(sh, "for s in x '' a; do [[ $s = ((^)#~b) ]] && print -rn -- \"<$s>\"; done; "
+                    "print"),
+            "<x><><a>\n");
 }
 
 }  // namespace

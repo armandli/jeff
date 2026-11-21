@@ -7,9 +7,6 @@
 // applies zsh's glob qualifiers.
 //
 // TODO(glob/kshglob): KSH_GLOB's `@(…)`, `*(…)`, `+(…)`, `?(…)`, `!(…)`.
-//
-// TODO(glob/cache): CompiledPattern is rebuilt for every directory; a small
-//   cache would help `**/` walks of large trees.
 
 namespace jfsh {
 }  // namespace jfsh

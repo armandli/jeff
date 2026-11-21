@@ -58,21 +58,36 @@ bool locale_multibyte() noexcept;
 
 // A pattern compiled once and matched many times.  Syntax, in the escaped
 // form the expander produces (a `\` makes the next character literal):
-//   *  ?  [abc] [a-z] [!x] [^x] [[:alpha:]]   (a|b)   <lo-hi>
+//   *  ?  [abc] [a-z] [!x] [^x] [[:alpha:]]   (a|b)   a|b   <lo-hi>
 // and, with `extended`, zsh's EXTENDED_GLOB operators:
-//   x#  (zero or more x)   x##  (one or more)   ^pat  (not pat)   a~b  (a but not b)
+//   x#  (zero or more x)   x##  (one or more)   a~b  (a but not b)
+//   ^pat  (anything but pat, which runs to the next `|`, `)` or `~`)
 //   (#i) (#l) (#I) (#b) (#B) (#m) (#M) (#aN) (#s) (#e) (#cN,M)  globbing flags
-// What a match found: the extent of each (#b) group, npos when it took
-// no part.
+// What a match found: the extent of each (#b) group in bytes, npos when it
+// took no part.
 struct PatternMatch {
   vec<s::pair<s::size_t, s::size_t>> groups;
+};
+
+// How a prefix match is looked for, kept by the caller across the calls
+// of one search through a string (each position of one ${x//…}).
+struct PrefixSearch {
+  // (#s) fails even at the start, (#e) even at the end, as where zsh's
+  // matcher has its PAT_NOTSTART or PAT_NOTEND left set.
+  bool notstart = false;
+  bool notend   = false;
+  // The backtracker ran out of steps finding the end zsh's search reaches
+  // first; the calls after it take the longest end instead of trying.
+  bool gave_up  = false;
 };
 
 struct CompiledPattern {
   struct Node;
   struct Impl;
 
-  // With `multibyte`, `?` and `[…]` match a UTF-8 character, not a byte.
+  // With `multibyte`, `?`, `[…]` and literals match a UTF-8 character, not
+  // a byte.  A pattern zsh calls bad (`(#X)`, `#a`, `*#`) compiles to one
+  // that matches nothing, with bad() true.
   static CompiledPattern compile(strv pattern,
                                  bool case_insensitive = false,
                                  bool extended = false,
@@ -84,26 +99,35 @@ struct CompiledPattern {
   // end of the whole `text` (${x/a(#e)/…} tries each part of x); the
   // backreferences in `info` count from b.
   bool matches(strv text, s::size_t b, s::size_t e, PatternMatch* info = nullptr) const;
-  // Length of the shortest (or longest) prefix of `text` that matches, or
-  // npos when none does.
+  // Length of the shortest prefix of `text` that matches, or with
+  // `longest` the one zsh's `##` takes: where its greedy search, with the
+  // end left open, first gets to the end of the pattern (${x##(a|aa)} on
+  // aaa takes `a`).  npos when none matches.
   s::size_t match_prefix(strv text, bool longest, PatternMatch* info = nullptr) const;
-  // The same for the part of `text` from b, as matches() with a window.
-  s::size_t match_prefix(strv text, s::size_t b, bool longest,
-                         PatternMatch* info = nullptr) const;
+  // The same for the part of `text` from b, as matches() with a window,
+  // looked for as `search` says.
+  s::size_t match_prefix(strv text, s::size_t b, bool longest, PatternMatch* info = nullptr,
+                         PrefixSearch* search = nullptr) const;
   // (#b) groups, and (#m), which set $match … and $MATCH … after a match.
   bool backrefs() const noexcept;
   bool sets_match() const noexcept;
+  // Whether the pattern was bad, so callers report "bad pattern".
+  bool bad() const noexcept;
+  // Whether characters may take several bytes, as compile() was told.
+  bool multibyte() const noexcept;
 
 private:
   sptr<const Impl> mImpl;
 };
 
-// After `pat` matched `len` characters of `text` from `start`: with (#b)
-// sets $match, $mbegin and $mend to the groups, with (#m) $MATCH, $MBEGIN
-// and $MEND to the match (1-based, or 0-based under `ksh_arrays`).
+// After `pat` matched `len` bytes of `text` from `start`: with (#b) sets
+// $match, $mbegin and $mend to the groups, with (#m) $MATCH, $MBEGIN and
+// $MEND to the match.  The indexes count characters, 1-based (0-based
+// under `ksh_arrays`); `start_char`, when known, is the characters before
+// `start`.
 void set_match_params(ParamTable& params, const CompiledPattern& pat, strv text,
                       s::size_t start, s::size_t len, const PatternMatch& m,
-                      bool ksh_arrays = false);
+                      bool ksh_arrays = false, s::size_t start_char = strv::npos);
 
 // Expands `pat` against the file system.  `pat.raw` is in the escaped form
 // described above; zsh's glob qualifiers at the end (`(.)`, `(N-/)`,

@@ -1332,6 +1332,13 @@ int Executor::exec_case(ExecState& es, WordCode head) {
       if (not pat) return fail(pat.error());
       auto cp = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob(),
                                          mCtx.opts.multibyte());
+      if (cp.bad()) {
+        // As in zsh: the command line ends, with status 0.
+        s::fprintf(stderr, "jfsh: bad pattern: %s\n", glob_unescape(*pat).c_str());
+        mCtx.aborting = mCtx.abort_line = true;
+        es.pc = end;
+        return 0;
+      }
       PatternMatch pm;
       match = cp.matches(*subject, &pm);
       if (match)
@@ -1653,6 +1660,11 @@ int Executor::exec_cond_node(ExecState& es, WordCode head) {
     note(trace_quote(*lhs) + " " + op + " " + trace_pattern(*pat));
     auto cp = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob(),
                                        mCtx.opts.multibyte());
+    if (cp.bad()) {
+      s::fprintf(stderr, "jfsh: bad pattern: %s\n", glob_unescape(*pat).c_str());
+      mCtx.aborting = mCtx.abort_line = true;
+      return finish(2);
+    }
     PatternMatch pm;
     bool match = cp.matches(*lhs, &pm);
     if (match)
