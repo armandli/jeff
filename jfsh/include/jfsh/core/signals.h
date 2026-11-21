@@ -143,6 +143,10 @@ struct SignalManager {
   // Hands the terminal to process group `pgid`, or back to the shell.
   void give_terminal(Pid pgid) noexcept;
   void take_terminal() noexcept;
+  // On the way out (or before `exec`), as zsh's release_pgrp: the
+  // terminal and the process group go back to the group the shell was
+  // started in, so the program that started it is in the foreground again.
+  void release_terminal() noexcept;
   // The terminal modes the shell keeps between jobs.
   void save_shell_modes() noexcept;
   void restore_shell_modes() noexcept;
@@ -209,6 +213,7 @@ private:
   bool           mJobControl   = false;
   int            mTtyFd        = -1;
   Pid            mShellPgid    = -1;
+  Pid            mOrigPgid     = -1;   // the group the shell was started in
   struct termios mShellModes{};
   bool           mHaveModes    = false;
   // Signals that were ignored when the shell started stay ignored when

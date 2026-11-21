@@ -72,6 +72,9 @@ struct Editor {
   void set_prebuffer(str text) { mPrebuffer = s::move(text); }
 
   void suspend() { if (mRawModeActive) exit_raw_mode(); }
+  // After a widget function ran a command (a pipeline, `$(…)`): the job
+  // code put the shell's terminal modes back, so the editor's go on again.
+  void resume_raw_mode();
   void resume() {}
 
   // Reads from `in` and draws on `out` instead of the terminal on 0 and 1.

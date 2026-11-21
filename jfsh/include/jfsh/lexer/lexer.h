@@ -76,6 +76,12 @@ enum LexFlags : s::uint32_t {
   LEX_ACTIVE       = 1 << 2,
   LEX_DOCSTRING    = 1 << 3,
   LEX_COND         = 1 << 4,   // inside [[ ]]: `<` `>` are words, `((` is two `(`
+  // A case pattern: a leading `(…)` group, blanks and all, is part of the
+  // word, as zsh's lexer reads one in incasepat.
+  LEX_CASEPAT      = 1 << 5,
+  // After a command's first word: `(` starts a glob group word
+  // (`echo (a|b).c`, `ls (#i)x*`) unless `)` follows (`f () …`).
+  LEX_ARGPAREN     = 1 << 6,
 };
 
 struct InputSource {
@@ -96,6 +102,9 @@ struct LexInput : InputSource {
   int  line() const noexcept override { return mRaw.line(); }
 
   void push(str text, sptr<const vec<str>> names);
+  // Puts back text the lexer read ahead; unlike an alias's text, a blank
+  // at its end doesn't make the next word an alias candidate.
+  void push_back_text(str text);
   // The aliases of the text being read now; null when reading the source.
   const sptr<const vec<str>>& current_aliases() const noexcept;
   // An alias text ending in a blank was read past since the last call.
@@ -106,6 +115,7 @@ private:
     str                  text;
     s::size_t            pos = 0;
     sptr<const vec<str>> names;
+    bool                 alias = true;
   };
   InputSource&  mRaw;
   vec<Pushed>   mPushed;
@@ -137,6 +147,17 @@ struct Lexer {
   // Puts a token back so the next peek or next_token returns it; nothing
   // may be peeked already.
   void unread(LexToken tok) { mPeeked = s::move(tok); }
+  // Puts `text` back in front of the input, to be read as tokens again.
+  void push_back_text(str text) { mSrc.push_back_text(s::move(text)); }
+  // Reads a peeked word that starts with `(` again under the current
+  // flags: one peeked as a case pattern can be a subshell instead.
+  void relex_peeked() {
+    if (mPeeked and mPeeked->type == TokType::TK_WORD and not mPeeked->text.empty()
+        and mPeeked->text[0] == '(') {
+      mSrc.push_back_text(s::move(mPeeked->text));
+      mPeeked.reset();
+    }
+  }
 
   void set_alias_expansion(bool on) noexcept { mAliasExpand = on; }
   bool alias_expansion() const noexcept { return mAliasExpand; }
@@ -158,7 +179,9 @@ struct Lexer {
   // word, it keeps parentheses and `|` inside them (`(a|b)*`), and ends at
   // a blank, or at a `)` or `|` outside parentheses.  nullopt at the end of
   // the input.
-  opt<str> read_cond_pattern();
+  // `prefix` is what was read of it already (a `(` the lexer took as a
+  // token).
+  opt<str> read_cond_pattern(str prefix = {});
 
   // Here-documents: the parser registers each delimiter as it parses the
   // redirection; the lexer reads the bodies, in order, when it reaches the

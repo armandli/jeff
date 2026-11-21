@@ -932,7 +932,10 @@ TEST(Exec, BackgroundPipelineBangIsTheLastStage) {
   Shell sh;
   EXPECT_EQ(out(sh, "sleep 0.1 | (exit 3) & wait $!; echo $?"), "3\n");
   EXPECT_EQ(out(sh, "true | sleep 5 & p=$!; kill $p; wait $p; echo $?"), "143\n");
-  EXPECT_EQ(out(sh, "sleep 5 | sleep 5 & ps -o comm= -p $! | grep -c sleep; kill %1; wait"), "1\n");
+  // The pause lets the stage exec sleep before ps looks at it.
+  EXPECT_EQ(out(sh, "sleep 5 | sleep 5 & sleep 0.3; ps -o comm= -p $! | grep -c sleep; "
+                    "kill %1; wait"),
+            "1\n");
 }
 
 // A command of nothing but redirections runs $NULLCMD, or $READNULLCMD
@@ -1134,6 +1137,134 @@ TEST(Exec, ParseErrorReportsTheLineAndRunsNothing) {
   EXPECT_EQ(r.rc, 1);
   EXPECT_EQ(r.out, "");
   EXPECT_EQ(r.err, "jfsh:2: parse error near `)'\n");
+}
+
+// ---- M15c: shell features compsys needs ------------------------------------------
+
+// {fd}>file opens a new fd and names it.
+TEST(Exec15c, VaridRedirection) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "exec {fd}>/dev/null; (( fd >= 10 )) && echo ok; exec {fd}>&-"),
+            "ok\n");
+}
+
+// >&p fails as zsh's does with no coprocess.
+TEST(Exec15c, CoprocessFdWithoutCoprocess) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "(:>&p) 2>/dev/null || echo no; echo done"),
+            "no\ndone\n");
+}
+
+// $funcstack names the calls; $signals the signals.
+TEST(Exec15c, FuncstackAndSignals) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "f() { g; }; g() { echo $funcstack; }; f; "
+                "echo $signals[3] $signals[10]"),
+            "g f\nINT KILL\n");
+}
+
+// UID, USERNAME, ZSH_VERSION.
+TEST(Exec15c, UserAndShellSpecials) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "(( UID >= 0 )) && echo uid; [[ -n $USERNAME ]] && echo user; "
+                "echo $ZSH_VERSION"),
+            "uid\nuser\n5.9\n");
+}
+
+// $parameters gives types, the expander's specials too.
+TEST(Exec15c, ParametersHash) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=1; typeset -a a; export Y=1; "
+                "echo $parameters[x] $parameters[a] $parameters[Y] $parameters[0] "
+                "$parameters[ARGC]"),
+            "scalar array scalar-export scalar-special integer-readonly-special\n");
+}
+
+// An autoload function not loaded yet reads as zsh shows it.
+TEST(Exec15c, FunctionsHashAutoload) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "autoload -Uz foo; "
+                "echo \"$functions[foo]\" ${+functions[foo]} ${+functions[nope]}"),
+            "builtin autoload -XU 1 0\n");
+}
+
+// set - is a no-op on options in zsh mode.
+TEST(Exec15c, SetMinusOnlyOutsideZsh) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "set -x; set -; [[ -o xtrace ]] && echo still; set +x"),
+            "still\n");
+}
+
+// Patterns are weighed by their parts, not their order.
+TEST(Exec15c, ZstyleMostSpecificPatternWins) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "zstyle ':completion:*' menu a; "
+                "zstyle ':completion:*:*:ls:*' menu b; "
+                "zstyle -s ':completion:x:y:ls:z' menu v; echo $v; "
+                "zstyle -s ':completion:x:y:cp:z' menu v; echo $v"),
+            "b\na\n");
+}
+
+// -e evaluates the value, which sets reply.
+TEST(Exec15c, ZstyleEvalStyle) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "zstyle -e ':t:*' st 'reply=(computed $#)'; zstyle -a ':t:x' st r; "
+                "echo $r"),
+            "computed 0\n");
+}
+
+// -t, -T and -L.
+TEST(Exec15c, ZstyleTestsAndLists) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "zstyle ':a' b yes; zstyle -t ':a' b && echo t; "
+                "zstyle -T ':a' nope && echo T; zstyle -t ':a' b no || echo f; "
+                "zstyle -L ':a'"),
+            "t\nT\nf\nzstyle :a b yes\n");
+}
+
+// -g lists the patterns, or a pattern's styles.
+TEST(Exec15c, ZstyleGetPatternsAndStyles) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "zstyle -d; zstyle ':p1' s1 v; zstyle ':p1' s2 w; zstyle -g out; echo $out; "
+                "zstyle -g out ':p1'; echo ${(o)out}; zstyle -g out ':p1' s2; "
+                "echo $out"),
+            ":p1\ns1 s2\nw\n");
+}
+
+// -D removes the options, -E keeps going past unknown ones.
+TEST(Exec15c, ZparseoptsArraysAndRemoval) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "set -- -a -b val -x rest; zparseopts -D -E a=o1 b:=o2; "
+                "echo $o1 \"|\" $o2 \"|\" $@"),
+            "-a | -b val | -x rest\n");
+}
+
+TEST(Exec15c, ZparseoptsAssociation) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "zparseopts -A h -- a: b; echo ${(kv)h}"),
+            "\n");
+}
+
+// %(x.yes.no) tests a spec; %-5x pads.
+TEST(Exec15c, ZformatTernaryAndPadding) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "zformat -f out '%(n.has:%n.none) [%-5n] [%5n]' n:ab; echo $out; "
+                "zformat -f out '%(z.y.n)' z:; echo $out"),
+            "has:ab [   ab] [ab   ]\ny\n");
+}
+
+// -a lines up descriptions.
+TEST(Exec15c, ZformatAlign) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "zformat -a out ' -- ' a:first longer:second; print -l $out"),
+            "a      -- first\nlonger -- second\n");
+}
+
+// $LOGNAME is set, and exported, when the environment has none, as zsh
+// does; compaudit needs it.
+TEST(Exec15c, LognameDefaultsToTheUser) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "[[ -n $LOGNAME ]] && echo set; echo ${(t)LOGNAME}"), "set\nscalar-export\n");
 }
 
 }  // namespace

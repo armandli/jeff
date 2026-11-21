@@ -145,6 +145,8 @@ struct ModuleManager {
   // own name as the trigger.
   void mark_autoload(str name, str builtin = {});
   opt<str> autoload_for_builtin(strv builtin_name) const;
+  // builtin → module of every `-a` mark ($builtins lists them "undefined").
+  const HashTable<str>& autoloads() const noexcept { return mAutoloads; }
 
   // `zmodload [-i] name`: load (or confirm loaded) a module.  Returns a
   // reference to the handle on success; a ShellError with zsh's wording on

@@ -67,6 +67,9 @@ struct MathOptions {
   bool c_precedences      = false;   // C_PRECEDENCES
   bool ksh_arrays         = false;   // KSH_ARRAYS: 0-based subscripts
   bool ksh_zero_subscript = false;   // KSH_ZERO_SUBSCRIPT: $a[0] = $a[1]
+  // Reads `name[(flags)…]`, a subscript with flags, through the expander
+  // (words[(I)-x] in (( … ))); without it such a subscript is arithmetic.
+  func<opt<str>(const str& name, const str& sub)> flagged_element;
 };
 
 MathOptions math_options(const OptionState& opts) noexcept;

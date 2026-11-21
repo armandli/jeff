@@ -199,8 +199,6 @@ unset prefix copy is "no such variable" to `typeset -p`; the module is now
 **Left to other milestones**
 - `typeset name` on an existing parameter doesn't print it, so `x=1 typeset x` shows
   nothing (zsh prints `x=1`); a typeset listing gap, not a prefix one.
-- `$path` is not tied to `$PATH`, so `path=(…)` doesn't change the search: see the M17
-  `typeset -T` item.
 - zsh runs a `#!` script whose interpreter is itself a script by hand; jfsh reports
   "exec format error".
 - `read`, `for` and `${x=v}` still store text into an integer or float parameter.
@@ -690,7 +688,7 @@ expected output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
   `compinit`; `zmodload` alone lists nothing.
 
 **Left**
-- `typeset -T`, `-Z`/`-L`/`-R` padding, `-h`, `-t`; `emulate -l`; `autoload -X`;
+- `-Z`/`-L`/`-R` padding, `-t`; `emulate -l`; `autoload -X`;
   `read -z -c -l -n -p`; `print -z` and `-p`; `fc -p/-P`; `hash -d` (named directories,
   no table yet).
 - `. ./fifo` / `source` of a fifo is refused ("no such file or directory"); zsh reads
@@ -763,8 +761,8 @@ the `jfsh` binary run with arguments) and the M8 cases in `tests/interactive_tes
   for parameters but not prompt escapes.
 - `preexec`'s `$2` should be a size-limited single-line version of the command (zsh
   elides function bodies); it is the whole line.
-- Some zsh specials are still missing: `$TTYIDLE`, `$UID`/`$EUID`/`$GID`/`$EGID`
-  (assignable in zsh), `$USERNAME`, `$ZSH_SUBSHELL`, `$funcstack`, `$funcfiletrace`.
+- Some zsh specials are still missing: `$TTYIDLE`, `$ZSH_SUBSHELL`, `$funcfiletrace`
+  (`$UID`…`$EGID`, `$USERNAME` and `$funcstack` came in M15c; they are not assignable).
   `local SECONDS` doesn't make a local copy of a special; `unset` drops the special
   meaning for good, as in zsh.
 - `$LINENO` in a one-line function (`f() { echo $LINENO; }`) is 1; not checked against
@@ -1401,15 +1399,14 @@ expansion list, leaving globbing for the next phases.
 
 **Expansion** (left after 13b)
 - Subscript flags on the left of an assignment: `a[(i)x]=y`, `h[(r)v]=…`.
-- `(g)`, `(S)`, `(B)`/`(E)`/`(N)` match-position flags; named directories
-  for `(D)` and `(%)`'s `%~` (M17).
+- Named directories for `(D)` and `(%)`'s `%~` (M17).  (`(g)`, `(S)`,
+  `(B)`/`(E)`/`(N)` came in M15c.)
 
 **Glob**
-- Globbing flags `(#i)` (case-insensitive subpattern), `(#l)` (letter-case-
-  insensitive), `(#I)` (case-sensitive scope), `(#b)` (named backreferences
-  → `$match`), `(#B)` (no backref), `(#m)` (sets `$MATCH`), `(#M)` (no
-  `$MATCH`), `(#a1)` / `(#a2)` approximate matching (Damerau–Levenshtein,
-  bounded).
+- Globbing flags (`#i #l #I #b #B #m #M #s #e #aN #cN,M`, approximate
+  matching, backreferences) and the full set of qualifiers (`e:`, `+fn`,
+  sizes, times, owners, permissions, modifiers, sorting, `[n,m]`) came in
+  M15c.
 - `KSH_GLOB`: `?(…)`, `*(…)`, `+(…)`, `@(…)`, `!(…)`.
 - Qualifier modifiers: add `(e:expr:)` (file passes a shell expression),
   `(+function)` (file passes a function test), size `(L[+-]n[kmp])`, age
@@ -1659,8 +1656,6 @@ specifications, the completion condition codes and zsh/computil.
   same results as main.
 
 **Left after 15b**
-- `comparguments` (zsh/computil's helper for `_arguments`) goes with
-  `_arguments` in phase 15c.
 - `$compstate[insert_positions]` is empty (zsh gives the positions in the
   line).  Brace expansion in the word (`{a,b}`) isn't handled by matching,
   as in jfsh before.  Matchers compare bytes; zsh's patterns compare
@@ -1681,20 +1676,15 @@ specifications, the completion condition codes and zsh/computil.
   added.  `compquote` with no arguments says "not enough arguments" with
   status 1 in zsh, returns 0 in jfsh.  Matches are sorted by byte value,
   zsh sorts by the locale's collation (en_US.UTF-8: zsh lists `fax foo
-  Foo`, jfsh `Foo fax foo`).  Without a completion function, with
+  Foo`, jfsh `Foo fax foo`; fixed in 15c).  Without a completion function, with
   COMPLETE_IN_WORD and the cursor inside the word, `ls abfile` gives `ls
   abfile file` where zsh gives `ls abfile `.
 
 **Left after 15a**
-- Listing: zsh lays several groups out on a shared column grid; jfsh lays
-  each group out on its own (same rows, spacing can differ).  `-o
-  numeric`/`reverse` are accepted and, as in zsh 5.9 here, change nothing.
+- `-o numeric`/`reverse` are accepted and, as in zsh 5.9 here, change
+  nothing.  (The shared column grid for several groups, and pipelines or
+  subshells in widget functions, were fixed in 15c.)
 - `expand-or-complete` still completes without expanding first.
-- A pipeline or a `( … )` subshell in any widget function (`g() { print
-  a | cat >>$LOG }` as a zle -N or zle -C widget) leaves the editor
-  unresponsive afterwards; after a widget that ran a subshell, another
-  whose function redirects (`print … >> $LOG`) kills jfsh.  Already so on
-  main.
 - When an auto-removable suffix becomes permanent (a widget function sets
   `$BUFFER`…, a ZLE_KEEPSUFFIX widget, auto-suffix-retain) jfsh forgets
   its `compadd -R` function; zsh keeps it and calls it once with length 0
@@ -1723,51 +1713,229 @@ specifications, the completion condition codes and zsh/computil.
 - `print` without `-r` keeps the backslash of an unknown escape (`\ `,
   `\'`, `\]`); zsh drops it.  Found comparing completion probes.
 
-**Core framework** (`src/completion/compsys.cpp`, headers under
-`include/jfsh/completion/`)
-- `_main_complete` dispatcher: propose a set of `_tag`s, then fill them with
-  `_complete` / `_approximate` / `_correct` / `_expand` / `_history` /
-  `_oldlist` / `_prefix` / `_match` / `_ignored` / `_menu` / `_user_expand`.
-- `_arguments [-s] [-A pattern] [-C] [-R] [-O arr] [-M spec] [-w] [-W]
-  specs…`: option specs (`-opt[desc]`, `--long=VALUE[desc]:action`,
-  `*::rest::action`), action syntax (`(a b c)`, `(( a\:desc b\:desc ))`,
-  `->state`, `->state=cond`, `{compl-code}`, `*`, `(-)`).
-- `_describe`, `_values`, `_wanted`, `_requested`, `_alternative`,
-  `_message`, `_tags`, `_prefix`, `_suffix`, `_complete`, `_default`,
-  `_normal`, `_files`, `_directories`, `_hosts`, `_users`, `_groups`,
-  `_commands`, `_parameters`, `_options`, `_cd`, `_path_files`.
-- `_approximate` / `_correct` using M13's `(#a1)`.
+**Phase 15c — done** (branch `jfsh-m15c-compsys`): zsh's own completion
+system runs on jfsh.  The planned `src/completion/compsys.cpp` is
+superseded: compsys is zsh's shell-function library, run as is.
+- **Shipped library**: `share/jfsh/functions/` holds zsh 5.9's function
+  library unchanged (1203 files) and its `LICENCE`.  It is installed to
+  `JFSH_FUNCTIONS_DIR` (CMake cache, default `share/jfsh/functions`).  The
+  default `$fpath` is the site-functions directory, then the library; it
+  falls back to the source tree's copy when the install directory is
+  missing.  `autoload -Uz compinit; compinit` works with no setup.
+  `docs/completion-compat.md` lists what is verified and what is known to
+  differ.
+- **compinit** is the library's function, and the `compinit` builtin
+  stub is removed:
+  - the dump (`-d`, and `-D` to skip it) is identical to zsh's;
+  - compaudit's insecure-directory check runs;
+  - it defines `compdef`, `_comps` and `_patcomps`, and binds the
+    completion widgets to `_main_complete`.
 
-**Menu selection** (`zsh/complist`)
-- `menu-select` ZLE widget: a key at the list opens a selection navigator;
-  arrow keys and vi keys move, Enter inserts; completion is replaced as the
-  highlight moves.
-- `menuselect` keymap with zsh's defaults (accept, cancel, accept-and-infer-
-  next-history, down/up-line-or-history, left/right, forward/backward-word,
-  undo, history-incremental-search-forward).
-- `$MENUSELECT`, `$LIST_PACKED`, `$LIST_ROWS_FIRST`.
-- `LIST_COLORS` and `list-colors` zstyle for colored listings.
+  Before compinit, the M9 builtins `compdef`/`_files`/`_directories` still
+  work; afterwards the functions win, because functions are looked up
+  before builtins.
+- **`comparguments`** (`src/modules/computil.cpp`) is a port of zsh's
+  computil.c parser for `_arguments`.  It takes `-i -D -O -L -s -M -a -W -n`
+  and keeps zsh's cache of eight parsed definitions.  All of `_arguments`
+  works through it: options and descriptions, `--long=` values,
+  exclusion lists, `*::rest` arguments, `->state` and `{code}` actions,
+  `-s` clustering, `-A`, `-S`, `-C`.
+- **Shell gaps** fixed in the general shell, each matching zsh 5.9:
+  - typeset and parameters:
+    - `typeset -H` / `-h` / `-T` (tied scalar and array, `PATH`/`path` and
+      the other tied specials), `+f` / `+m`
+    - specials stay special when made local, and give their value back
+      (`local OPTIND`)
+    - positional assignment (`2=x`), `argv`, and `a[i,j]=(…)` ranges
+  - specials:
+    - `$funcstack`, `$functrace`, `$signals`
+    - `$UID`, `$EUID`, `$GID`, `$EGID`, `$USERNAME`
+    - `$LOGNAME` set and exported when the environment has none
+    - `$ZSH_VERSION` 5.9, `$HOST`, `$OSTYPE` and the rest
+  - zsh/parameter:
+    - `$commands` with every command on the path
+    - `$functions` showing autoload stubs
+    - `$parameters` with zsh's type names and the specials
+    - `$userdirs`, `$usergroups`, `$nameddirs`
+    - autoloadable module builtins listed in `$builtins`
+  - builtins:
+    - `getopts`
+    - `emulate -o`
+    - `set -A` / `set -`
+    - `enable` / `disable [-f]`, `unfunction`
+    - `read -k` / `-q` from the terminal
+  - zsh/zutil and computil helpers:
+    - zstyle rewritten with zsh's pattern weights, `-e`,
+      `-L -g -d -s -b -a -t -T -m`
+    - zparseopts and zformat (`-f` ternaries and padding, `-a`) ported
+    - `sort` and the match order use the locale's collation (zsh's
+      eltpcmp)
+  - patterns and globbing:
+    - the pattern matcher rewritten with globbing flags
+      (`#i #l #I #b #B #m #M #s #e #aN #cN,M`), approximate matching and
+      backreferences (`$match` `$mbegin` `$mend` `$MATCH`)
+    - top-level `a|b`
+    - the full set of glob qualifiers: types, modes, owners, sizes,
+      times, `e:`/`+func`, sorting, `[n,m]`, `,` alternatives, `(#q)`,
+      modifiers
+  - parameter expansion:
+    - unbraced `$+x`, `$^x`, `$x:h` / `$0:t`
+    - the flags `~ b S B E N R I A AA m X g Z 0 q+ qqq qqqq -`
+    - `(k)`/`(kv)` with `(r)`/`(R)`
+    - `::=`, `:|`, `:*`, `(P)` with a subscript
+    - nested and split quoting fixes
+    - in `"${…}"` a `{` doesn't pair, `\}` is `}` and `'` is plain
+  - arithmetic: flagged subscripts (`(( words[(I)-x] ))`)
+  - parser and lexer:
+    - `{fd}>file` redirections
+    - case patterns:
+      - `case w; in`, `(w)` subjects, `<n-m>` and `(…)` groups in
+        patterns
+      - empty alternatives (`|a)`)
+      - a body starting with `(`
+    - `then;` / `do;`, `foreach … do`/`{ }`, and empty commands
+      (`a; ; b`, a line of `;`)
+    - `(((`, which is a subshell holding `((`, as zsh's cmd_or_math
+      decides
+    - anonymous `function {}` / `() {}` taking `=(…)` arguments
+    - `{echo hi}`
+    - `(a|b)` / `(#i)` group words after the command word
+    - `[[ n -gt ((x+4)) ]]`
+    - comments inside `name=(…)` and `$(…)`
+  - redirections: `>&p` with no coprocess gives zsh's error instead of
+    creating a file `p`.
+  - an interactive jfsh hands the terminal and its process group back on
+    exit, as zsh's release_pgrp does.  Already broken on main: a
+    `make test` run from a terminal was stopped by SIGTTIN once a test's
+    `jfsh -i` exited (`Binary.InteractiveShellGivesTheTerminalBack`).
+  - widgets:
+    - pipelines, subshells and `exec </dev/null` work in widget and
+      completion functions (stdin, stdout and stderr are kept, and the
+      terminal goes back to raw mode)
+    - listings use zsh's calclist layout (a shared column grid, packed
+      columns, rows-first) and stay below the prompt when they fit
+- **Verification**: about 90 end-to-end pty cases give the same line,
+  cursor and screen as `zsh -f` after `compinit -D -u` (the list is in
+  `docs/completion-compat.md`).
+- **Tests**: 70 new, every expected value taken from zsh 5.9; 916 tests
+  pass.
+  - `tests/compsys_test.cpp` (new): `Compinit.*` and `Compsys.*` cover
+    compinit, compdef, the dump, compaudit, `_arguments` dispatch, states
+    and code, exclusions and clustering, `_describe`, `_values`,
+    compstate, `_approximate`, and format with group-name.
+  - `Builtins15c`, `Subst15c`, `Compound15c` and `Exec15c` cover the shell
+    gaps.
+  - The old `a ; ;` parse-error test now expects zsh's behaviour: it is
+    an empty command.
+- **Review round 1 fixes**:
+  - files: compadd -f looks a file up as `-W dir` (or `./`) plus the word,
+    not with the `-p` prefix too, so files under a subdirectory get their
+    space and `/` (`ls dir/Mak<Tab>`, `cd dir/<Tab>` listing `other/`).
+  - patterns: `*`, `#`, `##` and `(#cN,M)` are greedy, so `(#b)`/`(#m)`
+    captures are zsh's.  `~` and `^` work inside groups, `~` binds tighter
+    than `|` at the top level (`b~b|a`), a `~` with nothing after it is a
+    plain `~`, and `${x//pat/r}` tries no empty match at the end.  An
+    unclosed `(` or `[` is a bad pattern.  A word that is all one group
+    with no `|` or `~` is qualifiers (`(a1)` finds nothing).  `*(T)`
+    marks plain files with a blank.
+  - completion: matches found by matching the line as a pattern (as
+    `_approximate` does) go in by menu completion while
+    `compstate[pattern_insert]` is `menu`, so several corrections cycle.
+  - expansion: a split in double quotes keeps one empty word for an empty
+    value, merges runs of separators and keeps empty fields at the ends
+    (`"${(s:,:)x}"`, `(f)`, `(z)`).  `{1..$#a}` is a range, since brace
+    expansion comes after parameter expansion.  `${(tP)${…}}` and
+    `${(P)${…}}` indirect through a nested subject.  `:s/l/r/` takes `l`
+    as text unless HIST_SUBST_PATTERN is set.
+  - parser and lexer: `!(…)` after the command word is one word, `(a|b)`
+    starts a word in `for … in` and in `a=( … )`, and `{echo}` runs echo.
+  - typeset: `typeset +m pat` and `typeset +i` (and the other `+`
+    options) list names only.
+  - install: `JFSH_FUNCTIONS_DIR` stays relative in the install rule, so
+    `cmake --install … --prefix X` installs the library under X.
+- **Review round 2 fixes**:
+  - `(#s)` and `(#e)` anchor to the whole value in substitutions: the
+    matcher takes a window of the string
+    (`CompiledPattern::matches(text, b, e)`, `match_prefix(text, b, …)`),
+    so `${x//(#s)a/q}`, `${x/a(#e)/q}`, `${x%(#s)b}` and (S) are zsh's.
+    `${x//pat/r}` tries the end of the string when nothing else matched
+    (`${x//(#e)/Z}` is `abcZ`, `${x//a#/q}` on `aaab` still `qqb`).
+  - compadd -f with a hidden `-s` suffix adds no `/` or space of its own,
+    so `_approximate` correcting a directory (`ls rvt/abx<Tab>`) gives
+    `mvd/abx` as zsh does.
+  - a word ending in `~` is no pattern (`rm foo.c~`); `(~a)` in a group is
+    "nothing but a"; `${x:&}` with no `:s` before it leaves the value.
+  - matching speed: runs of plain characters are matched in a loop, and a
+    `*` before a plain character tries only where that character is, so
+    `[[ a…b = *a*a*a*a*a*a*c ]]` (55 a's) takes 0.7 s (zsh 1.3 s; it was
+    6.5 s).
+  - `Exec.BackgroundPipelineBangIsTheLastStage` (from M2) raced `ps`
+    against the stage's exec; it now waits 0.3 s first.
+- **Review round 3 fixes**:
+  - a scalar's `(r)`/`(i)`/`(I)` subscript matches each tail on its own,
+    as zsh's getarg, so `(#s)` there is where the tail starts.
+  - `${x//pat/r}` tries the empty match at the end unless the step that
+    got there was a match (`${x//(b|(#e))/Z}` on `abcd` is `aZcdZ`,
+    `${x//a#/q}` on `aaab` still `qqb`); replace() and replace_each() are
+    one loop, `substitute()`, with a replacement callback.
+  - `~` alone never makes a word a pattern (`echo x~y foo.c~y`), while
+    `*.c~foo*` and `foo.c~f*` still exclude.
+  - `#` and `%` anchor after `//` too: `${y//#/Z}` is `Zabc`.
+  - the structs added or rewritten in 15c put methods before data
+    (FuncFrame, EmptyWord, PopState, Matcher, PatternParser and the test
+    helpers); `param_value`'s unused `inner` parameter is gone.
 
-**Named directories and cdpath in completion**
-- `hash -d name=path` (M17 ties this into the builtin), `~name` and `%~`
-  display, `_cdpath` walking `$cdpath`.
-
-**Shipped function library** (`share/jfsh/functions/Completion/`)
-- Install zsh's shipped completion functions under `JFSH_FUNCTIONS_DIR`
-  (CMake cache, default `share/jfsh/functions`), autoload them on
-  `compinit`. Start with Base (`_main_complete`, `_arguments`,
-  `_description`, `_tags`, `_message`, `_alternative`, …), Unix
-  (`_cd`, `_ls`, `_rm`, `_mv`, `_cp`, `_ssh`, `_scp`, `_rsync`, `_grep`,
-  `_find`, `_tar`, `_make`, `_sudo`, `_git`), and iteratively ship the
-  rest; publish `completion-compat.md` listing what is supported.
-- `compinit [-D] [-u] [-U] [-d dump] [-i] [-C]`: build `.zcompdump` of
-  autoload definitions with zsh's security check (fpath directory
-  ownership, 022 umask, insecure directory warning).
-
-**Tests**
-- `tests/completion_test.cpp`: `_arguments` dispatch, `_describe` display,
-  `compstate` feedback, menu selection in a pty.
-- The M20 compat corpus runs the function-library tests zsh ships.
+**Left after 15c**
+- Phase 15d:
+  - menu selection (`zsh/complist`): the `menu-select` widget, the
+    `menuselect` keymap, `$MENUSELECT`, `LIST_COLORS` and the
+    `list-colors` style;
+  - `hash -d` / `~name` named directories in completion (`$nameddirs`
+    is empty), and `_cdpath`.
+- The M20 compat corpus: run the function-library tests zsh ships.
+- Library files that do not parse yet: `_growisofs` and `compinstall`.
+- `zmodload` completion offers only module aliases: jfsh's modules are
+  built in, so there is no `$module_path` with module files.
+- No coprocesses (`coproc`, `>&p`).
+- Parameters zsh always defines that jfsh leaves unset in `-c` mode:
+  `IFS`, `PS1`…`PS4`, `PROMPT*`, `LINES`/`COLUMNS`, `HISTSIZE`/`SAVEHIST`,
+  `WORDCHARS`, `TTY`, `ZSH_SUBSHELL`, `histchars`, `MAILCHECK`, `FUNCNEST`,
+  `TIMEFMT`, `KEYTIMEOUT`, `LISTMAX`, `ZSH_ARGZERO`, `module_path`, …
+- Patterns: `${a:#a|b}` alternates in jfsh; in zsh it does not.  An
+  unclosed group's word runs past `;` (`echo a (b; echo c` says "bad
+  pattern: (b; echo c"; zsh "bad pattern: (b").  KSH_GLOB's `@(…)`,
+  `+(…)`, `?(…)`, `!(…)` aren't there.  The error for `(#q)` without
+  EXTENDED_GLOB is "no matches found", where zsh says "unknown file
+  attribute".  Also so on main:
+  - matching goes byte by byte on UTF-8: with `x='é日本x'`, `${x//?/Q}`
+    gives 9 Qs (zsh 4) and `${#x}` is 9 (zsh 4); `[[ $x = ?日本? ]]`
+    fails, `echo ?.txt` doesn't find `é.txt`, and `${x//[é]/E}` on
+    `aé日本é` gives `aEE日本EE` (zsh `aE日本E`).
+  - a match takes the longest length, not zsh's first alternative that
+    succeeds: `x=abc; ${x//(|c)/Z}` gives zsh `ZaZbZc`, jfsh `ZaZbZ`.
+  - `^` in the middle of a pattern isn't supported: `[[ a.h = *.^c ]]`,
+    `${x/a^b/Z}`.
+- `$parameters[HOME]` and the other parameters zsh makes special without
+  jfsh having a special for them say `scalar-export` where zsh says
+  `scalar-export-special`.  `exec {fd}>…` gives fd 12 where zsh gives
+  11: jfsh's signal self-pipe holds 10 and 11.  `"${(o)a}"` sorts before
+  joining (zsh leaves the order), `${=x:-a b}` doesn't split the
+  operand, and `"${x:-$a[@]}"` doesn't give separate words.
+- `(q)` of an array inside double quotes; `Z:c:` comment handling;
+  `{a,b}` at command position; `$functrace` values are approximate;
+  `$LINENO` inside `local`; `typeset -p` for tied pairs;
+  `disable -p/-a/-r`.
+- xtrace output differs in places (the order of assignments, how
+  `case`/`for` are traced).
+- Speed: `ls -<Tab>` takes about 0.14 s, zsh 0.02 s.  Nested repeats
+  that fail are exponential: `[[ a…ab = (a#)#c ]]` (30 a's) doesn't
+  finish in 5 s; zsh answers at once.
+- Glob sorting: ties on the sort key are ordered by name; zsh's qsort
+  order is unstable.
+- `exec cmd` from an interactive shell doesn't hand the terminal's process
+  group back first (zsh's release_pgrp runs there too); only exiting does.
+- Ctrl-C on a typed line: zsh's screen leaves a bare prompt row where jfsh
+  keeps `> echo foo` (seen in the pty probes, with or without completion).
 
 ### M16. ZLE polish and highlighting [editor/*]
 
@@ -1822,11 +1990,8 @@ specifications, the completion condition codes and zsh/computil.
 ### M17. Remaining builtins, specials, history options, PRIVILEGED
 
 **Builtins**
-- `typeset -T NAME SCALAR[=val] [sep]`: tied scalar/array pair
-  (`PATH`/`path`), separator, two-way updates. Until then `path=(…)` doesn't reach
-  the M1 command search, and `PATH=` gives an empty `$path`.
-- `typeset -Z N`, `-L N`, `-R N` padding; `-h` hidden from listing;
-  `-t` tagged (per-param tracing).
+- `typeset -Z N`, `-L N`, `-R N` padding; `-t` tagged (per-param tracing).
+  (`typeset -T` and `-h`/`-H` came in M15c.)
 - `typeset -n ref=name`: nameref semantics (M19 implements the lookup; this
   milestone wires the flag through the typeset builtin).
 - `emulate -l` listing (M12 adds the full behavior; this is the output
@@ -1854,11 +2019,10 @@ specifications, the completion condition codes and zsh/computil.
 
 **Specials**
 - `$TTYIDLE` (seconds since last keystroke).
-- `$UID`, `$EUID`, `$GID`, `$EGID`: readable; assignable through
-  setuid/setgid.
-- `$USERNAME`: readable; assignable through setuid.
+- `$UID`, `$EUID`, `$GID`, `$EGID`, `$USERNAME`: assignable through
+  setuid/setgid (readable since M15c).
 - `$ZSH_SUBSHELL` auto-incremented on fork.
-- `$funcstack`, `$funcfiletrace`, `$funcsourcetrace`, `$functrace`,
+- `$funcfiletrace`, `$funcsourcetrace` (`$funcstack`, `$functrace` came in M15c),
   `$ZSH_EVAL_CONTEXT`, `$ZSH_SCRIPT`, `$ZSH_ARGZERO`, `$HISTCHARS` (already
   have `$histchars`).
 - `local SECONDS` makes a local copy of the special and preserves live-

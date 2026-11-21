@@ -293,6 +293,7 @@ int builtin_compadd(vec<str>& args, ExecContext& ctx) {
   spec.file_prefix = get('W');
   spec.raw         = raw;
   spec.no_match    = has('U');
+  spec.extended    = ctx.opts.extended_glob();
   spec.files       = has('f');
   spec.hidden      = has('n');
   spec.lines       = has('l');
@@ -308,6 +309,12 @@ int builtin_compadd(vec<str>& args, ExecContext& ctx) {
     str order = get('o');
     spec.by_match = order.empty() or order.find("ma") != str::npos;
     if (order.find("no") != str::npos) spec.sorted = false;
+  }
+  // -E dummies in a named group go unsorted, duplicates kept, as with -2V
+  // (zsh's addmatches): _describe lays its columns out that way.
+  if (has('E') and not spec.group.empty()) {
+    spec.sorted = false;
+    spec.dups = 2;
   }
   if (has('X') and not has('x')) spec.explanation = get('X');
   if (has('x')) spec.message     = get('x');

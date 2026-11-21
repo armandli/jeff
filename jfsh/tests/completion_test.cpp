@@ -410,7 +410,8 @@ TEST(Compadd, GroupsInListings) {
   t.sh.run("l1() { compadd -V v -1 a a b a; compadd -V v2 -2 c c }");
   t.type("x " + CX + "1");
   EXPECT_EQ(t.screen.row(1), "a  b  a");
-  EXPECT_EQ(t.screen.row(2), "c  c");
+  // The groups share zsh's column grid: c is as wide as a and b.
+  EXPECT_EQ(t.screen.row(2), "c   c");
   t.send("\r");
   t.finish();
   t.sh.run("l1() { compadd -X '%Bbold%b 100%%' x y; compadd -X e2 z }");
@@ -424,7 +425,7 @@ TEST(Compadd, GroupsInListings) {
   t.sh.run("l1() { local -a d=(Zed Alpha); compadd -d d b a; compadd -J n -o nosort q p }");
   t.type("x " + CX + "1");
   EXPECT_EQ(t.screen.row(1), "Alpha  Zed");
-  EXPECT_EQ(t.screen.row(2), "q  p");
+  EXPECT_EQ(t.screen.row(2), "q      p");
   t.send("\r");
   t.finish();
 }

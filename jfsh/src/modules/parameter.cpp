@@ -1,5 +1,8 @@
 #include <jfsh/modules/parameter.h>
 
+#include <grp.h>
+#include <pwd.h>
+
 #include <algorithm>
 
 #include <jfsh/core/aliases.h>
@@ -21,12 +24,17 @@ namespace jfsh {
 namespace {
 
 // Hash special: pass just a get_hash; value flagged PM_HASH + PM_READONLY.
-void hash_special(ParamTable& params, str name,
-                  func<umap<str, str>()> getter) {
+// `elem`, when given, reads one key without making the whole table
+// (${+functions[f]} is asked often).
+Param& hash_special(ParamTable& params, str name,
+                    func<umap<str, str>()> getter,
+                    func<opt<str>(const str&)> elem = {}) {
   Param& p = params.assign(s::move(name), umap<str, str>{},
                            PM_HASH | PM_SPECIAL | PM_READONLY);
   p.handlers = s::make_unique<ParamHandlers>();
   p.handlers->get_hash = s::move(getter);
+  p.handlers->get_elem = s::move(elem);
+  return p;
 }
 
 void array_special(ParamTable& params, str name,
@@ -35,22 +43,6 @@ void array_special(ParamTable& params, str name,
                            PM_ARRAY | PM_SPECIAL | PM_READONLY);
   p.handlers = s::make_unique<ParamHandlers>();
   p.handlers->get_array = s::move(getter);
-}
-
-// Render a Param's flags into zsh's `typeset -p`-ish type string:
-//   "scalar", "integer", "float", "array", "association",
-// with `-readonly`, `-exported`, etc. markers after.
-str param_type(const Param& p) {
-  str t;
-  if      (p.is_hash())    t = "association";
-  else if (p.is_array())   t = "array";
-  else if (p.is_integer()) t = "integer";
-  else if (p.is_float())   t = "float";
-  else                     t = "scalar";
-  if (p.is_readonly()) t += "-readonly";
-  if (p.is_exported()) t += "-exported";
-  if (p.flags & PM_HIDE) t += "-hidden";
-  return t;
 }
 
 // zsh's reserved word list, in the order zsh uses when dumping them.
@@ -80,22 +72,40 @@ void register_parameter_module(ModuleManager& mm) {
     hash_special(params, "parameters", [ctxp]() {
       umap<str, str> h;
       ctxp->params.for_each([&](const Param& p) {
-        if (p.is_set()) h[p.name] = param_type(p);
+        if (p.is_set()) h[p.name] = param_type_text(p);
       });
+      // The specials the expander answers itself.
+      for (const char* n : {"!", "?", "#", "$", "ARGC"})
+        h.try_emplace(n, "integer-readonly-special");
+      for (const char* n : {"@", "*"}) h.try_emplace(n, "array-readonly-special");
+      h.try_emplace("-", "scalar-readonly-special");
+      h.try_emplace("0", "scalar-special");
       return h;
     });
 
-    // $commands: each command in the executor's cache → resolved path.
+    // $commands: each command in $PATH → its path.
     hash_special(params, "commands", [ctxp]() {
-      return umap<str, str>(ctxp->executor->command_hash());
+      return umap<str, str>(ctxp->executor->full_command_hash());
+    }, [ctxp](const str& name) -> opt<str> {
+      auto& h = ctxp->executor->full_command_hash();
+      if (auto it = h.find(name); it != h.end()) return it->second;
+      return s::nullopt;
     });
 
-    // $functions: each shell function → its body text.
+    // $functions: each shell function → its body text; one marked for
+    // autoload and not loaded yet, as zsh shows it.
     hash_special(params, "functions", [ctxp]() {
       umap<str, str> h;
       for (const auto& [name, body] : ctxp->functions)
         if (body) h[name] = function_text(name, *body);
+      for (const auto& name : ctxp->autoloads)
+        if (not h.contains(name)) h[name] = "builtin autoload -XU";
       return h;
+    }, [ctxp](const str& name) -> opt<str> {
+      if (auto it = ctxp->functions.find(name); it != ctxp->functions.end() and it->second)
+        return function_text(name, *it->second);
+      if (ctxp->autoloads.contains(name)) return str("builtin autoload -XU");
+      return s::nullopt;
     });
     hash_special(params, "dis_functions", []() { return umap<str, str>{}; });
 
@@ -130,6 +140,9 @@ void register_parameter_module(ModuleManager& mm) {
       ctxp->modules.for_each([&](const ModuleHandle& m) {
         for (const auto& b : m.features.builtins) h[b.name] = m.name;
       });
+      // Autoloaded ones not loaded yet, as zsh shows them.
+      for (const auto& [b, mod] : ctxp->modules.autoloads())
+        if (not h.contains(b)) h[b] = "undefined";
       return h;
     });
     hash_special(params, "dis_builtins", []() { return umap<str, str>{}; });
@@ -156,6 +169,26 @@ void register_parameter_module(ModuleManager& mm) {
       }
       return h;
     });
+
+    // $userdirs: each user's home directory; $usergroups: each group's
+    // id; $nameddirs: the named directories (none until hash -d exists).
+    hash_special(params, "userdirs", []() {
+      umap<str, str> h;
+      ::setpwent();
+      while (struct passwd* pw = ::getpwent())
+        if (pw->pw_name and pw->pw_dir) h.emplace(pw->pw_name, pw->pw_dir);
+      ::endpwent();
+      return h;
+    });
+    hash_special(params, "usergroups", []() {
+      umap<str, str> h;
+      ::setgrent();
+      while (struct group* gr = ::getgrent())
+        if (gr->gr_name) h.emplace(gr->gr_name, s::to_string(gr->gr_gid));
+      ::endgrent();
+      return h;
+    });
+    hash_special(params, "nameddirs", []() { return umap<str, str>{}; });
 
     // $reswords: a sorted array of zsh's reserved words.
     array_special(params, "reswords", []() {
@@ -186,6 +219,7 @@ void register_parameter_module(ModuleManager& mm) {
     });
 
     for (const char* n : {"parameters", "commands", "functions", "dis_functions",
+                          "userdirs", "usergroups", "nameddirs",
                           "aliases", "galiases", "saliases", "dis_aliases",
                           "dis_galiases", "dis_saliases", "builtins",
                           "dis_builtins", "modules", "options", "reswords",

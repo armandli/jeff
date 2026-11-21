@@ -117,8 +117,10 @@ str param(jfsh::ParamTable& params, s::string_view name) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-  // The line editor measures characters with wcwidth().
+  // The line editor measures characters with wcwidth(); sorting follows
+  // the locale's collation, as zsh's does.
   std::setlocale(LC_CTYPE, "");
+  std::setlocale(LC_COLLATE, "");
   auto parsed = jfsh::parse_invocation(vec<str>(argv, argv + argc));
   if (not parsed) {
     s::fprintf(stderr, "jfsh: %s\n", parsed.error().message.c_str());
@@ -165,6 +167,11 @@ int main(int argc, char* argv[]) {
   }
 
   jfsh::Signals.init(interactive);
+  // However main returns, the terminal goes back to the process group that
+  // started the shell, as zsh's release_pgrp does in zexit.
+  struct ReleaseTerminal {
+    ~ReleaseTerminal() { jfsh::Signals.release_terminal(); }
+  } release_terminal;
 
   jfsh::Router router;
   load_router(router, inv);
@@ -221,6 +228,11 @@ int main(int argc, char* argv[]) {
   jfsh::register_clone_module       (ctx.modules);
   jfsh::register_watch_module       (ctx.modules);
   jfsh::register_newuser_module     (ctx.modules);
+  // zsh's autoloaded builtins: the first use loads the module.
+  for (auto [mod, builtin] : {s::pair{"zsh/termcap", "echotc"}, s::pair{"zsh/terminfo", "echoti"},
+                              s::pair{"zsh/compctl", "compctl"},
+                              s::pair{"zsh/param/private", "private"}})
+    ctx.modules.mark_autoload(mod, builtin);
   (void)ctx.modules.load("zsh/datetime",  &ctx);
   (void)ctx.modules.load("zsh/mathfunc",  &ctx);
   (void)ctx.modules.load("zsh/parameter", &ctx);

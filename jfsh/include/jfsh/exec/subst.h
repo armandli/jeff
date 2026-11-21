@@ -28,6 +28,7 @@
 #include <jfsh/builtins/math.h>
 #include <jfsh/core/aliases.h>
 #include <jfsh/core/types.h>
+#include <jfsh/glob/glob.h>
 
 namespace jfsh {
 
@@ -82,8 +83,12 @@ struct Expander {
   bool         process_substitution() const noexcept { return mProcSubst; }
 
 private:
+  // What glob qualifiers run through the shell, made on first use.
+  const GlobHooks& glob_hooks();
+
   Executor&    mExec;
   ExecContext& mCtx;
+  GlobHooks    mGlobHooks;
   opt<int>     mSubstStatus;
   bool         mProcSubst = true;
 };

@@ -1,17 +1,17 @@
 // zsh/computil: the builtins the compsys shell functions lean on —
-// compdescribe (_describe), compvalues (_values), comptags and comptry
-// (_tags, _wanted, _requested), compfiles (_path_files) and compgroups.
-// Mirrors Src/Zle/computil.c; compquote (also computil's in zsh) is with
-// compadd in src/builtins/complete.cpp, and comparguments (_arguments) is
-// for later.  Their state (the parsed descriptions, the tags offered at
-// each function level) lives here between calls, as zsh keeps it in
-// statics.
+// comparguments (_arguments), compdescribe (_describe), compvalues
+// (_values), comptags and comptry (_tags, _wanted, _requested), compfiles
+// (_path_files) and compgroups.  Mirrors Src/Zle/computil.c; compquote
+// (also computil's in zsh) is with compadd in src/builtins/complete.cpp.
+// Their state (the parsed descriptions, the tags offered at each function
+// level) lives here between calls, as zsh keeps it in statics.
 
 #include <jfsh/modules/computil.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -24,6 +24,7 @@
 #include <jfsh/builtins/util.h>
 #include <jfsh/core/aliases.h>
 #include <jfsh/core/options.h>
+#include <jfsh/core/sort.h>
 #include <jfsh/core/utf8.h>
 #include <jfsh/editor/compmatch.h>
 #include <jfsh/editor/completion.h>
@@ -286,7 +287,7 @@ bool cd_prep(CdState& cd) {
 
     if (cd_groups_want_sorting(cd))
       s::stable_sort(grps.begin(), grps.end(),
-                     [](CdStr* a, CdStr* b) { return a->text < b->text; });
+                     [](CdStr* a, CdStr* b) { return zstrcmp(a->text, b->text) < 0; });
     // Those with the same description next to each other.
     for (s::size_t k = 0; k + 1 < grps.size(); ++k) {
       if (*grps[k]->desc == *grps[k + 1]->desc) continue;
@@ -1012,6 +1013,1270 @@ int builtin_compvalues(vec<str>& args, ExecContext& ctx) {
   }
 }
 
+// ---- comparguments ----------------------------------------------------------------
+
+// The parsed specifications of an _arguments call (zsh's cadef, caopt,
+// caarg), kept in a small cache keyed by the arguments, as zsh does: the
+// same _arguments call on the next Tab doesn't parse its specs again.
+// Sets (`- set …`) are a chain of CaDefs through `snext`.
+
+constexpr int CAO_NEXT = 1, CAO_DIRECT = 2, CAO_ODIRECT = 3, CAO_EQUAL = 4, CAO_OEQUAL = 5;
+constexpr int CAA_NORMAL = 1, CAA_OPT = 2, CAA_REST = 3, CAA_RARGS = 4, CAA_RREST = 5;
+constexpr int CDF_SEP = 1;   // -S: `--` ends the options
+
+struct CaArgSpec {
+  CaArgSpec* next = nullptr;
+  str        descr;
+  opt<vec<str>> xorl;
+  str        action;
+  int        type = CAA_NORMAL;
+  opt<str>   end;       // the pattern of `*PAT:…`
+  opt<str>   optname;   // the option it is an argument of
+  int        num = 0;
+  int        min = 0;
+  bool       direct = false;
+  bool       active = true;
+  opt<str>   gsname;    // the set or group name, with its `-`
+};
+
+struct CaOpt {
+  CaOpt*        next = nullptr;
+  str           name;
+  opt<str>      descr;
+  opt<vec<str>> xorl;
+  int           type = CAO_NEXT;
+  CaArgSpec*    args = nullptr;
+  bool          active = true;
+  int           num = 0;
+  opt<str>      gsname;
+  bool          not_ = false;   // `!…`: on the line, but not completed
+};
+
+struct CaDef {
+  CaArgSpec* new_arg() { return arg_store.emplace_back(s::make_unique<CaArgSpec>()).get(); }
+  CaOpt*     new_opt() { return opt_store.emplace_back(s::make_unique<CaOpt>()).get(); }
+
+  sptr<CaDef>   snext;
+  CaOpt*        opts = nullptr;
+  int           nopts = 0, ndopts = 0, nodopts = 0;
+  CaArgSpec*    args = nullptr;
+  CaArgSpec*    rest = nullptr;
+  vec<str>      defs;
+  s::time_t     lastt = 0;
+  bool          has_single = false;
+  s::array<CaOpt*, 188> single{};
+  str           match;
+  bool          argsactive = true;
+  opt<str>      set;
+  int           flags = 0;
+  opt<str>      nonarg;
+  // The nodes the raw pointers above point into.
+  vec<uptr<CaOpt>>     opt_store;
+  vec<uptr<CaArgSpec>> arg_store;
+};
+
+int single_index(char pre, char opt) {
+  if (opt <= 0x20 or opt > 0x7e) return -1;
+  return opt + (pre == '-' ? -0x21 : 94 - 0x21);
+}
+
+str bslashcolon(strv s) {
+  str out;
+  for (char c : s) {
+    if (c == ':') out += '\\';
+    out += c;
+  }
+  return out;
+}
+
+// zsh's parse_caarg: the description at def[p] up to an unquoted colon,
+// then the action (with `mult`, only up to the next colon).  Returns the
+// spec and where the reading stopped: the colon after it, or the end.
+s::pair<CaArgSpec*, s::size_t> parse_caarg_spec(CaDef& d, bool mult, int type, int num, int nopt,
+                                                const opt<str>& oname, const str& def,
+                                                s::size_t p, const opt<str>& set) {
+  CaArgSpec* ret = d.new_arg();
+  ret->num = num;
+  ret->min = num - nopt;
+  ret->type = type;
+  ret->optname = oname;
+  ret->gsname = set;
+  s::size_t b = p;
+  for (; p < def.size() and def[p] != ':'; ++p)
+    if (def[p] == '\\' and p + 1 < def.size()) ++p;
+  ret->descr = rembslashcolon(strv(def).substr(b, p - b));
+  if (p < def.size()) {
+    if (mult) {
+      s::size_t a = ++p;
+      for (; p < def.size() and def[p] != ':'; ++p)
+        if (def[p] == '\\' and p + 1 < def.size()) ++p;
+      ret->action = rembslashcolon(strv(def).substr(a, p - a));
+    } else {
+      ret->action = rembslashcolon(strv(def).substr(p + 1));
+      p = def.size();
+    }
+  }
+  return {ret, p};
+}
+
+sptr<CaDef> alloc_cadef(const vec<str>* args, bool single, const str& match,
+                        const opt<str>& nonarg, int flags) {
+  auto ret = s::make_shared<CaDef>();
+  ret->nonarg = nonarg;
+  if (args) ret->defs = *args;
+  ret->lastt = s::time(nullptr);
+  ret->has_single = single;
+  ret->match = match;
+  ret->flags = flags;
+  return ret;
+}
+
+void set_cadef_opts(CaDef& def) {
+  int xnum = 0;
+  for (CaArgSpec* a = def.args; a; a = a->next) {
+    if (not a->direct) a->min = a->num - xnum;
+    if (a->type == CAA_OPT) ++xnum;
+  }
+}
+
+bool inblank(char c) { return c == ' ' or c == '\t'; }
+
+// zsh's parse_cadef: args[0] is the auto-description, then _arguments'
+// own -s -S -A -M options, then the specs.
+sptr<CaDef> parse_cadef(strv nam, const vec<str>& in) {
+  str match = "r:|[_-]=* r:|=*";
+  opt<str> adpre, adsuf, axor, doset, nonarg;
+  bool single = false, foreignset = false;
+  int anum = 1, flags = 0;
+  if (auto pct = in[0].find("%d"); pct != str::npos) {
+    adpre = in[0].substr(0, pct);
+    adsuf = in[0].substr(pct + 2);
+  }
+  s::size_t a = 1;
+  while (a < in.size() and in[a].size() > 1 and in[a][0] == '-') {
+    const str& w = in[a];
+    s::size_t q = 1;
+    for (; q < w.size(); ++q)
+      if (w[q] == 'M' or w[q] == 'A') { q = w.size(); break; }
+      else if (w[q] != 's' and w[q] != 'S') break;
+    if (q < w.size()) break;
+    s::size_t p = 1;
+    for (; p < w.size(); ++p) {
+      if (w[p] == 's') {
+        single = true;
+      } else if (w[p] == 'S') {
+        flags |= CDF_SEP;
+      } else if (w[p] == 'A' or w[p] == 'M') {
+        str& dst = w[p] == 'A' ? nonarg.emplace() : match;
+        if (p + 1 < w.size()) {
+          dst = w.substr(p + 1);
+          p = w.size() - 1;
+        } else if (a + 1 < in.size()) {
+          dst = in[++a];
+        } else {
+          if (w[p] == 'A') nonarg.reset();
+          break;
+        }
+      }
+    }
+    if (p < w.size()) break;
+    ++a;
+  }
+  if (a < in.size() and in[a] == ":") ++a;
+  if (a >= in.size()) return nullptr;
+  auto all = alloc_cadef(&in, single, match, nonarg, flags);
+  CaDef* ret = all.get();
+  CaOpt** optp = &ret->opts;
+  s::size_t sargs = a;
+  opt<s::size_t> pendset, curset;
+  auto fail = [&](str msg) -> sptr<CaDef> {
+    builtin_error(nam, msg);
+    return nullptr;
+  };
+  for (;; ++a) {
+    if (a >= in.size()) {
+      if (not pendset) break;
+      // Start a new set: the common specs again.
+      a = sargs;
+      doset.reset();
+      set_cadef_opts(*ret);
+      ret->snext = alloc_cadef(nullptr, single, match, nonarg, flags);
+      ret = ret->snext.get();
+      optp = &ret->opts;
+      anum = 1;
+      foreignset = false;
+      curset = pendset;
+      pendset.reset();
+    }
+    if (in[a] == "-" and a + 1 < in.size()) {
+      if ((foreignset = curset and a != *curset)) {
+        if (not pendset and a > *curset) pendset = a;
+        ++a;
+      } else {
+        str p = in[++a];
+        if (p.size() > 1 and p.front() == '(' and p.back() == ')') {
+          p = p.substr(1, p.size() - 2);
+          axor = p;
+        } else {
+          axor.reset();
+        }
+        if (p.empty()) return fail("empty set name");
+        ret->set = doset = p + "-";
+        curset = a;
+      }
+      continue;
+    }
+    if (in[a] == "+" and a + 1 < in.size()) {
+      foreignset = false;
+      str p = in[++a];
+      if (p.size() > 1 and p.front() == '(' and p.back() == ')') {
+        p = p.substr(1, p.size() - 2);
+        axor = p;
+      } else {
+        axor.reset();
+      }
+      if (p.empty()) return fail("empty group name");
+      doset = p + "-";
+      continue;
+    }
+    if (foreignset) continue;
+    const str& def = in[a];
+    s::size_t p = 0;
+    int xnum = 0;
+    bool not_ = def[0] == '!';
+    if (not_) ++p;
+    opt<vec<str>> xorl;
+    if (p < def.size() and def[p] == '(') {
+      vec<str> list;
+      while (p < def.size() and def[p] != ')') {
+        for (++p; p < def.size() and inblank(def[p]); ++p) {}
+        if (p < def.size() and def[p] == ')') break;
+        s::size_t q = p++;
+        for (; p < def.size() and def[p] != ')' and not inblank(def[p]); ++p) {}
+        if (p >= def.size()) break;
+        list.push_back(def.substr(q, p - q));
+        ++xnum;
+      }
+      if (p >= def.size() or def[p] != ')') return fail("invalid argument: " + def);
+      if (doset and axor) {
+        ++xnum;
+        list.push_back(*axor);
+      }
+      xorl = s::move(list);
+      ++p;
+    } else if (doset and axor) {
+      xnum = 1;
+      xorl = vec<str>{*axor};
+    }
+    char c0 = p < def.size() ? def[p] : '\0';
+    char c1 = p + 1 < def.size() ? def[p + 1] : '\0';
+    if (c0 == '-' or c0 == '+' or (c0 == '*' and (c1 == '-' or c1 == '+'))) {
+      // An option.
+      str spec = def.substr(p);
+      int again = 0;
+      opt<str> againp;
+      for (;;) {
+        s::size_t q = 0;
+        bool multi = q < spec.size() and spec[q] == '*';
+        if (multi) ++q;
+        auto at = [&](s::size_t k) { return k < spec.size() ? spec[k] : '\0'; };
+        str name_buf;
+        s::size_t name_at;
+        if (((at(q) == '-' and at(q + 1) == '+') or (at(q) == '+' and at(q + 1) == '-'))
+            and at(q + 2) and at(q + 2) != ':' and at(q + 2) != '[' and at(q + 2) != '='
+            and at(q + 2) != '-' and at(q + 2) != '+') {
+          // `-+x` or `+-x`: the whole spec twice, as `+x` and `-x` (the
+          // second without a leading `*`, as in zsh).
+          againp = spec.substr(q);
+          ++q;
+          spec[q] = again ? '-' : '+';
+          ++again;
+          name_at = q;
+        } else {
+          name_at = q;
+          if (at(q) == '-' and at(q + 1) == '-') ++q;
+        }
+        if (not at(q + 1)) return fail("invalid argument: " + def);
+        for (++q; at(q) and at(q) != ':' and at(q) != '['
+                  and ((at(q) != '-' and at(q) != '+') or (at(q + 1) != ':' and at(q + 1) != '['))
+                  and (at(q) != '='
+                       or (at(q + 1) != ':' and at(q + 1) != '[' and at(q + 1) != '-'));
+             ++q)
+          if (at(q) == '\\' and at(q + 1)) ++q;
+        name_buf = spec.substr(name_at, q - name_at);
+        int otype = CAO_NEXT;
+        char c = at(q);
+        if (c == '-') {
+          otype = CAO_DIRECT;
+          c = at(++q);
+        } else if (c == '+') {
+          otype = CAO_ODIRECT;
+          c = at(++q);
+        } else if (c == '=') {
+          otype = CAO_OEQUAL;
+          if ((c = at(++q)) == '-') {
+            otype = CAO_EQUAL;
+            c = at(++q);
+          }
+        }
+        opt<str> descr;
+        if (c == '[') {
+          s::size_t b = ++q;
+          for (; at(q) and at(q) != ']'; ++q)
+            if (at(q) == '\\' and at(q + 1)) ++q;
+          if (not at(q)) return fail("invalid option definition: " + def);
+          descr = spec.substr(b, q - b);
+          c = at(++q);
+        }
+        if (c and c != ':') return fail("invalid option definition: " + def);
+        opt<vec<str>> oxor = xorl;
+        if (not multi) {
+          if (not oxor) oxor.emplace();
+          if (oxor->size() > static_cast<s::size_t>(xnum))
+            oxor->resize(static_cast<s::size_t>(xnum));
+          oxor->push_back(rembslashcolon(name_buf));
+        }
+        CaArgSpec* oargs = nullptr;
+        if (c == ':') {
+          CaArgSpec** oargp = &oargs;
+          int oanum = 1, onum = 0;
+          while (c == ':') {
+            bool rest = false;
+            opt<str> end;
+            int atype;
+            if (at(++q) == ':') {
+              atype = CAA_OPT;
+              ++q;
+            } else if (at(q) == '*') {
+              if (at(++q) != ':') {
+                s::size_t b = q++;
+                for (; at(q) and at(q) != ':'; ++q)
+                  if (at(q) == '\\' and at(q + 1)) ++q;
+                end = spec.substr(b, q - b);
+              }
+              if (at(q) != ':') return fail("invalid option definition: " + def);
+              if (at(++q) == ':') {
+                if (at(++q) == ':') {
+                  atype = CAA_RREST;
+                  ++q;
+                } else {
+                  atype = CAA_RARGS;
+                }
+              } else {
+                atype = CAA_REST;
+              }
+              rest = true;
+            } else {
+              atype = CAA_NORMAL;
+            }
+            auto [arg, next] = parse_caarg_spec(*all, not rest, atype, oanum++, onum, name_buf,
+                                                spec, q, doset);
+            *oargp = arg;
+            q = next;
+            if (atype == CAA_OPT) ++onum;
+            if (end) (*oargp)->end = end;
+            oargp = &(*oargp)->next;
+            if (rest) break;
+            c = at(q);
+          }
+        }
+        CaOpt* o = all->new_opt();
+        *optp = o;
+        optp = &o->next;
+        o->gsname = doset;
+        o->name = rembslashcolon(name_buf);
+        if (descr) {
+          o->descr = descr;
+        } else if (adpre and oargs and not oargs->next) {
+          bool blank = s::all_of(oargs->descr.begin(), oargs->descr.end(),
+                                 [](char ch) { return ch == ' ' or ch == '\t' or ch == '\n'; });
+          if (not blank) o->descr = *adpre + oargs->descr + *adsuf;
+        }
+        o->xorl = oxor;
+        o->type = otype;
+        o->args = oargs;
+        o->num = ret->nopts++;
+        o->not_ = not_;
+        if (otype == CAO_DIRECT or otype == CAO_EQUAL) ++ret->ndopts;
+        else if (otype == CAO_ODIRECT or otype == CAO_OEQUAL) ++ret->nodopts;
+        if (single and name_buf.size() == 2 and name_buf[1] != '-') {
+          int sidx = single_index(name_buf[0], name_buf[1]);
+          if (sidx >= 0) ret->single[static_cast<s::size_t>(sidx)] = o;
+        }
+        if (again != 1) break;
+        spec = *againp;
+      }
+    } else if (c0 == '*') {
+      // The rest arguments.
+      if (not_) continue;
+      int type = CAA_REST;
+      if (c1 != ':') return fail("invalid rest argument definition: " + def);
+      if (ret->rest) return fail("doubled rest argument definition: " + def);
+      p += 2;
+      if (p < def.size() and def[p] == ':') {
+        if (p + 1 < def.size() and def[p + 1] == ':') {
+          type = CAA_RREST;
+          p += 2;
+        } else {
+          type = CAA_RARGS;
+          ++p;
+        }
+      }
+      auto [arg, next] = parse_caarg_spec(*all, false, type, -1, 0, s::nullopt, def, p, doset);
+      ret->rest = arg;
+      p = next;
+      ret->rest->xorl = xorl;
+    } else {
+      // A normal argument.
+      if (not_) continue;
+      int type = CAA_NORMAL;
+      bool direct = p < def.size() and s::isdigit(static_cast<unsigned char>(def[p]));
+      if (direct) {
+        int num = 0;
+        while (p < def.size() and s::isdigit(static_cast<unsigned char>(def[p])))
+          num = num * 10 + (def[p++] - '0');
+        anum = num + 1;
+      } else {
+        ++anum;
+      }
+      if (p >= def.size() or def[p] != ':') return fail("invalid argument: " + def);
+      if (++p < def.size() and def[p] == ':') {
+        type = CAA_OPT;
+        ++p;
+      }
+      auto [arg, next] = parse_caarg_spec(*all, false, type, anum - 1, 0, s::nullopt, def, p,
+                                          doset);
+      p = next;
+      arg->xorl = xorl;
+      arg->direct = direct;
+      CaArgSpec *tmp = ret->args, *pre = nullptr;
+      for (; tmp and tmp->num < anum - 1; pre = tmp, tmp = tmp->next) {}
+      if (tmp and tmp->num == anum - 1) return fail("doubled argument definition: " + def);
+      arg->next = tmp;
+      if (pre) pre->next = arg;
+      else     ret->args = arg;
+    }
+  }
+  set_cadef_opts(*ret);
+  return all;
+}
+
+constexpr s::size_t MAX_CACACHE = 8;
+
+s::array<sptr<CaDef>, MAX_CACACHE>& cadef_cache() {
+  static s::array<sptr<CaDef>, MAX_CACACHE> cache;
+  return cache;
+}
+
+// The cached parse of `args`, or a new one in place of the least recently
+// used.
+sptr<CaDef> get_cadef(strv nam, const vec<str>& args) {
+  auto& cache = cadef_cache();
+  s::size_t min = 0;
+  for (s::size_t i = 0; i < MAX_CACACHE; ++i) {
+    if (cache[i] and cache[i]->defs == args) {
+      cache[i]->lastt = s::time(nullptr);
+      return cache[i];
+    }
+    if (not cache[i]) {
+      min = i;
+      break;
+    }
+    if (cache[i]->lastt < cache[min]->lastt) min = i;
+  }
+  auto fresh = parse_cadef(nam, args);
+  if (fresh) cache[min] = fresh;
+  return fresh;
+}
+
+// zsh's ca_get_opt: the option `line` is (with `full`), or begins with.
+// `end` gets where the option ends in it.
+CaOpt* ca_get_opt(CaDef& d, strv line, bool full, s::size_t* end) {
+  for (CaOpt* p = d.opts; p; p = p->next)
+    if (p->active and p->name == line) {
+      if (end) *end = line.size();
+      return p;
+    }
+  if (full) return nullptr;
+  for (CaOpt* p = d.opts; p; p = p->next) {
+    if (not p->active) continue;
+    bool hit = (not p->args or p->type == CAO_NEXT) ? p->name == line
+                                                     : line.starts_with(p->name);
+    if (not hit) continue;
+    s::size_t l = p->name.size();
+    if ((p->type == CAO_OEQUAL or p->type == CAO_EQUAL) and l < line.size() and line[l] != '=')
+      continue;
+    if (end) {
+      if ((p->type == CAO_OEQUAL or p->type == CAO_EQUAL) and l < line.size() and line[l] == '=')
+        ++l;
+      *end = l;
+    }
+    return p;
+  }
+  return nullptr;
+}
+
+// The same for clustered single-letter options; `lp` gets the options
+// before the last that take their argument in the next word.
+CaOpt* ca_get_sopt(CaDef& d, strv line, s::size_t* end, vec<CaOpt*>& lp) {
+  char pre = line[0];
+  CaOpt *p = nullptr, *pp = nullptr;
+  lp.clear();
+  s::size_t i = 1;
+  for (; i < line.size(); ++i) {
+    int sidx = single_index(pre, line[i]);
+    if (sidx != -1 and (p = d.single[static_cast<s::size_t>(sidx)]) and p->active and p->args) {
+      if (p->type == CAO_NEXT) {
+        lp.push_back(p);
+      } else {
+        if (end) {
+          ++i;
+          if ((p->type == CAO_OEQUAL or p->type == CAO_EQUAL) and i < line.size()
+              and line[i] == '=')
+            ++i;
+          *end = i;
+        }
+        pp = p;
+        break;
+      }
+    } else if (not p or not p->active) {
+      return nullptr;
+    }
+    pp = p->name[0] == pre ? p : nullptr;
+    p = nullptr;
+  }
+  if (pp and end and i >= line.size()) *end = i;
+  return pp;
+}
+
+// ca_get_sopt with zsh's `pe` left alone (null) unless it says.
+CaOpt* sopt_at(CaDef& d, strv line, opt<s::size_t>& pe, vec<CaOpt*>& sopts) {
+  s::size_t e = strv::npos;
+  CaOpt* o = ca_get_sopt(d, line, &e, sopts);
+  if (e != strv::npos) pe = e;
+  return o;
+}
+
+bool ca_foreign_opt(const CaDef* curset, const CaDef* all, strv option) {
+  for (const CaDef* d = all; d; d = d->snext.get()) {
+    if (d == curset) continue;
+    for (CaOpt* p = d->opts; p; p = p->next)
+      if (p->name == option) return true;
+  }
+  return false;
+}
+
+CaArgSpec* ca_get_arg(CaDef& d, int n) {
+  if (not d.argsactive) return nullptr;
+  CaArgSpec* a = d.args;
+  while (a and (not a->active or n < a->min or n > a->num)) {
+    if (not a->active) ++n;
+    a = a->next;
+  }
+  if (a and a->min <= n and a->num >= n and a->active) return a;
+  return d.rest and d.rest->active ? d.rest : nullptr;
+}
+
+bool gs_is(const opt<str>& gsname, strv grp, s::size_t extra) {
+  return gsname and gsname->size() == grp.size() + extra and gsname->starts_with(grp);
+}
+
+// zsh's ca_inactive: what `xorl` (or, with `opts`, all the options)
+// excludes is no longer active, from word `cur` on.
+void ca_inactive(CaDef& d, const vec<str>* xorl, int cur, bool opts, s::int64_t compcurrent) {
+  if (not (xorl or opts) or cur > compcurrent) return;
+  // The current word may be the start of a longer one: only single
+  // letters are excluded by it (clustering).
+  bool single = not opts and cur == compcurrent;
+  s::size_t n = opts ? 1 : xorl->size();
+  for (s::size_t k = 0; k < n; ++k) {
+    str x = opts ? str("-") : (*xorl)[k];
+    bool excludeall = false;
+    opt<str> grp;
+    s::size_t sep = 0;
+    while (sep < x.size() and x[sep] != '+' and x[sep] != '-' and x[sep] != ':' and x[sep] != '*'
+           and not s::isdigit(static_cast<unsigned char>(x[sep]))) {
+      auto next = x.find('-', sep);
+      if (next == str::npos or next + 1 >= x.size()) {
+        excludeall = true;
+        sep = x.size();
+        break;
+      }
+      sep = next + 1;
+    }
+    if (sep > 0) {
+      grp = x.substr(0, sep);
+      x = x.substr(sep);
+    }
+    s::size_t extra = excludeall ? 1 : 0;
+    auto in_grp = [&](const opt<str>& gs) { return not grp or gs_is(gs, *grp, extra); };
+    if (excludeall or x == ":") {
+      if (grp) {
+        for (CaArgSpec* a = d.args; a; a = a->next)
+          if (gs_is(a->gsname, *grp, extra)) a->active = false;
+        if (d.rest and gs_is(d.rest->gsname, *grp, extra)) d.rest->active = false;
+      } else {
+        d.argsactive = false;
+      }
+    }
+    if (excludeall or x == "-") {
+      for (CaOpt* p = d.opts; p; p = p->next)
+        if (in_grp(p->gsname) and not (single and p->name.size() > 2)) p->active = false;
+    }
+    if (excludeall or x == "*") {
+      if (d.rest and in_grp(d.rest->gsname)) d.rest->active = false;
+    }
+    if (not excludeall) {
+      auto starts = [&](const opt<str>& gs) { return not grp or (gs and gs->starts_with(*grp)); };
+      if (not x.empty() and s::isdigit(static_cast<unsigned char>(x[0]))) {
+        int num = s::atoi(x.c_str());
+        CaArgSpec* a = d.args;
+        while (a and a->num < num) a = a->next;
+        if (a and a->num == num and starts(a->gsname)) a->active = false;
+      } else if (CaOpt* o = ca_get_opt(d, x, true, nullptr);
+                 o and starts(o->gsname) and not (single and o->name.size() > 2)) {
+        o->active = false;
+      }
+      if (opts) break;
+    }
+  }
+}
+
+// An option's argument in the same word, past the option's name (zsh's
+// ca_opt_arg, which skips quoting in the word).
+str ca_opt_arg(const CaOpt& opt, strv line) {
+  const str& o = opt.name;
+  s::size_t oi = 0, li = 0;
+  for (;;) {
+    if (oi < o.size() and o[oi] == '\\') ++oi;
+    if (li < line.size() and (line[li] == '\\' or line[li] == '\'' or line[li] == '"')) ++li;
+    if (oi >= o.size() or li >= line.size() or o[oi] != line[li]) break;
+    ++oi;
+    ++li;
+  }
+  if (li < line.size() and (opt.type == CAO_EQUAL or opt.type == CAO_OEQUAL)) {
+    if (line[li] == '\\') ++li;
+    if (li < line.size() and line[li] == '=') ++li;
+  }
+  return str(line.substr(li));
+}
+
+// What parsing the line against one set found (zsh's castate).
+struct CaState {
+  sptr<CaDef> d;
+  CaArgSpec* def = nullptr;
+  CaArgSpec* ddef = nullptr;
+  CaOpt*     curopt = nullptr;
+  CaOpt*     dopt = nullptr;
+  int optflag = 1, arg = 1, argbeg = 1, optbeg = 1, nargbeg = 1, restbeg = 1;
+  int curpos = 0, argend = 0, inopt = 0, inarg = 1, nth = 1, singles = 0, oopt = 0;
+  int actopts = 1;
+  vec<str>           args;
+  vec<opt<vec<str>>> oargs;
+};
+
+struct CaParse {
+  vec<CaState> states;   // the first is zsh's ca_laststate, then the other sets
+  bool parsed = false;
+  int  doff = 0;
+};
+
+CaParse& ca_parse() {
+  static CaParse p;
+  return p;
+}
+
+// zsh's ca_parse_line: the words on the line against set `d`; the state
+// for the cursor goes into `last`.  True when the set doesn't fit the
+// options on the line.
+bool ca_parse_line(const sptr<CaDef>& dp, const CaDef* all, bool multi, CompState& st,
+                   CaState& last, int& doff_out, bool extended) {
+  CaDef& d = *dp;
+  const vec<str>& words = st.words;
+  s::int64_t compcurrent = st.current;
+  auto word = [&](int i) -> const str* {
+    return i >= 0 and static_cast<s::size_t>(i) < words.size() ? &words[static_cast<s::size_t>(i)]
+                                                                : nullptr;
+  };
+  for (CaOpt* p = d.opts; p; p = p->next) p->active = true;
+  d.argsactive = true;
+  if (d.rest) d.rest->active = true;
+  for (CaArgSpec* a = d.args; a; a = a->next) a->active = true;
+
+  CaState state;
+  state.d = dp;
+  state.argend = static_cast<int>(words.size()) - 1;
+  int argend = state.argend;
+  state.inopt = state.singles = state.oopt = 0;
+  state.curpos = static_cast<int>(compcurrent);
+  state.oargs.assign(static_cast<s::size_t>(d.nopts), s::nullopt);
+  last = state;
+
+  // zsh's ca_laststate shares the lists of words with the state being
+  // parsed: they end up with everything the parse put in them.
+  auto finish = [&] {
+    last.args  = state.args;
+    last.oargs = state.oargs;
+    last.actopts = 0;
+    for (CaOpt* p = d.opts; p; p = p->next)
+      if (p->active) ++last.actopts;
+  };
+  if (not word(1)) {
+    last.optflag = last.arg = 0;
+    finish();
+    return false;
+  }
+  opt<CompiledPattern> napat, endpat;
+  if (d.nonarg) napat = CompiledPattern::compile(*d.nonarg, false, extended);
+  const vec<str>* argxor = nullptr;
+  vec<CaOpt*> sopts;
+  int doff = 0;
+  int cur = 2;
+  const str* linep = word(1);
+  state.curopt = nullptr;
+  state.def = nullptr;
+  for (; linep; linep = word(cur++)) {
+    str line = *linep;
+    CaArgSpec *ddef = nullptr, *adef = nullptr;
+    CaOpt *dopt = nullptr, *wasopt = nullptr;
+    state.singles = 0;
+    bool arglast = false;
+    if (argxor) {
+      ca_inactive(d, argxor, cur - 1, false, compcurrent);
+      argxor = nullptr;
+    }
+    if ((d.flags & CDF_SEP) and cur != compcurrent and state.actopts and line == "--") {
+      ca_inactive(d, nullptr, cur, true, compcurrent);
+      state.actopts = 0;
+      continue;
+    }
+    bool to_cont = false;
+    if (state.def) {
+      state.arg = 0;
+      if (state.curopt) {
+        auto& l = state.oargs[static_cast<s::size_t>(state.curopt->num)];
+        if (not l) l.emplace();
+        l->push_back(line);
+      }
+      if ((state.optflag = state.def->type == CAA_OPT) and state.def->optname) ++state.oopt;
+      if (state.def->type == CAA_REST or state.def->type == CAA_RARGS
+          or state.def->type == CAA_RREST) {
+        if (state.def->end and endpat and endpat->matches(line)) {
+          state.def = nullptr;
+          state.curopt = nullptr;
+          state.optflag = state.arg = 1;
+          state.argend = last.argend = cur - 1;
+          to_cont = true;
+        }
+      } else if ((state.def = state.def->next)) {
+        state.argbeg = cur;
+        state.argend = argend;
+      } else if (not sopts.empty()) {
+        state.curopt = sopts.front();
+        sopts.erase(sopts.begin());
+        state.def = state.curopt->args;
+        state.optflag = 0;
+        state.argbeg = state.optbeg = state.inopt = cur;
+        state.argend = argend;
+        doff = 0;
+        state.singles = 1;
+        auto& l = state.oargs[static_cast<s::size_t>(state.curopt->num)];
+        if (not l) l.emplace();
+        to_cont = true;
+      } else {
+        state.curopt = nullptr;
+        state.optflag = 1;
+      }
+    } else {
+      state.optflag = state.arg = 1;
+      state.curopt = nullptr;
+    }
+    if (not to_cont) {
+      if (state.optflag) state.optflag = line.empty() ? 0 : line.size() > 1 ? 2 : 1;
+      // Where the option ends in the word; null as zsh's pe when nothing
+      // said.
+      opt<s::size_t> pe;
+      bool is_dash = not line.empty() and (line[0] == '-' or line[0] == '+');
+      auto eq_before = [&] { return pe and *pe > 0 and line[*pe - 1] == '='; };
+      auto rest_here = [&] { return pe and *pe < line.size(); };
+      bool long_opt = false;
+      if (state.optflag == 2 and is_dash) {
+        s::size_t e = 0;
+        state.curopt = ca_get_opt(d, line, false, &e);
+        if (state.curopt) pe = e;
+        CaOpt* o = state.curopt;
+        long_opt = o and (o->type == CAO_OEQUAL ? word(cur) != nullptr or eq_before()
+                          : o->type == CAO_EQUAL ? eq_before() or not rest_here() : true);
+      }
+      if (long_opt) {
+        if ((ddef = state.def = (state.curopt->type != CAO_EQUAL or eq_before())
+                                    ? state.curopt->args : nullptr))
+          dopt = state.curopt;
+        doff = static_cast<int>(*pe);
+        state.optbeg = state.argbeg = state.inopt = cur;
+        state.argend = argend;
+        state.singles = d.has_single and not rest_here() and state.curopt->name.size() == 2
+                        and state.curopt->name[1] != '-';
+        auto& l = state.oargs[static_cast<s::size_t>(state.curopt->num)];
+        if (not l) l.emplace();
+        if (state.curopt->xorl) ca_inactive(d, &*state.curopt->xorl, cur, false, compcurrent);
+        if (state.def and (state.curopt->type == CAO_DIRECT or state.curopt->type == CAO_EQUAL
+                           or (state.curopt->type == CAO_ODIRECT and rest_here())
+                           or (state.curopt->type == CAO_OEQUAL
+                               and (rest_here() or eq_before())))) {
+          if (state.def->type != CAA_REST and state.def->type != CAA_RARGS
+              and state.def->type != CAA_RREST)
+            state.def = state.def->next;
+          l->push_back(ca_opt_arg(*state.curopt, line));
+        }
+        if (state.def) {
+          state.optflag = 0;
+        } else {
+          if (not d.has_single or state.curopt->name.size() > 2) wasopt = state.curopt;
+          state.curopt = nullptr;
+        }
+      } else if (state.optflag == 2 and d.has_single and is_dash
+                 and ((state.curopt = sopt_at(d, line, pe, sopts))
+                      or (cur != compcurrent and not sopts.empty()))) {
+        // Clustered single-letter options.
+        if (cur != compcurrent and not sopts.empty()) {
+          state.curopt = sopts.front();
+          sopts.erase(sopts.begin());
+        }
+        auto& l = state.oargs[static_cast<s::size_t>(state.curopt->num)];
+        if (not l) l.emplace();
+        state.def = state.curopt->args;
+        ddef = state.curopt->type == CAO_NEXT and cur == compcurrent ? nullptr : state.def;
+        dopt = state.curopt;
+        doff = pe ? static_cast<int>(*pe) : 0;
+        state.optbeg = state.argbeg = state.inopt = cur;
+        state.argend = argend;
+        state.singles = not rest_here();
+        for (s::size_t k = 1; pe and k < *pe; ++k) {
+          int sidx = single_index(line[0], line[k]);
+          if (sidx == -1) continue;
+          if (CaOpt* tmp = d.single[static_cast<s::size_t>(sidx)]) {
+            auto& tl = state.oargs[static_cast<s::size_t>(tmp->num)];
+            if (not tl) tl.emplace();
+            if (tmp->xorl) ca_inactive(d, &*tmp->xorl, cur, false, compcurrent);
+          }
+        }
+        if (state.def and (state.curopt->type == CAO_DIRECT or state.curopt->type == CAO_EQUAL
+                           or (state.curopt->type == CAO_ODIRECT and rest_here())
+                           or (state.curopt->type == CAO_OEQUAL
+                               and (rest_here() or eq_before())))) {
+          if (state.def->type != CAA_REST and state.def->type != CAA_RARGS
+              and state.def->type != CAA_RREST)
+            state.def = state.def->next;
+          l->push_back(ca_opt_arg(*state.curopt, line));
+        }
+        if (state.def) state.optflag = 0;
+        else           state.curopt = nullptr;
+      } else if (multi and is_dash and cur != compcurrent and ca_foreign_opt(&d, all, line)) {
+        return true;
+      } else if (state.arg and cur <= compcurrent) {
+        // A normal argument.  -A's pattern: an unknown option to go past.
+        if (napat and cur < compcurrent and state.actopts) {
+          if (napat->matches(line)) continue;
+          ca_inactive(d, nullptr, cur + 1, true, compcurrent);
+          state.actopts = 0;
+        }
+        arglast = true;
+        if (state.inopt) {
+          state.inopt = 0;
+          state.nargbeg = cur - 1;
+          state.argend = argend;
+        }
+        if (not d.args and not d.rest and not line.empty() and line[0] != '-' and line[0] != '+') {
+          if (not multi and cur > compcurrent) break;
+          return true;
+        }
+        if ((adef = state.def = ca_get_arg(d, state.nth))
+            and (state.def->type == CAA_RREST or state.def->type == CAA_RARGS)) {
+          // The rest: an earlier definition for the current word wins;
+          // otherwise the remaining words are the rest's.
+          if (last.def) break;
+          state.optflag = cur == state.nargbeg + 1
+                      and (not multi or line.empty() or line[0] == '-' or line[0] == '+');
+          state.optbeg = state.nargbeg;
+          state.argbeg = cur - 1;
+          state.argend = argend;
+          for (; linep; linep = word(cur++)) state.args.push_back(*linep);
+          last = state;
+          last.ddef = nullptr;
+          last.dopt = nullptr;
+          break;
+        }
+        state.args.push_back(line);
+        if (adef) state.oopt = adef->num - state.nth;
+        if (state.def and cur != compcurrent and state.def->xorl) argxor = &*state.def->xorl;
+        if (state.def and state.def->type != CAA_NORMAL and state.def->type != CAA_OPT
+            and state.inarg) {
+          state.restbeg = cur;
+          state.inarg = 0;
+        } else if (not state.def or state.def->type == CAA_NORMAL or state.def->type == CAA_OPT) {
+          state.inarg = 1;
+        }
+        ++state.nth;
+        state.def = nullptr;
+      }
+      // The end pattern of `*PAT:…`.
+      if (state.def and state.curopt
+          and (state.def->type == CAA_RREST or state.def->type == CAA_RARGS)) {
+        if (state.def->end) {
+          endpat = CompiledPattern::compile(*state.def->end, false, extended);
+        } else {
+          auto& l = state.oargs[static_cast<s::size_t>(state.curopt->num)];
+          if (cur < compcurrent) last = state;
+          if (not l) l.emplace();
+          for (; linep; linep = word(cur++)) l->push_back(*linep);
+          last.ddef = nullptr;
+          last.dopt = nullptr;
+          break;
+        }
+      } else if (state.def and state.def->end) {
+        endpat = CompiledPattern::compile(*state.def->end, false, extended);
+      }
+    }
+    // cont: the state for the word at the cursor.
+    if (cur + 1 == compcurrent) {
+      last = state;
+      last.ddef = nullptr;
+      last.dopt = nullptr;
+    } else if (cur == compcurrent and not last.def) {
+      if ((last.def = ddef)) {
+        last.singles = state.singles;
+        if (state.curopt and state.curopt->type == CAO_NEXT) {
+          last.ddef = ddef;
+          last.dopt = dopt;
+          last.def = nullptr;
+          last.optflag = 1;
+          state.curopt->active = true;
+        } else {
+          doff_out = doff;
+          last.optflag = 0;
+        }
+      } else {
+        last.def = adef;
+        last.optflag = not arglast or not multi or line.empty() or line[0] == '-' or line[0] == '+';
+        last.ddef = nullptr;
+        last.dopt = nullptr;
+        last.optbeg = state.nargbeg;
+        last.argbeg = state.restbeg;
+        last.argend = state.argend;
+        last.singles = state.singles;
+        last.oopt = state.oopt;
+        if (wasopt) wasopt->active = true;
+      }
+    }
+  }
+  finish();
+  return false;
+}
+
+// zsh's restrict_range: the words from `b` to `e` (0-based) only.
+void restrict_range(CompState& st, int b, int e) {
+  int wl = static_cast<int>(st.words.size()) - 1;
+  if (wl and b >= 0 and e >= 0 and (b > 0 or e < wl)) {
+    if (e > wl) e = wl;
+    vec<str> w(st.words.begin() + b, st.words.begin() + e + 1);
+    st.words = s::move(w);
+    st.current -= b;
+  }
+}
+
+// zsh's ca_set_data: the descriptions, actions and subcontexts of the
+// arguments that may come at the cursor, from `arg` on.
+void ca_set_data(CompState& st, const CaState& last, vec<str>& descr, vec<str>& act,
+                 vec<str>& subc, opt<str> optname, CaArgSpec* arg, CaOpt* optdef, bool single) {
+  bool restr = false;
+  int miss = 0, oopt = 1, lopt = 0;
+  for (;;) {
+    int addopt = optname ? 0 : last.oopt;
+    while (arg and (optname or arg->num < 0
+                    or (arg->min <= last.nth + addopt and arg->num >= last.nth))) {
+      lopt = arg->type == CAA_OPT;
+      if (not optname and not lopt and oopt > 0) oopt = 0;
+      bool seen = false;
+      for (s::size_t k = 0; k < descr.size(); ++k)
+        if (descr[k] == arg->descr and act[k] == arg->action) { seen = true; break; }
+      // With an ignored prefix, no normal arguments are completed.
+      if (single and not arg->optname) return;
+      if (not seen) {
+        descr.push_back(arg->descr);
+        act.push_back(arg->action);
+        if (not restr) {
+          if ((restr = arg->type == CAA_RARGS))
+            restrict_range(st, last.optbeg, last.argend);
+          else if ((restr = arg->type == CAA_RREST))
+            restrict_range(st, last.argbeg, last.argend);
+        }
+        str gs = arg->gsname.value_or("");
+        if (arg->optname) {
+          if (arg->num > 0 and arg->type < CAA_REST)
+            subc.push_back(gs + "option" + *arg->optname + "-" + s::to_string(arg->num));
+          else
+            subc.push_back(gs + "option" + *arg->optname + "-rest");
+        } else if (arg->num > 0) {
+          subc.push_back(gs + "argument-" + s::to_string(arg->num));
+        } else {
+          subc.push_back(gs + "argument-rest");
+        }
+      }
+      // An argument the option says must be in this word: no normal
+      // arguments then.
+      if (arg->type == CAA_NORMAL and optname and optdef
+          and (optdef->type == CAO_NEXT or optdef->type == CAO_ODIRECT
+               or optdef->type == CAO_OEQUAL))
+        return;
+      if (single) break;
+      CaDef& d = *last.d;
+      CaArgSpec* rest = d.rest and d.rest->active ? d.rest : nullptr;
+      if (not optname) {
+        if (arg->num >= 0 and not arg->next and miss) {
+          arg = rest;
+        } else {
+          int onum = arg->num;
+          bool rst = onum != arg->min and onum == last.nth;
+          if ((arg = arg->next)) {
+            if (arg->num != onum + 1) miss = 1;
+          } else if (rst or (oopt > 0 and not optname)) {
+            arg = rest;
+            oopt = -1;
+          }
+        }
+      } else {
+        if (not lopt) break;
+        arg = arg->next;
+      }
+    }
+    if (not single and optname and (lopt or last.oopt)) {
+      optname.reset();
+      arg = ca_get_arg(*last.d, last.nth);
+      continue;
+    }
+    if (not optname and oopt > 0) {
+      oopt = -1;
+      arg = last.d->rest and last.d->rest->active ? last.d->rest : nullptr;
+      continue;
+    }
+    return;
+  }
+}
+
+str ca_nullist(const opt<vec<str>>& l) {
+  str out;
+  if (not l) return out;
+  for (s::size_t k = 0; k < l->size(); ++k) {
+    if (k) out += '\0';
+    out += (*l)[k];
+  }
+  return out;
+}
+
+str ca_colonlist(const opt<vec<str>>& l) {
+  str out;
+  if (not l) return out;
+  for (s::size_t k = 0; k < l->size(); ++k) {
+    if (k) out += ':';
+    for (char c : (*l)[k]) {
+      if (c == ':' or c == '\\') out += '\\';
+      out += c;
+    }
+  }
+  return out;
+}
+
+// comparguments -i autodescr [-sSAM…] specs… | -D descr act subc | -O next
+// direct odirect equal | -L opt descr act subc | -s var | -M var | -a |
+// -W line opt_args nul | -n var: _arguments' engine (zsh's
+// bin_comparguments).
+int builtin_comparguments(vec<str>& args, ExecContext& ctx) {
+  strv nam = args[0];
+  CompState* st = comp_state(ctx);
+  if (not st) return not_in_completion(nam);
+  if (args.size() < 2) return builtin_error(nam, "not enough arguments");
+  const str& o = args[1];
+  if (o.size() != 2 or o[0] != '-') return builtin_error(nam, "invalid argument: " + o);
+  CaParse& cp = ca_parse();
+  if (o[1] != 'i' and o[1] != 'I' and not cp.parsed) return builtin_error(nam, "no parsed state");
+  int min, max;
+  switch (o[1]) {
+    case 'i': min = 2; max = -1;
+    break; case 'D': min = 3; max = 3;
+    break; case 'O': min = 4; max = 4;
+    break; case 'L': min = 3; max = 4;
+    break; case 's': case 'M': case 'n': min = 1; max = 1;
+    break; case 'a': min = 0; max = 0;
+    break; case 'W': min = 3; max = 3;
+    break; default: return builtin_error(nam, "invalid option: " + o);
+  }
+  int n = static_cast<int>(args.size()) - 2;
+  if (n < min) return builtin_error(nam, "not enough arguments");
+  if (max >= 0 and n > max) return builtin_error(nam, "too many arguments");
+  vec<str> a(args.begin() + 2, args.end());
+  auto set_list = [&](const str& name, vec<str> v) {
+    (void)ctx.params.set_array(name, s::move(v));
+  };
+  switch (o[1]) {
+    case 'i': {
+      if (st->current <= 1 or st->words.empty()) return 1;
+      bool was = cp.parsed;
+      cp.parsed = false;
+      auto all = get_cadef(nam, a);
+      if (not all) return 1;
+      cp.parsed = was;
+      cp.doff = 0;
+      bool multi = all->snext != nullptr;
+      bool extended = ctx.opts.extended_glob();
+      vec<CaState> states;   // the sets that fit, last first, as zsh's list
+      CaState last;
+      int ret = 0;
+      for (sptr<CaDef> def = all; def;) {
+        CaState here;
+        bool use = not ca_parse_line(def, all.get(), multi, *st, here, cp.doff, extended);
+        def = def->snext;
+        if (use and def) {
+          states.insert(states.begin(), s::move(here));
+        } else if (use) {
+          last = s::move(here);
+          last.d = last.d;
+        } else if (not def) {
+          if (not states.empty()) {
+            last = s::move(states.front());
+            states.erase(states.begin());
+          } else {
+            last = s::move(here);
+            ret = 1;
+          }
+        }
+      }
+      cp.states.clear();
+      cp.states.push_back(s::move(last));
+      for (auto& s1 : states) cp.states.push_back(s::move(s1));
+      cp.parsed = true;
+      return ret;
+    }
+
+    break; case 'D': {
+      vec<str> descr, act, subc;
+      int ret = 1;
+      ignore_prefix(*st, static_cast<s::size_t>(cp.doff));
+      for (auto& ls : cp.states) {
+        if (CaArgSpec* arg = ls.def) {
+          ret = 0;
+          ca_set_data(*st, cp.states.front(), descr, act, subc, arg->optname, arg, ls.curopt,
+                      cp.doff > 0);
+        }
+      }
+      if (not ret) {
+        set_list(a[0], s::move(descr));
+        set_list(a[1], s::move(act));
+        set_list(a[2], s::move(subc));
+      }
+      return ret;
+    }
+
+    break; case 'O': {
+      vec<str> lists[4];
+      int ret = 1;
+      for (auto& ls : cp.states) {
+        CaArgSpec* def = ls.def;
+        bool want = ls.actopts
+                    and (ls.optflag or (cp.doff and def)
+                         or (def and def->optname
+                             and (def->type == CAA_OPT
+                                  or (def->type >= CAA_RARGS and def->num < 0))))
+                    and (not def or def->type < CAA_RARGS
+                         or (def->type == CAA_RARGS ? ls.curpos == ls.argbeg + 1
+                                                    : st->current == 1));
+        if (not want) continue;
+        ret = 0;
+        for (CaOpt* p = ls.d->opts; p; p = p->next) {
+          if (not p->active or p->not_) continue;
+          auto& l = lists[p->type == CAO_NEXT ? 0 : p->type == CAO_DIRECT ? 1
+                          : p->type == CAO_ODIRECT ? 2 : 3];
+          str s1 = bslashcolon(p->name);
+          if (p->descr) s1 += ":" + *p->descr;
+          if (s::find(l.begin(), l.end(), s1) == l.end()) l.push_back(s1);
+        }
+      }
+      if (not ret) {
+        for (int k = 0; k < 4; ++k) set_list(a[static_cast<s::size_t>(k)], s::move(lists[k]));
+        return 0;
+      }
+      return cp.states.front().singles ? 2 : 1;
+    }
+
+    break; case 'L': {
+      vec<str> descr, act, subc;
+      int ret = 1;
+      for (auto& ls : cp.states) {
+        CaOpt* opt = ca_get_opt(*ls.d, a[0], true, nullptr);
+        if (opt and opt->args) {
+          ret = 0;
+          ca_set_data(*st, cp.states.front(), descr, act, subc, opt->name, opt->args, opt, true);
+        }
+      }
+      if (not ret) {
+        set_list(a[1], s::move(descr));
+        set_list(a[2], s::move(act));
+        if (a.size() > 3) set_list(a[3], s::move(subc));
+      }
+      return ret;
+    }
+
+    break; case 's':
+      for (auto& ls : cp.states) {
+        if (ls.d->has_single and ls.singles and ls.actopts) {
+          str v;
+          if (ls.ddef and ls.dopt)
+            v = ls.dopt->type == CAO_DIRECT ? "direct"
+              : ls.dopt->type == CAO_OEQUAL or ls.dopt->type == CAO_EQUAL ? "equal" : "next";
+          (void)ctx.params.set_scalar(a[0], v);
+          return 0;
+        }
+      }
+      return 1;
+
+    break; case 'M':
+      (void)ctx.params.set_scalar(a[0], cp.states.front().d->match);
+      return 0;
+
+    break; case 'a':
+      for (auto& ls : cp.states)
+        if (ls.d->args or ls.d->rest) return 0;
+      return 1;
+
+    break; case 'W': {
+      bool nul = not a[2].empty() and a[2][0] != '0';
+      vec<str> line, pairs;
+      for (auto& ls : cp.states) line.insert(line.end(), ls.args.begin(), ls.args.end());
+      set_list(a[0], s::move(line));
+      for (auto& ls : cp.states) {
+        s::size_t k = 0;
+        for (CaOpt* p = ls.d->opts; p; p = p->next, ++k) {
+          if (k >= ls.oargs.size() or not ls.oargs[k]) continue;
+          pairs.push_back(p->gsname.value_or("") + p->name);
+          pairs.push_back(nul ? ca_nullist(ls.oargs[k]) : ca_colonlist(ls.oargs[k]));
+        }
+      }
+      set_hash(ctx, a[1], s::move(pairs));
+      return 0;
+    }
+
+    break; case 'n':
+      ctx.params.assign(a[0], static_cast<s::int64_t>(cp.states.front().optbeg
+                                                       + (ctx.opts.get(OPT_KSH_ARRAYS) ? 0 : 1)),
+                        PM_INTEGER);
+      return 0;
+
+    break; default:
+      return 1;
+  }
+  return 1;
+}
+
 // ---- comptags / comptry -------------------------------------------------------------
 
 struct CtSet {
@@ -1691,6 +2956,7 @@ int builtin_compgroups(vec<str>& args, ExecContext& ctx) {
 
 void register_computil_module(ModuleManager& mm) {
   mm.register_builtin_module("zsh/computil", [](ModuleFeatures& out, ExecContext&) {
+    out.builtins.push_back(BuiltinDef{"comparguments", builtin_comparguments, BINF_NONE});
     out.builtins.push_back(BuiltinDef{"compdescribe", builtin_compdescribe, BINF_NONE});
     out.builtins.push_back(BuiltinDef{"compfiles",    builtin_compfiles,    BINF_NONE});
     out.builtins.push_back(BuiltinDef{"compgroups",   builtin_compgroups,   BINF_NONE});

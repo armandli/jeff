@@ -31,9 +31,13 @@ void BuiltinTable::register_all() {
   add({"return",   builtin_return,     BINF_SPECIAL});
   add({"set",      builtin_set,        BINF_SPECIAL});
   add({"shift",    builtin_shift,      BINF_SPECIAL});
+  add({"getopts",  builtin_getopts,    BINF_NONE});
   add({"times",    builtin_times,      BINF_SPECIAL});
   add({"trap",     builtin_trap,       BINF_SPECIAL});
   add({"unset",    builtin_unset,      BINF_SPECIAL});
+  add({"unfunction", builtin_unfunction, BINF_NONE});
+  add({"enable",   builtin_enable,     BINF_NONE});
+  add({"disable",  builtin_disable,    BINF_NONE});
 
   add({"cd",       builtin_cd,         BINF_NONE, 0, 2});
   add({"pushd",    builtin_pushd,      BINF_NONE});
@@ -83,7 +87,6 @@ void BuiltinTable::register_all() {
   add({"whence",   builtin_whence,     BINF_NONE});
   add({"which",    builtin_which,      BINF_NONE});
   add({"type",     builtin_type,       BINF_NONE});
-  add({"compinit", builtin_compinit,   BINF_NONE});
   add({"compdef",  builtin_compdef,    BINF_NONE});
   add({"compadd",  builtin_compadd,    BINF_NONE});
   add({"compset",  builtin_compset,    BINF_NONE});

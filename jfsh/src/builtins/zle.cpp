@@ -1,12 +1,16 @@
 // Line-editor builtins: bindkey, zle, vared, and the completion ones,
-// compdef, compinit and the _files/_directories/_command_names helpers
-// (compadd, compset and compquote are in complete.cpp).  Also the glue
+// compdef and the _files/_directories/_command_names helpers (compadd,
+// compset and compquote are in complete.cpp).  These completion ones are
+// jfsh's own simple completion system, there before compinit has run;
+// compinit (zsh's, from the shipped function library) defines functions
+// of the same names, and functions come before builtins.  Also the glue
 // that lets the editor run shell functions (user widgets, completion
 // widgets, compdef functions), with $BUFFER, $CURSOR and friends bound to
 // the editor's state while they run.
 
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -122,7 +126,28 @@ void bind_editor_params(ExecContext& ctx, Editor& ed, bool readonly = false) {
   }
 }
 
+// The editor's fds 0, 1 and 2 while a widget function runs: `exec
+// </dev/null` in one (compsys's _comp_setup does it) lasts only as long
+// as the function, as in zsh.
+struct KeepStdFds {
+  KeepStdFds() {
+    for (int fd = 0; fd < 3; ++fd) saved[fd] = ::fcntl(fd, F_DUPFD_CLOEXEC, 10);
+  }
+  ~KeepStdFds() {
+    s::fflush(nullptr);
+    for (int fd = 0; fd < 3; ++fd) {
+      if (saved[fd] < 0) continue;
+      ::dup2(saved[fd], fd);
+      ::close(saved[fd]);
+    }
+  }
+  KeepStdFds(const KeepStdFds&) = delete;
+  KeepStdFds& operator=(const KeepStdFds&) = delete;
+  int saved[3] = {-1, -1, -1};
+};
+
 int call_shell_function(ExecContext& ctx, const str& fn, vec<str> args) {
+  KeepStdFds keep;
   auto it = ctx.functions.find(fn);
   if (it == ctx.functions.end() and ctx.autoloads.contains(fn) and ctx.executor->load_autoload(fn))
     it = ctx.functions.find(fn);
@@ -150,6 +175,7 @@ void install_zle_hooks(Executor& ex) {
     ctx.abort_line = false;
     ++*depth;
     int rc = call_shell_function(ctx, fn, args);
+    ed.resume_raw_mode();
     // An error throws the line away, as zsh does.
     if (ctx.aborting) ed.abort_line();
     if (--*depth == 0) ctx.aborting = ctx.abort_line = false;
@@ -180,6 +206,7 @@ void install_zle_hooks(Executor& ex) {
     ctx.abort_line = false;
     ++*depth;
     int rc = call_shell_function(ctx, fn, {});
+    if (Editor* ed = ctx.zle->active) ed->resume_raw_mode();
     // An error throws away what the function found; an expansion error
     // the line too.
     if (ctx.aborting) {
@@ -526,9 +553,6 @@ int builtin_vared(vec<str>& args, ExecContext& ctx) {
 }
 
 // ---- Completion ------------------------------------------------------------------
-
-// compinit: completion is always on in jfsh; this is for .zshrc files.
-int builtin_compinit(vec<str>&, ExecContext&) { return 0; }
 
 // compdef fn cmd…; compdef -d cmd…
 int builtin_compdef(vec<str>& args, ExecContext& ctx) {
