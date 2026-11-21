@@ -164,7 +164,14 @@ static Redirection fetch_redir(ExecState& es) {
 // array like command arguments.
 static Result<void> expand_assignment(Expander& ex, Assignment& a) {
   if (auto lb = a.name.find('['); lb != str::npos and a.name.back() == ']') {
-    auto sub = ex.scalar(strv(a.name).substr(lb + 1, a.name.size() - lb - 2));
+    strv raw = strv(a.name).substr(lb + 1, a.name.size() - lb - 2);
+    int depth = 0;
+    for (char c : raw) {
+      if (c == '(' or c == '[' or c == '{') ++depth;
+      else if (c == ')' or c == ']' or c == '}') --depth;
+      else if (c == ',' and depth == 0) { a.subscript_comma = true; break; }
+    }
+    auto sub = ex.scalar(raw);
     if (not sub) return s::unexpected(sub.error());
     a.subscript = s::move(*sub);
     a.name.resize(lb);
@@ -282,12 +289,13 @@ int Executor::exec_simple(vec<str> args,
     ProcSubstResources* outer;
     bool pipe_last;
   } psubst_guard{this, &psubst, s::exchange(mPsubst, &psubst), (flags & EF_PIPELAST) != 0};
-  bool expanded = expand_command(args, redirs, subst_status);
+  bool fatal = true;
+  bool expanded = expand_command(args, redirs, subst_status, fatal);
   if (noglob) mCtx.opts.assign(OPT_GLOB, globbing);
   // A failed expansion (`${x?msg}`, NO_UNSET, `$((1/0))`) ends the command
   // line, as zsh's errflag does: a non-interactive shell exits.
   if (not expanded) {
-    mCtx.aborting = true;
+    if (fatal) mCtx.aborting = true;
     return 1;
   }
   // The prefix scope of a builtin or function, popped when the command is
@@ -1026,7 +1034,8 @@ int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
   while (wc_code(es.peek()) == WC_REDIR) redirs.push_back(fetch_redir(es));
   vec<str>        no_args;
   opt<int>        subst_status;
-  if (not expand_command(no_args, redirs, subst_status)) return 1;
+  bool fatal = true;
+  if (not expand_command(no_args, redirs, subst_status, fatal)) return 1;
   SavedFds saved;
   s::fflush(nullptr);
   if (not apply_redirects(redirs, saved, flags)) return 1;
@@ -1278,7 +1287,7 @@ int Executor::exec_case(ExecState& es, WordCode head) {
       if (match) break;
       auto pat = ex.pattern(word);
       if (not pat) return fail(pat.error());
-      match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob())
+      match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob(), mCtx.opts.multibyte())
                   .matches(*subject);
     }
     if (not match) {
@@ -1575,7 +1584,7 @@ int Executor::exec_cond_node(ExecState& es, WordCode head) {
     auto pat = ex.pattern(rhs_word);
     if (not pat) return fail(pat.error());
     note(trace_quote(*lhs) + " " + op + " " + trace_pattern(*pat));
-    bool match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob()).matches(*lhs);
+    bool match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob(), mCtx.opts.multibyte()).matches(*lhs);
     return finish(match == (op != "!=") ? 0 : 1);
   }
   auto rhs = ex.scalar(rhs_word);
@@ -2260,7 +2269,8 @@ void Executor::procsubst_release(ProcSubstResources& res) noexcept {
 // redirections of the same kind, which MULTIOS then fans out.
 bool Executor::expand_command(vec<str>& args,
                               vec<Redirection>& redirs,
-                              opt<int>&         subst_status) {
+                              opt<int>&         subst_status,
+                              bool&             fatal) {
   Expander ex{*this, mCtx};
   auto fail = [&](const ShellError& e) {
     s::fprintf(stderr, "jfsh: %s\n", e.message.c_str());
@@ -2280,27 +2290,33 @@ bool Executor::expand_command(vec<str>& args,
       case REDIR_HEREDOC: case REDIR_HEREDOCD:
         if (not r.literal) {
           auto body = ex.heredoc(r.target);
-          if (not body) return fail(body.error());
+          if (not body) { fatal = false; return fail(body.error()); }
           r.target = s::move(*body);
         }
         out.push_back(s::move(r));
       break; case REDIR_HERESTR: case REDIR_MERGE: case REDIR_IN_DUP: {
         auto v = ex.scalar(r.target);
-        if (not v) return fail(v.error());
+        if (not v) { fatal = r.type != REDIR_HERESTR; return fail(v.error()); }
         r.target = s::move(*v);
         out.push_back(s::move(r));
       }
       break; case REDIR_CLOSE: case REDIR_PROC_IN: case REDIR_PROC_OUT:
         out.push_back(s::move(r));
       break; default: {
-        str word = r.target;
+        // Without MULTIOS the target is one word, as for a scalar: no
+        // splitting, braces or globbing (`> a*` writes `a*`).
+        if (not mCtx.opts.get(OPT_MULTIOS)) {
+          auto v = ex.scalar(r.target);
+          if (not v) return fail(v.error());
+          r.target = s::move(*v);
+          out.push_back(s::move(r));
+          break;
+        }
         auto targets = ex.words({r.target});
         if (not targets) return fail(targets.error());
         // No words at all is a file with an empty name, which fails to
         // open as zsh's does: the command fails, the line goes on.
         if (targets->empty()) targets->emplace_back();
-        if (targets->size() > 1 and not mCtx.opts.get(OPT_MULTIOS))
-          return fail(ShellError{ErrorKind::ExecError, "ambiguous redirect: " + word});
         for (auto& t : *targets) {
           Redirection copy = r;
           copy.target = s::move(t);
@@ -2359,12 +2375,27 @@ static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
     if (p.is_readonly())
       return s::unexpected(ShellError{ErrorKind::ExecError,
           "read-only variable: " + a.name});
+    if (auto* h = p.hash_ptr(); h and p.is_set()) {
+      str& slot = (*h)[key];
+      slot = a.append ? slot + a.value : a.value;
+      return {};
+    }
     auto h = p.hash();
     h[key] = a.append ? h[key] + a.value : a.value;
     p.set(s::move(h));
     return {};
   }
-  auto n = math_eval(key, ctx.params, math_options(ctx.opts),
+  // As zsh's getindex, an index from an expansion stops at its first
+  // top-level comma (`i=2,3; a[$i]=x` sets a[2]); a comma written in the
+  // subscript stays for the arithmetic (`a[2,]=x` is an error).
+  str index = key;
+  for (int depth = 0, k = 0; not a.subscript_comma and k < static_cast<int>(index.size()); ++k) {
+    char c = index[static_cast<s::size_t>(k)];
+    if (c == '(' or c == '[') ++depth;
+    else if (c == ')' or c == ']') --depth;
+    else if (c == ',' and depth == 0) { index.resize(static_cast<s::size_t>(k)); break; }
+  }
+  auto n = math_eval(index, ctx.params, math_options(ctx.opts),
                      &ctx.modules.math_funcs());
   if (not n) return s::unexpected(n.error());
   auto p = ctx.params.lookup(a.name);
@@ -2372,17 +2403,21 @@ static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
     return s::unexpected(ShellError{ErrorKind::ExecError,
         "read-only variable: " + a.name});
   bool scalar = p and p->get().is_set() and not p->get().is_array();
+  s::int64_t size = scalar ? static_cast<s::int64_t>(p->get().scalar().size())
+                  : p and p->get().is_array()
+                  ? static_cast<s::int64_t>(p->get().array_ref().size()) : 0;
+  s::int64_t idx = n->as_int();
+  if (idx < 0) idx += size + 1;
+  if (idx <= 0)
+    return s::unexpected(ShellError{ErrorKind::ExecError,
+        a.name + ": assignment to invalid subscript range"});
   vec<str> arr;
   if (scalar) {
     for (char c : p->get().scalar()) arr.emplace_back(1, c);
   } else if (p and p->get().is_array()) {
-    arr = p->get().array();
+    // Moved out and set again below, so one element costs no copy.
+    arr = p->get().handlers ? p->get().array() : p->get().take_array();
   }
-  s::int64_t idx = n->as_int();
-  if (idx < 0) idx += static_cast<s::int64_t>(arr.size()) + 1;
-  if (idx <= 0)
-    return s::unexpected(ShellError{ErrorKind::ExecError,
-        a.name + ": assignment to invalid subscript range"});
   auto at = static_cast<s::size_t>(idx - 1);
   if (arr.size() <= at) arr.resize(at + 1);
   if (a.array) {

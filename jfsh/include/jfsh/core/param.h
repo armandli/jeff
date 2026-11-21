@@ -93,6 +93,16 @@ struct Param {
   double          floatv()  const noexcept;
   vec<str>        array()   const noexcept;
   umap<str, str>  hash()    const noexcept;
+  // The stored array or association itself, for reading one element
+  // without copying the rest; empty for a value of another type.
+  const vec<str>&       array_ref() const noexcept;
+  const umap<str, str>& hash_ref()  const noexcept;
+  // The stored array moved out, for a caller that sets it again; an
+  // empty array for a value of another type.
+  vec<str>              take_array() noexcept;
+  // The stored association, to change one element in place; nullptr for
+  // a value of another type.
+  umap<str, str>*       hash_ptr() noexcept { return s::get_if<umap<str, str>>(&value); }
 
   void set(str s) noexcept {
     value = s::move(s);

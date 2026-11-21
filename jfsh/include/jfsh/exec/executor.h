@@ -177,6 +177,9 @@ struct Assignment {
   // `name[sub]=value`: the subscript, expanded, once `name` has been split
   // off it.
   opt<str> subscript;
+  // The subscript as written has a top-level comma (`a[2,3]=x`), as
+  // opposed to one that came from an expansion (`i=2,3; a[$i]=x`).
+  bool     subscript_comma = false;
 };
 
 // A single redirection decoded from the bytecode.  `fd == -1` means the
@@ -391,9 +394,12 @@ protected:
   // apply_assigns.  Prints the error and returns false when an expansion
   // fails.  `subst_status` receives the status of the last command
   // substitution, if any ran.
+  // `fatal` is cleared when only a here-document or here-string failed,
+  // which fails the command alone, as in zsh.
   bool expand_command(vec<str>& args,
                       vec<Redirection>& redirs,
-                      opt<int>&         subst_status);
+                      opt<int>&         subst_status,
+                      bool&             fatal);
   // Where apply_assigns puts the assignments: the shell's parameters, or
   // (in front of a command) the current scope, which the caller pushed and
   // pops, optionally exported.

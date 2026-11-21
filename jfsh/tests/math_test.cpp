@@ -224,5 +224,66 @@ TEST(Math, ShellOptions) {
   EXPECT_EQ(sh.run("echo $((1 + 2 << 1))").out, "6\n");
 }
 
+TEST(Math, CharacterCodes) {
+  EXPECT_EQ(eval("##a"), "97");
+  EXPECT_EQ(eval("##^A"), "1");
+  EXPECT_EQ(eval("##\\M-a"), "225");
+  EXPECT_EQ(eval("##"), "error: bad math expression: character missing after ##");
+  ParamTable params;
+  params.assign("x", "hello", PM_SCALAR);
+  EXPECT_EQ(eval(params, "#x + 1"), "105");
+  EXPECT_EQ(eval(params, "#nosuch"), "0");
+}
+
+TEST(Math, LiteralsPastTheIntegerRangeAreTruncated) {
+  Shell sh;
+  auto r = sh.run("echo $((9223372036854775808)) $((0xffffffffffffffff))");
+  EXPECT_EQ(r.out, "922337203685477580 1152921504606846975\n");
+  EXPECT_EQ(r.err, "jfsh: number truncated after 18 digits: 9223372036854775808\n"
+                   "jfsh: number truncated after 15 digits: ffffffffffffffff\n");
+}
+
+TEST(Math, DeepNestingFailsInsteadOfCrashing) {
+  // 1000 levels fit an 8 MB stack.
+  str ok = str(1000, '(') + "1" + str(1000, ')');
+  EXPECT_EQ(eval(ok), "1");
+  // On a 1 MB stack every recursive chain fails with zsh's message.
+  test::on_stack(1 << 20, [] {
+    auto chain = [](strv op, int n, strv tail = "") {
+      str e;
+      for (int k = 0; k < n; ++k) e += op;
+      return e + "1" + str(tail);
+    };
+    str colons;
+    for (int k = 0; k < 20000; ++k) colons += ":1";
+    ParamTable params;
+    auto run = [&](const str& e) {
+      auto v = math_eval(e, params);
+      return v ? format_math(*v) : "error: " + v.error().message;
+    };
+    const str overflow = "error: stack overflow";
+    EXPECT_EQ(run(str(20000, '(') + "1" + str(20000, ')')), overflow);
+    EXPECT_EQ(run(chain("-", 20000)).substr(0, 6), "error:");
+    EXPECT_EQ(run(chain("- ", 20000)), overflow);
+    EXPECT_EQ(run(chain("2**", 20000)), overflow);
+    EXPECT_EQ(run(chain("a=", 20000)), overflow);
+    EXPECT_EQ(run(chain("a+=", 20000)), overflow);
+    EXPECT_EQ(run(chain("1?", 20000, colons)), overflow);
+    EXPECT_EQ(run(chain("1+", 50000)), "50001");
+    EXPECT_EQ(run(chain("2**", 3)), "16");
+  });
+  EXPECT_EQ(eval("'1' + 2"), "error: bad math expression: illegal character: '");
+}
+
+TEST(Math, NoUnsetNames) {
+  ParamTable params;
+  MathOptions o;
+  o.no_unset = true;
+  auto v = math_eval("zz + 1", params, o);
+  ASSERT_FALSE(v);
+  EXPECT_EQ(v.error().message, "zz: parameter not set");
+  EXPECT_TRUE(math_eval("zz = 1", params, o));
+}
+
 }  // namespace
 }  // namespace jfsh

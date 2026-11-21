@@ -12,6 +12,8 @@
 #include <string_view>
 
 #include <jfsh/core/aliases.h>
+#include <jfsh/core/stack.h>
+#include <jfsh/core/utf8.h>
 #include <jfsh/modules/module.h>
 
 // TODO(math/output): output bases `$(( [#16] x ))` and C_BASES.
@@ -32,7 +34,8 @@ MathOptions math_options(const OptionState& opts) noexcept {
           opts.get(OPT_OCTALZEROES),
           opts.get(OPT_CPRECEDENCES),
           opts.get(OPT_KSH_ARRAYS),
-          opts.get(OPT_KSH_ZERO_SUBSCRIPT)};
+          opts.get(OPT_KSH_ZERO_SUBSCRIPT),
+          not opts.get(OPT_UNSET)};
 }
 
 str format_math(const MathNum& n) {
@@ -192,28 +195,37 @@ struct Arith {
 
   MathNum lookup(const Val& v) {
     auto p = params.lookup(v.name);
-    if (not p or not p->get().is_set()) return {};
+    if (not p or not p->get().is_set()) {
+      if (opts.no_unset)
+        fail(v.name + (v.indexed ? "[" + v.sub + "]" : str{}) + ": parameter not set");
+      return {};
+    }
     const Param& param = p->get();
     str text;
     if (v.indexed) {
       if (param.is_hash()) {
-        auto h = param.hash();
+        const auto& h = param.hash_ref();
         auto it = h.find(v.sub);
         if (it == h.end()) return {};
         text = it->second;
       } else {
         s::int64_t i = eval_sub(v.sub, v.name).as_int();
-        auto arr = param.is_array() ? param.array() : vec<str>{param.scalar()};
-        s::int64_t slot = array_slot(i, static_cast<s::int64_t>(arr.size()));
-        if (failed() or slot < 0 or slot >= static_cast<s::int64_t>(arr.size())) return {};
-        text = arr[static_cast<s::size_t>(slot)];
+        // The parameter may be gone after evaluating the subscript.
+        auto again = params.lookup(v.name);
+        if (failed() or not again) return {};
+        const Param& cur = again->get();
+        str one = cur.is_array() ? str{} : cur.scalar();
+        s::int64_t n = cur.is_array() ? static_cast<s::int64_t>(cur.array_ref().size()) : 1;
+        s::int64_t slot = array_slot(i, n);
+        if (slot < 0 or slot >= n) return {};
+        text = cur.is_array() ? cur.array_ref()[static_cast<s::size_t>(slot)] : one;
       }
     } else if (param.is_integer()) {
       return MathNum::of(param.integer());
     } else if (param.is_float()) {
       return MathNum::of(param.floatv());
     } else if (param.is_array()) {
-      for (const auto& e : param.array()) text += (text.empty() ? "" : " ") + e;
+      for (const auto& e : param.array_ref()) text += (text.empty() ? "" : " ") + e;
     } else {
       text = param.scalar();
     }
@@ -252,6 +264,10 @@ struct Arith {
     str text = format_math(v);
     auto p = params.lookup(lv.name);
     if (p and p->get().is_hash()) {
+      if (auto* h = p->get().hash_ptr(); h and p->get().is_set()) {
+        (*h)[lv.sub] = s::move(text);
+        return;
+      }
       auto h = p->get().hash();
       h[lv.sub] = s::move(text);
       p->get().set(s::move(h));
@@ -259,11 +275,20 @@ struct Arith {
     }
     s::int64_t i = eval_sub(lv.sub, lv.name).as_int();
     if (failed()) return;
-    vec<str> arr;
-    if (p and p->get().is_set())
-      arr = p->get().is_array() ? p->get().array() : vec<str>{p->get().scalar()};
-    s::int64_t slot = array_slot(i, static_cast<s::int64_t>(arr.size()));
+    // The subscript may have changed the table: look again.
+    p = params.lookup(lv.name);
+    bool set = p and p->get().is_set();
+    s::int64_t n = not set ? 0 : p->get().is_array()
+        ? static_cast<s::int64_t>(p->get().array_ref().size()) : 1;
+    s::int64_t slot = array_slot(i, n);
     if (slot < 0) { fail(lv.name + ": assignment to invalid subscript range"); return; }
+    vec<str> arr;
+    if (set) {
+      Param& cur = p->get();
+      if (not cur.is_array())  arr = {cur.scalar()};
+      else if (cur.handlers)   arr = cur.array();
+      else                     arr = cur.take_array();   // set again below
+    }
     if (slot >= static_cast<s::int64_t>(arr.size())) arr.resize(static_cast<s::size_t>(slot) + 1);
     arr[static_cast<s::size_t>(slot)] = s::move(text);
     if (auto r = params.set_array(lv.name, s::move(arr)); not r) fail(r.error().message);
@@ -282,11 +307,57 @@ struct Arith {
     }
   }
 
+  // A literal past INT64_MAX keeps the digits that fit, with zsh's
+  // warning.
   MathNum to_integer(strv digits, int base) {
-    s::int64_t v = 0;
-    for (char c : digits) v = wadd(wmul(v, base), digit_value(c));
-    if (opts.force_float) return MathNum::of(static_cast<double>(v));
-    return MathNum::of(v);
+    s::uint64_t v = 0;
+    auto b = static_cast<s::uint64_t>(base);
+    constexpr auto limit = static_cast<s::uint64_t>(INT64_MAX);
+    for (s::size_t k = 0; k < digits.size(); ++k) {
+      auto d = static_cast<s::uint64_t>(digit_value(digits[k]));
+      if (v > (limit - d) / b) {
+        s::fprintf(stderr, "jfsh: number truncated after %zu digits: %.*s\n", k,
+                   static_cast<int>(digits.size()), digits.data());
+        break;
+      }
+      v = v * b + d;
+    }
+    auto i = static_cast<s::int64_t>(v);
+    if (opts.force_float) return MathNum::of(static_cast<double>(i));
+    return MathNum::of(i);
+  }
+
+  // The code of the character at pos, for `##c`: `^c` is a control
+  // character and `\C-c`, `\M-c` and the C escapes work as in $'…'.
+  s::int64_t char_code() {
+    bool ctl = false, meta = false;
+    s::int64_t c = -1;
+    while (pos < s.size() and c < 0) {
+      if (s[pos] == '^' and pos + 1 < s.size()) {
+        ctl = true;
+        ++pos;
+      } else if (s[pos] == '\\' and pos + 1 < s.size()) {
+        char e = s[pos + 1];
+        pos += 2;
+        if ((e == 'C' or e == 'M') and pos < s.size()) {
+          if (s[pos] == '-') ++pos;
+          (e == 'C' ? ctl : meta) = true;
+          continue;
+        }
+        constexpr strv FROM = "abefnrtv", TO = "\a\b\x1b\f\n\r\t\v";
+        auto k = FROM.find(e);
+        c = static_cast<unsigned char>(k == strv::npos ? e : TO[k]);
+      } else {
+        s::size_t len = 1;
+        c = MB_CUR_MAX > 1 ? static_cast<s::int64_t>(utf8_decode(s, pos, len))
+                           : static_cast<unsigned char>(s[pos]);
+        pos += len;
+      }
+    }
+    if (c < 0) return 0;
+    if (ctl)  c = c == '?' ? 0x7f : (c & 0x9f);
+    if (meta) c |= 0x80;
+    return c;
   }
 
   MathNum number() {
@@ -359,6 +430,23 @@ struct Arith {
     skip_ws();
     if (pos >= s.size()) { bad("operand expected at end of string"); return {}; }
     char c = s[pos];
+    // ##c: the character's code; #name: that of the first character of
+    // $name.
+    if (c == '#' and pos + 1 < s.size() and s[pos + 1] == '#') {
+      pos += 2;
+      if (pos >= s.size()) { bad("character missing after ##"); return {}; }
+      return num(char_code());
+    }
+    if (c == '#' and pos + 1 < s.size() and is_ident_start(s[pos + 1])) {
+      s::size_t start = ++pos;
+      while (pos < s.size() and is_ident_char(s[pos])) ++pos;
+      auto p = params.lookup(s.substr(start, pos - start));
+      str text = p and p->get().is_set() ? p->get().scalar() : str{};
+      if (text.empty()) return num(s::int64_t{0});
+      s::size_t len = 1;
+      return num(MB_CUR_MAX > 1 ? static_cast<s::int64_t>(utf8_decode(text, 0, len))
+                                : static_cast<s::int64_t>(static_cast<unsigned char>(text[0])));
+    }
     if (c == '(') {
       ++pos;
       Val v = num(comma(live));
@@ -415,6 +503,7 @@ struct Arith {
       if (pos < s.size() and s[pos] == '[') v.indexed = subscript(v.sub);
       return v;
     }
+    if (c == '\'') { bad("illegal character: '"); return {}; }
     bad("operand expected at `" + rest() + "'");
     return {};
   }
@@ -441,7 +530,19 @@ struct Arith {
     return v;
   }
 
-  Val unary(bool live) {
+  // Every recursion (parentheses, unary operators, the right side of
+  // `**`, `=` and `?:` chains) passes through one of unary(), binary(),
+  // ternary() and assign(); when the stack runs low the expression fails
+  // with zsh's message instead of running off its end.
+  template <typename F>
+  Val nested(F f) {
+    if (stack_low()) { fail("stack overflow"); return {}; }
+    return f();
+  }
+
+  Val unary(bool live) { return nested([&] { return unary_op(live); }); }
+
+  Val unary_op(bool live) {
     if (at("++") or at("--")) {
       bool inc = s[pos] == '+';
       pos += 2;
@@ -528,6 +629,10 @@ struct Arith {
   }
 
   Val binary(int min_prec, bool live) {
+    return nested([&] { return binary_at(min_prec, live); });
+  }
+
+  Val binary_at(int min_prec, bool live) {
     Val l = unary(live);
     for (;;) {
       if (failed()) return {};
@@ -547,7 +652,9 @@ struct Arith {
     }
   }
 
-  Val ternary(bool live) {
+  Val ternary(bool live) { return nested([&] { return ternary_at(live); }); }
+
+  Val ternary_at(bool live) {
     Val c = binary(0, live);
     if (failed() or not eat("?")) return c;
     bool cv = rvalue(c).truthy();
@@ -558,7 +665,9 @@ struct Arith {
     return num(cv ? a : b);
   }
 
-  Val assign(bool live) {
+  Val assign(bool live) { return nested([&] { return assign_at(live); }); }
+
+  Val assign_at(bool live) {
     Val l = ternary(live);
     if (failed()) return {};
     skip_ws();
@@ -598,7 +707,8 @@ struct Arith {
     if (pos >= s.size()) return {};
     MathNum v = comma(true);
     skip_ws();
-    if (not failed() and pos < s.size()) bad("operator expected at `" + rest() + "'");
+    if (not failed() and pos < s.size())
+      bad(s[pos] == '\'' ? str("illegal character: '") : "operator expected at `" + rest() + "'");
     return v;
   }
 };

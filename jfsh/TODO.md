@@ -366,53 +366,258 @@ fails to take it (`type echo >&-`) is dropped when the redirections are undone
 
 **Done.** The expander is `src/exec/subst.cpp` (`Expander`, documented in
 `include/jfsh/exec/subst.h`); `Executor::expand_command` runs it over a simple command's
-assignments, words and redirection targets. Tests: `tests/subst_test.cpp`.
+assignments, words and redirection targets. Tests: `tests/subst_test.cpp` (the
+`SubstReview` tests cover the review below), `tests/subst_m13_test.cpp`,
+`tests/subst_m13b_test.cpp`, `tests/glob_test.cpp` and `tests/math_test.cpp`.
 - **Lexer (bug B8 fixed):** `$(…)`, `${…}`, `$((…))`, `$[…]`, backquotes and `$'…'` stay
   in one word, nested to any depth and with quotes tracked inside them. `{`/`}` are
   reserved only as words of their own, so `a{b,c}`, `{1..3}` and `{}` are words; `(…)`
   inside a word (`*.(c|h)`, `*(.)`, `name=(…)`) and `<lo-hi>` stay in the word.
-- **Here-documents:** the lexer now reads bodies when it reaches the end of the line
+- **Here-documents:** the lexer reads bodies when it reaches the end of the line
   (`Lexer::take_heredocs`), so the rest of the line and the following lines still parse
-  (they used to be swallowed, bug B62). Bodies are expanded unless the delimiter was quoted
-  (new `literal` bit in `WC_REDIR`).
-- **Quotes:** `'…'`, `"…"` (with `\$ \` \" \\ \newline`), `$'…'` C escapes, `\`.
-- **Parameters:** `$name`, `${name}`, `$1`…`${10}`, `$#`, `$@`, `$*`, `$argv`, `$?`, `$$`,
-  `$!`, `$-`, `$0`, `$PPID`, `$RANDOM`; `$name[sub]` without braces; `$#name`, `$=name`,
-  `$~name`. Positional parameters live in `ExecContext::positional`/`arg0`, set from
-  `jfsh script args…` and `jfsh -c cmd name args…`.
+  (bug B62). Bodies are expanded unless the delimiter was quoted (`literal` bit in
+  `WC_REDIR`); an expansion error in a body or a here-string fails only the command.
+- **Quotes:** `'…'`, `"…"` (with `\$ \` \" \\ \newline`), `$'…'` C escapes with zsh's
+  `\C-x`, `\M-x` and `\M-\C-x`, `\`.
+- **Parameters:** `$name`, `${name}`, `$1`…`$10…` (all digits unless `KSH_ARRAYS`), `$#`,
+  `$@`, `$*`, `$argv`, `$?`, `$$`, `$!`, `$-`, `$0`, `$PPID`, `$RANDOM`; `$name[sub]`
+  without braces; `$#name`, `$=name`, `$~name`; `${:-word}` and `${(flags):-word}` with
+  no name. Under `KSH_ARRAYS` an array named without a subscript is its first element.
   - Operators: `- := = ::= ? + ` (with and without `:`), `# ## % %%`, `/ // /# /% :/`,
-    `:offset:length`, the modifiers `:h :t :r :e :u :l :q :Q :a :A` (chainable), `${#x}`,
-    `${+x}`, `${=x}`/`${==x}`, `${~x}`.
+    `:offset:length` (saturating, with zsh's `substring expression` error); the
+    pattern of `# % /` is never double-quoted text, though in double quotes the
+    replacement is; `${y//#…}`/`${y//%…}` anchors after `//`; the
+    modifiers `:h :t` (with counts, ignoring trailing slashes) `:r :e :u :l :q :Q :a :A`
+    (chainable), `${#x}`, `${+x}`, `${=x}`/`${==x}`, `${~x}`.
   - Subscripts `[i]`, `[i,j]`, negative indices, `[@]`, `[*]`, scalar character
-    ranges, associative-array keys; nested `${${x#a}%b}` and `${(f)"$(cmd)"}`.
-  - Flags `U L C j:…: s:…: f F q qq q- Q k v o O i n u @ P t z p`.
-  - Unset parameters expand to nothing, or fail under `NO_UNSET`.
+    ranges, associative-array keys, read in place without copying the array; nested
+    `${${x#a}%b}`, `${(f)"$(cmd)"}` (quotes inside the command included); `(P)` on a
+    nested value or a value with a subscript (`x='a[2]'`), whose subscript never runs a
+    command.
+  - Flags `U L C j:…: s:…: f F q qq qqq qqqq q- q+ Q k v o O i n u @ P t z p`: `(s)`,
+    `(f)`, `(z)` and `${=x}` keep words apart in double quotes; `(i)`/`(n)` sort on
+    their own, `(n)` in zsh's natural order and `(o)` by the locale's collation; `(z)`
+    takes an array assignment apart; `(t)` knows zsh's special parameters.
+  - `NO_UNSET` fails for unset positional parameters, missing elements and keys
+    (`a[5]: parameter not set`) and names in arithmetic.
 - **Command substitution:** `$(…)` and `` `…` `` fork, capture stdout, strip trailing
   newlines and set `$?` (so `x=$(false)` returns 1).
-- **Arithmetic:** `$((…))` and `$[…]` through a new integer evaluator
-  (`include/jfsh/builtins/math.h`) with zsh's operator precedence, assignments, `++`/`--`,
-  `0x`, `0b` and `base#n` literals and recursive evaluation of names. `let` uses it.
-- **Splitting:** unquoted arrays become separate words with empty elements removed; command
-  substitutions split on `$IFS`; scalars only with `SH_WORD_SPLIT` or `${=x}`; `"$@"` and
-  `"${a[@]}"` keep elements apart; empty unquoted words disappear.
-- **Brace expansion:** `{a,b}`, nested, `{1..5}`, `{5..1}`, `{01..10..2}`, `{a..e}`,
-  `BRACE_CCL` `{abc}`, `IGNORE_BRACES`. Braces from quotes or expansions are literal.
+- **Arithmetic:** `$((…))` and `$[…]` through the evaluator in
+  `include/jfsh/builtins/math.h`; double quotes in the expression are removed and a
+  single quote is "illegal character"; `##c` and `#name` give character codes; a
+  literal past INT64_MAX is truncated with zsh's warning; recursion (parentheses,
+  unary operators, the right side of `**`, `=` and `?:` chains) fails with zsh's
+  "stack overflow" when the thread's stack runs low (`stack_low()` in
+  `include/jfsh/core/stack.h`), about 4300 levels of parentheses with an 8 MB stack.
+- **Splitting:** spacesplit as zsh does it: two non-whitespace IFS separators in a row,
+  or one at either end, leave an empty word (`IFS=:; $=x`, `$(…)`, SH_WORD_SPLIT); unquoted
+  arrays become separate words, empty elements going away unless glued to text;
+  scalar contexts join arrays with the first character of `$IFS`.
+- **Brace expansion:** `{a,b}`, nested, `{1..5}`, `{5..1}`, `{01..10..2}`, negative steps
+  reversing, `{a..e}` (stepped character ranges stay literal), `BRACE_CCL` `{abc}` and
+  `{a-d}`, `IGNORE_BRACES`. Only braces and commas written unquoted in the script are
+  active; the text of a sequence may come from an expansion (`{1..$n}`). Which braces
+  expand is decided by a port of zsh's hasbraces() (so `{{{a,b}` stays literal) and
+  the expansion by its xpandbraces() (`{1..3..}` gives `1..3..`, `{+1..3}` stays); the
+  groups of a word expand as one product, left to right, so a run of groups is
+  linear; only real nesting recurses, and nesting past the stack stays literal.
 - **Tilde and equals:** `~`, `~/x`, `~user`, `~+`, `~-`; after `=` and `:` in assignments,
-  and in arguments under `MAGIC_EQUAL_SUBST`. `=cmd` expands to the command's path (`EQUALS`).
-- **Globbing (bug B30 fixed):** see "Glob" below. Characters that came from quotes or
+  and in arguments under `MAGIC_EQUAL_SUBST`. `=cmd` expands to the command's path
+  (`EQUALS`). Only the `~` or `=` must be unquoted: `~"root"`, `=$x`.
+- **Globbing (bug B30 fixed):** see M13. The matcher (`src/glob/glob.cpp`) runs over a set
+  of positions, so long subjects and patterns use no stack and `${x//p/r}`, `${x#p}` are
+  linear for simple patterns; `?` and `[…]` take a UTF-8 character under MULTIBYTE;
+  results sort by the locale's collation (`collate`); a final `**/` lists directories
+  recursively; an unclosed `[` is "bad pattern" (the word itself under
+  NO_BAD_PATTERN); a pattern whose groups nest deeper than the stack holds is matched
+  as literal text as a whole. Characters that came from quotes or
   expansions are literal unless `GLOB_SUBST` or `${~x}`.
+- **Multibyte:** under MULTIBYTE in a UTF-8 locale `${#x}`, `${x:o:l}`, `${x[i]}`,
+  `(s::)`, `(l)`/`(r)` padding, `(c)`, `(U)`/`(L)`/`(C)` and `:u`/`:l` count and map
+  characters (`Chars` in subst.cpp).
 - Redirection targets are expanded like words; several results (`> {a,b}`) become several
-  redirections that MULTIOS fans out. `<<<` and `>&$fd` targets stay one word.
+  redirections that MULTIOS fans out. Without MULTIOS a target is one literal word
+  (`> a*` writes `a*`). `<<<` and `>&$fd` targets stay one word.
+
+**Review fixes** (branch jfsh-m3-review): splitting flags and `${=x}` inside double
+quotes keep their words (with zsh's empty-piece rules, `(@)`, and arrays joined before
+splitting), and an inner `(@)` no longer stops the outer level joining; `ifs_split`
+follows zsh's spacesplit (empty fields after non-whitespace separators, in `$=x`,
+`$(…)` and SH_WORD_SPLIT); `${a:off:len}` saturates (it threw `length_error`); stepped
+character ranges stay literal (an int64 step hung); arithmetic nesting is bounded; the
+pattern matcher is a position-set simulation instead of per-character continuation
+recursion (200000-character subjects crashed, `${x//a/b}` on 30 KB took 10 s);
+`$[…]` stays one word in the lexer; `${:-word}`; quotes inside `$(…)` inside `${"…"}`;
+`(P)` on nested values and subscripted names; `$10`; NO_UNSET for positionals,
+elements, keys and arithmetic, with the subscript in the message, and `${y:?}` saying
+"parameter not set"; `(q)` and `:q` round-trip through eval (`''`, `$'\n'`), plus
+`(qqq)`, `(qqqq)`, `(q+)`; brace expansion from script text only, sequence elements
+literal, empty brace words kept, BRACE_CCL ranges, `{x..y..-n}` reversed, linear pair
+search; double quotes in `$((…))`; multibyte characters in lengths, offsets,
+subscripts, patterns, padding and case mapping; `Param::array_ref`/`hash_ref` so
+`${a[i]}`, `${h[k]}`, `$((a[i]))` and element assignment no longer copy the container
+(2000 lookups in a 20000-key hash: 11 s → 0.05 s); collation for globs and `(o)`,
+`collate` with zsh's numeric rule for `(n)` and NUMERIC_GLOB_SORT, `LC_COLLATE` set at
+startup; `**/` and `***/` as the last segment; `:h`/`:t` trailing slashes and counts;
+IFS-joined scalars; here-document and here-string errors not fatal; `##c`, `#name`,
+truncated literals; offset and subscript range errors as zsh's; `(i)`/`(n)` sorting;
+`\C-`/`\M-` escapes; `=$x`, `="ls"`, `=a/b` not found, `~"root"`, `~` with HOME unset
+empty, `~-` without OLDPWD; the dq null test on arrays; nested `${…}` bounded at 1000;
+`(t)` for zsh's specials; `${(k)h[a]}`; `(z)` on array assignments; `${x///X}`; KSH_ARRAYS
+`$a`; NO_MULTIOS targets; `[]`, `[!]` and unclosed `[` as zsh. Round 3: the pattern of
+`# ## % %% / // /# /%` is read without the double-quote state of the substitution, so
+`"${x#*/}"`, `y="${x#*/}"`, here-documents, `$((…))` and `[[ "${x%.*}" … ]]` match
+again (the operand's own quotes still quote; the replacement is read as double-quoted
+text in double quotes); the arithmetic limit counts every recursive level, so `**`,
+`=`, `+=` and `?:` chains give "stack overflow" instead of crashing; NO_BAD_PATTERN
+keeps an unclosed `[`; consecutive brace groups expand as one product with one pair
+scan (9000 groups: 1.6 s → 0.01 s) and only nesting counts toward the depth limit;
+`$((` nesting is bounded through the Expander's depth count (it also counts nested
+scalar expansions, so `"${"${…}"}"` stops near 500 levels), the lexer's nested slurping
+at 10000 and pattern groups at 1000; KSH_ARRAYS first element for `(P)`; `:#` joins
+the array first in double quotes; `${y//#/Q}`; G4/E2/D2 style fixes in the matcher,
+`Chars` and the tests. The old `Subst13.Filter*` tests expected the unjoined dq
+filter and now hold zsh's values. Round 4: in a double-quoted `${…}` operand or
+replacement `\}` drops its backslash and a `"…"` inside is a nested double-quoted
+region where it stays (`Scan::brace_dq`), as zsh; a single quote there quotes only
+when closed, and neither the Expander's `find_close` nor the lexer looks for the
+closing `}` inside one (`"${y:-'}'}"` gives `''}`); an unquoted replacement takes
+`~`; brace expansion is a re-implementation of hasbraces()/xpandbraces() (a 2500-word
+fuzz against zsh: 432 differences before, 1 after); the depth limits of
+`${…}`, arithmetic, braces, pattern groups and the lexer are a stack-headroom check
+instead of level counts, so the depths that worked before (1100 nested `${…}`, 600
+`"${"${…}"}"`, 1000 parentheses) work again, deeper ones fail with an error; a pattern
+nested past the stack is literal as a whole. Round 5: the flag group of `${(…)…}` ends
+where zsh's flag parser says, skipping the delimited arguments of (j) (s) (l) (r)
+(`"${(s:':)x}"`, `${(s:):)x}`); in a word that stays one word (an assignment, a
+here-string, a pattern) the outermost `${…}` does not apply (s), (f) or `=`
+(`y="${(s:,:)x}"` keeps `a,b`), as zsh, while (z) and the operands of `:-`, `:+` and
+`=` still split (round 6); the stack margin is min(512 KB, a quarter of the stack), so a
+`ulimit -s 512` shell still expands; the lexer passes a stack-low failure up;
+running out of stack in `find_close` says "substitutions nested too deeply"; nested
+brace expansion works on index ranges of one field and moves the words of a group
+that is the whole range (9000 nested levels: 3.0 s → 0.53 s, as zsh), and a `}` that
+zsh's lexer would not count as a brace (more `}` than `{` before it) is plain text,
+which removes the last brace-fuzz differences (15000 words of the reviewer's fuzz and
+2500 of ours: none left outside lexer errors); `${x:?word}` prints the word as written,
+as zsh 5.9 (no expansion, so no command runs); the depth tests run on a 1 MB thread
+(`test::on_stack`) and assert the errors, and `SmallStackStillExpands` runs ordinary
+expansions on 256 KB. Round 6: the operands of `:-`, `:+`, `=`, `:=` are scanned
+as words (zsh's multsub), so a nested (s)/(f) or `$a` splits there and the words are
+joined with IFS's first character (`y=${z:-${(s:,:)x}}` gives `a b`; empty elements
+drop); replacement and pattern operands stay unsplit; (z) splits in one-word contexts
+too; a nested `${=x}` (or SH_WORD_SPLIT on a nested `${x}`) splits before the outer
+level's subscripts and flags; `${x::=word}` works (the `::=` form was parsed wrongly
+and failed as "bad substitution"); flags (A), (AA), (0) and (Z:opts:) (C, c and n
+as completed in round 7);
+a subscript index stops at its first top-level comma (`i=2,3; ${a[$i]}` is `${a[2]}`);
+the `?` message shows control characters as zerr() does (`\t`, `^X`);
+`test::on_stack` reports a failed thread and rethrows exceptions. Round 7 (regressions
+only): a split operand (`${=t:+…}`, SH_WORD_SPLIT) splits at unquoted IFS characters
+only, its expansions having been split when it was scanned, and each piece keeps its
+quoting and pattern characters (`${t:+a\ b}` is one word, `${t+a*}` globs, braces in it
+expand); one-word contexts reach nested operands (`no_shwordsplit` is inherited); the
+`=` operators assign, and go on with, the words joined as one string unless (A) is
+given; (Z:opts:) finds comments in a pre-pass (a `#` starting a word runs to the
+newline, quotes in it included; c keeps it as one word, C drops it), n makes newlines
+blanks, unknown letters are "error in flags" and empty options split nothing; (AA)
+of an empty operand is an empty association; the range end of a subscript and an
+assigned element's index also stop at a top-level comma; one `split_on()` helper. Round 8
+(regressions only): `${^z:=…}` (and RC_EXPAND_PARAM) keeps the product when its scalar
+result splits, as do `x${^=v}y` and `x${^v}y` under SH_WORD_SPLIT; when the result of an
+assigning operator is to be split (`${=z:=…}`, or SH_WORD_SPLIT where words are made)
+the operand is assigned with no `${=…}`, SH_WORD_SPLIT, (s) or (f) splitting at its own
+top level (zsh's PREFORK_SINGLE; one level deeper they apply: `${=z:=${(s:,:)v}}` with
+v=`a,b c` assigns `a,b c`, `${=z:=${${(s:,:)v}}}` assigns `a b c`), and (A) splits its
+words then; the `${^…}` product of a split scalar keeps the empty pieces of leading and
+trailing blanks (`v=' a '; x${^=v}y` gives `[xy][xay][xy]`); in double quotes `${=…}` no longer splits an operand's value, as in
+the base, since zsh splits only the unquoted text there;
+a quoted empty string in a split operand stays a word (`Field::qmarks`); (Z:c:)/(Z:C:)
+find comments only at top-level word starts, after an unescaped blank, skipping
+substitutions and backquotes; a comma written in an element-assignment subscript is
+left to the arithmetic again (`a[2,]=X` is an error), only an expanded one is cut.
+Tests: the `SubstReview`
+tests in `tests/subst_test.cpp`, `GlobPatternMatch.LongSubjectsAndPatterns`,
+`RepeatsAndGroups`, `PrefixMatchesWithOperators`, `MultibyteCharacters` and
+`GlobCollate.NumericRunsAndTies` in `tests/glob_test.cpp`, and `Math.CharacterCodes`,
+`LiteralsPastTheIntegerRangeAreTruncated`, `DeepNestingFailsInsteadOfCrashing`,
+`NoUnsetNames` in `tests/math_test.cpp`. Updated tests that encoded the old behaviour:
+`Subst.Flags`, `Subst.NestedSubstitutions`, `Subst.WordSplitting`,
+`Subst.IfsWithNonWhitespaceSeparators`, `Subst.PositionalParameters` and
+`Emulate.KshArraysLengthStillArraySize` (now `KshArraysNameAloneIsFirstElement`).
 
 **Left**
-- `${^x}`/`RC_EXPAND_PARAM`, `${x:#pat}`, subscript flags `[(r)pat]`/`[(i)pat]`, padding
-  flags `(l:n:)`/`(r:n:)`, `(%)`, `(e)`, `(D)`, `(V)`, `(c)`/`(w)`, the `:s/x/y/` modifier
-  and `KSH_ARRAYS` indexing [subst/param].
-- A failed `${x?}` should make a non-interactive shell exit; jfsh only fails the
-  command [subst/errexit].
-- In `${x:-word}`, unquoted pattern characters in `word` should still glob.
-- Floating-point arithmetic and `OCTAL_ZEROES` landed with M5.
-- `NO_GLOB` (`set -f`) has no option slot yet; `CSH_NULL_GLOB` is not honoured.
+- `CSH_NULL_GLOB` is not honoured (zsh: "no match" only when every pattern fails).
+- Locale: jfsh sets `LC_CTYPE` and `LC_COLLATE` once at startup; assigning `LANG` or
+  `LC_*` in the shell does not call setlocale again as zsh does. MULTIBYTE patterns in
+  builtins without the shell's options (`print -m`, `zstyle`, …) follow the locale only.
+- Multibyte: `(V)`, `(q)` of invalid bytes inside an otherwise valid string and
+  `${x/pat/repl}` on a match ending inside a character are byte-based; `(l)`/`(r)` pad by
+  characters, not display columns, as zsh does for most text.
+- Arithmetic: `[#16]` output bases and `C_BASES`; literals longer than 19 digits are
+  truncated at a different digit than zsh's.
+- Nesting stops where the stack runs low (512 KB left, or a quarter of a smaller stack), so how deep `${…}`, `$((…))`,
+  parentheses, braces and pattern groups go depends on `ulimit -s` and the build
+  (zsh goes deeper: 30000 parentheses); the very deep cases are slow, as each level
+  rescans the rest of the word or subject: 50000 nested `$((` take 7 s to fail, and a
+  10000-level pattern group from a value (`${#v//$~v/q}`) takes 6.7 s where zsh takes
+  0.5 s (the matcher walks every nesting level from every start position).
+- In double quotes an operand that makes several words keeps them apart in zsh:
+  `"${x:-$@}"`, `"${x:+$@}"`, `"${x:-${a[@]}}"`, `"${x:-$a[@]}"`, `"${x:-${(@)a}}"`,
+  `"${v+${(s:,:)c}}"` (`[1][2]`) and `"${x:-a$@b}"` (`[ap][q rb]`); jfsh joins them.
+- In a word that stays one word zsh brace- and tilde-expands an operand (multsub
+  runs prefork): `y=${t:+{1,2}}` gives `1 2`, `y=${t:+x{1,2}}` `x1 x2`,
+  `${z::=x{1,2}}` assigns `x1 x2`, and `y=${x:-~}`, `y=${x:-~/a}` expand the tilde.
+- zsh quirks not copied: in double quotes zsh ends an operand at its first `}`
+  (`"${z:+{1,2}}"` gives `}`, jfsh an empty word), and it expands a here-string after
+  forking, so `cat <<< ${z=Q}` (and a here-document's `${u:=…}`) leaves the
+  parameter unset where jfsh sets it.
+- Slice assignment `a[2,3]=X` is not supported: zsh replaces the slice, jfsh assigns
+  the element the comma expression gives (`a[3]`); `a+=([2,3]=x)` gives "no matches
+  found", and subscript flags in assignments (`a[(i)3]=X`, `s[(i)c]=X`) are "bad math
+  expression"; `a[2]=()` is a parse error.
+- Quoted operand words still split under SH_WORD_SPLIT or `=`: `x${^z:-"$@"}y` with
+  SH_WORD_SPLIT gives zsh `[xx yy][xzy]`, jfsh `[xxy][xyy][xzy]` (also `"${a[@]}"`).
+- `${1::=…}` and `${@::=…}`: zsh assigns the positionals (or says "not an identifier:
+  @"); jfsh says "can't set 1".
+- (z): `a (b c) d` gives zsh `[a][(b c)][d]` where jfsh splits the parentheses, and a
+  backslash-newline is not removed (zsh `[ab]`); zsh's lexer reads a comment inside
+  `$(…)` or `<(…)` to the end of the line, so `(Z:c:)` of `a $(x # y) d` gives zsh
+  `[a][$(x # y) d]`, jfsh `[a][$(x # y)][d]`.
+- Unquoted `${(f)$(printf 'a b\nc')}` gives zsh `[a b c]`, jfsh `[a b][c]`.
+- Under RC_EXPAND_PARAM with SH_WORD_SPLIT (or
+  `${=z:-a b}`), `x${z:-a b}y` gives zsh `[xay][xby]`, jfsh `[xa][by]`.
+- In double quotes `${=…}` does not split an operand's value: zsh splits its unquoted
+  text (`"${=t:+a b}"` gives `[a][b]`) but not what came from an expansion.
+- Brace sequence steps are int64; zsh truncates them to an int, so
+  `{1..10..4294967298}` steps by 2 and `{0..9223372036854775807..4611686018427387904}`
+  stays literal there.
+- `typeset -a y=${(s:,:)x}` is accepted where zsh reports "inconsistent type for
+  assignment".
+- Parameter flags not implemented: (a) (b) (I:n:) (m) (W) (X) (~) (R) (_:…:) and the
+  (S)/(B)/(E)/(N) match positions; `${a[(2,3)]}` takes `(2,3)` as subscript flags where
+  zsh evaluates it as arithmetic.
+- `setopt [no]braceexpand` is unknown: jfsh has no option aliases (zsh's BRACE_EXPAND is
+  NO_IGNORE_BRACES).
+- The lexer accepts an unterminated `$(`, `"` or nesting cut off by the stack at the
+  end of the input and leaves the text as it is, where zsh reports a parse error.
+- A word ending in an unmatched `}` (`print a}`, `{a,b\}`) is a parse error in zsh
+  and accepted by jfsh; under IGNORE_BRACES zsh accepts `print -r -- }` where jfsh
+  gives a parse error.
+- An unmatched `"` inside `${…}` gives "bad substitution" where zsh says `unmatched "`.
+- `(q+)`/`(q-)` follow zsh for the cases tested (control characters, quotes, `~`, `=`
+  at the start), not every corner of zsh's quotestring.
+- `[[ … == [a ]]` and `case` patterns with an unclosed `[` match literally instead of
+  failing with "bad pattern".
+- `(t)` decorates only parameters that exist in jfsh (jfsh has no `$IFS`, `$path`,
+  `$fpath`, … parameters until M17).
+- Brace expansion still materializes every word of a large sequence as a `Field`
+  (`echo {1..2000000}`: 343 MB against zsh's 123 MB, 487 MB before).
+- `${(q)x:-""}` prints `''` where zsh prints nothing (zsh's operand null marker).
+- Pre-existing, found while testing: a readonly array element assignment reports
+  "read-only variable" twice; `a[-5]=x` on a 2-element array is "invalid subscript
+  range" where zsh prepends; `path[3]=…` does not update `$PATH` (M17 tied arrays);
+  `print -3` takes `-3` as an option.
 - History expansion still happens in the REPL before parsing (`HistoryManager::expand`).
 
 ### M4. Compound commands and functions [parser/*], [exec/*]
@@ -466,6 +671,8 @@ and `tests/compound_test.cpp` (behaviour, with zsh's output as the expected valu
   mode with `TCSADRAIN`, so pasted multi-line input isn't discarded.
 
 **Left**
+- Deeply nested `[[ ( ( … ) ) ]]` crashes the condition parser (about 30000 levels on
+  an 8 MB stack; found in the M3 review).
 - zsh's other short forms: `if [[ x ]] { … }`, `while cond { … }`, `foreach … end`,
   `for x in a b; cmd` [parser/short].
 - Redirections written after a function definition (`f() { … } > log`) should become part
@@ -1418,7 +1625,6 @@ expansion list, leaving globbing for the next phases.
   modifier to each result).
 - `CSH_NULL_GLOB`: unmatched patterns empty only if **every** pattern on the
   command line is unmatched.
-- `NO_GLOB` option slot (`set -f`).
 
 **Tests**
 - Extend `tests/subst_test.cpp` and `tests/glob_test.cpp`; add

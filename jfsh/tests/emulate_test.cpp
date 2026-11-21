@@ -353,12 +353,13 @@ TEST(Emulate, KshArraysSlicePositive) {
   EXPECT_EQ(r.out, "x y y z\n");
 }
 
-TEST(Emulate, KshArraysLengthStillArraySize) {
+TEST(Emulate, KshArraysNameAloneIsFirstElement) {
   Shell sh;
-  // ${#a} is array length under both regimes (not length of $a[0]).
-  auto r = sh.run("setopt ksharrays; a=(x y z); echo \"${#a}\"");
+  // As in zsh, $a and ${#a} take the first element under KSH_ARRAYS;
+  // ${#a[@]} is still the number of elements.
+  auto r = sh.run("setopt ksharrays; a=(xyz b c); echo \"${#a}\" $a ${#a[@]}");
   EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "3\n");
+  EXPECT_EQ(r.out, "3 xyz 3\n");
 }
 
 TEST(Emulate, KshArraysAtGivesAllElements) {

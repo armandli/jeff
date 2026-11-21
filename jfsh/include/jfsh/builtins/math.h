@@ -67,6 +67,7 @@ struct MathOptions {
   bool c_precedences      = false;   // C_PRECEDENCES
   bool ksh_arrays         = false;   // KSH_ARRAYS: 0-based subscripts
   bool ksh_zero_subscript = false;   // KSH_ZERO_SUBSCRIPT: $a[0] = $a[1]
+  bool no_unset           = false;   // NO_UNSET: an unset name is an error
 };
 
 MathOptions math_options(const OptionState& opts) noexcept;

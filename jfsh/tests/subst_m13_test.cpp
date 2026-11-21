@@ -17,16 +17,19 @@ namespace jfsh::test {
 
 TEST(Subst13, FilterDropMatchingArrayElements) {
   Shell sh;
-  auto r = sh.run("a=(foo bar baz); echo \"${a:#b*}\"");
+  auto r = sh.run("a=(foo bar baz); echo ${a:#b*}");
   EXPECT_EQ(r.rc, 0);
   EXPECT_EQ(r.out, "foo\n");
+  // In double quotes the array is joined first, as in zsh.
+  EXPECT_EQ(sh.run("echo \"${a:#b*}\"").out, "foo bar baz\n");
 }
 
 TEST(Subst13, FilterKeepMatchingArrayElementsWithMFlag) {
   Shell sh;
-  auto r = sh.run("a=(foo bar baz); echo \"${(M)a:#b*}\"");
+  auto r = sh.run("a=(foo bar baz); echo ${(M)a:#b*}");
   EXPECT_EQ(r.rc, 0);
   EXPECT_EQ(r.out, "bar baz\n");
+  EXPECT_EQ(sh.run("echo \"${(M)a:#b*}\" \"${(@M)a:#b*}\"").out, " bar baz\n");
 }
 
 TEST(Subst13, FilterScalarMatchingBecomesEmpty) {

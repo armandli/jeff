@@ -118,6 +118,8 @@ str param(jfsh::ParamTable& params, s::string_view name) {
 int main(int argc, char* argv[]) {
   // The line editor measures characters with wcwidth().
   std::setlocale(LC_CTYPE, "");
+  // Globs and ${(o)a} sort by the locale's collation, as in zsh.
+  std::setlocale(LC_COLLATE, "");
   auto parsed = jfsh::parse_invocation(vec<str>(argv, argv + argc));
   if (not parsed) {
     s::fprintf(stderr, "jfsh: %s\n", parsed.error().message.c_str());

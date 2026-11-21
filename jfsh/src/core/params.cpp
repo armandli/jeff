@@ -36,6 +36,23 @@ vec<str> Param::array() const noexcept {
   return {};
 }
 
+const vec<str>& Param::array_ref() const noexcept {
+  static const vec<str> NONE;
+  if (auto* a = s::get_if<vec<str>>(&value)) return *a;
+  return NONE;
+}
+
+const umap<str, str>& Param::hash_ref() const noexcept {
+  static const umap<str, str> NONE;
+  if (auto* h = s::get_if<umap<str, str>>(&value)) return *h;
+  return NONE;
+}
+
+vec<str> Param::take_array() noexcept {
+  if (auto* a = s::get_if<vec<str>>(&value)) return s::move(*a);
+  return {};
+}
+
 umap<str, str> Param::hash() const noexcept {
   using Map = umap<str, str>;
   if (auto* h = s::get_if<Map>(&value)) return *h;
