@@ -5,12 +5,16 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <pthread.h>
 #include <unistd.h>
 
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <string_view>
+
+#include <gtest/gtest.h>
 
 #include <jfsh/core/aliases.h>
 #include <jfsh/core/jobs.h>
@@ -173,6 +177,34 @@ struct Shell {
     return (p and p->get().is_set()) ? p->get().scalar() : "<unset>";
   }
 };
+
+// Runs fn on a thread whose stack is `bytes`, so tests of the stack-depth
+// limits do not depend on `ulimit -s`.  An exception from fn is rethrown
+// here; a thread that cannot be made fails the test.
+template <typename Fn>
+void on_stack(s::size_t bytes, Fn fn) {
+  struct Job {
+    Fn&                fn;
+    s::exception_ptr   error;
+  } job{fn, nullptr};
+  auto run = [](void* p) -> void* {
+    auto* j = static_cast<Job*>(p);
+    try { j->fn(); } catch (...) { j->error = s::current_exception(); }
+    return nullptr;
+  };
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, bytes);
+  pthread_t t;
+  int rc = pthread_create(&t, &attr, run, &job);
+  pthread_attr_destroy(&attr);
+  if (rc != 0) {
+    ADD_FAILURE() << "pthread_create failed: " << rc;
+    return;
+  }
+  pthread_join(t, nullptr);
+  if (job.error) s::rethrow_exception(job.error);
+}
 
 // A scratch directory removed when the test ends.
 struct TempDir {

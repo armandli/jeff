@@ -7,6 +7,7 @@
 // names and behaves identically.
 
 #include <cstdint>
+#include <cstdlib>
 
 #include <array>
 #include <functional>
@@ -260,6 +261,8 @@ struct OptionState {
   bool default_of(const OptionInfo& info) const noexcept;
 
   bool extended_glob() const noexcept { return mOpts[OPT_EXTENDEDGLOB]; }
+  // MULTIBYTE in a locale whose characters may take several bytes.
+  bool multibyte() const noexcept { return mOpts[OPT_MULTIBYTE] and MB_CUR_MAX > 1; }
   bool monitor()       const noexcept { return mOpts[OPT_MONITOR]; }
   bool interactive()   const noexcept { return mOpts[OPT_INTERACTIVE]; }
   bool login()         const noexcept { return mOpts[OPT_LOGIN]; }

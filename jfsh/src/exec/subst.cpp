@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwctype>
 #include <pwd.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -16,6 +18,8 @@
 
 #include <jfsh/builtins/math.h>
 #include <jfsh/core/aliases.h>
+#include <jfsh/core/stack.h>
+#include <jfsh/core/utf8.h>
 #include <jfsh/core/sort.h>
 #include <jfsh/exec/executor.h>
 #include <jfsh/glob/glob.h>
@@ -47,37 +51,75 @@ bool is_special_param(char c) noexcept {
   return strv("?$!#-@*0").find(c) != strv::npos;
 }
 
+s::size_t find_close(strv w, s::size_t open, bool dq = false);
+
+// Set when find_close() gave up because the stack ran low.
+thread_local bool CloseTooDeep = false;
+
+// The error for a `${` that find_close() found unclosed.
+ShellError unclosed_error() {
+  bool deep = s::exchange(CloseTooDeep, false);
+  return subst_error(deep ? "substitutions nested too deeply" : "bad substitution");
+}
+
+// Index of the `"` that ends the double-quoted text opened at w[q],
+// skipping the substitutions inside it; npos when it is never closed.
+s::size_t dquote_end(strv w, s::size_t q) {
+  for (s::size_t i = q + 1; i < w.size(); ++i) {
+    char ch = w[i];
+    if (ch == '"') return i;
+    if (ch == '\\') {
+      ++i;
+    } else if (ch == '`') {
+      for (++i; i < w.size() and w[i] != '`'; ++i)
+        if (w[i] == '\\') ++i;
+      if (i >= w.size()) return strv::npos;
+    } else if (ch == '$' and i + 1 < w.size() and (w[i + 1] == '(' or w[i + 1] == '{')) {
+      // ${…} stays in the double quotes; $(…) starts afresh.
+      auto e = find_close(w, i + 1, w[i + 1] == '{');
+      if (e == strv::npos) return e;
+      i = e;
+    }
+  }
+  return strv::npos;
+}
+
 // Index of the character that closes the bracket at w[open], skipping
 // quoted text and nested substitutions; npos when it is never closed.
-// `dq`: a ${…} in double quotes, where, as in zsh, a `{` inside does not
-// pair with a `}` ("${x:-a{b\}c}") and a `'` is an ordinary character.
-s::size_t find_close(strv w, s::size_t open, bool dq = false) {
+// With `dq` the `${` is inside double quotes, where, as in zsh, a single
+// quote does not quote: "${y:-'}'}" ends at the first `}`.
+s::size_t find_close(strv w, s::size_t open, bool dq) {
+  // Nesting past what the stack holds counts as never closed, and the
+  // caller says why (unclosed_error()).
+  if (stack_low()) { CloseTooDeep = true; return strv::npos; }
   char o = w[open];
   char c = o == '(' ? ')' : o == '{' ? '}' : ']';
+  bool singles = o != '[' and not (dq and o == '{');
   int depth = 1;
   for (s::size_t i = open + 1; i < w.size(); ++i) {
     char ch = w[i];
     if (ch == '\\') { ++i; continue; }
-    if (ch == '$' and i + 1 < w.size() and w[i + 1] == '\'' and o != '[') {
+    if (ch == '$' and i + 1 < w.size() and w[i + 1] == '\'' and singles) {
       // $'…', where `\'` doesn't end it.
       for (i += 2; i < w.size() and w[i] != '\''; ++i)
         if (w[i] == '\\') ++i;
       if (i >= w.size()) return strv::npos;
       continue;
     }
-    if (ch == '\'' and o != '[' and not dq) {
+    if (ch == '\'' and singles) {
       auto e = w.find('\'', i + 1);
       if (e == strv::npos) return e;
       i = e;
     } else if (ch == '"') {
-      for (++i; i < w.size() and w[i] != '"'; ++i)
-        if (w[i] == '\\') ++i;
+      auto e = dquote_end(w, i);
+      if (e == strv::npos) return e;
+      i = e;
     } else if (ch == '`') {
       for (++i; i < w.size() and w[i] != '`'; ++i)
         if (w[i] == '\\') ++i;
     } else if (ch == '$' and i + 1 < w.size()
-               and (w[i + 1] == '(' or w[i + 1] == '{') and (w[i + 1] != o or dq)) {
-      auto e = find_close(w, i + 1, dq);
+               and (w[i + 1] == '(' or w[i + 1] == '{') and w[i + 1] != o) {
+      auto e = find_close(w, i + 1, w[i + 1] == '{' and dq and o == '{');
       if (e == strv::npos) return e;
       i = e;
     } else if (ch == o and not (dq and o == '{')) {
@@ -107,11 +149,21 @@ void append_utf8(str& out, s::uint32_t cp) {
   }
 }
 
-// Decodes the body of $'…' (and the (p) flag's separators): C escapes.
+// Decodes the body of $'…' (and the (p) flag's separators): C escapes,
+// with zsh's \C-x (control) and \M-x (meta) applying to the next
+// character, however it is written.
 str c_escapes(strv s) {
   str out;
+  bool ctl = false, meta = false;
+  auto emit = [&](char ch) {
+    auto c = static_cast<unsigned char>(ch);
+    if (ctl)  c = c == '?' ? 0x7f : static_cast<unsigned char>(c & 0x9f);
+    if (meta) c = static_cast<unsigned char>(c | 0x80);
+    ctl = meta = false;
+    out += static_cast<char>(c);
+  };
   for (s::size_t i = 0; i < s.size(); ++i) {
-    if (s[i] != '\\' or i + 1 >= s.size()) { out += s[i]; continue; }
+    if (s[i] != '\\' or i + 1 >= s.size()) { emit(s[i]); continue; }
     char e = s[++i];
     auto hex = [&](s::size_t max) {
       s::uint32_t v = 0;
@@ -127,42 +179,88 @@ str c_escapes(strv s) {
       return v;
     };
     switch (e) {
-      case 'a': out += '\a';
-      break; case 'b': out += '\b';
-      break; case 'e': case 'E': out += '\x1b';
-      break; case 'f': out += '\f';
-      break; case 'n': out += '\n';
-      break; case 'r': out += '\r';
-      break; case 't': out += '\t';
-      break; case 'v': out += '\v';
-      break; case 'x': out += static_cast<char>(hex(2));
+      case 'a': emit('\a');
+      break; case 'b': emit('\b');
+      break; case 'e': case 'E': emit('\x1b');
+      break; case 'f': emit('\f');
+      break; case 'n': emit('\n');
+      break; case 'r': emit('\r');
+      break; case 't': emit('\t');
+      break; case 'v': emit('\v');
+      break; case 'x': emit(static_cast<char>(hex(2)));
       break; case 'u': append_utf8(out, hex(4));
       break; case 'U': append_utf8(out, hex(8));
-      break; case 'c':
-        if (i + 1 < s.size()) out += static_cast<char>(s[++i] & 0x1f);
+      break; case 'C': case 'M': {
+        // With nothing after it, zsh drops it.
+        if (i + 1 < s.size() and s[i + 1] == '-') ++i;
+        (e == 'C' ? ctl : meta) = true;
+      }
       break; case '0': case '1': case '2': case '3':
       case '4': case '5': case '6': case '7': {
         int v = e - '0';
         for (int n = 0; n < 2 and i + 1 < s.size() and s[i + 1] >= '0' and s[i + 1] <= '7'; ++n)
           v = v * 8 + (s[++i] - '0');
-        out += static_cast<char>(v);
+        emit(static_cast<char>(v));
       }
-      break; default: out += e;
+      break; default: emit(e);
     }
   }
   return out;
 }
 
-str quote_backslash(strv s) {
-  constexpr strv SPECIAL = " \t\n'\"\\$`&|;<>()[]{}*?#~=%!^";
+// The length of the character at s[i] when it prints as itself, or 0 for
+// a control character or (under `mb`, a byte outside a valid UTF-8
+// character; without it, any byte from 0x80), which zsh's quoting writes
+// as an escape.
+s::size_t printable_len(strv s, s::size_t i, bool mb) {
+  auto c = static_cast<unsigned char>(s[i]);
+  if (c < 0x80) return c < 0x20 or c == 0x7f ? 0 : 1;
+  if (not mb) return 0;
+  s::size_t len = 1;
+  utf8_decode(s, i, len);
+  return len > 1 ? len : 0;
+}
+
+// `c` inside $'…': a named escape, else three octal digits.
+str dollar_escape(unsigned char c, bool nul_short) {
+  switch (c) {
+    case '\n': return "\\n";
+    case '\t': return "\\t";
+    case '\r': return "\\r";
+    case '\a': return "\\a";
+    case '\b': return "\\b";
+    case '\f': return "\\f";
+    case '\v': return "\\v";
+    default: {
+      if (c == 0 and nul_short) return "\\0";
+      char buf[8];
+      s::snprintf(buf, sizeof buf, "\\%03o", c);
+      return buf;
+    }
+  }
+}
+
+// (q) and :q: a backslash before each special character, and $'…' for
+// each unprintable one.
+str quote_backslash(strv s, bool mb) {
+  constexpr strv SPECIAL = " \t\n'\"\\$`&|;<>()[]{}*?#^";
   str out;
-  for (char c : s) {
-    if (SPECIAL.find(c) != strv::npos) out += '\\';
-    out += c;
+  for (s::size_t i = 0; i < s.size();) {
+    if (s::size_t n = printable_len(s, i, mb); n == 0) {
+      out += "$'" + dollar_escape(static_cast<unsigned char>(s[i]), true) + "'";
+      ++i;
+    } else {
+      char c = s[i];
+      if (n == 1 and (SPECIAL.find(c) != strv::npos or (i == 0 and (c == '~' or c == '='))))
+        out += '\\';
+      out += s.substr(i, n);
+      i += n;
+    }
   }
   return out;
 }
 
+// (qq).
 str quote_single(strv s) {
   str out = "'";
   for (char c : s) {
@@ -172,42 +270,191 @@ str quote_single(strv s) {
   return out + "'";
 }
 
-// (qqq): in double quotes, a backslash before " $ ` and \.
+// (qqq).
 str quote_double(strv s) {
   str out = "\"";
   for (char c : s) {
-    if (strv("\"$`\\").find(c) != strv::npos) out += '\\';
+    if (strv("\"\\$`").find(c) != strv::npos) out += '\\';
     out += c;
   }
   return out + "\"";
 }
 
-// (qqqq): in $'…', with C escapes for what needs them.
-str quote_dollar(strv s) {
+// (qqqq).
+str quote_dollar(strv s, bool mb) {
   str out = "$'";
-  for (char c : s) {
-    auto u = static_cast<unsigned char>(c);
-    if (c == '\n') out += "\\n";
-    else if (c == '\t') out += "\\t";
-    else if (c == '\r') out += "\\r";
-    else if (c == '\033') out += "\\e";
-    else if (c == '\'' or c == '\\') { out += '\\'; out += c; }
-    else if (u < 0x20 or u == 0x7f) {
-      char buf[8];
-      s::snprintf(buf, sizeof buf, "\\%03o", u);
-      out += buf;
-    } else out += c;
+  for (s::size_t i = 0; i < s.size();) {
+    if (s::size_t n = printable_len(s, i, mb); n == 0) {
+      out += dollar_escape(static_cast<unsigned char>(s[i]), true);
+      ++i;
+    } else {
+      if (n == 1 and strv("'\\!").find(s[i]) != strv::npos) out += '\\';
+      out += s.substr(i, n);
+      i += n;
+    }
   }
   return out + "'";
 }
 
-// zsh's (q-): quote only when needed, with single quotes.
+// Whether (q-) or (q+) must quote `s`.  (q+) also quotes `~` and `=`
+// anywhere, (q-) only at the start.
+bool needs_quotes(strv s, bool plus) {
+  constexpr strv SPECIAL = " \t\n\"\\$`&|;<>()[]{}*?#^";
+  for (s::size_t i = 0; i < s.size(); ++i) {
+    char c = s[i];
+    if (c == '\0' or SPECIAL.find(c) != strv::npos) return true;
+    if ((c == '~' or c == '=') and (plus or i == 0)) return true;
+  }
+  return false;
+}
+
+// (q-): quotes only where needed.  The text between single quotes goes in
+// '…' when it needs it, and each single quote becomes \'.
 str quote_minimal(strv s) {
-  constexpr strv SAFE =
-      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@%+=:,./-";
-  if (not s.empty() and s.find_first_not_of(SAFE) == strv::npos)
-    return str(s);
-  return quote_single(s);
+  if (s.empty()) return "''";
+  str out;
+  for (s::size_t b = 0;;) {
+    auto e = s.find('\'', b);
+    strv part = s.substr(b, e == strv::npos ? strv::npos : e - b);
+    if (needs_quotes(part, false))
+      out += "'" + str(part) + "'";
+    else
+      out += part;
+    if (e == strv::npos) break;
+    out += "\\'";
+    b = e + 1;
+  }
+  return out;
+}
+
+// (q+): like (q-), but text with unprintable characters becomes one
+// $'…' word with \C- and \M- for them, and text with a single quote has
+// every other part quoted.
+str quote_plus(strv s, bool mb) {
+  if (s.empty()) return "''";
+  bool unprintable = false;
+  for (s::size_t i = 0, n = 0; i < s.size() and not unprintable; i += n ? n : 1)
+    unprintable = (n = printable_len(s, i, mb)) == 0;
+  if (unprintable) {
+    str out = "$'";
+    for (s::size_t i = 0; i < s.size();) {
+      s::size_t n = printable_len(s, i, mb);
+      auto c = static_cast<unsigned char>(s[i]);
+      if (n) {
+        if (n == 1 and strv("'\\").find(s[i]) != strv::npos) out += '\\';
+        out += s.substr(i, n);
+        i += n;
+        continue;
+      }
+      ++i;
+      if (c == '\n' or c == '\t') { out += dollar_escape(c, true); continue; }
+      if (c >= 0x80) { out += "\\M-"; c = static_cast<unsigned char>(c - 0x80); }
+      if (c < 0x20)       { out += "\\C-"; out += static_cast<char>(c + 0x40); }
+      else if (c == 0x7f) out += "\\C-?";
+      else                out += static_cast<char>(c);
+    }
+    return out + "'";
+  }
+  if (s.find('\'') == strv::npos)
+    return needs_quotes(s, true) ? "'" + str(s) + "'" : str(s);
+  str out;
+  for (s::size_t b = 0;;) {
+    auto e = s.find('\'', b);
+    strv part = s.substr(b, e == strv::npos ? strv::npos : e - b);
+    if (not part.empty()) out += "'" + str(part) + "'";
+    if (e == strv::npos) break;
+    out += "\\'";
+    b = e + 1;
+  }
+  return out;
+}
+
+// (U), (L), (C), :u and :l: `how` is 'U', 'L' or 'C' (capitalize each
+// word); under `mb` a UTF-8 character is mapped as one character.
+str map_case(strv s, char how, bool mb) {
+  str out;
+  out.reserve(s.size());
+  bool start = true;
+  for (s::size_t i = 0; i < s.size();) {
+    s::size_t len = 1;
+    char32_t c = mb ? utf8_decode(s, i, len) : static_cast<unsigned char>(s[i]);
+    bool up = how == 'U' or (how == 'C' and start);
+    if (len == 1 and c < 0x80) {
+      auto u = static_cast<unsigned char>(s[i]);
+      out += static_cast<char>(up ? s::toupper(u) : s::tolower(u));
+      start = not s::isalnum(u);
+    } else if (len > 1) {
+      auto w = static_cast<wint_t>(c);
+      utf8_append(out, static_cast<char32_t>(up ? ::towupper(w) : ::towlower(w)));
+      start = not ::iswalnum(w);
+    } else {
+      out += s[i];
+      start = true;
+    }
+    i += len;
+  }
+  return out;
+}
+
+// A piece of text split on $IFS.  `keep` is false only for the empty
+// pieces that leading or trailing IFS whitespace leaves: they glue the
+// neighbouring text but vanish as words of their own.
+struct IfsPiece {
+  str  text;
+  bool keep = true;
+};
+
+// The parts of `s` between occurrences of `sep`, empty ones included.
+vec<str> split_on(strv s, strv sep) {
+  vec<str> out;
+  for (s::size_t b = 0;;) {
+    auto e = s.find(sep, b);
+    out.emplace_back(s.substr(b, e == strv::npos ? strv::npos : e - b));
+    if (e == strv::npos) break;
+    b = e + sep.size();
+  }
+  return out;
+}
+
+// Text as zsh's zerr() prints it: control characters as \t, \n or ^X.
+str nice_text(strv s) {
+  str out;
+  for (char ch : s) {
+    auto c = static_cast<unsigned char>(ch);
+    if (c == '\n')                  out += "\\n";
+    else if (c == '\t')             out += "\\t";
+    else if (c < 0x20 or c == 0x7f) { out += '^'; out += static_cast<char>(c ^ 0x40); }
+    else                            out += ch;
+  }
+  return out;
+}
+
+// zsh's spacesplit(): a run of IFS whitespace with at most one other IFS
+// character in it is one separator, so two non-whitespace separators in a
+// row, or one at either end, leave an empty piece that is kept.
+vec<IfsPiece> ifs_pieces(strv s, strv ifs) {
+  auto is_sep  = [&](char c) { return ifs.find(c) != strv::npos; };
+  auto is_ws   = [&](char c) {
+    return (c == ' ' or c == '\t' or c == '\n') and is_sep(c);
+  };
+  auto is_hard = [&](char c) { return is_sep(c) and not is_ws(c); };
+  vec<IfsPiece> out;
+  s::size_t i = 0, n = s.size();
+  auto skip_ws = [&] { while (i < n and is_ws(s[i])) ++i; };
+  skip_ws();
+  if (i < n and is_hard(s[i])) out.push_back({"", true});
+  else if (i != 0)             out.push_back({"", false});
+  s::size_t t = 0;
+  while (i < n) {
+    if (is_hard(s[i])) { ++i; skip_ws(); }
+    t = i;
+    while (i < n and not is_sep(s[i])) ++i;
+    out.push_back({str(s.substr(t, i - t)), true});
+    t = i;
+    skip_ws();
+  }
+  if (t != i) out.push_back({"", false});
+  return out;
 }
 
 // (q+): as (q-), but text with control characters goes in $'…'.
@@ -242,9 +489,17 @@ struct Field {
   bool quoted   = false;   // had quotes, so it survives being empty
   bool empty_at = false;   // an empty "$@" landed here
   bool dropped  = false;   // ${^x} of an empty array: the word goes away
+  // Where in `text` each quoted string began, so splitting an operand
+  // keeps a quoted empty string as a word (`${=t:+a "" b}`).  Only the
+  // scanner sets it; slices and joins leave it out.
+  vec<s::size_t> qmarks;
 
   void put(char c, bool l) { text += c; lit.push_back(l); }
-  void put(strv s, bool l) { for (char c : s) put(c, l); }
+  // The text of an expansion: even where it may glob, its braces and
+  // commas are never brace syntax.
+  void put(strv s, bool l) {
+    for (char c : s) put(c, l or c == '{' or c == '}' or c == ',');
+  }
 
   Field slice(s::size_t b, s::size_t e) const {
     Field f;
@@ -257,6 +512,12 @@ struct Field {
   void append(const Field& o) {
     text += o.text;
     lit.insert(lit.end(), o.lit.begin(), o.lit.end());
+  }
+  // o.text[b, e), without a temporary slice.
+  void append(const Field& o, s::size_t b, s::size_t e) {
+    text.append(o.text, b, e - b);
+    lit.insert(lit.end(), o.lit.begin() + static_cast<s::ptrdiff_t>(b),
+               o.lit.begin() + static_cast<s::ptrdiff_t>(e));
   }
   bool unlit(s::size_t i) const { return i < text.size() and not lit[i]; }
 
@@ -314,7 +575,9 @@ struct ParamFlags {
   bool sort_asc = false, sort_desc = false, sort_nocase = false, sort_numeric = false;
   bool unique = false, indirect = false, type = false, split_words = false;
   bool unquote = false, escapes = false;
-  int  quote = 0;              // q count; -1 for (q-)
+  int  array_assign = 0;       // (A) count: ${(A)x::=…} makes an array, (AA) an association
+  str  z_opts;                 // (Z:opts:): c keeps comments, C strips them, n newlines as blanks
+  int  quote = 0;              // q count; -1 for (q-), -2 for (q+)
   bool join = false, split = false;
   str join_sep, split_sep;
   // M13 Phase 13a additions:
@@ -361,30 +624,98 @@ opt<str> read_delimited(strv f, s::size_t& i) {
   return arg;
 }
 
-// Pads (or truncates) `s` to `w` columns: on the left for (l), keeping
+// The characters of a scalar.  Under MULTIBYTE a UTF-8 character counts
+// as one, so ${#x}, ${x:o:l}, ${x[i]}, (s::) and padding count characters.
+struct Chars {
+  Chars(strv text, bool mb) : s{text} {
+    if (not mb or s::none_of(s.begin(), s.end(),
+                             [](char c) { return static_cast<unsigned char>(c) >= 0x80; }))
+      return;
+    for (s::size_t i = 0; i < s.size();) {
+      at.push_back(i);
+      s::size_t len = 1;
+      utf8_decode(s, i, len);
+      i += len;
+    }
+    at.push_back(s.size());
+  }
+  s::size_t size() const { return at.empty() ? s.size() : at.size() - 1; }
+  s::size_t pos(s::size_t k) const {
+    return at.empty() ? s::min(k, s.size()) : at[s::min(k, size())];
+  }
+  // `n` characters from character `b`.
+  str sub(s::size_t b, s::size_t n) const {
+    s::size_t p = pos(b), q = n >= size() ? s.size() : pos(b + n);
+    return str(s.substr(p, q - p));
+  }
+
+  strv           s;
+  vec<s::size_t> at;   // each character's offset, then s.size(); empty when
+                       // every character is one byte
+};
+
+// Pads (or truncates) `s` to `w` characters: on the left for (l), keeping
 // the rightmost characters, on the right for (r), keeping the leftmost.
 // `once` goes next to the word, `fill` repeats in the rest of the room.
-str pad_word(const str& s, s::size_t w, const ParamFlags::Pad& p, bool left) {
-  if (s.size() >= w)
-    return left ? s.substr(s.size() - w) : s.substr(0, w);
-  s::size_t room = w - s.size();
-  str once = p.once;
-  if (once.size() > room)
-    once = left ? once.substr(once.size() - room) : once.substr(0, room);
-  s::size_t n = room - once.size();
-  str fill = p.fill.empty() ? str(" ") : p.fill, rep;
-  while (rep.size() < n) rep += fill;
-  rep = left ? rep.substr(rep.size() - n) : rep.substr(0, n);
+str pad_word(const str& s, s::size_t w, const ParamFlags::Pad& p, bool left, bool mb) {
+  Chars cs{s, mb};
+  if (cs.size() >= w)
+    return left ? cs.sub(cs.size() - w, w) : cs.sub(0, w);
+  s::size_t room = w - cs.size();
+  Chars co{p.once, mb};
+  str once = co.size() > room
+      ? (left ? co.sub(co.size() - room, room) : co.sub(0, room)) : p.once;
+  s::size_t n = room - s::min(room, co.size());
+  str fill = p.fill.empty() ? str(" ") : p.fill;
+  s::size_t fc = Chars{fill, mb}.size();
+  str rep;
+  for (s::size_t have = 0; have < n; have += fc) rep += fill;
+  Chars cr{rep, mb};
+  rep = left ? cr.sub(cr.size() - n, n) : cr.sub(0, n);
   return left ? rep + once + s : s + once + rep;
 }
 
-enum class Mode : int { Word, Scalar, Heredoc };
+// Arith is Heredoc text in which double quotes are removed, as in
+// `$(( "$x" + 1 ))`; a single quote stays and the evaluator rejects it.
+enum class Mode : int { Word, Scalar, Heredoc, Arith };
+
+// zsh's special parameters as ${(t)…} shows them in a fresh shell.
+struct SpecialType {
+  strv name, type;
+  bool readonly = false, tied = false, hide = false;
+};
+constexpr SpecialType SPECIAL_TYPES[] = {
+  {"!", "integer", true}, {"#", "integer", true}, {"$", "integer", true},
+  {"?", "integer", true}, {"ARGC", "integer", true}, {"HISTCMD", "integer", true},
+  {"LINENO", "integer", true}, {"PPID", "integer", true}, {"status", "integer", true},
+  {"ZSH_SUBSHELL", "integer", true}, {"TTYIDLE", "integer", true},
+  {"*", "array", true}, {"@", "array", true}, {"-", "scalar", true}, {"0", "scalar"},
+  {"argv", "array"}, {"pipestatus", "array"}, {"watch", "array"},
+  {"SECONDS", "integer"}, {"RANDOM", "integer"}, {"EUID", "integer"},
+  {"EGID", "integer"}, {"UID", "integer"}, {"GID", "integer"},
+  {"HISTSIZE", "integer"}, {"SAVEHIST", "integer"}, {"OPTIND", "integer"},
+  {"COLUMNS", "integer"}, {"LINES", "integer"}, {"SHLVL", "integer"},
+  {"USERNAME", "scalar"}, {"HOME", "scalar"}, {"IFS", "scalar"}, {"TERM", "scalar"},
+  {"PROMPT", "scalar"}, {"PS1", "scalar"}, {"PS2", "scalar"}, {"PS3", "scalar"},
+  {"PS4", "scalar"}, {"HISTCHARS", "scalar"}, {"histchars", "scalar"},
+  {"OPTARG", "scalar"}, {"WORDCHARS", "scalar"}, {"NULLCMD", "scalar"},
+  {"READNULLCMD", "scalar"}, {"WATCH", "scalar"}, {"_", "scalar"},
+  {"PATH", "scalar", false, true}, {"FPATH", "scalar", false, true},
+  {"CDPATH", "scalar", false, true}, {"MANPATH", "scalar", false, true},
+  {"MODULE_PATH", "scalar", false, true}, {"PSVAR", "scalar", false, true},
+  {"path", "array", false, true}, {"fpath", "array", false, true},
+  {"cdpath", "array", false, true}, {"manpath", "array", false, true},
+  {"module_path", "array", false, true}, {"psvar", "array", false, true},
+  {"ZSH_EVAL_CONTEXT", "scalar", true, true},
+  {"funcstack", "array", true, false, true}, {"dirstack", "array", false, false, true},
+};
+
+Result<void> tilde_expand(Field& f, bool assign_like, ExecContext& ctx);
 
 struct Scan {
   Expander& ex;
   Mode      mode;
   vec<Field> fields{1};
-  bool pending_break = false;
   // After ${^x}, fields[rc_from..] are the copies of the word, one per
   // element; text that follows goes onto every one of them.
   s::size_t rc_from = NONE;
@@ -394,22 +725,23 @@ struct Scan {
   // Scanning a word as written (not the inside of ${…}): an unquoted
   // `<(…)` / `>(…)`, or `=(…)` at its start, is a process substitution.
   bool top = false;
-  // Scanning the operand of a ${…}: in double quotes `\}` is a `}`.
-  bool in_brace = false;
+  // The text is the operand of a ${…} in double quotes: there `\}` is an
+  // escape too, and a `"` opens a nested double-quoted region instead of
+  // ending the quotes, as in zsh.
+  bool brace_dq = false;
+  // An operand of a word that stays one word: SH_WORD_SPLIT is off.
+  bool no_shwordsplit = false;
+  // An operand of ${=x:-…}: its expansions split even without SH_WORD_SPLIT.
+  bool force_split = false;
+  // The `=` operand of a result that will be split: no ${=…} splitting.
+  bool no_eq_split = false;
 
   Scan(Expander& e, Mode m) : ex{e}, mode{m} {}
 
   ExecContext& ctx() { return ex.ctx(); }
   OptionState& opts() { return ex.ctx().opts; }
 
-  Field& cur() {
-    if (pending_break) {
-      pending_break = false;
-      rc_from = NONE;
-      fields.emplace_back();
-    }
-    return fields.back();
-  }
+  Field& cur() { return fields.back(); }
   template <typename T>
   void put(T x, bool lit) {
     Field& f = cur();
@@ -422,14 +754,15 @@ struct Scan {
       for (s::size_t k = rc_from; k < fields.size(); ++k) fields[k].quoted = true;
   }
   void new_field(bool quoted) {
-    pending_break = false;
     rc_from = NONE;
     fields.emplace_back();
     fields.back().quoted = quoted;
   }
   // ${^x}: the word so far is copied once per element, each copy getting
   // that element; with no elements the word is removed.
-  void rc_splice(const vec<str>& parts, bool lit) {
+  // With `words` (an operand's own words, one per part) each copy keeps
+  // its word's quoting, so a quoted empty word stays.
+  void rc_splice(const vec<str>& parts, bool lit, const vec<Field>* words = nullptr) {
     cur();
     s::size_t from = rc_from == NONE ? fields.size() - 1 : rc_from;
     vec<Field> base(s::make_move_iterator(fields.begin() + static_cast<s::ptrdiff_t>(from)),
@@ -442,9 +775,15 @@ struct Scan {
       return;
     }
     for (auto& b : base)
-      for (auto& p : parts) {
+      for (s::size_t k = 0; k < parts.size(); ++k) {
         fields.push_back(b);
-        fields.back().put(strv(p), lit);
+        if (words) {
+          const Field& wd = (*words)[k];
+          for (s::size_t c = 0; c < wd.text.size(); ++c) fields.back().put(wd.text[c], wd.lit[c]);
+          fields.back().quoted = fields.back().quoted or wd.quoted;
+        } else {
+          fields.back().put(strv(parts[k]), lit);
+        }
       }
   }
   // First part continues the current word; each further part starts one.
@@ -465,28 +804,30 @@ struct Scan {
     return s.empty() ? str{} : str(1, s[0]);
   }
 
-  // Unquoted text split on $IFS joins the current word only if it doesn't
-  // start with a separator, and ends it if it ends with one.
+  // Unquoted text split on $IFS: the first piece continues the current
+  // word and each further piece starts one.  An empty piece between two
+  // non-whitespace separators is a word of its own.
   void splice_split(strv s, bool lit) {
-    str sep = ifs();
-    if (s.empty()) return;
-    bool lead  = sep.find(s.front()) != str::npos;
-    bool trail = sep.find(s.back())  != str::npos;
-    auto parts = ifs_split(s, sep);
-    if (lead and not cur().text.empty()) new_field(false);
-    splice(parts, lit, false);
-    if (trail) pending_break = true;
+    auto pieces = ifs_pieces(s, ifs());
+    for (s::size_t k = 0; k < pieces.size(); ++k) {
+      if (k) new_field(false);
+      if (pieces[k].keep and pieces[k].text.empty()) mark_quoted();
+      put(strv(pieces[k].text), lit);
+    }
   }
 
   // -------------------------------------------------------------------------
   // The scanner proper.
   // -------------------------------------------------------------------------
   Result<void> scan(strv w, bool dq = false) {
+    bool inner = false;   // in a nested "…" of a brace_dq operand
     for (s::size_t i = 0; i < w.size();) {
       char c = w[i];
-      if (mode == Mode::Heredoc) {
+      if (mode == Mode::Heredoc or mode == Mode::Arith) {
+        if (mode == Mode::Arith and c == '"') { dq = not dq; ++i; continue; }
         if (c == '\\' and i + 1 < w.size()
-            and strv("$`\\\n").find(w[i + 1]) != strv::npos) {
+            and (strv("$`\\\n").find(w[i + 1]) != strv::npos
+                 or (dq and w[i + 1] == '"'))) {
           if (w[i + 1] != '\n') put(w[i + 1], true);
           i += 2;
           continue;
@@ -511,21 +852,26 @@ struct Scan {
           continue;
         }
         if (c == '\'') {
-          mark_quoted();
+          // An unclosed one (from an operand read in double quotes, where
+          // zsh's lexer did not take it as a quote) is a plain character.
           auto e = w.find('\'', i + 1);
-          if (e == strv::npos) e = w.size();
+          if (e == strv::npos) { put(c, true); ++i; continue; }
+          mark_quoted();
+          cur().qmarks.push_back(cur().text.size());
           put(w.substr(i + 1, e - i - 1), true);
           i = e + 1;
           continue;
         }
         if (c == '"') {
           mark_quoted();
+          cur().qmarks.push_back(cur().text.size());
           dq = true;
           ++i;
           continue;
         }
         if (c == '$' and i + 1 < w.size() and w[i + 1] == '\'') {
           mark_quoted();
+          cur().qmarks.push_back(cur().text.size());
           s::size_t e = i + 2;
           while (e < w.size() and w[e] != '\'') e += (w[e] == '\\') ? 2u : 1u;
           put(c_escapes(w.substr(i + 2, s::min(e, w.size()) - i - 2)), true);
@@ -533,10 +879,11 @@ struct Scan {
           continue;
         }
       } else {
+        if (c == '"' and brace_dq) { inner = not inner; mark_quoted(); ++i; continue; }
         if (c == '"') { dq = false; ++i; continue; }
         if (c == '\\' and i + 1 < w.size()
             and (strv("$`\"\\\n").find(w[i + 1]) != strv::npos
-                 or (in_brace and w[i + 1] == '}'))) {
+                 or (brace_dq and not inner and w[i + 1] == '}'))) {
           if (w[i + 1] != '\n') put(w[i + 1], true);
           i += 2;
           continue;
@@ -597,9 +944,9 @@ struct Scan {
       return arithmetic(w.substr(n + 1, e - n - 1), dq);
     }
     if (c == '{') {
+      CloseTooDeep = false;
       s::size_t e = find_close(w, n, dq);
-      if (e == strv::npos)
-        return s::unexpected(subst_error("bad substitution"));
+      if (e == strv::npos) return s::unexpected(unclosed_error());
       i = e + 1;
       return param(w.substr(n + 1, e - n - 1), dq);
     }
@@ -622,8 +969,13 @@ struct Scan {
           j = e + 1;
         }
       }
-    } else if (j < w.size() and (s::isdigit(static_cast<unsigned char>(w[j]))
-                                 or is_special_param(w[j]))) {
+    } else if (j < w.size() and s::isdigit(static_cast<unsigned char>(w[j]))) {
+      // $10 is the tenth argument; under KSH_ARRAYS it is $1 then `0`.
+      s::size_t s = j++;
+      if (not opts().get(OPT_KSH_ARRAYS))
+        while (j < w.size() and s::isdigit(static_cast<unsigned char>(w[j]))) ++j;
+      expr += w.substr(s, j - s);
+    } else if (j < w.size() and is_special_param(w[j])) {
       expr += w[j++];
     } else {
       put('$', dq or mode != Mode::Word);
@@ -710,9 +1062,18 @@ struct Scan {
     return out;
   }
 
-  Result<str> expand_scalar(strv text, Mode m = Mode::Heredoc) {
+  // `dq`: the text is read as if inside double quotes.
+  Result<str> expand_scalar(strv text, Mode m = Mode::Heredoc, bool dq = false) {
+    // `$(( $(( … )) ))` and the like recurse through here: nesting that
+    // would run the stack out fails instead.
+    if (stack_low()) return s::unexpected(subst_error("substitutions nested too deeply"));
+    return expand_scalar_at(text, m, dq);
+  }
+
+  Result<str> expand_scalar_at(strv text, Mode m, bool dq) {
     Scan sub{ex, m};
-    if (auto r = sub.scan(text); not r) return s::unexpected(r.error());
+    sub.brace_dq = dq;
+    if (auto r = sub.scan(text, dq); not r) return s::unexpected(r.error());
     str out;
     for (s::size_t k = 0; k < sub.fields.size(); ++k) {
       if (k) out += ' ';
@@ -723,7 +1084,7 @@ struct Scan {
 
   // Quotes come off before the arithmetic, as in zsh: (( "5" > x )).
   Result<MathNum> math(strv expr) {
-    auto text = expand_scalar(expr, Mode::Scalar);
+    auto text = expand_scalar(expr, Mode::Arith);
     if (not text) return s::unexpected(text.error());
     MathOptions mo = math_options(opts());
     mo.flagged_element = [this](const str& name, const str& sub) -> opt<str> {
@@ -740,6 +1101,23 @@ struct Scan {
     return v->as_int();
   }
 
+  // A subscript index: as zsh's getindex, the expanded text is evaluated
+  // only up to its first top-level comma (`i=2,3; ${a[$i]}` is ${a[2]}).
+  Result<s::int64_t> index(strv expr) {
+    auto text = expand_scalar(expr, Mode::Arith);
+    if (not text) return s::unexpected(text.error());
+    int depth = 0;
+    for (s::size_t k = 0; k < text->size(); ++k) {
+      char c = (*text)[k];
+      if (c == '(' or c == '[') ++depth;
+      else if (c == ')' or c == ']') --depth;
+      else if (c == ',' and depth == 0) { text->resize(k); break; }
+    }
+    auto v = math_eval(*text, ctx().params, math_options(opts()), &ctx().modules.math_funcs());
+    if (not v) return s::unexpected(v.error());
+    return v->as_int();
+  }
+
   Result<void> arithmetic(strv expr, bool dq) {
     auto v = math(expr);
     if (not v) return s::unexpected(v.error());
@@ -751,6 +1129,14 @@ struct Scan {
   // -------------------------------------------------------------------------
   // Parameters.
   // -------------------------------------------------------------------------
+  struct ParamResult {
+    Value v;
+    bool  keep_separate = false;   // "$@", "${a[@]}", "${(@)a}"
+    bool  split         = false;
+    bool  glob          = false;
+    bool  rc_expand     = false;   // ${^x}, RC_EXPAND_PARAM
+  };
+
   str option_letters() { return opts().letters(); }
 
   Value get_param(strv name, const ParamFlags& fl) {
@@ -784,14 +1170,14 @@ struct Scan {
     const Param& param = p->get();
     v.set = true;
     if (param.is_hash()) {
-      auto h = param.hash();
-      vec<str> keys;
-      for (auto& [k, _] : h) keys.push_back(k);
-      s::sort(keys.begin(), keys.end());
+      const auto& h = param.hash_ref();
+      vec<const s::pair<const str, str>*> items;
+      for (auto& kv : h) items.push_back(&kv);
+      s::sort(items.begin(), items.end(), [](auto* a, auto* b) { return a->first < b->first; });
       vec<str> out;
-      for (auto& k : keys) {
-        if (fl.keys) out.push_back(k);
-        if (fl.values or not fl.keys) out.push_back(h[k]);
+      for (auto* kv : items) {
+        if (fl.keys) out.push_back(kv->first);
+        if (fl.values or not fl.keys) out.push_back(kv->second);
       }
       v.make_array(s::move(out));
     } else if (param.is_array()) {
@@ -804,12 +1190,70 @@ struct Scan {
 
   str type_of(strv name) {
     auto p = ctx().params.lookup(name);
-    if (not p or not p->get().is_set()) {
-      if (name == "@" or name == "*" or name == "argv") return "array-special";
-      if (name == "?" or name == "$" or name == "#" or name == "!") return "integer-special";
-      return {};
+    bool set = p and p->get().is_set();
+    const SpecialType* sp = nullptr;
+    for (const auto& e : SPECIAL_TYPES) if (e.name == name) { sp = &e; break; }
+    // The positional and status parameters are always set.
+    bool always = sp and (name.size() == 1 or name == "ARGC" or name == "argv"
+                          or name == "status" or name == "pipestatus");
+    if (not set and not always) return {};
+    const Param* param = set ? &p->get() : nullptr;
+    str t = sp ? str(sp->type)
+          : param->is_hash() ? "association" : param->is_array() ? "array"
+          : param->is_integer() ? "integer" : param->is_float() ? "float" : "scalar";
+    if (param and param->flags & PM_LOCAL)               t += "-local";
+    if ((sp and sp->readonly) or (param and param->is_readonly())) t += "-readonly";
+    if (sp and sp->tied)                                 t += "-tied";
+    if (param and param->is_exported())                  t += "-export";
+    if (sp and sp->hide)                                 t += "-hide-hideval";
+    if (sp or (param and param->flags & PM_SPECIAL))     t += "-special";
+    return t;
+  }
+
+  // The value of a nested ${…}: one that ${=x} (or SH_WORD_SPLIT) splits
+  // is split here, before the outer level's subscripts and flags.
+  Value nested_value(const ParamResult& r, bool dq) {
+    Value v = r.v;
+    if (not r.split or dq or not v.set) return v;
+    str text = v.scalar;
+    if (v.array) {
+      str sep = ifs_first();
+      text.clear();
+      for (s::size_t k = 0; k < v.arr.size(); ++k) text += (k ? sep : str{}) + v.arr[k];
     }
-    return param_type_text(p->get());
+    v.make_array(ifs_split(text, ifs()));
+    return v;
+  }
+
+  // The `)` that ends the flags opened at t[open]: as zsh's flag parser,
+  // the delimited arguments of (j) (s) (l) (r) are skipped whole, so a
+  // quote or parenthesis in one is just text: ${(s:):)x}, "${(j:':)a}".
+  static s::size_t flags_end(strv t, s::size_t open) {
+    auto skip_arg = [&](s::size_t k) -> s::size_t {   // k at the opening delimiter
+      if (k >= t.size()) return strv::npos;
+      char o = t[k];
+      char c = o == '(' ? ')' : o == '[' ? ']' : o == '{' ? '}' : o == '<' ? '>' : o;
+      auto e = t.find(c, k + 1);
+      return e;
+    };
+    for (s::size_t k = open + 1; k < t.size(); ++k) {
+      char c = t[k];
+      if (c == ')') return k;
+      if (c == 'j' or c == 's' or c == 'Z') {
+        k = skip_arg(k + 1);
+        if (k == strv::npos) return k;
+      } else if (c == 'l' or c == 'r') {
+        // A width, then optional fill and once arguments with the same
+        // delimiter.
+        if (k + 1 >= t.size()) return strv::npos;
+        char o = t[k + 1];
+        k = skip_arg(k + 1);
+        for (int more = 0; more < 2 and k != strv::npos and k + 1 < t.size() and t[k + 1] == o; ++more)
+          k = skip_arg(k + 1);
+        if (k == strv::npos) return k;
+      }
+    }
+    return strv::npos;
   }
 
   Result<ParamFlags> parse_flags(strv f) {
@@ -817,6 +1261,9 @@ struct Scan {
     for (s::size_t i = 0; i < f.size(); ++i) {
       char c = f[i];
       auto delimited = [&]() -> Result<str> {
+        // zsh takes no `{` as a delimiter: it would end the ${.
+        if (i + 1 < f.size() and f[i + 1] == '{')
+          return s::unexpected(subst_error("error in flags"));
         auto a = read_delimited(f, i);
         if (not a) return s::unexpected(subst_error("error in flags"));
         return *a;
@@ -897,6 +1344,17 @@ struct Scan {
         break; case 'r':
           if (auto r = padding(fl.pad_r); not r) return s::unexpected(r.error());
         break; case 'f': fl.split = true; fl.split_sep = "\n";
+        break; case '0': fl.split = true; fl.split_sep = str(1, '\0');
+        break; case 'A': ++fl.array_assign;
+        break; case 'Z': {
+          auto a = delimited();
+          if (not a) return s::unexpected(a.error());
+          if (a->find_first_not_of("cCn") != str::npos)
+            return s::unexpected(subst_error("error in flags"));
+          // zsh splits nothing with an empty option list.
+          fl.split_words = not a->empty();
+          fl.z_opts = *a;
+        }
         break; case 'F': fl.join = true; fl.join_sep = "\n";
         break; case 'j': {
           auto a = delimited();
@@ -928,19 +1386,8 @@ struct Scan {
   // Index of the end of the nested substitution that starts at t[i].
   static s::size_t nested_end(strv t, s::size_t i) {
     if (t[i] == '"') {
-      // Substitutions inside it are passed over whole: "$(cmd "a")".
-      for (++i; i < t.size() and t[i] != '"'; ++i) {
-        if (t[i] == '\\') {
-          ++i;
-        } else if (t[i] == '$' and i + 1 < t.size() and (t[i + 1] == '(' or t[i + 1] == '{')) {
-          auto e = find_close(t, i + 1);
-          if (e != strv::npos) i = e;
-        } else if (t[i] == '`') {
-          auto e = t.find('`', i + 1);
-          if (e != strv::npos) i = e;
-        }
-      }
-      return s::min(i + 1, t.size());
+      auto e = dquote_end(t, i);
+      return e == strv::npos ? t.size() : e + 1;
     }
     // t[i] == '$'
     if (i + 1 < t.size() and (t[i + 1] == '{' or t[i + 1] == '(')) {
@@ -955,9 +1402,21 @@ struct Scan {
   }
 
   // Expands an operand of ${x:-word} etc.  Several words make an array.
-  Result<Value> operand(strv word, bool dq) {
-    Scan sub{ex, mode == Mode::Word ? Mode::Word : Mode::Scalar};
-    sub.in_brace = true;
+  // `split`: the substitution splits its result (${=x:-…}); `assign`:
+  // the operand of `=`, whose value is assigned as one string.
+  // `no_eq`: no ${=…} splitting inside (the `=` operand of a split result).
+  Result<Value> operand(strv word, bool dq, bool split = false, bool assign = false,
+                        bool no_eq = false) {
+    // zsh expands the operand as words (multsub) even in a word that stays
+    // one word: `y=${z:-${(s:,:)x}}` splits, and the words are joined later.
+    Scan sub{ex, Mode::Word};
+    sub.brace_dq = dq;
+    // There SH_WORD_SPLIT does not split a plain $x; ${=x} still does.
+    sub.no_shwordsplit = no_shwordsplit or mode != Mode::Word or assign;
+    // ${=x:-$v}: the operand's expansions split as for SH_WORD_SPLIT.
+    sub.force_split = force_split or split;
+    // Only at the operand's own level: deeper operands split as usual.
+    sub.no_eq_split = no_eq;
     if (auto r = sub.scan(word, dq); not r) return s::unexpected(r.error());
     Value v;
     v.set = true;
@@ -985,7 +1444,7 @@ struct Scan {
       if (k) pat += ' ';
       pat += sub.fields[k].as_pattern();
     }
-    return CompiledPattern::compile(pat, false, opts().extended_glob());
+    return CompiledPattern::compile(pat, false, opts().extended_glob(), opts().multibyte());
   }
 
   // `name[key]` where `name` has a get_elem handler and `key` is not @
@@ -1010,8 +1469,116 @@ struct Scan {
     return Result<Value>(s::move(v));
   }
 
-  // `keys`: (k), so an association's subscript gives the key; `values`
-  // (v) with it, the key and the value.
+  // The parameter that `ref`, the value of a (P) substitution, names; an
+  // invalid name is unset.  A subscript in it is evaluated as arithmetic
+  // or a key, but one that would expand anything (`a[$(cmd)]`) is not
+  // taken, unlike in zsh, so a value never runs a command.
+  Result<Value> indirect(strv ref, const ParamFlags& fl, str& name, ParamResult& res) {
+    s::size_t j = 0;
+    if (j < ref.size() and is_name_start(ref[j])) {
+      while (j < ref.size() and is_name_char(ref[j])) ++j;
+    } else if (j < ref.size() and s::isdigit(static_cast<unsigned char>(ref[j]))) {
+      while (j < ref.size() and s::isdigit(static_cast<unsigned char>(ref[j]))) ++j;
+    } else if (j < ref.size() and is_special_param(ref[j])) {
+      ++j;
+    }
+    name = str(ref.substr(0, j));
+    Value v;
+    if (j == 0) return v;
+    for (s::size_t k = j; k < ref.size(); ++k)
+      if (ref[k] == '$' or ref[k] == '`') return v;
+    if (fl.type and j == ref.size()) {
+      v.set = true;
+      v.make_scalar(type_of(name));
+      return v;
+    }
+    if (auto ev = element_view(name, ref, j)) {
+      if (not *ev) return s::unexpected(ev->error());
+      v = s::move(**ev);
+    } else {
+      v = get_param(name, fl);
+    }
+    if (name == "@") res.keep_separate = true;
+    // KSH_ARRAYS: an array named without a subscript is its first element.
+    if (j == ref.size() and opts().get(OPT_KSH_ARRAYS) and v.array
+        and name != "@" and name != "*") {
+      str first = v.arr.empty() ? str{} : v.arr[0];
+      v.make_scalar(s::move(first));
+    }
+    while (j < ref.size()) {
+      s::size_t e = ref[j] == '[' ? find_close(ref, j) : strv::npos;
+      if (e == strv::npos) return Value{};
+      bool all = false;
+      if (auto r = apply_subscript(v, ref.substr(j + 1, e - j - 1), name, all); not r)
+        return s::unexpected(r.error());
+      if (all) res.keep_separate = true;
+      j = e + 1;
+    }
+    return v;
+  }
+
+  // An external 1-based (zsh) or 0-based (KSH_ARRAYS) subscript as a
+  // 1-based internal index.  Below any first slot comes back as 0 or less
+  // so the callers can still clamp uniformly.
+  s::int64_t norm_index(s::int64_t i, s::int64_t n) {
+    if (opts().get(OPT_KSH_ARRAYS)) {
+      if (i < 0) i += n;
+      return i + 1;
+    }
+    if (i == 0 and opts().get(OPT_KSH_ZERO_SUBSCRIPT)) return 1;
+    return i < 0 ? n + i + 1 : i;
+  }
+
+  // ${a[i]} or ${h[key]} on an ordinary array or association: the one
+  // element, read in place rather than from a copy of the whole value.
+  // Null when the subscript is not a single index or key.
+  opt<Result<Value>> element_in_place(strv name, const ParamFlags& fl, strv t, s::size_t i) {
+    if (i >= t.size() or t[i] != '[') return s::nullopt;
+    auto p = ctx().params.lookup(name);
+    if (not p or not p->get().is_set() or not (p->get().is_array() or p->get().is_hash()))
+      return s::nullopt;
+    bool hash = p->get().is_hash();
+    s::size_t e = find_close(t, i);
+    if (e == strv::npos) return s::nullopt;
+    strv sub = t.substr(i + 1, e - i - 1);
+    if (sub.empty() or sub == "@" or sub == "*" or sub[0] == '(') return s::nullopt;
+    if (not hash) {
+      int depth = 0;
+      for (char c : sub) {
+        if (c == '(' or c == '[') ++depth;
+        else if (c == ')' or c == ']') --depth;
+        else if (c == ',' and depth == 0) return s::nullopt;
+      }
+    }
+    Value v;
+    bool key_only = fl.keys and not fl.values;
+    if (hash) {
+      auto key = expand_scalar(sub, Mode::Scalar);
+      if (not key) return Result<Value>(s::unexpected(key.error()));
+      // Expanding the key may have changed the table: look again.
+      auto q = ctx().params.lookup(name);
+      if (not q or not q->get().is_hash()) return Result<Value>(s::move(v));
+      const auto& h = q->get().hash_ref();
+      if (auto it = h.find(*key); it != h.end()) {
+        v.set = true;
+        v.make_scalar(key_only ? *key : it->second);
+      }
+      return Result<Value>(s::move(v));
+    }
+    auto idx = index(sub);
+    if (not idx) return Result<Value>(s::unexpected(idx.error()));
+    auto q = ctx().params.lookup(name);
+    if (not q or not q->get().is_array()) return Result<Value>(s::move(v));
+    const auto& arr = q->get().array_ref();
+    s::int64_t n = static_cast<s::int64_t>(arr.size());
+    s::int64_t a = norm_index(*idx, n);
+    if (a >= 1 and a <= n) {
+      v.set = true;
+      v.make_scalar(key_only ? s::to_string(*idx) : arr[static_cast<s::size_t>(a - 1)]);
+    }
+    return Result<Value>(s::move(v));
+  }
+
   Result<void> apply_subscript(Value& v, strv sub, strv name,
                                bool& all, bool keys = false, bool values = false) {
     if (sub == "@" or sub == "*") {
@@ -1039,7 +1606,9 @@ struct Scan {
     if (auto p = ctx().params.lookup(name); p and p->get().is_hash()) {
       auto key = expand_scalar(sub, Mode::Scalar);
       if (not key) return s::unexpected(key.error());
-      auto h = p->get().hash();
+      auto q = ctx().params.lookup(name);
+      static const umap<str, str> NO_HASH;
+      const auto& h = q and q->get().is_hash() ? q->get().hash_ref() : NO_HASH;
       auto it = h.find(*key);
       if (it == h.end()) { v.set = false; v.make_scalar(""); }
       else               v.make_scalar(keys ? it->first : it->second);
@@ -1052,66 +1621,43 @@ struct Scan {
       else if (sub[k] == ')' or sub[k] == ']') --depth;
       else if (sub[k] == ',' and depth == 0) { comma = k; break; }
     }
-    // A bound may be a search: a[1,(i)--] ends at the first `--`.
-    auto bound = [&](strv text) -> Result<s::int64_t> {
-      if (text.empty() or text[0] != '(') return arith(text);
-      auto e = find_close(text, 0);
-      if (e == strv::npos) return s::unexpected(subst_error("bad subscript"));
-      str flags(text.substr(1, e - 1));
-      for (char& c : flags) c = c == 'r' ? 'i' : c == 'R' ? 'I' : c;
-      Value copy = v;
-      if (auto r = subscript_flags(copy, flags, text.substr(e + 1), name); not r)
-        return s::unexpected(r.error());
-      return static_cast<s::int64_t>(s::strtoll(copy.scalar.c_str(), nullptr, 10));
-    };
-    auto lo = bound(sub.substr(0, comma));
+    auto lo = index(sub.substr(0, comma));
     if (not lo) return s::unexpected(lo.error());
     opt<s::int64_t> hi;
     if (comma != strv::npos) {
-      auto h = bound(sub.substr(comma + 1));
+      auto h = index(sub.substr(comma + 1));
       if (not h) return s::unexpected(h.error());
       hi = *h;
     }
-    // Normalise an external 1-based (zsh) or 0-based (KSH_ARRAYS)
-    // subscript into a 1-based internal index.  Below any first slot
-    // comes back as 0 so the callers can still clamp uniformly.
     bool ksh  = opts().get(OPT_KSH_ARRAYS);
-    bool kz   = opts().get(OPT_KSH_ZERO_SUBSCRIPT);
-    auto norm = [&](s::int64_t i, s::int64_t n) -> s::int64_t {
-      if (ksh) {
-        if (i < 0) i += n;
-        return i + 1;   // convert ksh 0-based to internal 1-based
-      }
-      if (i == 0 and kz) return 1;
-      return i < 0 ? n + i + 1 : i;
-    };
+    auto norm = [&](s::int64_t i, s::int64_t n) { return norm_index(i, n); };
     if (v.array) {
       s::int64_t n = static_cast<s::int64_t>(v.arr.size());
       s::int64_t a = norm(*lo, n);
       if (not hi) {
-        if (a >= 1 and a <= n) {
-          v.make_scalar(v.arr[static_cast<s::size_t>(a - 1)]);
-        } else {
-          v.make_scalar("");
-          v.set = false;
-        }
+        if (a >= 1 and a <= n) v.make_scalar(v.arr[static_cast<s::size_t>(a - 1)]);
+        else                   { v.make_scalar(""); v.set = false; }
         return {};
       }
       s::int64_t b = s::min(norm(*hi, n), n);
+      // A start before the first element selects nothing, unlike on a
+      // scalar, where it is clamped.
+      if (a < 1 and (*lo < 0 or ksh)) b = 0;
       a = s::max<s::int64_t>(a, 1);
       vec<str> out;
       for (s::int64_t k = a; k <= b; ++k) out.push_back(v.arr[static_cast<s::size_t>(k - 1)]);
       v.make_array(s::move(out));
       return {};
     }
-    s::int64_t n = static_cast<s::int64_t>(v.scalar.size());
+    Chars cs{v.scalar, opts().multibyte()};
+    s::int64_t n = static_cast<s::int64_t>(cs.size());
     s::int64_t a = norm(*lo, n);
     s::int64_t b = hi ? norm(*hi, n) : a;
     a = s::max<s::int64_t>(a, 1);
     b = s::min(b, n);
     v.make_scalar(a > b ? str{}
-                        : v.scalar.substr(static_cast<s::size_t>(a - 1),
-                                       static_cast<s::size_t>(b - a + 1)));
+                        : cs.sub(static_cast<s::size_t>(a - 1),
+                                 static_cast<s::size_t>(b - a + 1)));
     return {};
   }
 
@@ -1190,28 +1736,23 @@ struct Scan {
       pat_text += sub.fields[k].as_pattern();
     }
     bool extended = opts().extended_glob();
-    auto pat = CompiledPattern::compile(pat_text, false, extended);
+    auto pat = CompiledPattern::compile(pat_text, false, extended, opts().multibyte());
     auto test = [&](const str& s) { return exact ? s == text : pat.matches(s); };
 
     // Associations.
     if (auto p = ctx().params.lookup(name); not name.empty() and p and p->get().is_hash()) {
-      auto h = p->get().hash();
-      vec<str> keys;
-      for (auto& [key, _] : h) keys.push_back(key);
-      s::sort(keys.begin(), keys.end());
+      const auto& h = p->get().hash_ref();
+      vec<const str*> keys;
+      for (auto& [key, _] : h) keys.push_back(&key);
+      s::sort(keys.begin(), keys.end(), [](const str* a, const str* b) { return *a < *b; });
       vec<str> out;
-      for (auto& key : keys) {
+      for (const str* key : keys) {
+        const str& val = h.at(*key);
         bool hit = kind == 'k' or kind == 'K'
-            ? (exact ? key == text
-                     : CompiledPattern::compile(key, false, extended).matches(text))
-            : test(kind == 'i' or kind == 'I' ? key : h[key]);
-        if (not hit) continue;
-        if (kind == 'i' or kind == 'I') {
-          out.push_back(key);
-        } else {
-          if (want_keys) out.push_back(key);
-          if (want_values or not want_keys) out.push_back(h[key]);
-        }
+            ? (exact ? *key == text
+                     : CompiledPattern::compile(*key, false, extended, opts().multibyte()).matches(text))
+            : test(kind == 'i' or kind == 'I' ? *key : val);
+        if (hit) out.push_back(kind == 'i' or kind == 'I' ? *key : val);
       }
       if (kind == 'R' or kind == 'I' or kind == 'K') {
         v.set = true;
@@ -1225,17 +1766,16 @@ struct Scan {
 
     // Arrays, and scalars by character position.
     bool ksh = opts().get(OPT_KSH_ARRAYS);
-    s::int64_t n = static_cast<s::int64_t>(v.array ? v.arr.size() : v.scalar.size());
+    Chars cs{v.scalar, opts().multibyte()};
+    s::int64_t n = static_cast<s::int64_t>(v.array ? v.arr.size() : cs.size());
     auto hit_at = [&](s::int64_t k) {   // k is 1-based
       if (v.array) {
         const str& e = v.arr[static_cast<s::size_t>(k - 1)];
         return kind == 'k' or kind == 'K'
-            ? CompiledPattern::compile(e, false, extended).matches(text)
+            ? CompiledPattern::compile(e, false, extended, opts().multibyte()).matches(text)
             : test(e);
       }
-      // As zsh's getarg: each tail is a string of its own, so (#s) is
-      // where it starts.
-      strv rest = strv(v.scalar).substr(static_cast<s::size_t>(k - 1));
+      strv rest = strv(v.scalar).substr(cs.pos(static_cast<s::size_t>(k - 1)));
       return exact ? rest.starts_with(text) : pat.match_prefix(rest, false) != strv::npos;
     };
     bool backward = kind == 'R' or kind == 'I' or kind == 'K';
@@ -1260,21 +1800,55 @@ struct Scan {
     v.set = found != 0;
     if (not found)    v.make_scalar("");
     else if (v.array) v.make_scalar(v.arr[static_cast<s::size_t>(found - 1)]);
-    else              v.make_scalar(v.scalar.substr(static_cast<s::size_t>(found - 1), 1));
+    else              v.make_scalar(cs.sub(static_cast<s::size_t>(found - 1), 1));
     return {};
   }
 
-  static str modify(str s, char m) {
+  // :h and :t, with an optional count: `n` leading or trailing path
+  // components.  Trailing slashes are ignored.
+  static str path_head(const str& s, s::size_t n) {
+    s::size_t e = s.size();
+    while (e > 0 and s[e - 1] == '/') --e;
+    if (n == 0) {
+      if (e == 0) return s.empty() ? "." : "/";
+      auto sl = s.rfind('/', e - 1);
+      if (sl == str::npos) return ".";
+      while (sl > 0 and s[sl - 1] == '/') --sl;
+      return sl == 0 ? "/" : s.substr(0, sl);
+    }
+    if (e == 0) return s.empty() ? s : "/";
+    s::size_t i = 0, count = 0;
+    if (s[0] == '/') { i = 1; count = 1; }
+    while (count < n and i < s.size()) {
+      while (i < s.size() and s[i] == '/') ++i;
+      if (i == s.size()) break;
+      while (i < s.size() and s[i] != '/') ++i;
+      ++count;
+    }
+    if (count < n or s.find_first_not_of('/', i) == str::npos) return s;
+    return s.substr(0, i);
+  }
+  static str path_tail(const str& s, s::size_t n) {
+    s::size_t e = s.size();
+    while (e > 0 and s[e - 1] == '/') --e;
+    if (e == 0) return {};
+    s::size_t b = e;
+    for (s::size_t k = 0; k < s::max<s::size_t>(n, 1); ++k) {
+      if (k) {
+        while (b > 0 and s[b - 1] == '/') --b;
+        if (b == 0) return s.substr(0, e);
+      }
+      auto sl = s.rfind('/', b - 1);
+      if (sl == str::npos) return s.substr(0, e);
+      b = sl + 1;
+    }
+    return s.substr(b, e - b);
+  }
+
+  static str modify(str s, char m, s::size_t count, bool mb) {
     switch (m) {
-      case 'h': {
-        auto slash = s.rfind('/');
-        if (slash == str::npos) return ".";
-        return slash == 0 ? "/" : s.substr(0, slash);
-      }
-      case 't': {
-        auto slash = s.rfind('/');
-        return slash == str::npos ? s : s.substr(slash + 1);
-      }
+      case 'h': return path_head(s, count);
+      case 't': return path_tail(s, count);
       case 'r': {
         auto dot = s.rfind('.');
         auto slash = s.rfind('/');
@@ -1287,13 +1861,9 @@ struct Scan {
         if (dot == str::npos or (slash != str::npos and dot < slash)) return {};
         return s.substr(dot + 1);
       }
-      case 'u':
-        for (auto& ch : s) ch = static_cast<char>(s::toupper(static_cast<unsigned char>(ch)));
-        return s;
-      case 'l':
-        for (auto& ch : s) ch = static_cast<char>(s::tolower(static_cast<unsigned char>(ch)));
-        return s;
-      case 'q': return quote_backslash(s);
+      case 'u': return map_case(s, 'U', mb);
+      case 'l': return map_case(s, 'L', mb);
+      case 'q': return quote_backslash(s, mb);
       case 'Q': return remove_quotes(s);
       case 'a': case 'A': case 'P': {
         if (s.empty() or s[0] != '/') {
@@ -1399,93 +1969,10 @@ struct Scan {
     else         v.scalar = fn(v.scalar);
   }
 
-  // ${name/pat/repl}, ${name//pat/repl}, ${name:/pat/repl}.
-  // ${(A)name=…}: `name` becomes an array, or (hash) an association of
-  // the words taken as key/value pairs.
-  Result<void> assign_array(const str& name, vec<str> words, bool hash) {
-    auto& params = ctx().params;
-    if (not hash) {
-      auto p = params.lookup(name);
-      if (p and p->get().is_hash()) (void)params.unset(name);
-      return params.set_array(name, s::move(words));
-    }
-    if (words.size() % 2)
-      return s::unexpected(subst_error("bad set of key/value pairs for associative array"));
-    umap<str, str> h;
-    for (s::size_t k = 0; k + 1 < words.size(); k += 2) h[words[k]] = words[k + 1];
-    auto p = params.lookup(name);
-    if (p and p->get().is_readonly())
-      return s::unexpected(subst_error("read-only variable: " + name));
-    if (not p) {
-      (void)params.set_array(name, {});
-      p = params.lookup(name);
-    }
-    p->get().set(s::move(h));
-    return {};
-  }
-
-  // (I:expr:): which match, 1 without.
-  Result<s::int64_t> nth_match(const ParamFlags& fl) {
-    if (fl.nth.empty()) return 1;
-    return arith(fl.nth);
-  }
-
-  // zsh's getmatch for ${x#pat} ${x##pat} ${x%pat} ${x%%pat}: the match,
-  // anchored at the start (or, for `end`, the end) or with (S) anywhere,
-  // the first (last for `end`) or (I:n:) nth; then what the flags ask
-  // for: (M) the match, (R) the rest (the default), (B) (E) (N) its
-  // start, end and length.  No match is an empty one at the start.
-  static str get_match(const str& s, const CompiledPattern& pat, bool end, bool longest,
-                       const ParamFlags& fl, s::int64_t nth) {
-    s::size_t n = s.size(), mb = 0, me = 0;
-    if (not fl.m_substr) {
-      if (not end) {
-        s::size_t len = pat.match_prefix(s, longest);
-        if (len != str::npos) me = len;
-      } else {
-        for (s::size_t k = 0; k <= n; ++k) {
-          s::size_t b = longest ? k : n - k;
-          if (pat.matches(s, b, s.size())) {
-            mb = b;
-            me = n;
-            break;
-          }
-        }
-      }
-    } else {
-      for (s::size_t k = 0; k <= n; ++k) {
-        s::size_t b = end ? n - k : k;
-        s::size_t len = pat.match_prefix(s, b, longest);
-        if (len == str::npos or --nth > 0) continue;
-        mb = b;
-        me = b + len;
-        break;
-      }
-    }
-    str out;
-    bool rest = fl.m_rest or not (fl.match_mode or fl.m_begin or fl.m_end or fl.m_len);
-    if (fl.match_mode) out += s.substr(mb, me - mb);
-    if (rest) out += s.substr(0, mb) + s.substr(me);
-    auto num = [&](s::size_t v) {
-      if (not out.empty()) out += ' ';
-      out += s::to_string(v);
-    };
-    if (fl.m_begin) num(mb + 1);
-    if (fl.m_end) num(me + 1);
-    if (fl.m_len) num(me - mb);
-    return out;
-  }
-
-  // The replacement for a match of s[b, b + len), whose backreferences
-  // are in the PatternMatch.
-  using ReplaceFn = func<Result<str>(s::size_t, s::size_t, const PatternMatch&)>;
-
-  // zsh's igetmatch for ${x/pat/r}: `anchor` is 'w' (the whole value),
-  // '#' (the start), '%' (the end) or 0 (anywhere); `shortest` is (S),
-  // `nth` (I:n:) skips the matches before it.
-  static Result<str> substitute(const str& s, const CompiledPattern& pat, bool global,
-                                char anchor, bool shortest, s::int64_t nth,
-                                const ReplaceFn& repl) {
+  // ${name/pat/repl}, ${name//pat/repl}, ${name:/pat/repl}.  Matches are
+  // tried at character starts only.
+  static str replace(const str& s, const CompiledPattern& pat,
+                     const str& repl, bool global, char anchor, bool mb) {
     s::size_t n = s.size();
     PatternMatch pm;
     if (anchor == 'w') {
@@ -1499,30 +1986,24 @@ struct Scan {
       if (not r) return r;
       return *r + s.substr(len);
     }
+    Chars cs{s, mb};
     if (anchor == '%') {
-      for (s::size_t k = 0; k <= n; ++k) {
-        s::size_t b = shortest ? n - k : k;
-        if (pat.matches(s, b, n, &pm)) {
-          auto r = repl(b, n - b, pm);
-          if (not r) return r;
-          return s.substr(0, b) + *r;
-        }
-      }
+      for (s::size_t k = 0; k <= cs.size(); ++k)
+        if (pat.matches(strv(s).substr(cs.pos(k)))) return s.substr(0, cs.pos(k)) + repl;
       return s;
     }
     str out;
-    // `last_hit`: the step that got to `b` was a match (one, or an empty
-    // one and the character after it).  As in zsh, the empty match at the
-    // end is tried unless that step reached it, and, without `global`,
-    // only when nothing matched: ${x//(b|(#e))/Z} on `abcd` is `aZcdZ`,
-    // ${x//a#/q} on `aaab` is `qqb`.
-    bool done = false, any = false, last_hit = false;
-    for (s::size_t b = 0; b < n;) {
-      s::size_t len = done ? str::npos : pat.match_prefix(s, b, not shortest, &pm);
-      if (len == str::npos) {
-        out += s[b];
-        ++b;
-        last_hit = false;
+    bool done = false;
+    for (s::size_t k = 0; k <= cs.size();) {
+      s::size_t b = cs.pos(k);
+      // zsh tries no empty match at the end of a non-empty string.
+      s::size_t len = done or (b == n and n > 0)
+          ? str::npos : pat.match_prefix(strv(s).substr(b), true);
+      if (len == str::npos or len == 0) {
+        if (len == 0) out += repl;
+        if (len == 0 and not global) done = true;
+        if (b < n) out += cs.sub(k, 1);
+        ++k;
         continue;
       }
       any = last_hit = true;
@@ -1536,12 +2017,9 @@ struct Scan {
       if (not r) return r;
       out += *r;
       if (not global) done = true;
-      if (len == 0) {
-        out += s[b];
-        ++b;
-      } else {
-        b += len;
-      }
+      // Resume at the first character start at or after the match.
+      s::size_t e = b + len;
+      while (k <= cs.size() and cs.pos(k) < e) ++k;
     }
     if (not last_hit and (global or not any) and nth <= 1
         and pat.match_prefix(s, n, false, &pm) == 0) {
@@ -1577,7 +2055,9 @@ struct Scan {
 
   // ${…}: `t` is the text between the braces.
   Result<void> param(strv t, bool dq) {
-    auto r = param_value(t, dq);
+    // At the top of the `=` operand of a result that is to be split, zsh
+    // (PREFORK_SINGLE) also skips (s) and (f).
+    auto r = param_value(t, dq, mode != Mode::Word or no_eq_split);
     if (not r) return s::unexpected(r.error());
     auto& [v, keep_separate, split, glob, rc_expand] = *r;
     if (mode != Mode::Word) {
@@ -1585,9 +2065,9 @@ struct Scan {
       // ${~x} and GLOB_SUBST make the value's characters active.
       bool literal = dq or not (glob or glob_values);
       if (v.array) {
-        str joined;
+        str sep = ifs_first(), joined;
         for (s::size_t k = 0; k < v.arr.size(); ++k) {
-          if (k) joined += ' ';
+          if (k) joined += sep;
           joined += v.arr[k];
         }
         put(joined, literal);
@@ -1617,20 +2097,111 @@ struct Scan {
     }
     bool lit = not glob;
     // ${x:-word}: the operand's own words, so `*` in `word` still globs.
+    // ${^z:=…} under SH_WORD_SPLIT, ${^=v}: a scalar value that splits
+    // into words makes their product (an operand's own words, and a value
+    // with no words, stay as before).
+    if (rc_expand and not v.array and split and not v.words_current()) {
+      // Every piece, the empty ones that leading or trailing IFS
+      // whitespace leaves included, as zsh keeps them under ${^…}.
+      vec<str> parts;
+      for (auto& p : ifs_pieces(v.scalar, ifs())) parts.push_back(s::move(p.text));
+      if (not parts.empty()) {
+        rc_splice(parts, lit);
+        return {};
+      }
+    }
     rc_expand = rc_expand and v.array;
+    if (not rc_expand and split and v.words_current()) {
+      // ${=x:-word}, or SH_WORD_SPLIT: the operand's words split at their
+      // unquoted IFS characters (an expansion's value was split when the
+      // operand was scanned); each piece keeps its quoting and pattern
+      // characters, so `a\ b` stays one word and `a*` still globs.
+      str sep = ifs();
+      bool first = true;
+      for (auto& wd : v.words) {
+        s::size_t n = wd.text.size(), k = 0;
+        auto is_sep = [&](s::size_t i) {
+          return not wd.lit[i] and sep.find(wd.text[i]) != str::npos;
+        };
+        auto emit = [&](s::size_t from, s::size_t to, bool quoted) {
+          if (not first) new_field(quoted);
+          if (quoted) mark_quoted();
+          for (s::size_t c = from; c < to; ++c) {
+            char ch = wd.text[c];
+            bool l = wd.lit[c];
+            put(ch, glob ? l and strv("{},").find(ch) != strv::npos : l);
+          }
+          first = false;
+        };
+        // A quoted string that began at q belongs to the piece [from, to]
+        // around it; one inside a run of separators is an empty word.
+        auto quoted_in = [&](s::size_t from, s::size_t to) {
+          return s::any_of(wd.qmarks.begin(), wd.qmarks.end(),
+                           [&](s::size_t q) { return q >= from and q <= to; });
+        };
+        bool any = false;
+        while (k < n or (not any and k == n)) {
+          s::size_t run = k;
+          while (k < n and is_sep(k)) ++k;
+          // Empty quoted words inside the separators [run, k).
+          s::size_t last = str::npos;
+          for (s::size_t q : wd.qmarks)
+            if (q != last and (q > run or (q == run and run == 0))
+                and (q < k or (q == k and k == n))) {
+              emit(q, q, true);
+              any = true;
+              last = q;
+            }
+          if (k >= n) break;
+          s::size_t e = k;
+          while (e < n and not is_sep(e)) ++e;
+          emit(k, e, wd.quoted and quoted_in(k, e));
+          any = true;
+          k = e;
+        }
+        if (not any and wd.quoted) {   // a quoted empty word stays
+          emit(0, 0, true);
+        }
+      }
+      return {};
+    }
     if (not rc_expand and v.words_current()) {
       for (s::size_t k = 0; k < v.words.size(); ++k) {
         if (k) new_field(v.words[k].quoted);
         if (v.words[k].quoted) mark_quoted();
-        if (glob) put(strv(v.words[k].text), false);
-        else for (s::size_t c = 0; c < v.words[k].text.size(); ++c)
-          put(v.words[k].text[c], static_cast<bool>(v.words[k].lit[c]));
+        // ${~x:-word} makes the word's characters pattern syntax; its
+        // braces and commas stay as written.
+        for (s::size_t c = 0; c < v.words[k].text.size(); ++c) {
+          char ch = v.words[k].text[c];
+          bool l = v.words[k].lit[c];
+          put(ch, glob ? l and strv("{},").find(ch) != strv::npos : l);
+        }
       }
       return {};
     }
+    if (v.array and split and not rc_expand) {
+      // zsh joins the elements, then splits the result.
+      str sep = ifs_first(), joined;
+      for (s::size_t k = 0; k < v.arr.size(); ++k) {
+        if (k) joined += sep;
+        joined += v.arr[k];
+      }
+      splice_split(joined, lit);
+      return {};
+    }
+    if (v.array and no_eq_split) {
+      // Inside the `=` operand of a result that is to be split (zsh's
+      // PREFORK_SINGLE) an array is its elements joined, empty ones
+      // included, with no ${^…} product.
+      str sep = ifs_first(), joined;
+      for (s::size_t k = 0; k < v.arr.size(); ++k) joined += (k ? sep : str{}) + v.arr[k];
+      put(strv(joined), lit);
+      return {};
+    }
     if (v.array) {
-      vec<str> parts;
-      for (auto& e : v.list()) if (rc_expand or v.quoted_elems or not e.empty()) parts.push_back(e);
+      // Empty elements stay: one glued to text is part of a word, and an
+      // empty word on its own goes away later.
+      vec<str> parts = v.arr;
       if (split) {
         str sep = ifs();
         vec<str> words;
@@ -1638,35 +2209,28 @@ struct Scan {
           for (auto& w : ifs_split(e, sep)) words.push_back(w);
         parts = s::move(words);
       }
-      if (rc_expand) {
-        rc_splice(parts, lit);
-      } else if (v.quoted_elems) {
-        mark_quoted();
-        splice(parts, lit, true);
-      } else {
-        splice(parts, lit, false);
-      }
+      if (rc_expand) rc_splice(parts, lit, not split and v.words_current() ? &v.words : nullptr);
+      else           splice(parts, lit, false);
       return {};
     }
     if (split) splice_split(v.scalar, lit);
     else       put(v.scalar, lit);
     return {};
   }
+  // `single`: the outermost ${…} of a word that stays one word (an
+  // assignment, a here-string, a pattern), where zsh does no splitting.
+  Result<ParamResult> param_value(strv t, bool dq, bool single = false) {
+    // Nested ${…} past what the stack holds fails instead of crashing.
+    if (stack_low()) return s::unexpected(subst_error("substitutions nested too deeply"));
+    return param_value_at(t, dq, single);
+  }
 
-  struct ParamResult {
-    Value v;
-    bool  keep_separate = false;   // "$@", "${a[@]}", "${(@)a}"
-    bool  split         = false;
-    bool  glob          = false;
-    bool  rc_expand     = false;   // ${^x}, RC_EXPAND_PARAM
-  };
-
-  Result<ParamResult> param_value(strv t, bool dq) {
+  Result<ParamResult> param_value_at(strv t, bool dq, bool single) {
     ParamResult res;
     s::size_t i = 0;
     ParamFlags fl;
     if (i < t.size() and t[i] == '(') {
-      auto e = find_close(t, i);
+      auto e = flags_end(t, i);
       if (e == strv::npos) return s::unexpected(subst_error("bad substitution"));
       auto f = parse_flags(t.substr(i + 1, e - i - 1));
       if (not f) return s::unexpected(f.error());
@@ -1674,7 +2238,8 @@ struct Scan {
       i = e + 1;
     }
     bool length = false, plus = false;
-    bool eq_split = opts().get(OPT_SHWORDSPLIT);
+    bool eq_split = (opts().get(OPT_SHWORDSPLIT) and not no_shwordsplit) or force_split;
+    bool eq_given = false;   // ${=x}: splits even in double quotes
     bool glob = opts().get(OPT_GLOBSUBST);
     bool rc_expand = opts().get(OPT_RCEXPANDPARAM);
     // Prefix operators: ${=x} ${==x} ${~x} ${~~x} ${^x} ${^^x} ${+x} ${#x}.
@@ -1682,11 +2247,11 @@ struct Scan {
       char c = t[i], n = t[i + 1];
       // ${#:-word}: the length of the word (an empty subject).
       bool subject = is_name_start(n) or is_special_param(n) or n == '$' or n == '"'
-                  or s::isdigit(static_cast<unsigned char>(n))
-                  or (c == '#' and n == ':' and i + 2 < t.size() and t[i + 2] == '-');
+                  or s::isdigit(static_cast<unsigned char>(n)) or n == ':';
       if (c == '=' or c == '~') {
         bool twice = n == c;
         (c == '=' ? eq_split : glob) = not twice;
+        if (c == '=') eq_given = not twice;
         i += twice ? 2 : 1;
       } else if (c == '^') {
         rc_expand = n != '^';
@@ -1702,10 +2267,13 @@ struct Scan {
       }
     }
 
+    if (no_eq_split) eq_split = eq_given = false;
+
     // The subject: a name, a special parameter, or a nested substitution.
     str name;
     Value v;
     bool nested = false;
+    bool subscripted = false;   // the first subscript is applied already
     if (i + 1 < t.size() and (t[i] == '$' or t[i] == '"')) {
       nested = true;
       s::size_t e = nested_end(t, i);
@@ -1713,30 +2281,12 @@ struct Scan {
       if (inner.size() > 2 and inner[0] == '$' and inner[1] == '{') {
         auto r = param_value(inner.substr(2, inner.size() - 3), dq);
         if (not r) return s::unexpected(r.error());
-        v = r->v;
-        res.keep_separate = r->keep_separate;
-        // Unquoted, the inner result's empty elements go, as when it is
-        // a word list: ${#${a}}.
-        if (not dq and v.array and not v.quoted_elems)
-          s::erase_if(v.arr, [](const str& e) { return e.empty(); });
+        v = nested_value(*r, dq);
       } else if (inner.size() > 1 and inner[0] == '$'
                  and inner[1] != '(' and inner[1] != '[') {
         auto r = param_value(inner.substr(1), dq);
         if (not r) return s::unexpected(r.error());
-        v = r->v;
-        res.keep_separate = r->keep_separate;
-      } else if (inner[0] == '"') {
-        // ${~"${(@s.:.)x}"}: the words of the quoted string, kept apart
-        // where (@) keeps them.
-        Scan sub{ex, Mode::Word};
-        if (auto r = sub.scan(inner); not r) return s::unexpected(r.error());
-        vec<str> words;
-        for (auto& f : sub.fields)
-          if (not f.dropped and (f.quoted or not f.text.empty())) words.push_back(f.text);
-        v.set = true;
-        v.quoted_elems = true;
-        if (words.size() == 1) v.make_scalar(words[0]);
-        else                   v.make_array(s::move(words));
+        v = nested_value(*r, dq);
       } else {
         auto s = expand_scalar(inner, Mode::Scalar);
         if (not s) return s::unexpected(s.error());
@@ -1765,27 +2315,14 @@ struct Scan {
         while (i < t.size() and s::isdigit(static_cast<unsigned char>(t[i]))) ++i;
       } else if (i < t.size() and is_special_param(t[i])) {
         ++i;
-      } else if (i < t.size() and t[i] == ':') {
-        // ${:-word}, ${(z):-word}: no parameter, so the word.
-        nested = true;
-      } else {
+      } else if (i < t.size() and strv(":-+=?#%/").find(t[i]) == strv::npos) {
         return s::unexpected(subst_error("bad substitution"));
       }
+      // No name at all, as in ${:-word}: an unset parameter.
       name = str(t.substr(s, i - s));
       if (fl.indirect) {
-        // ${(P)a[2]}: the subscript picks the name, which is then looked up.
-        Value ref = get_param(name, fl);
-        if (i < t.size() and t[i] == '[') {
-          s::size_t e = find_close(t, i);
-          if (e == strv::npos) return s::unexpected(subst_error("bad substitution"));
-          bool all = false;
-          if (auto r = apply_subscript(ref, t.substr(i + 1, e - i - 1), name, all, fl.keys); not r)
-            return s::unexpected(r.error());
-          i = e + 1;
-        }
-        name = ref.array ? (ref.arr.empty() ? "" : ref.arr[0]) : ref.scalar;
-      }
-      if (fl.type) {
+        v = get_param(name, ParamFlags{});
+      } else if (fl.type) {
         v.set = true;
         v.make_scalar(type_of(name));
       } else if (auto ev = element_view(name, t, i)) {
@@ -1793,17 +2330,36 @@ struct Scan {
         // `${h[key]}` reads that key only, not the whole table.
         if (not *ev) return s::unexpected(ev->error());
         v = s::move(**ev);
+      } else if (auto el = element_in_place(name, fl, t, i)) {
+        if (not *el) return s::unexpected(el->error());
+        v = s::move(**el);
+        subscripted = true;
       } else {
         v = get_param(name, fl);
       }
       if (name == "@") res.keep_separate = true;
     }
 
+    // The parameter as error messages name it: `a[5]: parameter not set`.
+    str label = name;
+    // KSH_ARRAYS: an array named without a subscript is its first element.
+    if (opts().get(OPT_KSH_ARRAYS) and not nested and v.array and not fl.indirect
+        and name != "@" and name != "*" and (i >= t.size() or t[i] != '[')) {
+      str first = v.arr.empty() ? str{} : v.arr[0];
+      v.make_scalar(s::move(first));
+    }
     // Subscripts, possibly several: ${a[2][1]}.
     s::size_t subscripts = i;
     while (i < t.size() and t[i] == '[') {
+      CloseTooDeep = false;
       s::size_t e = find_close(t, i);
-      if (e == strv::npos) return s::unexpected(subst_error("bad substitution"));
+      if (e == strv::npos) return s::unexpected(unclosed_error());
+      label += t.substr(i, e - i + 1);
+      if (subscripted) {   // done in place already
+        subscripted = false;
+        i = e + 1;
+        continue;
+      }
       bool all = false;
       if (auto r = apply_subscript(v, t.substr(i + 1, e - i - 1), nested ? "" : name, all,
                                    fl.keys, fl.values);
@@ -1811,6 +2367,16 @@ struct Scan {
         return s::unexpected(r.error());
       if (all) res.keep_separate = true;
       i = e + 1;
+    }
+    if (fl.indirect) {
+      // (P): the value so far names the parameter, perhaps with a
+      // subscript (`a[2]`).
+      str ref = v.array ? (v.arr.empty() ? str{} : v.arr[0]) : v.scalar;
+      auto r = indirect(ref, fl, name, res);
+      if (not r) return s::unexpected(r.error());
+      v = s::move(*r);
+      if (not ref.empty()) label = ref;
+      nested = false;
     }
     if (fl.at) res.keep_separate = true;
 
@@ -1826,6 +2392,10 @@ struct Scan {
     strv op = t.substr(i);
     bool special = not name.empty() and (is_special_param(name[0])
                     or s::isdigit(static_cast<unsigned char>(name[0])));
+    // NO_UNSET: special parameters are always set, except positional
+    // parameters past the last.
+    bool nounset_error = not v.set and not opts().get(OPT_UNSET) and not nested
+                     and not label.empty();
 
     // Double-quoted joining happens before the operators.
     auto join_dq = [&] {
@@ -1839,11 +2409,20 @@ struct Scan {
       }
     };
 
+    bool from_operand = false;   // the value is that of ${x:-word} and the like
     if (not op.empty()) {
       bool colon = op[0] == ':';
       strv rest = colon ? op.substr(1) : op;
+      // ${x::=word} assigns unconditionally.
+      bool force_assign = colon and rest.starts_with(":=");
+      if (force_assign) rest.remove_prefix(1);
       char o = rest.empty() ? 0 : rest[0];
+      // In double quotes (without (@)) an array is null when its joined
+      // value is: ("") is, ("" "") is not unless IFS is empty.
       bool null = not v.set or (v.array ? v.arr.empty() : v.scalar.empty());
+      if (v.set and v.array and dq and not res.keep_separate and not null)
+        null = s::all_of(v.arr.begin(), v.arr.end(), [](const str& e) { return e.empty(); })
+           and (v.arr.size() == 1 or ifs_first().empty());
       bool empty_test = colon ? null : not v.set;
       // ${x::=word} assigns unconditionally.
       bool force_assign = colon and rest.starts_with(":=");
@@ -1856,60 +2435,85 @@ struct Scan {
         switch (o) {
           case '-':
             if (empty_test) {
-              auto w = operand(word, dq);
+              auto w = operand(word, dq, eq_given and eq_split);
               if (not w) return s::unexpected(w.error());
               v = *w;
+              from_operand = true;
             }
           break; case '+':
             if (empty_test) { v.set = true; v.make_scalar(""); }
             else {
-              auto w = operand(word, dq);
+              auto w = operand(word, dq, eq_given and eq_split);
               if (not w) return s::unexpected(w.error());
               v = *w;
+              from_operand = true;
             }
           break; case '=':
             if (empty_test or force_assign) {
+              if (not nested and name.empty())
+                return s::unexpected(subst_error("not an identifier: "));
               if (nested or special)
                 return s::unexpected(subst_error("can't set " + str(name)));
-              auto w = operand(word, dq);
+              // When the result will be split (${=…}, or SH_WORD_SPLIT where
+              // words are made), zsh assigns the operand with no ${=…},
+              // SH_WORD_SPLIT, (s) or (f) splitting at its own top level
+              // (multsub with PREFORK_SINGLE); one level deeper they apply.
+              // With (A) its words are split instead.
+              bool will_split = eq_split and (eq_given or mode == Mode::Word);
+              auto w = operand(word, dq, false, true, will_split and not fl.array_assign);
               if (not w) return s::unexpected(w.error());
+              if (eq_split and fl.array_assign) {
+                vec<str> parts;
+                for (auto& e : w->list())
+                  for (auto& p : ifs_split(e, ifs())) parts.push_back(s::move(p));
+                w->make_array(s::move(parts));
+              }
               Result<void> r;
-              if (fl.assign) {
-                // (A) assigns an array, (AA) an association.
+              if (fl.array_assign) {
+                // (A): the words become an array; (AA): an association's
+                // key/value pairs.  An empty operand is an empty one.
                 vec<str> words = w->array ? w->arr
                                : w->scalar.empty() ? vec<str>{} : vec<str>{w->scalar};
-                r = assign_array(name, s::move(words), fl.assign == 2);
-                if (r) {
-                  w->set = true;
-                  w->make_array(get_param(name, ParamFlags{}).list());
+                // (s:sep:) and (f) split the words before they are assigned.
+                if (fl.split and not fl.split_sep.empty()) {
+                  vec<str> parts;
+                  for (auto& wd : words)
+                    for (auto& part : split_on(wd, fl.split_sep))
+                      if (not part.empty()) parts.push_back(s::move(part));
+                  words = s::move(parts);
                 }
-              } else if (not subscripted.empty()) {
-                // ${h[key]:=word}: that element.
-                auto key = expand_scalar(subscripted.substr(1, subscripted.size() - 2),
-                                         Mode::Scalar);
-                if (not key) return s::unexpected(key.error());
-                Assignment as;
-                as.name = name;
-                as.value = w->array ? (w->arr.empty() ? str{} : w->arr[0]) : w->scalar;
-                as.subscript = *key;
-                r = ex.exec().assign_expanded(as);
+                if (fl.array_assign >= 2) {
+                  auto p = ctx().params.lookup(name);
+                  if (not p or not p->get().is_hash())
+                    ctx().params.assign(name, umap<str, str>{}, PM_HASH);
+                }
+                r = ctx().params.set_array(name, words);
+                if (fl.array_assign >= 2) {
+                  vec<str> values;
+                  for (s::size_t k = 1; k < words.size(); k += 2) values.push_back(words[k]);
+                  words = s::move(values);
+                }
+                w->make_array(s::move(words));
               } else {
-                r = w->array ? ctx().params.set_array(name, w->arr)
-                             : ctx().params.set_scalar(name, w->scalar);
+                // zsh assigns, and goes on with, the words joined as one
+                // string; only that result is split by SH_WORD_SPLIT.
+                if (w->array) {
+                  str sep = ifs_first(), joined;
+                  for (s::size_t k = 0; k < w->arr.size(); ++k) joined += (k ? sep : str{}) + w->arr[k];
+                  w->make_scalar(s::move(joined));
+                }
+                w->words.clear();   // the result is a plain value now
+                r = ctx().params.set_scalar(name, w->scalar);
               }
               if (not r) return s::unexpected(r.error());
               v = *w;
             }
           break; default:  // '?'
             if (empty_test) {
-              str msg = word.empty()
-                  ? (v.set ? "parameter null" : "parameter not set")
-                  : str(word);
-              if (not word.empty()) {
-                auto w = expand_scalar(word, Mode::Scalar);
-                if (w) msg = *w;
-              }
-              return s::unexpected(subst_error(name + ": " + msg));
+              // zsh 5.9 prints the word as written: no expansion, no
+              // quote removal (`${x:?'boom'}` says `x: 'boom'`).
+              str msg = word.empty() ? str("parameter not set") : nice_text(word);
+              return s::unexpected(subst_error(label + ": " + msg));
             }
         }
         join_dq();
@@ -1919,6 +2523,7 @@ struct Scan {
         // in M13 Phase 13a.  The pattern operand is read with `dq=false`
         // so glob characters stay active even when the whole
         // substitution is in a double-quoted context.
+        join_dq();
         auto pat = operand_pattern(rest.substr(1), /*dq=*/false);
         if (not pat) return s::unexpected(pat.error());
         auto keep = [&](const str& s) {
@@ -1944,15 +2549,27 @@ struct Scan {
         if (v.array) v.make_array(s::move(out));
         else         v.make_scalar(out.empty() ? str{} : out[0]);
       } else if (not colon and (o == '#' or o == '%')) {
-        if (not v.set and not opts().get(OPT_UNSET) and not special)
-          return s::unexpected(subst_error(name + ": parameter not set"));
+        if (nounset_error)
+          return s::unexpected(subst_error(label + ": parameter not set"));
         join_dq();
         bool longest = rest.size() > 1 and rest[1] == o;
-        auto pat = operand_pattern(rest.substr(longest ? 2 : 1), /*dq=*/false);
+        auto pat = operand_pattern(rest.substr(longest ? 2 : 1), false);
         if (not pat) return s::unexpected(pat.error());
-        auto nth = nth_match(fl);
-        if (not nth) return s::unexpected(nth.error());
-        each(v, [&](const str& s) { return get_match(s, *pat, o == '%', longest, fl, *nth); });
+        bool mb = opts().multibyte();
+        each(v, [&](const str& s) {
+          if (o == '#') {
+            s::size_t len = pat->match_prefix(s, longest);
+            return len == str::npos ? s : s.substr(len);
+          }
+          // Suffix: the shortest suffix starts as far right as possible.
+          Chars cs{s, mb};
+          s::size_t n = cs.size();
+          for (s::size_t k = 0; k <= n; ++k) {
+            s::size_t b = cs.pos(longest ? k : n - k);
+            if (pat->matches(strv(s).substr(b))) return s.substr(0, b);
+          }
+          return s;
+        });
       } else if (o == '/') {
         join_dq();
         strv body = rest.substr(1);
@@ -1962,7 +2579,7 @@ struct Scan {
           global = true;
           body.remove_prefix(1);
         }
-        // `#` or `%` anchors, after `//` too (${y//#/Z} is Zabc, as zsh).
+        // An anchor may follow `//` as well: ${y//#/Q}.
         if (not body.empty() and (body[0] == '#' or body[0] == '%')) {
           anchor = body[0];
           body.remove_prefix(1);
@@ -1972,38 +2589,35 @@ struct Scan {
           if (body[k] == '\\') { ++k; continue; }
           if (body[k] == '/') { slash = k; break; }
         }
-        auto pat = operand_pattern(body.substr(0, slash), /*dq=*/false);
+        auto pat = operand_pattern(body.substr(0, slash), false);
         if (not pat) return s::unexpected(pat.error());
-        auto nth = nth_match(fl);
-        if (not nth) return s::unexpected(nth.error());
-        strv repl_text = slash != strv::npos ? body.substr(slash + 1) : strv{};
-        if (pat->backrefs() or pat->sets_match()) {
-          // (#b) and (#m): the replacement is expanded for each match, with
-          // $match and $MATCH set to it.
-          opt<ShellError> err;
-          each(v, [&](const str& s) {
-            if (err) return s;
-            auto r = replace_each(s, *pat, repl_text, global, anchor, fl.m_substr, *nth);
-            if (not r) {
-              err = r.error();
-              return s;
-            }
-            return *r;
-          });
-          if (err) return s::unexpected(*err);
-        } else {
-          str repl;
-          if (slash != strv::npos) {
-            auto r = expand_scalar(repl_text, Mode::Scalar);
+        str repl;
+        if (slash != strv::npos) {
+          // In double quotes the replacement is read as double-quoted
+          // text; the pattern is not, so `"${x#*/}"` still matches.
+          if (dq) {
+            auto r = expand_scalar(body.substr(slash + 1), Mode::Scalar, dq);
             if (not r) return s::unexpected(r.error());
             repl = *r;
+          } else {
+            // Unquoted, a leading `~` expands: ${x/b/~} gives a$HOME…
+            Scan sub{ex, Mode::Scalar};
+            if (auto r = sub.scan(body.substr(slash + 1)); not r) return s::unexpected(r.error());
+            Field all;
+            for (s::size_t k = 0; k < sub.fields.size(); ++k) {
+              if (k) all.put(' ', true);
+              all.append(sub.fields[k]);
+            }
+            if (auto r = tilde_expand(all, false, ctx()); not r) return s::unexpected(r.error());
+            repl = s::move(all.text);
           }
-          each(v, [&](const str& s) {
-            return replace(s, *pat, repl, global, anchor, fl.m_substr, *nth);
-          });
         }
-      } else if (colon and (o == 0 or s::isdigit(static_cast<unsigned char>(o))
-                            or o == ' ' or o == '(' or o == '$')) {
+        bool mb = opts().multibyte();
+        each(v, [&](const str& s) { return replace(s, *pat, repl, global, anchor, mb); });
+      } else if (colon and o == 0) {
+        return s::unexpected(subst_error("unrecognized modifier"));
+      } else if (colon and (s::isdigit(static_cast<unsigned char>(o))
+                            or strv(" ($\"'").find(o) != strv::npos)) {
         // ${x:offset} / ${x:offset:length}, 0-based.
         join_dq();
         s::size_t c2 = find_top_colon(rest);
@@ -2015,21 +2629,32 @@ struct Scan {
           if (not l) return s::unexpected(l.error());
           len = *l;
         }
-        auto cut = [&](s::int64_t n, s::int64_t& b, s::int64_t& e) {
+        // [b, e) of n items.  n + x cannot overflow for n >= 0 and x < 0,
+        // and b + len is only formed when it stays below n.
+        s::int64_t b = 0, e = 0;
+        auto cut = [&](s::int64_t n) -> Result<void> {
           b = *off < 0 ? s::max<s::int64_t>(0, n + *off) : s::min(*off, n);
-          e = not len ? n : (*len < 0 ? s::max(b, n + *len) : s::min(n, b + *len));
+          if (not len)       e = n;
+          else if (*len < 0) e = n + *len;
+          else               e = *len >= n - b ? n : b + *len;
+          if (e < b) {
+            if (len and *len < 0)
+              return s::unexpected(subst_error("substring expression: "
+                  + s::to_string(e) + " < " + s::to_string(b)));
+            e = b;
+          }
+          return {};
         };
         // $@ and $* count $0 as offset 0, as zsh (and bash) do.
         if (v.array and not nested and (name == "@" or name == "*"))
           v.arr.insert(v.arr.begin(), get_param("0", ParamFlags{}).scalar);
         if (v.array) {
-          s::int64_t b, e;
-          cut(static_cast<s::int64_t>(v.arr.size()), b, e);
+          if (auto r = cut(static_cast<s::int64_t>(v.arr.size())); not r) return s::unexpected(r.error());
           v.make_array(vec<str>(v.arr.begin() + b, v.arr.begin() + e));
         } else {
-          s::int64_t b, e;
-          cut(static_cast<s::int64_t>(v.scalar.size()), b, e);
-          v.make_scalar(v.scalar.substr(static_cast<s::size_t>(b), static_cast<s::size_t>(e - b)));
+          Chars cs{v.scalar, opts().multibyte()};
+          if (auto r = cut(static_cast<s::int64_t>(cs.size())); not r) return s::unexpected(r.error());
+          v.make_scalar(cs.sub(static_cast<s::size_t>(b), static_cast<s::size_t>(e - b)));
         }
       } else if (colon and (strv("htreulqQaAcPs&").find(o) != strv::npos or o == 'g')) {
         join_dq();
@@ -2037,14 +2662,75 @@ struct Scan {
         // plus :s/pat/repl/ (and :gs/pat/repl/ for global), the
         // history-style substitution modifier (M13 Phase 13a), and :& for
         // "repeat the last :s".
-        if (auto r = apply_modifiers(v, op); not r) return s::unexpected(r.error());
+        strv mods = op;
+        opt<str> last_pat, last_repl;
+        while (mods.size() >= 2 and mods[0] == ':') {
+          char m = mods[1];
+          bool global = false;
+          if (m == 'g' and mods.size() >= 3 and (mods[2] == 's' or mods[2] == '&')) {
+            global = true;
+            mods.remove_prefix(1);
+            m = mods[1];
+          }
+          if (m == 's' or m == '&') {
+            str pat_text, repl_text;
+            if (m == 's') {
+              if (mods.size() < 4) return s::unexpected(subst_error("bad substitution"));
+              char delim = mods[2];
+              s::size_t mid = mods.find(delim, 3);
+              if (mid == strv::npos)
+                return s::unexpected(subst_error("bad substitution"));
+              s::size_t end = mods.find(delim, mid + 1);
+              if (end == strv::npos) end = mods.size();
+              pat_text  = str(mods.substr(3, mid - 3));
+              repl_text = str(mods.substr(mid + 1, end - mid - 1));
+              last_pat  = pat_text;
+              last_repl = repl_text;
+              mods.remove_prefix(end < mods.size() ? end + 1 : mods.size());
+            } else {
+              if (not last_pat)
+                return s::unexpected(subst_error(":& without a preceding :s"));
+              pat_text  = *last_pat;
+              repl_text = *last_repl;
+              mods.remove_prefix(2);
+            }
+            auto cp = CompiledPattern::compile(pat_text, false,
+                                               opts().get(OPT_EXTENDEDGLOB), opts().multibyte());
+            bool g = global;
+            each(v, [&](const str& s) {
+              return replace(s, cp, repl_text, g, /*anchor=*/0, opts().multibyte());
+            });
+            continue;
+          }
+          if (strv("htreulqQaAcP").find(m) == strv::npos)
+            return s::unexpected(
+                subst_error("unrecognized modifier `" + str(1, m) + "'"));
+          mods.remove_prefix(2);
+          // :h2, :t3: a count of path components.
+          s::size_t count = 0;
+          if (m == 'h' or m == 't')
+            while (not mods.empty() and s::isdigit(static_cast<unsigned char>(mods[0]))) {
+              count = s::min<s::size_t>(count * 10 + static_cast<s::size_t>(mods[0] - '0'), 1u << 20);
+              mods.remove_prefix(1);
+            }
+          if (m == 'c') {
+            // :c — the command's path, as `=cmd` would give.
+            each(v, [&](const str& s) { return ex.exec().find_command(s).value_or(s); });
+          } else {
+            bool mb = opts().multibyte();
+            each(v, [&](const str& s) { return modify(s, m, count, mb); });
+          }
+        }
+        if (not mods.empty()) return s::unexpected(subst_error("bad substitution"));
+      } else if (colon and s::isalpha(static_cast<unsigned char>(o))) {
+        return s::unexpected(
+            subst_error("unrecognized modifier `" + str(1, o) + "'"));
       } else {
         return s::unexpected(subst_error("bad substitution"));
       }
     } else {
-      if (not v.set and not opts().get(OPT_UNSET) and not special and not nested)
-        return s::unexpected(subst_error(name + str(subscripted)
-                                         + ": parameter not set"));
+      if (nounset_error)
+        return s::unexpected(subst_error(label + ": parameter not set"));
       // M13 Phase 13a: don't pre-join arrays here — the (V)/(#)/(c)/(w)/
       // (D) flags below work element-wise through each(), and the final
       // dq-join at the end of this function still collapses the array
@@ -2052,7 +2738,30 @@ struct Scan {
     }
 
     if (length) {
-      s::size_t n = v.array ? v.arr.size() : v.scalar.size();
+      bool mb = opts().multibyte();
+      s::size_t n = v.array ? v.arr.size() : Chars{v.scalar, mb}.size();
+      // (w) counts words and (c) characters, an array's elements being
+      // joined with spaces first.
+      if ((fl.count_w or fl.count_c) and (v.array or fl.count_w)) {
+        str all = v.scalar;
+        if (v.array) {
+          all.clear();
+          for (s::size_t k = 0; k < v.arr.size(); ++k) all += (k ? " " : "") + v.arr[k];
+        }
+        if (fl.count_c) {
+          n = Chars{all, mb}.size();
+        } else if (fl.split and not fl.split_sep.empty()) {
+          n = 0;
+          for (s::size_t b = 0;;) {
+            auto e = all.find(fl.split_sep, b);
+            if ((e == str::npos ? all.size() : e) > b) ++n;
+            if (e == str::npos) break;
+            b = e + fl.split_sep.size();
+          }
+        } else {
+          n = ifs_split(all, ifs()).size();
+        }
+      }
       v.set = true;
       v.make_scalar(s::to_string(n));
       res.v = s::move(v);
@@ -2067,87 +2776,77 @@ struct Scan {
       }
       v.make_scalar(joined);
     }
-    if (fl.split or fl.split_words) {
-      // A split stays words of their own in double quotes, as in zsh.
-      if (dq) res.keep_separate = true;
+    // Splitting (rule 11 of zsh's list).  An array is joined first unless
+    // (@) keeps its elements apart.  In double quotes the pieces stay
+    // separate words; there, as zsh does, empty pieces of (s)/(f) between
+    // the first and the last go away unless (@) is given.
+    // An operand's value in double quotes is not split by `=` (zsh splits
+    // only its unquoted text; jfsh, like the base, splits none of it).
+    bool dq_eq_split = dq and eq_split and eq_given and not from_operand;
+    // (z) splits even where the word stays one word, as zsh's shsplit.
+    if (fl.split_words or ((fl.split or dq_eq_split) and not single)) {
+      if (v.array and not fl.at) {
+        str sep = ifs_first(), joined;
+        for (s::size_t k = 0; k < v.arr.size(); ++k) {
+          if (k) joined += sep;
+          joined += v.arr[k];
+        }
+        v.make_scalar(s::move(joined));
+      }
       vec<str> out;
       for (auto& s : v.list()) {
+        if (not fl.split and not fl.split_words) {
+          for (auto& p : ifs_pieces(s, ifs())) out.push_back(s::move(p.text));
+          continue;
+        }
         if (fl.split_words) {
-          s::size_t before = out.size();
-          // In double quotes nothing to split is one empty word.
-          struct EmptyWord {
-            ~EmptyWord() { if (dq and out.size() == before) out.emplace_back(); }
-            vec<str>& out;
-            s::size_t before;
-            bool dq;
-          } empty_word{out, before, dq};
-          // (Z:C:) drops comments, (Z:n:) takes newlines as blanks.
-          StringInputSource in{s};
-          Lexer lex{in};
-          if (fl.z_opts.find('C') != str::npos) lex.push_state(LEX_SKIPCOMMENTS);
-          bool newline_blank = fl.z_opts.find('n') != str::npos;
-          for (;;) {
-            auto tok = lex.next_token();
-            if (tok.is_eof()) break;
-            if (tok.is_newline()) {
-              if (not newline_blank) out.push_back(";");
-            } else {
-              out.push_back(tok.text);
-            }
-          }
+          z_words(s, fl.z_opts, out);
           continue;
         }
         if (fl.split_sep.empty()) {
-          for (char ch : s) out.emplace_back(1, ch);
+          Chars cs{s, opts().multibyte()};
+          for (s::size_t k = 0; k < cs.size(); ++k) out.push_back(cs.sub(k, 1));
           continue;
         }
-        s::size_t b = 0;
-        vec<str> parts;
-        for (;;) {
-          auto e = s.find(fl.split_sep, b);
-          parts.push_back(s.substr(b, e == str::npos ? str::npos : e - b));
-          if (e == str::npos) break;
-          b = e + fl.split_sep.size();
-        }
-        for (s::size_t k = 0; k < parts.size(); ++k) {
-          // In double quotes with (@) empty fields stay: "${(@s.:.)x}".
-          // Without it, as zsh's sepsplit, a run of separators is one, but
-          // an empty field at either end stays ("${(s:,:)x}" on `,a` is
-          // `` and `a`; on nothing, one empty word).
-          bool end = k == 0 or k + 1 == parts.size();
-          if (not parts[k].empty() or (dq and (fl.at or end))) out.push_back(s::move(parts[k]));
-        }
+        for (auto& part : split_on(s, fl.split_sep)) out.push_back(s::move(part));
       }
+      if (not dq)
+        s::erase_if(out, [](const str& p) { return p.empty(); });
+      else if (fl.split and not fl.at and out.size() > 2)
+        out.erase(s::remove_if(out.begin() + 1, out.end() - 1,
+                               [](const str& p) { return p.empty(); }),
+                  out.end() - 1);
+      if (dq and out.empty()) out.emplace_back();
       v.make_array(s::move(out));
       eq_split = false;
+      if (dq) res.keep_separate = true;
     }
     if (fl.upper or fl.lower or fl.capitalize) {
-      each(v, [&](str s) {
-        bool start = true;
-        for (auto& ch : s) {
-          unsigned char u = static_cast<unsigned char>(ch);
-          if (fl.upper) ch = static_cast<char>(s::toupper(u));
-          else if (fl.lower) ch = static_cast<char>(s::tolower(u));
-          else {
-            ch = static_cast<char>(start ? s::toupper(u) : s::tolower(u));
-            start = not s::isalnum(u);
-          }
-        }
-        return s;
-      });
+      char how = fl.upper ? 'U' : fl.lower ? 'L' : 'C';
+      bool mb = opts().multibyte();
+      each(v, [&](const str& s) { return map_case(s, how, mb); });
     }
-    if (v.array and (fl.sort_asc or fl.sort_desc or fl.sort_numeric or fl.sort_nocase)) {
-      auto key_less = [&](const str& a, const str& b) {
-        if (fl.sort_nocase) {
-          str x = a, y = b;
-          for (char& c : x) c = static_cast<char>(s::tolower(static_cast<unsigned char>(c)));
-          for (char& c : y) c = static_cast<char>(s::tolower(static_cast<unsigned char>(c)));
-          return zstrcmp(x, y, fl.sort_numeric) < 0;
-        }
-        return zstrcmp(a, b, fl.sort_numeric) < 0;
-      };
-      s::stable_sort(v.arr.begin(), v.arr.end(), key_less);
-      if (fl.sort_desc) s::reverse(v.arr.begin(), v.arr.end());
+    // Sorting; (i) and (n) alone sort ascending too.
+    if (v.array and (fl.sort_asc or fl.sort_desc or fl.sort_nocase or fl.sort_numeric)) {
+      bool mb = opts().multibyte();
+      // Without (n) the strxfrm() keys compare bytewise, which is much
+      // cheaper than strcoll() per comparison.
+      vec<s::pair<str, s::size_t>> keys;
+      keys.reserve(v.arr.size());
+      for (s::size_t k = 0; k < v.arr.size(); ++k) {
+        str key = fl.sort_nocase ? map_case(v.arr[k], 'L', mb) : v.arr[k];
+        keys.emplace_back(fl.sort_numeric ? s::move(key) : collate_key(key), k);
+      }
+      s::stable_sort(keys.begin(), keys.end(), [&](const auto& a, const auto& b) {
+        if (not fl.sort_numeric) return a.first < b.first;
+        if (fl.sort_nocase and a.first == b.first) return false;
+        return collate(a.first, b.first, true) < 0;
+      });
+      vec<str> sorted;
+      sorted.reserve(keys.size());
+      for (auto& [_, k] : keys) sorted.push_back(s::move(v.arr[k]));
+      if (fl.sort_desc) s::reverse(sorted.begin(), sorted.end());
+      v.arr = s::move(sorted);
     }
     if (v.array and fl.unique) {
       uset<str> seen;
@@ -2156,24 +2855,15 @@ struct Scan {
       v.arr = s::move(out);
     }
     if (fl.unquote) each(v, [](const str& s) { return remove_quotes(s); });
-    if (fl.escapes_g) each(v, [](const str& s) { return c_escapes(s); });
-    if (fl.quote_pat) {
-      each(v, [](const str& s) {
-        str out;
-        for (char c : s) {
-          if (PATTERN_CHARS.find(c) != strv::npos) out += '\\';
-          out += c;
-        }
-        return out;
-      });
-    }
-    if (fl.quote == -2) each(v, [](const str& s) { return quote_minimal_plus(s); });
+    bool mb = opts().multibyte();
+    // An empty word quotes as '' so that it survives being read back.
     if (fl.quote == -1) each(v, [](const str& s) { return quote_minimal(s); });
+    else if (fl.quote == -2) each(v, [&](const str& s) { return quote_plus(s, mb); });
     else if (fl.quote == 1)
-      each(v, [](const str& s) { return s.empty() ? str("''") : quote_backslash(s); });
+      each(v, [&](const str& s) { return s.empty() ? str("''") : quote_backslash(s, mb); });
     else if (fl.quote == 2) each(v, [](const str& s) { return quote_single(s); });
     else if (fl.quote == 3) each(v, [](const str& s) { return quote_double(s); });
-    else if (fl.quote >= 4) each(v, [](const str& s) { return quote_dollar(s); });
+    else if (fl.quote >= 4) each(v, [&](const str& s) { return quote_dollar(s, mb); });
 
     // (D) — abbreviate home-relative paths as `~` / `~user`.  Only the
     // shell's own $HOME is consulted; the named-dir table is M17.
@@ -2197,7 +2887,8 @@ struct Scan {
       each(v, [](str s) -> str {
         if (s.empty()) return "''";
         str out;
-        for (unsigned char c : s) {
+        for (char ch : s) {
+          auto c = static_cast<unsigned char>(ch);
           if      (c == '\t') out += "\\t";
           else if (c == '\n') out += "\\n";
           else if (c == '\r') out += "\\r";
@@ -2225,7 +2916,7 @@ struct Scan {
     // (c) — replace each element with its character length (same semantic
     // as ${#x}, but per-element for arrays).
     if (fl.count_c) {
-      each(v, [](const str& s) { return s::to_string(s.size()); });
+      each(v, [&](const str& s) { return s::to_string(Chars{s, mb}.size()); });
     }
 
     // (w) — count words in each element (after `ifs`-style split).  For a
@@ -2284,11 +2975,12 @@ struct Scan {
       }
       each(v, [&](const str& s) {
         if (wl and wr) {
-          s::size_t half = s.size() / 2;
-          return pad_word(s.substr(0, half), *wl, fl.pad_l, true)
-               + pad_word(s.substr(half), *wr, fl.pad_r, false);
+          Chars cs{s, mb};
+          s::size_t half = cs.size() / 2;
+          return pad_word(cs.sub(0, half), *wl, fl.pad_l, true, mb)
+               + pad_word(cs.sub(half, cs.size()), *wr, fl.pad_r, false, mb);
         }
-        return wl ? pad_word(s, *wl, fl.pad_l, true) : pad_word(s, *wr, fl.pad_r, false);
+        return wl ? pad_word(s, *wl, fl.pad_l, true, mb) : pad_word(s, *wr, fl.pad_r, false, mb);
       });
     }
 
@@ -2297,6 +2989,132 @@ struct Scan {
     res.glob  = glob or fl.glob_pat;
     res.rc_expand = rc_expand;
     return res;
+  }
+
+  // (z): the shell words of `s`, a newline being `;`.  An array
+  // assignment in command position comes apart as zsh's lexer gives it:
+  // `y=(`, its elements, `)`.
+  // (z) and (Z:opts:).  With c or C a `#` that starts a word starts a
+  // comment running to the end of its line, quotes in it included: c keeps
+  // it as one word, C drops it.  With n a newline is a blank, not `;`.
+  static void z_words(strv s, strv opts, vec<str>& out) {
+    bool keep = opts.find('c') != strv::npos, drop = opts.find('C') != strv::npos;
+    bool blank = opts.find('n') != strv::npos;
+    if (not keep and not drop) { blank ? code_blank(s, out) : shell_words(s, out); return; }
+    // Find the comments: outside quotes and substitutions, at the start
+    // of a word (after an unescaped blank).
+    s::size_t from = 0;
+    bool sq = false, dq = false, word_start = true;
+    for (s::size_t k = 0; k < s.size(); ++k) {
+      char c = s[k];
+      bool start = word_start;
+      word_start = false;
+      if (sq) { if (c == '\'') sq = false; continue; }
+      if (c == '\\') { ++k; continue; }
+      if (dq) { if (c == '"') dq = false; continue; }
+      if (c == '\'') { sq = true; continue; }
+      if (c == '"') { dq = true; continue; }
+      if (c == '`') {
+        for (++k; k < s.size() and s[k] != '`'; ++k)
+          if (s[k] == '\\') ++k;
+        continue;
+      }
+      if ((c == '$' or c == '<' or c == '>') and k + 1 < s.size()
+          and (s[k + 1] == '(' or (c == '$' and (s[k + 1] == '{' or s[k + 1] == '[')))) {
+        auto e = find_close(s, k + 1);
+        k = e == strv::npos ? s.size() : e;
+        continue;
+      }
+      if (strv(" \t\n;|&").find(c) != strv::npos) { word_start = true; continue; }
+      if (c != '#' or not start) continue;
+      auto e = s.find('\n', k);
+      if (e == strv::npos) e = s.size();
+      if (blank) code_blank(s.substr(from, k - from), out);
+      else       shell_words(s.substr(from, k - from), out);
+      if (keep) out.emplace_back(s.substr(k, e - k));
+      from = k = e;   // the newline itself goes with the code after
+      if (k >= s.size()) break;
+      --k;
+    }
+    if (from < s.size()) {
+      if (blank) code_blank(s.substr(from), out);
+      else       shell_words(s.substr(from), out);
+    }
+  }
+
+  // shell_words() with each newline taken as a blank.
+  static void code_blank(strv s, vec<str>& out) {
+    str t(s);
+    bool sq = false, dq = false;
+    for (s::size_t k = 0; k < t.size(); ++k) {
+      char c = t[k];
+      if (sq) { if (c == '\'') sq = false; continue; }
+      if (c == '\\') { ++k; continue; }
+      if (c == '"') { dq = not dq; continue; }
+      if (dq) continue;
+      if (c == '\'') { sq = true; continue; }
+      if (c == '\n') t[k] = ' ';
+    }
+    shell_words(t, out);
+  }
+
+  static void shell_words(strv s, vec<str>& out) {
+    StringInputSource in{str(s)};
+    Lexer lex{in};
+    bool command = true;   // the next word starts a simple command
+    for (;;) {
+      auto tok = lex.next_token();
+      if (tok.is_eof()) break;
+      if (tok.is_newline()) { out.push_back(";"); command = true; continue; }
+      const str& w = tok.text;
+      s::size_t k = 0;
+      while (k < w.size() and is_name_char(w[k])) ++k;
+      if (k > 0 and k < w.size() and w[k] == '[') {
+        auto e = find_close(w, k);
+        k = e == strv::npos ? 0 : e + 1;
+      }
+      if (k < w.size() and w[k] == '+') ++k;
+      bool assign = k > 0 and is_name_start(w[0]) and k < w.size() and w[k] == '=';
+      bool array = command and assign and w.compare(k, 2, "=(") == 0 and w.back() == ')';
+      bool sep = w == ";" or w == "|" or w == "||" or w == "&&" or w == "&" or w == "|&"
+              or w == ";;" or w == "(" or w == "{";
+      command = sep or (command and assign);
+      if (not array) { out.push_back(w); continue; }
+      out.push_back(w.substr(0, k + 2));
+      array_words(strv(w).substr(k + 2, w.size() - k - 3), out);
+      out.push_back(")");
+    }
+  }
+
+  // The elements of `name=(…)` for (z): words split on blanks outside
+  // quotes, substitutions and parentheses.
+  static void array_words(strv s, vec<str>& out) {
+    str cur;
+    int depth = 0;
+    auto flush = [&] { if (not cur.empty()) out.push_back(s::move(cur)); cur.clear(); };
+    for (s::size_t i = 0; i < s.size(); ++i) {
+      char c = s[i];
+      s::size_t e = strv::npos;
+      if (c == '\\' and i + 1 < s.size()) e = i + 1;
+      else if (c == '\'') e = s.find('\'', i + 1);
+      else if (c == '"') e = dquote_end(s, i);
+      else if (c == '$' and i + 1 < s.size() and strv("({[").find(s[i + 1]) != strv::npos)
+        e = find_close(s, i + 1);
+      if (e != strv::npos) {
+        cur += s.substr(i, e - i + 1);
+        i = e;
+        continue;
+      }
+      if (depth == 0 and (c == ' ' or c == '\t' or c == '\n')) {
+        flush();
+        if (c == '\n') out.push_back(";");
+        continue;
+      }
+      if (c == '(') ++depth;
+      else if (c == ')' and depth > 0) --depth;
+      cur += c;
+    }
+    flush();
   }
 
   static s::size_t find_top_colon(strv s) {
@@ -2314,129 +3132,334 @@ struct Scan {
 // Brace expansion.
 // ---------------------------------------------------------------------------
 
-// Parses `a..b` or `a..b..step` (numbers or single characters) and returns
-// the sequence, or nothing when `s` is not a sequence.
-opt<vec<str>> brace_sequence(strv s) {
-  auto dots = s.find("..");
-  if (dots == strv::npos) return s::nullopt;
-  strv a = s.substr(0, dots), rest = s.substr(dots + 2);
-  strv b = rest, step_s;
-  if (auto d2 = rest.find(".."); d2 != strv::npos) {
-    b = rest.substr(0, d2);
-    step_s = rest.substr(d2 + 2);
-  }
-  auto is_int = [](strv x) {
-    if (x.empty()) return false;
-    s::size_t k = (x[0] == '-' or x[0] == '+') ? 1 : 0;
-    if (k == x.size()) return false;
-    for (; k < x.size(); ++k)
-      if (not s::isdigit(static_cast<unsigned char>(x[k]))) return false;
-    return true;
-  };
-  s::int64_t step = 1;
-  if (not step_s.empty()) {
-    if (not is_int(step_s)) return s::nullopt;
-    s::int64_t v = s::strtoll(str(step_s).c_str(), nullptr, 10);
-    step = v == INT64_MIN ? INT64_MAX : s::abs(v);
-    if (step == 0) step = 1;
-  }
-  vec<str> out;
-  if (is_int(a) and is_int(b)) {
-    s::int64_t x = s::strtoll(str(a).c_str(), nullptr, 10);
-    s::int64_t y = s::strtoll(str(b).c_str(), nullptr, 10);
-    auto padded = [](strv v) {
-      strv d = (v[0] == '-' or v[0] == '+') ? v.substr(1) : v;
-      return d.size() > 1 and d[0] == '0';
-    };
-    s::size_t width = (padded(a) or padded(b)) ? s::max(a.size(), b.size()) : 0;
-    // Step towards y without overflowing past it.
-    using U = s::uint64_t;
-    for (s::int64_t k = x;;) {
-      out.push_back(s::to_string(k));
-      U left = x <= y ? static_cast<U>(y) - static_cast<U>(k)
-                      : static_cast<U>(k) - static_cast<U>(y);
-      if (left < static_cast<U>(step)) break;
-      k = x <= y ? k + step : k - step;
+// zsh's BRACE_CCL set: the characters of `{…}`, `x-y` adding a range.
+vec<char> brace_ccl(strv t) {
+  bool in[256] = {};
+  int last = -1;
+  for (s::size_t k = 0; k < t.size(); ++k) {
+    int c = static_cast<unsigned char>(t[k]);
+    int next = k + 1 < t.size() ? static_cast<unsigned char>(t[k + 1]) : -1;
+    if (c == '-' and last >= 0 and next >= 0 and last <= next) {
+      while (last < next) in[last++] = true;
+      last = -1;
+    } else {
+      in[last = c] = true;
     }
-    if (width)
-      for (auto& e : out) {
-        bool neg = e[0] == '-';
-        str digits = neg ? e.substr(1) : e;
-        s::size_t want = width - (neg ? 1 : 0);
-        if (digits.size() < want) digits.insert(0, want - digits.size(), '0');
-        e = (neg ? "-" : "") + digits;
-      }
-    return out;
   }
-  if (a.size() == 1 and b.size() == 1) {
-    int x = static_cast<unsigned char>(a[0]), y = static_cast<unsigned char>(b[0]);
-    int by = static_cast<int>(step);
-    if (x <= y)
-      for (int k = x; k <= y; k += by) out.emplace_back(1, static_cast<char>(k));
-    else
-      for (int k = x; k >= y; k -= by) out.emplace_back(1, static_cast<char>(k));
-    return out;
-  }
-  return s::nullopt;
+  vec<char> out;
+  for (int c = 1; c < 256; ++c) if (in[c]) out.push_back(static_cast<char>(c));
+  return out;
 }
 
-void brace_expand(const Field& f, bool ccl, vec<Field>& out) {
-  for (s::size_t b = 0; b < f.text.size(); ++b) {
-    if (f.text[b] != '{' or not f.unlit(b)) continue;
-    // Find the matching unquoted `}` and the top-level commas.
-    int depth = 0;
-    s::size_t e = str::npos;
-    vec<s::size_t> commas;
-    for (s::size_t k = b + 1; k < f.text.size(); ++k) {
-      if (not f.unlit(k)) continue;
-      char c = f.text[k];
-      if (c == '{') ++depth;
-      else if (c == '}') {
-        if (depth == 0) { e = k; break; }
-        --depth;
-      } else if (c == ',' and depth == 0) {
-        commas.push_back(k);
-      }
-    }
-    if (e == str::npos) return out.push_back(f);
-    Field prefix = f.slice(0, b), suffix = f.slice(e + 1, f.text.size());
-    vec<Field> alts;
-    if (not commas.empty()) {
-      s::size_t s = b + 1;
-      for (s::size_t c : commas) { alts.push_back(f.slice(s, c)); s = c + 1; }
-      alts.push_back(f.slice(s, e));
-    } else {
-      Field inner = f.slice(b + 1, e);
-      // A range expands whatever made its text, as in zsh: {1..$#a},
-      // {"1"..3}; only the braces must be unquoted.
-      if (auto seq = brace_sequence(inner.text)) {
-        for (auto& s : *seq) {
-          Field a;
-          a.put(s, false);
-          alts.push_back(s::move(a));
+// Brace expansion follows zsh's hasbraces() and xpandbraces() (glob.c).
+// An active brace or comma is one written unquoted in the script (Field::put
+// keeps those of a value literal); has_braces() makes literal the ones
+// that cannot take part in an expansion, as zsh untokenizes them.
+struct BraceScan {
+  struct CharRange { char32_t from, to; };
+  struct Number { s::int64_t value; s::size_t end; };
+
+  // Scans field.text up to `end`, the end of the range being expanded.
+  BraceScan(Field& field, s::size_t end) : f{field}, n{end} {}
+
+  bool tok(s::size_t k, char c) const { return k < n and f.text[k] == c and not f.lit[k]; }
+  bool digit(s::size_t k) const {
+    return k < n and s::isdigit(static_cast<unsigned char>(f.text[k]));
+  }
+  bool dots(s::size_t k) const { return k + 1 < n and f.text[k] == '.' and f.text[k + 1] == '.'; }
+  void literal(s::size_t k) { f.lit[k] = true; }
+
+  // zsh's bracechardots(): `{x..y}` with single characters, at f.text[p].
+  opt<CharRange> char_dots(s::size_t p, bool mb) const {
+    s::size_t q = p + 1;
+    auto take = [&](char32_t& c) {
+      if (q >= n or tok(q, '{')) return false;
+      s::size_t len = 1;
+      c = mb ? utf8_decode(f.text, q, len) : static_cast<unsigned char>(f.text[q]);
+      q += len;
+      return true;
+    };
+    char32_t a = 0, b = 0;
+    if (not take(a) or not dots(q)) return s::nullopt;
+    q += 2;
+    if (not take(b) or not tok(q, '}')) return s::nullopt;
+    return CharRange{a, b};
+  }
+
+  // zsh's hasbraces() from f.text[from]: whether an expansion is left.
+  bool has_braces(s::size_t from, bool ccl, bool mb) {
+    if (ccl) {
+      int bc = 0;
+      for (s::size_t k = from; k < n; ++k) {
+        if (tok(k, '{')) {
+          if (bc == 0 and tok(k + 1, '}')) { literal(k); literal(k + 1); ++k; }
+          else ++bc;
+        } else if (tok(k, '}')) {
+          if (bc == 0) literal(k);
+          else if (--bc == 0) return true;
         }
       }
-      if (alts.empty() and ccl and not inner.text.empty()) {
-        vec<char> chars(inner.text.begin(), inner.text.end());
-        s::sort(chars.begin(), chars.end());
-        chars.erase(s::unique(chars.begin(), chars.end()), chars.end());
-        for (char c : chars) {
-          Field a;
-          a.put(c, true);
-          alts.push_back(s::move(a));
+      return false;
+    }
+    constexpr s::size_t NO = static_cast<s::size_t>(-1);
+    s::size_t lbr = NO, mbr = NO, comma = NO, i = from;
+    // zsh's loop always ends; the bound only guards against a slip here.
+    for (s::size_t steps = 0; steps < 64 * (n + 1) * (n + 1) + 1024; ++steps) {
+      if (i >= n) {
+        if (lbr != NO) literal(lbr);
+        if (mbr == NO and comma == NO) return false;
+        i = comma != NO ? comma : n + 1;
+        if (mbr != NO and mbr < i) i = mbr;
+        lbr = mbr = comma = NO;
+        continue;
+      }
+      s::size_t p = i++;
+      if (tok(p, '{')) {
+        if (lbr == NO) {
+          if (char_dots(p, mb)) return true;
+          lbr = p;
+          // {n..m} and {n..m..s}, digits in at least one end.
+          if (i < n and f.text[i] == '-') ++i;
+          while (digit(i)) ++i;
+          for (int part = 0; part < 2 and dots(i); ++part) {
+            i += 2;
+            if (i < n and f.text[i] == '-') ++i;
+            while (digit(i)) ++i;
+            if (tok(i, '}') and (digit(lbr + 1) or digit(i - 1))) return true;
+          }
+        } else {
+          s::size_t k = p;
+          int level = 1;
+          while (++k < n and level)
+            if (tok(k, '{')) ++level;
+            else if (tok(k, '}')) --level;
+          if (level) {   // never closed: neither is a brace
+            literal(lbr);
+            literal(p);
+            i = comma != NO ? comma : k;
+            if (mbr != NO and mbr < i) i = mbr;
+            lbr = mbr = comma = NO;
+          } else {
+            i = k;
+            if (mbr == NO) mbr = p;
+          }
+        }
+      } else if (tok(p, '}')) {
+        if (lbr == NO) {
+          literal(p);
+        } else if (comma != NO) {
+          return true;
+        } else {
+          literal(lbr);
+          literal(p);
+          if (mbr != NO) i = mbr;
+          mbr = lbr = NO;
+        }
+      } else if (tok(p, ',')) {
+        if (lbr == NO) literal(p);
+        else if (comma == NO) comma = p;
+      }
+    }
+    return false;
+  }
+
+  // zsh's zstrtol() for a sequence: an optional sign and digits,
+  // saturating; the end is where the digits stop.
+  Number number(s::size_t k) const {
+    bool neg = k < n and f.text[k] == '-';
+    if (k < n and (f.text[k] == '-' or f.text[k] == '+')) ++k;
+    // Saturating at INT64_MAX, or at INT64_MIN for a negative number.
+    s::uint64_t limit = static_cast<s::uint64_t>(INT64_MAX) + (neg ? 1 : 0);
+    s::uint64_t v = 0;
+    for (; digit(k); ++k) {
+      auto d = static_cast<s::uint64_t>(f.text[k] - '0');
+      v = v > (limit - d) / 10 ? limit : v * 10 + d;
+    }
+    if (neg) return {static_cast<s::int64_t>(0 - v), k};
+    return {static_cast<s::int64_t>(v), k};
+  }
+
+  // The words of `{n..m}`/`{n..m..s}` opened at g and closed at c, as
+  // xpandbraces makes them, or nothing when the text is not one.
+  opt<vec<str>> sequence(s::size_t g, s::size_t c, int dotdot) const {
+    auto [rstart, d1] = number(g + 1);
+    if (d1 == g + 1 or not dots(d1)) return s::nullopt;
+    auto [rend, p] = number(d1 + 2);
+    if (p == d1 + 2) return s::nullopt;
+    s::int64_t rincr = 1;
+    s::size_t wid1 = d1 - g - 1, wid2 = c - d1 - 2, wid3 = 0, d2 = s::size_t(-1);
+    if (p != c) {
+      wid2 = p - d1 - 2;
+      d2 = p;
+      if (dotdot != 2 or not dots(p)) return s::nullopt;
+      auto [inc, e] = number(p + 2);
+      // zsh keeps the step in an int (so {1..10..4294967298} steps by 2
+      // there); a full int64 step cannot turn a huge range into billions
+      // of words.
+      rincr = inc;
+      wid3 = e - d2 - 2;
+      if (e != c or rincr == 0) return s::nullopt;
+    }
+    auto zero_at = [&](s::size_t k) {
+      return k < n and (f.text[k] == '0' or (f.text[k] == '-' and k + 1 < n and f.text[k + 1] == '0'));
+    };
+    int minw = static_cast<int>(zero_at(g + 1) ? wid1 : zero_at(d1 + 2) ? wid2
+                                : d2 != s::size_t(-1) and zero_at(d2 + 2) ? wid3 : 0);
+    bool rev = false;
+    if (rincr < 0) { rincr = rincr == INT64_MIN ? INT64_MAX : -rincr; rev = not rev; }
+    using U = s::uint64_t;
+    auto step = static_cast<U>(rincr);
+    if (rstart > rend) {
+      s::swap(rstart, rend);
+      rev = not rev;
+    } else if (rincr > 1) {
+      rend = static_cast<s::int64_t>(static_cast<U>(rend)
+                                     - (static_cast<U>(rend) - static_cast<U>(rstart)) % step);
+    }
+    vec<str> out;
+    char buf[32];
+    for (s::int64_t v = rend;;) {
+      s::snprintf(buf, sizeof buf, "%0*lld", minw, static_cast<long long>(v));
+      out.emplace_back(buf);
+      if (static_cast<U>(v) - static_cast<U>(rstart) < step) break;
+      v = static_cast<s::int64_t>(static_cast<U>(v) - step);
+    }
+    // Made highest first; zsh lists them lowest first unless reversed.
+    if (not rev) s::reverse(out.begin(), out.end());
+    return out;
+  }
+
+  Field&    f;
+  s::size_t n;
+};
+
+// The words f.text[lo, hi) expands to: xpandbraces on the first
+// expansion has_braces() finds, then on the rest.  The groups of a word
+// are expanded left to right as one product, the first varying slowest,
+// which is zsh's order; only an expansion's own alternatives recurse.
+void brace_range(Field& f, s::size_t lo, s::size_t hi, bool ccl, bool mb,
+                 vec<Field>& out)
+{
+  struct Group {
+    s::size_t size() const { return alts.empty() ? words.size() : alts.size(); }
+
+    s::size_t  open, close;
+    vec<Field> alts;    // alternatives, each expanded
+    vec<str>   words;   // or the words of a sequence or BRACE_CCL set
+  };
+  // The scan marks literal braces in `f` itself: the ranges recursed on
+  // are disjoint, and each is scanned only after the text before it, as
+  // zsh scans each new word.
+  BraceScan bs{f, hi};
+  vec<Group> groups;
+  for (s::size_t pos = lo; pos < hi and bs.has_braces(pos, ccl, mb);) {
+    s::size_t g = pos;
+    while (not bs.tok(g, '{')) ++g;
+    // Match the brace, counting the commas and `..` at its top.
+    int bc = 0, comma = 0, dotdot = 0;
+    s::size_t c = g;
+    for (; c < hi; ++c) {
+      if (bs.tok(c, '{')) {
+        ++bc;
+      } else if (bs.tok(c, '}')) {
+        if (--bc == 0) break;
+      } else if (bc == 1) {
+        if (bs.tok(c, ',')) ++comma;
+        else if (bs.dots(c)) { ++dotdot; ++c; }
+      }
+    }
+    if (c >= hi) break;
+    // A group that is the whole range puts its words straight into `out`,
+    // so deep nesting moves words up instead of copying them per level.
+    bool whole = groups.empty() and g == lo and c + 1 == hi;
+    Group grp{g, c, {}, {}};
+    strv inner = strv(f.text).substr(g + 1, c - g - 1);
+    bool done = false;
+    if (not comma and dotdot) {
+      if (auto r = bs.char_dots(g, mb)) {
+        for (char32_t k = r->from;;) {
+          str ch;
+          if (mb) utf8_append(ch, k);
+          else    ch = str(1, static_cast<char>(k));
+          grp.words.push_back(s::move(ch));
+          if (k == r->to) break;
+          if (r->from <= r->to) ++k;
+          else                  --k;
+        }
+        done = true;
+      } else if (auto seq = bs.sequence(g, c, dotdot)) {
+        grp.words = s::move(*seq);
+        done = true;
+      }
+    }
+    if (not done and not comma and ccl) {
+      for (char ch : brace_ccl(inner)) grp.words.emplace_back(1, ch);
+      done = not grp.words.empty();
+    }
+    if (not done) {
+      // Comma alternatives, or the text alone (`{1..3..}` gives `1..3..`).
+      vec<Field>& into = whole ? out : grp.alts;
+      s::size_t first = into.size();
+      s::size_t st = g + 1;
+      int cnt = 0;
+      for (s::size_t k = g + 1; k <= c; ++k) {
+        if (k < c and bs.tok(k, '{')) ++cnt;
+        else if (k < c and bs.tok(k, '}')) --cnt;
+        else if (k == c or (cnt == 0 and bs.tok(k, ','))) {
+          // Nesting that would run the stack out stays as it is.
+          if (not stack_low()) {
+            brace_range(f, st, k, ccl, mb, into);
+          } else {
+            into.push_back(f.slice(st, k));
+          }
+          st = k + 1;
         }
       }
-      if (alts.empty()) continue;   // `{a}`, `{}`: not an expansion
+      if (whole) {
+        for (s::size_t k = first; k < out.size(); ++k) out[k].quoted = true;
+        return;
+      }
     }
-    for (auto& a : alts) {
-      Field w = prefix;
-      w.append(a);
-      w.append(suffix);
-      brace_expand(w, ccl, out);
-    }
+    groups.push_back(s::move(grp));
+    pos = c + 1;
+  }
+  if (groups.empty()) {
+    out.push_back(lo == 0 and hi == f.text.size() ? f : f.slice(lo, hi));
     return;
   }
-  out.push_back(f);
+
+  // Every combination, as an odometer whose last group turns fastest.
+  vec<s::size_t> at(groups.size(), 0);
+  for (;;) {
+    Field w;
+    s::size_t pos = lo;
+    for (s::size_t k = 0; k < groups.size(); ++k) {
+      const Group& g = groups[k];
+      w.append(f, pos, g.open);
+      if (g.alts.empty()) w.put(strv(g.words[at[k]]), true);
+      else                w.append(g.alts[at[k]]);
+      pos = g.close + 1;
+    }
+    w.append(f, pos, hi);
+    w.quoted = true;   // a word of a brace expansion stays when empty
+    out.push_back(s::move(w));
+    s::size_t k = groups.size();
+    while (k > 0 and ++at[k - 1] == groups[k - 1].size()) at[--k] = 0;
+    if (k == 0) break;
+  }
+}
+
+void brace_expand(const Field& f, bool ccl, bool mb, vec<Field>& out) {
+  Field w = f;
+  // zsh's lexer makes a `}` a brace only while more `{` than `}` came
+  // before it; any other `}` is plain text.
+  int open = 0;
+  for (s::size_t k = 0; k < w.text.size(); ++k) {
+    if (w.lit[k]) continue;
+    if (w.text[k] == '{') ++open;
+    else if (w.text[k] == '}' and open-- == 0) { open = 0; w.lit[k] = true; }
+  }
+  brace_range(w, 0, w.text.size(), ccl, mb, out);
 }
 
 }  // namespace
@@ -2482,34 +3505,9 @@ str remove_quotes(strv w) {
 }
 
 vec<str> ifs_split(strv s, strv ifs) {
-  auto is_sep = [&](char c) { return ifs.find(c) != strv::npos; };
-  auto is_ws  = [&](char c) { return is_sep(c) and (c == ' ' or c == '\t' or c == '\n'); };
-  auto skip_ws = [&](s::size_t& i) { while (i < s.size() and is_ws(s[i])) ++i; };
   vec<str> out;
-  str cur;
-  bool open = false;   // a word has started and not been pushed yet
-  s::size_t i = 0;
-  skip_ws(i);
-  while (i < s.size()) {
-    if (not is_sep(s[i])) {
-      cur += s[i++];
-      open = true;
-      continue;
-    }
-    // One separator: a run of IFS whitespace with at most one other IFS
-    // character in it.
-    out.push_back(s::move(cur));
-    cur.clear();
-    open = false;
-    bool hard = not is_ws(s[i]);
-    ++i;
-    skip_ws(i);
-    if (not hard and i < s.size() and is_sep(s[i])) {
-      ++i;
-      skip_ws(i);
-    }
-  }
-  if (open) out.push_back(s::move(cur));
+  for (auto& p : ifs_pieces(s, ifs))
+    if (p.keep) out.push_back(s::move(p.text));
   return out;
 }
 
@@ -2518,10 +3516,10 @@ vec<str> ifs_split(strv s, strv ifs) {
 // ---------------------------------------------------------------------------
 namespace {
 
-// `~`, `~+`, `~-`, `~user` at text[p] (unquoted); `end` bounds the name.
+// `~`, `~+`, `~-`, `~user` at text[p] (unquoted); `end` bounds the name,
+// which may be quoted or come from an expansion (`~"root"`, `~$user`), as
+// in zsh.
 Result<void> tilde_at(Field& f, s::size_t p, s::size_t end, ExecContext& ctx) {
-  for (s::size_t k = p; k < end; ++k)
-    if (f.lit[k]) return {};
   str name = f.text.substr(p + 1, end - p - 1);
   auto param = [&](const char* n) -> opt<str> {
     auto v = ctx.params.lookup(n);
@@ -2530,12 +3528,14 @@ Result<void> tilde_at(Field& f, s::size_t p, s::size_t end, ExecContext& ctx) {
   };
   opt<str> dir;
   if (name.empty()) {
-    dir = param("HOME");
-    if (not dir) if (auto* pw = ::getpwuid(::getuid())) dir = pw->pw_dir;
+    dir = param("HOME").value_or("");   // zsh: empty when HOME is unset
   } else if (name == "+") {
     dir = param("PWD");
   } else if (name == "-") {
+    // Before any cd, or once OLDPWD is unset, zsh's own record of the
+    // previous directory is the one the shell started in.
     dir = param("OLDPWD");
+    if (not dir) dir = param("PWD");
   } else if (auto digits = strv(name).substr(name[0] == '+' or name[0] == '-' ? 1 : 0);
              not digits.empty() and s::all_of(digits.begin(), digits.end(), [](char d) {
                return s::isdigit(static_cast<unsigned char>(d)); })) {
@@ -2599,7 +3599,7 @@ Result<vec<str>> Expander::words(const vec<str>& words) {
     for (auto& f : scan.fields) {
       if (f.dropped) continue;
       if (opts.get(OPT_IGNOREBRACES)) fields.push_back(s::move(f));
-      else brace_expand(f, opts.get(OPT_BRACECCL), fields);
+      else brace_expand(f, opts.get(OPT_BRACECCL), opts.multibyte(), fields);
     }
     for (auto& f : fields) {
       if (f.text.empty()) {
@@ -2609,12 +3609,18 @@ Result<vec<str>> Expander::words(const vec<str>& words) {
       bool magic = opts.get(OPT_MAGICEQUALSUBST)
           and s::any_of(f.text.begin(), f.text.end(), [](char c) { return c == '='; });
       if (auto r = tilde_expand(f, magic, mCtx); not r) return s::unexpected(r.error());
-      // `=cmd` becomes the command's path.
+      // `=cmd` becomes the command's path.  Only the `=` must be unquoted:
+      // the name may be quoted or come from an expansion (`=$x`), as in zsh.
       if (opts.get(OPT_EQUALS) and f.text.size() > 1 and f.text[0] == '=' and f.unlit(0)
-          and s::none_of(f.lit.begin(), f.lit.end(), [](bool l) { return l; })
-          and f.text[1] != '(') {
+          and not (f.text[1] == '(' and f.unlit(1))) {
         str name = f.text.substr(1);
         auto path = mExec.find_command(name);
+        // A name with a slash must be an executable file.
+        struct stat st{};
+        if (path and name.find('/') != str::npos
+            and (::stat(path->c_str(), &st) != 0 or not S_ISREG(st.st_mode)
+                 or ::access(path->c_str(), X_OK) != 0))
+          path = s::unexpected(subst_error(name + " not found"));
         if (not path) return s::unexpected(subst_error(name + " not found"));
         out.push_back(*path);
         continue;

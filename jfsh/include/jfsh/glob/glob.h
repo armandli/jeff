@@ -53,6 +53,9 @@ struct GlobPattern {
   static GlobPattern compile(strv pat, GlobFlags flags = GLOB_NONE);
 };
 
+// Whether the locale's characters may take several bytes (UTF-8).
+bool locale_multibyte() noexcept;
+
 // A pattern compiled once and matched many times.  Syntax, in the escaped
 // form the expander produces (a `\` makes the next character literal):
 //   *  ?  [abc] [a-z] [!x] [^x] [[:alpha:]]   (a|b)   <lo-hi>
@@ -69,9 +72,11 @@ struct CompiledPattern {
   struct Node;
   struct Impl;
 
+  // With `multibyte`, `?` and `[…]` match a UTF-8 character, not a byte.
   static CompiledPattern compile(strv pattern,
                                  bool case_insensitive = false,
-                                 bool extended = false);
+                                 bool extended = false,
+                                 bool multibyte = locale_multibyte());
 
   // Whole-string match; `info` gets the backreferences.
   bool matches(strv text, PatternMatch* info = nullptr) const;
@@ -124,6 +129,16 @@ bool pattern_match(
 bool ext_pattern_match(
   strv pattern,
   strv text) noexcept;
+
+// zsh's sort order (sort.c), for globs and the (o) flag: the locale's
+// collation, with runs of digits compared by value when `numeric`.  Ties
+// break by byte value, so different strings never compare equal.
+int collate(const str& a, const str& b, bool numeric = false);
+// Sorts `v` in collate() order.
+void collate_sort(vec<str>& v, bool numeric = false);
+// The strxfrm() form of `s`: keys compare bytewise as collate() orders
+// their strings without `numeric`, ties aside.
+str collate_key(const str& s);
 
 // True when `s` contains an unescaped pattern character.
 bool has_glob_chars(strv s, bool extended = false) noexcept;

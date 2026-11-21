@@ -6,6 +6,7 @@
 #include <utility>
 
 #include <jfsh/core/aliases.h>
+#include <jfsh/core/stack.h>
 
 namespace jfsh {
 
@@ -95,14 +96,7 @@ static bool is_word_break(int c) noexcept {
 }
 
 static bool slurp_nested(InputSource& src, str& text, char open,
-                         char close, bool comments = false, bool dq = false);
-
-// Whether the next character is `c`; nothing is consumed.
-static bool next_is(InputSource& src, int c) {
-  int n = src.next_char();
-  src.unget(n);
-  return n == c;
-}
+                         char close, bool dq = false);
 
 // Appends a backquoted command substitution up to and including its closing
 // backquote.  A backslash keeps the next character.
@@ -118,41 +112,55 @@ static void slurp_backquote(InputSource& src, str& text) {
   }
 }
 
+// The bracket that closes `$(`, `${` or `$[`.
+static char close_of(int open) {
+  return open == '(' ? ')' : open == '{' ? '}' : ']';
+}
+
 // Appends a double-quoted string up to and including its closing quote.
 // Substitutions inside it are slurped whole so a `"` in `$(…)` doesn't end it.
-static void slurp_dquote(InputSource& src, str& text) {
+// False when the input ends first or nesting runs the stack low.
+static bool slurp_dquote(InputSource& src, str& text) {
   for (int c; (c = src.next_char()) != -1;) {
     text += static_cast<char>(c);
-    if (c == '"') return;
+    if (c == '"') return true;
     if (c == '\\') {
       int n = src.next_char();
-      if (n == -1) return;
+      if (n == -1) return false;
       text += static_cast<char>(n);
     } else if (c == '`') {
       slurp_backquote(src, text);
     } else if (c == '$') {
       int n = src.next_char();
-      if (n == '(' or n == '{') {
+      if (n == '(' or n == '{' or n == '[') {
         text += static_cast<char>(n);
-        slurp_nested(src, text, static_cast<char>(n), n == '(' ? ')' : '}',
-                     n == '(' and not next_is(src, '('), n == '{');
+        if (not slurp_nested(src, text, static_cast<char>(n), close_of(n), n == '{'))
+          return false;
       } else {
         src.unget(n);
       }
     }
   }
+  return false;
 }
+
+static bool slurp_nested_at(InputSource& src, str& text, char open, char close,
+                            bool dq);
 
 // Appends text up to and including the `close` that balances an `open` the
 // caller has already consumed.  Quotes, backslashes, backquotes and nested
-// `$(…)`/`${…}` are tracked so their contents can't close it early.
-// False when the input ends first.
-// With `comments` (the elements of `name=(…)`, the commands of `$(…)`), a
-// comment inside is dropped: its quotes and braces don't count.
-// With `dq` (a ${…} in double quotes) a `{` inside doesn't pair with a
-// `}` and a `'` is an ordinary character, as in zsh: "${x:-a{b\}c}".
+// `$(…)`/`${…}` are tracked so their contents can't close it early; with
+// `dq` the `${` is inside double quotes, where a single quote is an
+// ordinary character, as in zsh.  False when the input ends first.
 static bool slurp_nested(InputSource& src, str& text, char open,
-                         char close, bool comments, bool dq) {
+                         char close, bool dq) {
+  // Nesting that would run the stack out ends the word, unclosed.
+  if (stack_low()) return false;
+  return slurp_nested_at(src, text, open, close, dq);
+}
+
+static bool slurp_nested_at(InputSource& src, str& text, char open,
+                            char close, bool dq) {
   int depth = 1;
   for (int c; (c = src.next_char()) != -1;) {
     if (c == '#' and comments and not text.empty()
@@ -171,16 +179,16 @@ static bool slurp_nested(InputSource& src, str& text, char open,
         if (q == '\'') break;
       }
     } else if (c == '"') {
-      slurp_dquote(src, text);
+      if (not slurp_dquote(src, text)) return false;
     } else if (c == '`') {
       slurp_backquote(src, text);
     } else if (c == '$') {
       int n = src.next_char();
-      if ((n == '(' or n == '{') and (n != open or dq)) {
+      if ((n == '(' or n == '{' or n == '[') and n != open) {
         text += static_cast<char>(n);
-        slurp_nested(src, text, static_cast<char>(n), n == '(' ? ')' : '}',
-                     n == '(' and not next_is(src, '('), dq and n == '{');
-      } else if (n == '\'') {
+        if (not slurp_nested(src, text, static_cast<char>(n), close_of(n), dq and n == '{'))
+          return false;
+      } else if (n == '\'' and not dq) {
         // $'…', where `\'` doesn't end it.
         text += '\'';
         for (int q; (q = src.next_char()) != -1;) {
@@ -570,15 +578,17 @@ opt<str> Lexer::read_cond_pattern(str prefix) {
       if (q == -1) { mIncomplete = true; break; }
       text += '\'';
     } else if (c == '"') {
-      slurp_dquote(mSrc, text);
+      if (not slurp_dquote(mSrc, text)) { mIncomplete = true; break; }
     } else if (c == '`') {
       slurp_backquote(mSrc, text);
     } else if (c == '$') {
       int n = mSrc.next_char();
       if (n == '(' or n == '{') {
         text += static_cast<char>(n);
-        slurp_nested(mSrc, text, static_cast<char>(n), n == '(' ? ')' : '}',
-                     n == '(' and not next_is(mSrc, '('));
+        if (not slurp_nested(mSrc, text, static_cast<char>(n), close_of(n))) {
+          mIncomplete = true;
+          break;
+        }
       } else {
         mSrc.unget(n);
       }
@@ -678,11 +688,12 @@ LexToken Lexer::read_word(int first_char, str prefix) {
       // Substitutions are one unit of the word, whatever they contain.
       if (c == '$') {
         int n = mSrc.next_char();
-        if (n == '(' or n == '{') {
+        if (n == '(' or n == '{' or n == '[') {
           text += '$';
           text += static_cast<char>(n);
-          slurp_nested(mSrc, text, static_cast<char>(n), n == '(' ? ')' : '}',
-                       n == '(' and not next_is(mSrc, '('), in_double and n == '{');
+          if (not slurp_nested(mSrc, text, static_cast<char>(n), close_of(n),
+                               in_double and n == '{'))
+            mIncomplete = true;
           all_digits_so_far = false;
           c = mSrc.next_char();
           continue;
