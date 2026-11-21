@@ -295,13 +295,21 @@ int Executor::exec_simple(vec<str> args,
     ProcSubstResources* outer;
     bool pipe_last;
   } psubst_guard{this, &psubst, s::exchange(mPsubst, &psubst), (flags & EF_PIPELAST) != 0};
+  // typeset's assignments go back between the words they were among.
+  vec<s::size_t> counts;
   bool fatal = true;
-  bool expanded = expand_command(args, redirs, subst_status, fatal);
+  bool expanded = expand_command(args, redirs, subst_status, fatal,
+                                 typeset_args.empty() ? nullptr : &counts);
+  for (auto& a : typeset_args) {
+    s::size_t n = 0;
+    for (s::size_t k = 0; k < a.position and k < counts.size(); ++k) n += counts[k];
+    a.position = n;
+  }
   if (noglob) mCtx.opts.assign(OPT_GLOB, globbing);
   // A failed expansion (`${x?msg}`, NO_UNSET, `$((1/0))`) ends the command
   // line, as zsh's errflag does: a non-interactive shell exits.
   if (not expanded) {
-    if (fatal) mCtx.aborting = true;
+    if (fatal) mCtx.aborting = mCtx.abort_line = true;
     return 1;
   }
   // The prefix scope of a builtin or function, popped when the command is
@@ -1322,8 +1330,13 @@ int Executor::exec_case(ExecState& es, WordCode head) {
       if (match) break;
       auto pat = ex.pattern(word);
       if (not pat) return fail(pat.error());
-      match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob(), mCtx.opts.multibyte())
-                  .matches(*subject);
+      auto cp = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob(),
+                                         mCtx.opts.multibyte());
+      PatternMatch pm;
+      match = cp.matches(*subject, &pm);
+      if (match)
+        set_match_params(mCtx.params, cp, *subject, 0, subject->size(), pm,
+                         mCtx.opts.get(OPT_KSH_ARRAYS));
     }
     if (not match) {
       es.pc = next;
@@ -1638,7 +1651,12 @@ int Executor::exec_cond_node(ExecState& es, WordCode head) {
     auto pat = ex.pattern(rhs_word);
     if (not pat) return fail(pat.error());
     note(trace_quote(*lhs) + " " + op + " " + trace_pattern(*pat));
-    bool match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob(), mCtx.opts.multibyte()).matches(*lhs);
+    auto cp = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob(),
+                                       mCtx.opts.multibyte());
+    PatternMatch pm;
+    bool match = cp.matches(*lhs, &pm);
+    if (match)
+      set_match_params(mCtx.params, cp, *lhs, 0, lhs->size(), pm, mCtx.opts.get(OPT_KSH_ARRAYS));
     return finish(match == (op != "!=") ? 0 : 1);
   }
   auto rhs = ex.scalar(rhs_word);
@@ -2395,7 +2413,8 @@ void Executor::procsubst_release(ProcSubstResources& res) noexcept {
 bool Executor::expand_command(vec<str>& args,
                               vec<Redirection>& redirs,
                               opt<int>&         subst_status,
-                              bool&             fatal) {
+                              bool&             fatal,
+                              vec<s::size_t>*   counts) {
   Expander ex{*this, mCtx};
   auto fail = [&](const ShellError& e) {
     s::fprintf(stderr, "jfsh: %s\n", e.message.c_str());
@@ -2524,19 +2543,6 @@ static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
     p.set(s::move(h));
     return {};
   }
-  // As zsh's getindex, an index from an expansion stops at its first
-  // top-level comma (`i=2,3; a[$i]=x` sets a[2]); a comma written in the
-  // subscript stays for the arithmetic (`a[2,]=x` is an error).
-  str index = key;
-  for (int depth = 0, k = 0; not a.subscript_comma and k < static_cast<int>(index.size()); ++k) {
-    char c = index[static_cast<s::size_t>(k)];
-    if (c == '(' or c == '[') ++depth;
-    else if (c == ')' or c == ']') --depth;
-    else if (c == ',' and depth == 0) { index.resize(static_cast<s::size_t>(k)); break; }
-  }
-  auto n = math_eval(index, ctx.params, math_options(ctx.opts),
-                     &ctx.modules.math_funcs());
-  if (not n) return s::unexpected(n.error());
   auto p = ctx.params.lookup(a.name);
   if (p and p->get().is_readonly())
     return s::unexpected(ShellError{ErrorKind::ExecError,
@@ -2545,9 +2551,50 @@ static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
   s::int64_t size = scalar ? static_cast<s::int64_t>(p->get().scalar().size())
                   : p and p->get().is_array()
                   ? static_cast<s::int64_t>(p->get().array_ref().size()) : 0;
-  s::int64_t idx = n->as_int();
-  if (idx < 0) idx += size + 1;
-  if (idx <= 0)
+  auto math = [&](strv text) -> Result<s::int64_t> {
+    auto n = math_eval(text, ctx.params, math_options(ctx.opts), &ctx.modules.math_funcs());
+    if (not n) return s::unexpected(n.error());
+    return n->as_int();
+  };
+  // The subscript is worked out before the array is taken out below, so a
+  // failing one leaves the array as it was.
+  s::int64_t first, last;
+  if (not key.empty() and key[0] == '(') {
+    // a[(r)pat]=…: the element a search finds, as ${a[(i)pat]} gives it.
+    str flags = key.substr(1, key.find(')') - 1);
+    for (char& c : flags) c = c == 'r' ? 'i' : c == 'R' ? 'I' : c;
+    Expander ex{*ctx.executor, ctx};
+    auto v = ex.scalar("${" + a.name + "[(" + flags + ")" + key.substr(key.find(')') + 1) + "]}");
+    if (not v) return s::unexpected(v.error());
+    first = last = s::strtoll(v->c_str(), nullptr, 10);
+  } else {
+    s::size_t comma = str::npos;
+    for (s::size_t k = 0, depth = 0; k < key.size(); ++k) {
+      if (key[k] == '(' or key[k] == '[') ++depth;
+      else if ((key[k] == ')' or key[k] == ']') and depth > 0) --depth;
+      else if (key[k] == ',' and depth == 0) { comma = k; break; }
+    }
+    // As zsh's getindex, an index from an expansion stops at its first
+    // top-level comma (`i=2,3; a[$i]=x` sets a[2]); only a comma written
+    // in the subscript makes a range (`a[2,3]=x`).
+    bool range = comma != str::npos and a.subscript_comma;
+    // A range with a bound left out (`a[2,]=x`) is bad arithmetic, as in
+    // zsh, where an empty expression would otherwise be 0.
+    auto blank = [](strv text) { return text.find_first_not_of(" \t\n") == strv::npos; };
+    if (range and (blank(strv(key).substr(0, comma)) or blank(strv(key).substr(comma + 1))))
+      if (auto whole = math(key); not whole) return s::unexpected(whole.error());
+    auto lo = math(strv(key).substr(0, comma));
+    if (not lo) return s::unexpected(lo.error());
+    first = last = *lo;
+    if (range) {
+      auto hi = math(strv(key).substr(comma + 1));
+      if (not hi) return s::unexpected(hi.error());
+      last = *hi;
+    }
+  }
+  if (first < 0) first += size + 1;
+  if (last < 0) last += size + 1;
+  if (first <= 0)
     return s::unexpected(ShellError{ErrorKind::ExecError,
         a.name + ": assignment to invalid subscript range"});
   vec<str> arr;
@@ -2557,7 +2604,7 @@ static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
     // Moved out and set again below, so one element costs no copy.
     arr = p->get().handlers ? p->get().array() : p->get().take_array();
   }
-  auto at = static_cast<s::size_t>(idx - 1);
+  auto at = static_cast<s::size_t>(first - 1);
   if (arr.size() <= at) arr.resize(at + 1);
   // The elements first … last go (none for a[i,i-1]), the value comes in.
   auto end = static_cast<s::size_t>(s::clamp<s::int64_t>(last, first - 1, size));

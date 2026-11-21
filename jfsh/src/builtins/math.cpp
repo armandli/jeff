@@ -30,12 +30,14 @@ s::int64_t MathNum::as_int() const noexcept {
 }
 
 MathOptions math_options(const OptionState& opts) noexcept {
-  return {opts.get(OPT_FORCEFLOAT),
-          opts.get(OPT_OCTALZEROES),
-          opts.get(OPT_CPRECEDENCES),
-          opts.get(OPT_KSH_ARRAYS),
-          opts.get(OPT_KSH_ZERO_SUBSCRIPT),
-          not opts.get(OPT_UNSET)};
+  MathOptions m;
+  m.force_float        = opts.get(OPT_FORCEFLOAT);
+  m.octal_zeroes       = opts.get(OPT_OCTALZEROES);
+  m.c_precedences      = opts.get(OPT_CPRECEDENCES);
+  m.ksh_arrays         = opts.get(OPT_KSH_ARRAYS);
+  m.ksh_zero_subscript = opts.get(OPT_KSH_ZERO_SUBSCRIPT);
+  m.no_unset           = not opts.get(OPT_UNSET);
+  return m;
 }
 
 str format_math(const MathNum& n) {

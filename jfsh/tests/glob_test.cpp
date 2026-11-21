@@ -115,6 +115,25 @@ TEST(GlobPatternMatch, MultibyteCharacters) {
   EXPECT_EQ(CompiledPattern::compile("h?", false, false, true).match_prefix("h\xc3\xa9llo", false), 3u);
 }
 
+TEST(GlobPatternMatch, BackreferencesWithMultibyteAndLongSubjects) {
+  // (#b) groups count bytes, but `?` takes a whole character.
+  auto pat = CompiledPattern::compile("(#b)(?)(*)", false, true, true);
+  PatternMatch pm;
+  ASSERT_TRUE(pat.matches("\xc3\xa9t\xc3\xa9", &pm));
+  ASSERT_EQ(pm.groups.size(), 2u);
+  EXPECT_EQ(pm.groups[0], (s::pair<s::size_t, s::size_t>{0, 2}));
+  EXPECT_EQ(pm.groups[1], (s::pair<s::size_t, s::size_t>{2, 5}));
+  // A subject that cannot match is refused without backtracking, which
+  // would take quadratic time here, and one far too long for the stack to
+  // backtrack through fails cleanly or still matches.
+  str big(200000, 'a');
+  EXPECT_FALSE(CompiledPattern::compile("(#b)(*)(*)c", false, true).matches(big));
+  EXPECT_FALSE(CompiledPattern::compile("(#b)(a#)(a#)c", false, true).matches(big));
+  EXPECT_TRUE(CompiledPattern::compile("(#b)(a#)", false, true).matches(big));
+  EXPECT_EQ(CompiledPattern::compile("(#b)(a#)b", false, true).match_prefix(big + "b", true),
+            big.size() + 1);
+}
+
 TEST(GlobCollate, NumericRunsAndTies) {
   EXPECT_LT(collate("x2", "x10", true), 0);
   EXPECT_GT(collate("x2", "x10", false), 0);

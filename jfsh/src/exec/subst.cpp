@@ -18,9 +18,9 @@
 
 #include <jfsh/builtins/math.h>
 #include <jfsh/core/aliases.h>
+#include <jfsh/core/sort.h>
 #include <jfsh/core/stack.h>
 #include <jfsh/core/utf8.h>
-#include <jfsh/core/sort.h>
 #include <jfsh/exec/executor.h>
 #include <jfsh/glob/glob.h>
 #include <jfsh/lexer/input.h>
@@ -86,8 +86,9 @@ s::size_t dquote_end(strv w, s::size_t q) {
 
 // Index of the character that closes the bracket at w[open], skipping
 // quoted text and nested substitutions; npos when it is never closed.
-// With `dq` the `${` is inside double quotes, where, as in zsh, a single
-// quote does not quote: "${y:-'}'}" ends at the first `}`.
+// `dq`: a ${…} in double quotes, where, as in zsh, a `{` inside does not
+// pair with a `}` ("${x:-a{b\}c}") and a `'` is an ordinary character:
+// "${y:-'}'}" ends at the first `}`.
 s::size_t find_close(strv w, s::size_t open, bool dq) {
   // Nesting past what the stack holds counts as never closed, and the
   // caller says why (unclosed_error()).
@@ -118,7 +119,8 @@ s::size_t find_close(strv w, s::size_t open, bool dq) {
       for (++i; i < w.size() and w[i] != '`'; ++i)
         if (w[i] == '\\') ++i;
     } else if (ch == '$' and i + 1 < w.size()
-               and (w[i + 1] == '(' or w[i + 1] == '{') and w[i + 1] != o) {
+               and (w[i + 1] == '(' or w[i + 1] == '{')
+               and (w[i + 1] != o or (dq and o == '{'))) {
       auto e = find_close(w, i + 1, w[i + 1] == '{' and dq and o == '{');
       if (e == strv::npos) return e;
       i = e;
@@ -457,28 +459,6 @@ vec<IfsPiece> ifs_pieces(strv s, strv ifs) {
   return out;
 }
 
-// (q+): as (q-), but text with control characters goes in $'…'.
-str quote_minimal_plus(strv s) {
-  bool control = s::any_of(s.begin(), s.end(), [](char c) {
-    auto u = static_cast<unsigned char>(c);
-    return u < 0x20 or u == 0x7f;
-  });
-  if (not control) return quote_minimal(s);
-  str out = "$'";
-  for (char c : s) {
-    auto u = static_cast<unsigned char>(c);
-    if (c == '\n') out += "\\n";
-    else if (c == '\t') out += "\\t";
-    else if (c == '\'' or c == '\\') { out += '\\'; out += c; }
-    else if (u < 0x20 or u == 0x7f) {
-      char buf[8];
-      s::snprintf(buf, sizeof buf, "\\%03o", u);
-      out += buf;
-    } else out += c;
-  }
-  return out + "'";
-}
-
 // ---------------------------------------------------------------------------
 // Fields: words under construction.  `lit[i]` marks text[i] as literal,
 // i.e. quoted or produced by an expansion, so not pattern/brace/tilde syntax.
@@ -603,9 +583,7 @@ struct ParamFlags {
   // and length, (R) the rest; (I:n:) the nth match.
   bool m_substr = false, m_begin = false, m_end = false, m_len = false, m_rest = false;
   str  nth;
-  int  assign = 0;             // (A) an array, (AA) an association
   opt<str> escapes_g;          // (g:opts:): print's escapes
-  str  z_opts;                 // (Z:opts:): (z) with c, C, n
 };
 
 constexpr s::size_t NONE = static_cast<s::size_t>(-1);
@@ -1197,16 +1175,15 @@ struct Scan {
     bool always = sp and (name.size() == 1 or name == "ARGC" or name == "argv"
                           or name == "status" or name == "pipestatus");
     if (not set and not always) return {};
+    if (not sp) return param_type_text(p->get());
     const Param* param = set ? &p->get() : nullptr;
-    str t = sp ? str(sp->type)
-          : param->is_hash() ? "association" : param->is_array() ? "array"
-          : param->is_integer() ? "integer" : param->is_float() ? "float" : "scalar";
-    if (param and param->flags & PM_LOCAL)               t += "-local";
-    if ((sp and sp->readonly) or (param and param->is_readonly())) t += "-readonly";
-    if (sp and sp->tied)                                 t += "-tied";
-    if (param and param->is_exported())                  t += "-export";
-    if (sp and sp->hide)                                 t += "-hide-hideval";
-    if (sp or (param and param->flags & PM_SPECIAL))     t += "-special";
+    str t(sp->type);
+    if (param and param->flags & PM_LOCAL)                  t += "-local";
+    if (sp->readonly or (param and param->is_readonly()))   t += "-readonly";
+    if (sp->tied)                                           t += "-tied";
+    if (param and param->is_exported())                     t += "-export";
+    if (sp->hide)                                           t += "-hide-hideval";
+    t += "-special";
     return t;
   }
 
@@ -1312,7 +1289,6 @@ struct Scan {
         break; case 'E': fl.m_end = true;
         break; case 'N': fl.m_len = true;
         break; case 'R': fl.m_rest = true;
-        break; case 'A': ++fl.assign;
         break; case 'm': case 'X':   // widths are counted in bytes; errors reported anyway
         break; case 'I': {
           auto a = delimited();
@@ -1324,13 +1300,6 @@ struct Scan {
           if (not a) return s::unexpected(a.error());
           fl.escapes_g = *a;
         }
-        break; case 'Z': {
-          auto a = delimited();
-          if (not a) return s::unexpected(a.error());
-          fl.split_words = true;
-          fl.z_opts = *a;
-        }
-        break; case '0': fl.split = true; fl.split_sep = str(1, '\0');
         break; case 'M': fl.match_mode = true;
         break; case 'V': fl.visible = true;
         break; case '#': fl.arith = true;
@@ -1437,7 +1406,6 @@ struct Scan {
   // work in double quotes too, as in zsh, so `dq` is passed as false.
   Result<CompiledPattern> operand_pattern(strv word, bool dq) {
     Scan sub{ex, Mode::Scalar};
-    sub.in_brace = true;
     if (auto r = sub.scan(word, dq); not r) return s::unexpected(r.error());
     str pat;
     for (s::size_t k = 0; k < sub.fields.size(); ++k) {
@@ -1579,6 +1547,8 @@ struct Scan {
     return Result<Value>(s::move(v));
   }
 
+  // `keys`: (k), so an association's subscript gives the key; `values`
+  // (v) with it, the key and the value.
   Result<void> apply_subscript(Value& v, strv sub, strv name,
                                bool& all, bool keys = false, bool values = false) {
     if (sub == "@" or sub == "*") {
@@ -1621,11 +1591,23 @@ struct Scan {
       else if (sub[k] == ')' or sub[k] == ']') --depth;
       else if (sub[k] == ',' and depth == 0) { comma = k; break; }
     }
-    auto lo = index(sub.substr(0, comma));
+    // A bound may be a search: a[1,(i)--] ends at the first `--`.
+    auto bound = [&](strv text) -> Result<s::int64_t> {
+      if (text.empty() or text[0] != '(') return index(text);
+      auto e = find_close(text, 0);
+      if (e == strv::npos) return s::unexpected(subst_error("bad subscript"));
+      str flags(text.substr(1, e - 1));
+      for (char& c : flags) c = c == 'r' ? 'i' : c == 'R' ? 'I' : c;
+      Value copy = v;
+      if (auto r = subscript_flags(copy, flags, text.substr(e + 1), name); not r)
+        return s::unexpected(r.error());
+      return static_cast<s::int64_t>(s::strtoll(copy.scalar.c_str(), nullptr, 10));
+    };
+    auto lo = bound(sub.substr(0, comma));
     if (not lo) return s::unexpected(lo.error());
     opt<s::int64_t> hi;
     if (comma != strv::npos) {
-      auto h = index(sub.substr(comma + 1));
+      auto h = bound(sub.substr(comma + 1));
       if (not h) return s::unexpected(h.error());
       hi = *h;
     }
@@ -1752,7 +1734,13 @@ struct Scan {
             ? (exact ? *key == text
                      : CompiledPattern::compile(*key, false, extended, opts().multibyte()).matches(text))
             : test(kind == 'i' or kind == 'I' ? *key : val);
-        if (hit) out.push_back(kind == 'i' or kind == 'I' ? *key : val);
+        if (not hit) continue;
+        if (kind == 'i' or kind == 'I') {
+          out.push_back(*key);
+        } else {
+          if (want_keys) out.push_back(*key);
+          if (want_values or not want_keys) out.push_back(val);
+        }
       }
       if (kind == 'R' or kind == 'I' or kind == 'K') {
         v.set = true;
@@ -1775,6 +1763,8 @@ struct Scan {
             ? CompiledPattern::compile(e, false, extended, opts().multibyte()).matches(text)
             : test(e);
       }
+      // As zsh's getarg: each tail is a string of its own, so (#s) is
+      // where it starts.
       strv rest = strv(v.scalar).substr(cs.pos(static_cast<s::size_t>(k - 1)));
       return exact ? rest.starts_with(text) : pat.match_prefix(rest, false) != strv::npos;
     };
@@ -1940,24 +1930,33 @@ struct Scan {
           }
           pat_text = s::move(lit);
         }
+        bool mb = opts().multibyte();
         auto cp = CompiledPattern::compile(pat_text, false,
-                                           opts().get(OPT_EXTENDEDGLOB));
+                                           opts().get(OPT_EXTENDEDGLOB), mb);
         bool g = global;
         each(v, [&](const str& s) {
-          return replace(s, cp, repl_text, g, /*anchor=*/0);
+          return replace(s, cp, repl_text, g, /*anchor=*/0, mb);
         });
         continue;
       }
       if (strv("htreulqQaAcP").find(m) == strv::npos)
         return s::unexpected(
             subst_error("unrecognized modifier `" + str(1, m) + "'"));
+      mods.remove_prefix(2);
+      // :h2, :t3: a count of path components.
+      s::size_t count = 0;
+      if (m == 'h' or m == 't')
+        while (not mods.empty() and s::isdigit(static_cast<unsigned char>(mods[0]))) {
+          count = s::min<s::size_t>(count * 10 + static_cast<s::size_t>(mods[0] - '0'), 1u << 20);
+          mods.remove_prefix(1);
+        }
       if (m == 'c') {
         // :c — the command's path, as `=cmd` would give.
         each(v, [&](const str& s) { return ex.exec().find_command(s).value_or(s); });
       } else {
-        each(v, [&](const str& s) { return modify(s, m); });
+        bool mb = opts().multibyte();
+        each(v, [&](const str& s) { return modify(s, m, count, mb); });
       }
-      mods.remove_prefix(2);
     }
     if (not mods.empty()) return s::unexpected(subst_error("bad substitution"));
     return {};
@@ -1969,10 +1968,102 @@ struct Scan {
     else         v.scalar = fn(v.scalar);
   }
 
-  // ${name/pat/repl}, ${name//pat/repl}, ${name:/pat/repl}.  Matches are
-  // tried at character starts only.
-  static str replace(const str& s, const CompiledPattern& pat,
-                     const str& repl, bool global, char anchor, bool mb) {
+  // ${(A)name=…}: `name` becomes an array, or (hash) an association of
+  // the words taken as key/value pairs.
+  Result<void> assign_array(const str& name, vec<str> words, bool hash) {
+    auto& params = ctx().params;
+    if (not hash) {
+      auto p = params.lookup(name);
+      if (p and p->get().is_hash()) (void)params.unset(name);
+      return params.set_array(name, s::move(words));
+    }
+    if (words.size() % 2)
+      return s::unexpected(subst_error("bad set of key/value pairs for associative array"));
+    umap<str, str> h;
+    for (s::size_t k = 0; k + 1 < words.size(); k += 2) h[words[k]] = words[k + 1];
+    auto p = params.lookup(name);
+    if (p and p->get().is_readonly())
+      return s::unexpected(subst_error("read-only variable: " + name));
+    if (not p) {
+      (void)params.set_array(name, {});
+      p = params.lookup(name);
+    }
+    p->get().set(s::move(h));
+    return {};
+  }
+
+  // (I:expr:): which match, 1 without.
+  Result<s::int64_t> nth_match(const ParamFlags& fl) {
+    if (fl.nth.empty()) return 1;
+    return arith(fl.nth);
+  }
+
+  // zsh's getmatch for ${x#pat} ${x##pat} ${x%pat} ${x%%pat}: the match,
+  // anchored at the start (or, for `end`, the end) or with (S) anywhere,
+  // the first (last for `end`) or (I:n:) nth; then what the flags ask
+  // for: (M) the match, (R) the rest (the default), (B) (E) (N) its
+  // start, end and length.  No match is an empty one at the start.
+  // Matches are tried at character starts only, and (B) (E) (N) count
+  // characters.
+  static str get_match(const str& s, const CompiledPattern& pat, bool end, bool longest,
+                       const ParamFlags& fl, s::int64_t nth, bool multibyte) {
+    Chars cs{s, multibyte};
+    s::size_t n = cs.size(), mb = 0, me = 0;
+    if (not fl.m_substr) {
+      if (not end) {
+        s::size_t len = pat.match_prefix(s, longest);
+        if (len != str::npos) me = len;
+      } else {
+        for (s::size_t k = 0; k <= n; ++k) {
+          s::size_t b = cs.pos(longest ? k : n - k);
+          if (pat.matches(s, b, s.size())) {
+            mb = b;
+            me = s.size();
+            break;
+          }
+        }
+      }
+    } else {
+      for (s::size_t k = 0; k <= n; ++k) {
+        s::size_t b = cs.pos(end ? n - k : k);
+        s::size_t len = pat.match_prefix(s, b, longest);
+        if (len == str::npos or --nth > 0) continue;
+        mb = b;
+        me = b + len;
+        break;
+      }
+    }
+    str out;
+    bool rest = fl.m_rest or not (fl.match_mode or fl.m_begin or fl.m_end or fl.m_len);
+    if (fl.match_mode) out += s.substr(mb, me - mb);
+    if (rest) out += s.substr(0, mb) + s.substr(me);
+    // The character a byte offset falls in.
+    auto char_at = [&](s::size_t off) {
+      s::size_t k = 0;
+      while (k < n and cs.pos(k + 1) <= off) ++k;
+      return off >= s.size() ? n : k;
+    };
+    auto num = [&](s::size_t v) {
+      if (not out.empty()) out += ' ';
+      out += s::to_string(v);
+    };
+    if (fl.m_begin) num(char_at(mb) + 1);
+    if (fl.m_end) num(char_at(me) + 1);
+    if (fl.m_len) num(char_at(me) - char_at(mb));
+    return out;
+  }
+
+  // The replacement for a match of s[b, b + len), whose backreferences
+  // are in the PatternMatch.
+  using ReplaceFn = func<Result<str>(s::size_t, s::size_t, const PatternMatch&)>;
+
+  // zsh's igetmatch for ${x/pat/r}: `anchor` is 'w' (the whole value),
+  // '#' (the start), '%' (the end) or 0 (anywhere); `shortest` is (S),
+  // `nth` (I:n:) skips the matches before it.  Matches are tried at
+  // character starts only.
+  static Result<str> substitute(const str& s, const CompiledPattern& pat, bool global,
+                                char anchor, bool shortest, s::int64_t nth, bool mb,
+                                const ReplaceFn& repl) {
     s::size_t n = s.size();
     PatternMatch pm;
     if (anchor == 'w') {
@@ -1987,39 +2078,55 @@ struct Scan {
       return *r + s.substr(len);
     }
     Chars cs{s, mb};
+    s::size_t chars = cs.size();
     if (anchor == '%') {
-      for (s::size_t k = 0; k <= cs.size(); ++k)
-        if (pat.matches(strv(s).substr(cs.pos(k)))) return s.substr(0, cs.pos(k)) + repl;
+      for (s::size_t k = 0; k <= chars; ++k) {
+        s::size_t b = cs.pos(shortest ? chars - k : k);
+        if (pat.matches(s, b, n, &pm)) {
+          auto r = repl(b, n - b, pm);
+          if (not r) return r;
+          return s.substr(0, b) + *r;
+        }
+      }
       return s;
     }
     str out;
-    bool done = false;
-    for (s::size_t k = 0; k <= cs.size();) {
+    // `last_hit`: the step that got to `b` was a match (one, or an empty
+    // one and the character after it).  As in zsh, the empty match at the
+    // end is tried unless that step reached it, and, without `global`,
+    // only when nothing matched: ${x//(b|(#e))/Z} on `abcd` is `aZcdZ`,
+    // ${x//a#/q} on `aaab` is `qqb`.
+    bool done = false, any = false, last_hit = false;
+    // After a match of `len` from character k: the first character start
+    // at or after its end, past one character for an empty match.
+    auto after = [&](s::size_t k, s::size_t len) {
+      s::size_t e = cs.pos(k) + len, j = k + 1;
+      while (j < chars and cs.pos(j) < e) ++j;
+      return j;
+    };
+    for (s::size_t k = 0; k < chars;) {
       s::size_t b = cs.pos(k);
-      // zsh tries no empty match at the end of a non-empty string.
-      s::size_t len = done or (b == n and n > 0)
-          ? str::npos : pat.match_prefix(strv(s).substr(b), true);
-      if (len == str::npos or len == 0) {
-        if (len == 0) out += repl;
-        if (len == 0 and not global) done = true;
-        if (b < n) out += cs.sub(k, 1);
+      s::size_t len = done ? str::npos : pat.match_prefix(s, b, not shortest, &pm);
+      if (len == str::npos) {
+        out += cs.sub(k, 1);
         ++k;
+        last_hit = false;
         continue;
       }
       any = last_hit = true;
+      s::size_t next = after(k, len);
       if (nth > 1) {
         --nth;
-        out += s.substr(b, s::max<s::size_t>(len, 1));
-        b += s::max<s::size_t>(len, 1);
+        out += s.substr(b, cs.pos(next) - b);
+        k = next;
         continue;
       }
       auto r = repl(b, len, pm);
       if (not r) return r;
       out += *r;
       if (not global) done = true;
-      // Resume at the first character start at or after the match.
-      s::size_t e = b + len;
-      while (k <= cs.size() and cs.pos(k) < e) ++k;
+      if (len == 0) out += cs.sub(k, 1);
+      k = next;
     }
     if (not last_hit and (global or not any) and nth <= 1
         and pat.match_prefix(s, n, false, &pm) == 0) {
@@ -2030,23 +2137,39 @@ struct Scan {
     return out;
   }
 
+  // The replacement text of ${x/pat/repl}, expanded.  In double quotes it
+  // is read as double-quoted text (the pattern is not, so `"${x#*/}"`
+  // still matches); unquoted, a leading `~` expands: ${x/b/~} gives a$HOME…
+  Result<str> replacement(strv text, bool dq) {
+    if (dq) return expand_scalar(text, Mode::Scalar, dq);
+    Scan sub{ex, Mode::Scalar};
+    if (auto r = sub.scan(text); not r) return s::unexpected(r.error());
+    Field all;
+    for (s::size_t k = 0; k < sub.fields.size(); ++k) {
+      if (k) all.put(' ', true);
+      all.append(sub.fields[k]);
+    }
+    if (auto r = tilde_expand(all, false, ctx()); not r) return s::unexpected(r.error());
+    return s::move(all.text);
+  }
+
   // substitute() for a pattern with (#b) or (#m): $match … are set to
   // each match before `repl_text` is expanded for it.
-  Result<str> replace_each(const str& s, const CompiledPattern& pat, strv repl_text,
+  Result<str> replace_each(const str& s, const CompiledPattern& pat, strv repl_text, bool dq,
                            bool global, char anchor, bool shortest, s::int64_t nth) {
     bool ksh = opts().get(OPT_KSH_ARRAYS);
-    return substitute(s, pat, global, anchor, shortest, nth,
+    return substitute(s, pat, global, anchor, shortest, nth, opts().multibyte(),
                       [&](s::size_t b, s::size_t len, const PatternMatch& pm) -> Result<str> {
                         set_match_params(ctx().params, pat, s, b, len, pm, ksh);
-                        return expand_scalar(repl_text, Mode::Scalar);
+                        return replacement(repl_text, dq);
                       });
   }
 
   // substitute() with a fixed replacement.
   static str replace(const str& s, const CompiledPattern& pat,
-                     const str& repl, bool global, char anchor,
+                     const str& repl, bool global, char anchor, bool mb,
                      bool shortest = false, s::int64_t nth = 1) {
-    auto r = substitute(s, pat, global, anchor, shortest, nth,
+    auto r = substitute(s, pat, global, anchor, shortest, nth, mb,
                         [&](s::size_t, s::size_t, const PatternMatch&) -> Result<str> {
                           return repl;
                         });
@@ -2209,8 +2332,14 @@ struct Scan {
           for (auto& w : ifs_split(e, sep)) words.push_back(w);
         parts = s::move(words);
       }
-      if (rc_expand) rc_splice(parts, lit, not split and v.words_current() ? &v.words : nullptr);
-      else           splice(parts, lit, false);
+      if (rc_expand) {
+        rc_splice(parts, lit, not split and v.words_current() ? &v.words : nullptr);
+      } else if (v.quoted_elems) {
+        mark_quoted();
+        splice(parts, lit, true);
+      } else {
+        splice(parts, lit, false);
+      }
       return {};
     }
     if (split) splice_split(v.scalar, lit);
@@ -2282,11 +2411,27 @@ struct Scan {
         auto r = param_value(inner.substr(2, inner.size() - 3), dq);
         if (not r) return s::unexpected(r.error());
         v = nested_value(*r, dq);
+        // Unquoted, the inner result's empty elements go, as when it is
+        // a word list: ${#${a}}.
+        if (not dq and v.array and not v.quoted_elems)
+          s::erase_if(v.arr, [](const str& e) { return e.empty(); });
       } else if (inner.size() > 1 and inner[0] == '$'
                  and inner[1] != '(' and inner[1] != '[') {
         auto r = param_value(inner.substr(1), dq);
         if (not r) return s::unexpected(r.error());
         v = nested_value(*r, dq);
+      } else if (inner[0] == '"') {
+        // ${~"${(@s.:.)x}"}: the words of the quoted string, kept apart
+        // where (@) keeps them.
+        Scan sub{ex, Mode::Word};
+        if (auto r = sub.scan(inner); not r) return s::unexpected(r.error());
+        vec<str> words;
+        for (auto& f : sub.fields)
+          if (not f.dropped and (f.quoted or not f.text.empty())) words.push_back(f.text);
+        v.set = true;
+        v.quoted_elems = true;
+        if (words.size() == 1) v.make_scalar(words[0]);
+        else                   v.make_array(s::move(words));
       } else {
         auto s = expand_scalar(inner, Mode::Scalar);
         if (not s) return s::unexpected(s.error());
@@ -2296,17 +2441,8 @@ struct Scan {
         else                                    v.make_scalar(*s);
       }
       i = e;
-      // ${(P)${…}}: the value names the parameter; ${(tP)…} its type.
-      if (fl.indirect) {
-        name = v.array ? (v.arr.empty() ? str{} : v.arr[0]) : v.scalar;
-        if (fl.type) {
-          v = Value{};
-          v.set = true;
-          v.make_scalar(type_of(name));
-        } else {
-          v = get_param(name, fl);
-        }
-      }
+      // ${(P)${…}} and ${(tP)${…}} are resolved once the subscripts are
+      // applied, by indirect() below.
     } else {
       s::size_t s = i;
       if (i < t.size() and is_name_start(t[i])) {
@@ -2388,7 +2524,7 @@ struct Scan {
       return res;
     }
 
-    strv subscripted = t.substr(subscripts, i - subscripts);
+    strv subscript_text = t.substr(subscripts, i - subscripts);
     strv op = t.substr(i);
     bool special = not name.empty() and (is_special_param(name[0])
                     or s::isdigit(static_cast<unsigned char>(name[0])));
@@ -2424,12 +2560,6 @@ struct Scan {
         null = s::all_of(v.arr.begin(), v.arr.end(), [](const str& e) { return e.empty(); })
            and (v.arr.size() == 1 or ifs_first().empty());
       bool empty_test = colon ? null : not v.set;
-      // ${x::=word} assigns unconditionally.
-      bool force_assign = colon and rest.starts_with(":=");
-      if (force_assign) {
-        rest.remove_prefix(1);
-        o = '=';
-      }
       if (o == '-' or o == '=' or o == '?' or o == '+') {
         strv word = rest.substr(1);
         switch (o) {
@@ -2482,17 +2612,13 @@ struct Scan {
                       if (not part.empty()) parts.push_back(s::move(part));
                   words = s::move(parts);
                 }
-                if (fl.array_assign >= 2) {
-                  auto p = ctx().params.lookup(name);
-                  if (not p or not p->get().is_hash())
-                    ctx().params.assign(name, umap<str, str>{}, PM_HASH);
-                }
-                r = ctx().params.set_array(name, words);
+                r = assign_array(name, words, fl.array_assign >= 2);
                 if (fl.array_assign >= 2) {
                   vec<str> values;
                   for (s::size_t k = 1; k < words.size(); k += 2) values.push_back(words[k]);
                   words = s::move(values);
                 }
+                w->set = true;
                 w->make_array(s::move(words));
               } else {
                 // zsh assigns, and goes on with, the words joined as one
@@ -2503,7 +2629,19 @@ struct Scan {
                   w->make_scalar(s::move(joined));
                 }
                 w->words.clear();   // the result is a plain value now
-                r = ctx().params.set_scalar(name, w->scalar);
+                if (not subscript_text.empty()) {
+                  // ${h[key]:=word}: that element.
+                  auto key = expand_scalar(subscript_text.substr(1, subscript_text.size() - 2),
+                                           Mode::Scalar);
+                  if (not key) return s::unexpected(key.error());
+                  Assignment as;
+                  as.name = name;
+                  as.value = w->scalar;
+                  as.subscript = *key;
+                  r = ex.exec().assign_expanded(as);
+                } else {
+                  r = ctx().params.set_scalar(name, w->scalar);
+                }
               }
               if (not r) return s::unexpected(r.error());
               v = *w;
@@ -2555,21 +2693,10 @@ struct Scan {
         bool longest = rest.size() > 1 and rest[1] == o;
         auto pat = operand_pattern(rest.substr(longest ? 2 : 1), false);
         if (not pat) return s::unexpected(pat.error());
+        auto nth = nth_match(fl);
+        if (not nth) return s::unexpected(nth.error());
         bool mb = opts().multibyte();
-        each(v, [&](const str& s) {
-          if (o == '#') {
-            s::size_t len = pat->match_prefix(s, longest);
-            return len == str::npos ? s : s.substr(len);
-          }
-          // Suffix: the shortest suffix starts as far right as possible.
-          Chars cs{s, mb};
-          s::size_t n = cs.size();
-          for (s::size_t k = 0; k <= n; ++k) {
-            s::size_t b = cs.pos(longest ? k : n - k);
-            if (pat->matches(strv(s).substr(b))) return s.substr(0, b);
-          }
-          return s;
-        });
+        each(v, [&](const str& s) { return get_match(s, *pat, o == '%', longest, fl, *nth, mb); });
       } else if (o == '/') {
         join_dq();
         strv body = rest.substr(1);
@@ -2579,7 +2706,7 @@ struct Scan {
           global = true;
           body.remove_prefix(1);
         }
-        // An anchor may follow `//` as well: ${y//#/Q}.
+        // `#` or `%` anchors, after `//` too (${y//#/Z} is Zabc, as zsh).
         if (not body.empty() and (body[0] == '#' or body[0] == '%')) {
           anchor = body[0];
           body.remove_prefix(1);
@@ -2591,29 +2718,35 @@ struct Scan {
         }
         auto pat = operand_pattern(body.substr(0, slash), false);
         if (not pat) return s::unexpected(pat.error());
-        str repl;
-        if (slash != strv::npos) {
-          // In double quotes the replacement is read as double-quoted
-          // text; the pattern is not, so `"${x#*/}"` still matches.
-          if (dq) {
-            auto r = expand_scalar(body.substr(slash + 1), Mode::Scalar, dq);
-            if (not r) return s::unexpected(r.error());
-            repl = *r;
-          } else {
-            // Unquoted, a leading `~` expands: ${x/b/~} gives a$HOME…
-            Scan sub{ex, Mode::Scalar};
-            if (auto r = sub.scan(body.substr(slash + 1)); not r) return s::unexpected(r.error());
-            Field all;
-            for (s::size_t k = 0; k < sub.fields.size(); ++k) {
-              if (k) all.put(' ', true);
-              all.append(sub.fields[k]);
+        auto nth = nth_match(fl);
+        if (not nth) return s::unexpected(nth.error());
+        strv repl_text = slash != strv::npos ? body.substr(slash + 1) : strv{};
+        if (pat->backrefs() or pat->sets_match()) {
+          // (#b) and (#m): the replacement is expanded for each match, with
+          // $match and $MATCH set to it.
+          opt<ShellError> err;
+          each(v, [&](const str& s) {
+            if (err) return s;
+            auto r = replace_each(s, *pat, repl_text, dq, global, anchor, fl.m_substr, *nth);
+            if (not r) {
+              err = r.error();
+              return s;
             }
-            if (auto r = tilde_expand(all, false, ctx()); not r) return s::unexpected(r.error());
-            repl = s::move(all.text);
+            return *r;
+          });
+          if (err) return s::unexpected(*err);
+        } else {
+          str repl;
+          if (slash != strv::npos) {
+            auto r = replacement(repl_text, dq);
+            if (not r) return s::unexpected(r.error());
+            repl = s::move(*r);
           }
+          bool mb = opts().multibyte();
+          each(v, [&](const str& s) {
+            return replace(s, *pat, repl, global, anchor, mb, fl.m_substr, *nth);
+          });
         }
-        bool mb = opts().multibyte();
-        each(v, [&](const str& s) { return replace(s, *pat, repl, global, anchor, mb); });
       } else if (colon and o == 0) {
         return s::unexpected(subst_error("unrecognized modifier"));
       } else if (colon and (s::isdigit(static_cast<unsigned char>(o))
@@ -2662,66 +2795,7 @@ struct Scan {
         // plus :s/pat/repl/ (and :gs/pat/repl/ for global), the
         // history-style substitution modifier (M13 Phase 13a), and :& for
         // "repeat the last :s".
-        strv mods = op;
-        opt<str> last_pat, last_repl;
-        while (mods.size() >= 2 and mods[0] == ':') {
-          char m = mods[1];
-          bool global = false;
-          if (m == 'g' and mods.size() >= 3 and (mods[2] == 's' or mods[2] == '&')) {
-            global = true;
-            mods.remove_prefix(1);
-            m = mods[1];
-          }
-          if (m == 's' or m == '&') {
-            str pat_text, repl_text;
-            if (m == 's') {
-              if (mods.size() < 4) return s::unexpected(subst_error("bad substitution"));
-              char delim = mods[2];
-              s::size_t mid = mods.find(delim, 3);
-              if (mid == strv::npos)
-                return s::unexpected(subst_error("bad substitution"));
-              s::size_t end = mods.find(delim, mid + 1);
-              if (end == strv::npos) end = mods.size();
-              pat_text  = str(mods.substr(3, mid - 3));
-              repl_text = str(mods.substr(mid + 1, end - mid - 1));
-              last_pat  = pat_text;
-              last_repl = repl_text;
-              mods.remove_prefix(end < mods.size() ? end + 1 : mods.size());
-            } else {
-              if (not last_pat)
-                return s::unexpected(subst_error(":& without a preceding :s"));
-              pat_text  = *last_pat;
-              repl_text = *last_repl;
-              mods.remove_prefix(2);
-            }
-            auto cp = CompiledPattern::compile(pat_text, false,
-                                               opts().get(OPT_EXTENDEDGLOB), opts().multibyte());
-            bool g = global;
-            each(v, [&](const str& s) {
-              return replace(s, cp, repl_text, g, /*anchor=*/0, opts().multibyte());
-            });
-            continue;
-          }
-          if (strv("htreulqQaAcP").find(m) == strv::npos)
-            return s::unexpected(
-                subst_error("unrecognized modifier `" + str(1, m) + "'"));
-          mods.remove_prefix(2);
-          // :h2, :t3: a count of path components.
-          s::size_t count = 0;
-          if (m == 'h' or m == 't')
-            while (not mods.empty() and s::isdigit(static_cast<unsigned char>(mods[0]))) {
-              count = s::min<s::size_t>(count * 10 + static_cast<s::size_t>(mods[0] - '0'), 1u << 20);
-              mods.remove_prefix(1);
-            }
-          if (m == 'c') {
-            // :c — the command's path, as `=cmd` would give.
-            each(v, [&](const str& s) { return ex.exec().find_command(s).value_or(s); });
-          } else {
-            bool mb = opts().multibyte();
-            each(v, [&](const str& s) { return modify(s, m, count, mb); });
-          }
-        }
-        if (not mods.empty()) return s::unexpected(subst_error("bad substitution"));
+        if (auto r = apply_modifiers(v, op); not r) return s::unexpected(r.error());
       } else if (colon and s::isalpha(static_cast<unsigned char>(o))) {
         return s::unexpected(
             subst_error("unrecognized modifier `" + str(1, o) + "'"));
@@ -2855,6 +2929,17 @@ struct Scan {
       v.arr = s::move(out);
     }
     if (fl.unquote) each(v, [](const str& s) { return remove_quotes(s); });
+    if (fl.escapes_g) each(v, [](const str& s) { return c_escapes(s); });
+    if (fl.quote_pat) {
+      each(v, [](const str& s) {
+        str out;
+        for (char c : s) {
+          if (PATTERN_CHARS.find(c) != strv::npos) out += '\\';
+          out += c;
+        }
+        return out;
+      });
+    }
     bool mb = opts().multibyte();
     // An empty word quotes as '' so that it survives being read back.
     if (fl.quote == -1) each(v, [](const str& s) { return quote_minimal(s); });

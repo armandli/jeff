@@ -4,8 +4,8 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
-#include <cwctype>
 #include <ctime>
+#include <cwctype>
 #include <dirent.h>
 #include <grp.h>
 #include <pwd.h>
@@ -16,9 +16,9 @@
 #include <functional>
 
 #include <jfsh/core/aliases.h>
+#include <jfsh/core/sort.h>
 #include <jfsh/core/stack.h>
 #include <jfsh/core/utf8.h>
-#include <jfsh/core/sort.h>
 
 namespace jfsh {
 
@@ -65,11 +65,11 @@ struct CompiledPattern::Impl {
   PatternSeq      main;
   vec<PatternSeq> excludes;   // a~b~c: `b` and `c`
   bool            negate = false;   // ^pat
-  bool            nocase = false;
-  bool            multibyte = false;   // ? and [...] take a UTF-8 character
   int             captures = 0;     // groups under (#b)
   bool            set_match = false;  // (#m) seen
+  bool            approx = false;     // (#aN) with N > 0 seen
   int             end_approx = 0;   // (#aN) in force at the end
+  bool            multibyte = false;   // ? and [...] take a UTF-8 character
 };
 
 namespace {
@@ -94,13 +94,15 @@ int (*class_fn(strv name))(int) {
   return nullptr;
 }
 
-struct PatternParser {
-  strv      p;
-  bool      ext;
-  s::size_t i  = 0;
-  bool      mb = false;
-  bool      too_deep = false;
+// The globbing flags as a pattern is read; a group's changes end with it.
+struct PatFlags {
+  bool nocase  = false;
+  bool lower   = false;
+  int  approx  = 0;
+  bool backref = false;
+};
 
+struct PatternParser {
   struct Decoded {
     char32_t  c;
     s::size_t next;   // the position after it
@@ -112,15 +114,7 @@ struct PatternParser {
     char32_t c = utf8_decode(p, j, len);
     return {c, j + len};
   }
-// The globbing flags as a pattern is read; a group's changes end with it.
-struct PatFlags {
-  bool nocase  = false;
-  bool lower   = false;
-  int  approx  = 0;
-  bool backref = false;
-};
 
-struct PatternParser {
   // `[…]` starting at p[i] == '['.  Returns false (and leaves i) when the
   // bracket is never closed, so the caller treats `[` as a literal.
   bool parse_class(Node& n) {
@@ -187,7 +181,7 @@ struct PatternParser {
   // Groups nested deeper than the stack holds make the whole pattern
   // literal text (`too_deep`), so that neither parsing nor matching runs
   // off the end of the stack and the pattern stays consistent.
-  bool parse_group(Node& n) {
+  bool parse_group(Node& n, PatFlags fl) {
     if (too_deep or stack_low()) { too_deep = true; return false; }
     s::size_t save = i;
     int saved_captures = impl.captures;
@@ -204,7 +198,7 @@ struct PatternParser {
         ++i;
         n.alt_excludes.back().push_back(parse_seq(true, fl));
       }
-      if (i >= p.size()) {
+      if (i >= p.size() or too_deep) {
         i = save;
         n.alts.clear();
         n.alt_negate.clear();
@@ -266,6 +260,7 @@ struct PatternParser {
       }
     }
     fl = nf;
+    if (fl.approx > 0) impl.approx = true;
     i = close + 1;
     if (anchor) seq.push_back(*anchor);
     return true;
@@ -274,7 +269,7 @@ struct PatternParser {
   // `top_bar`: at the top level, `|` separates alternatives (a|b).
   Seq parse_seq(bool in_group, PatFlags fl, bool top_bar = false) {
     Seq seq;
-    while (i < p.size()) {
+    while (i < p.size() and not too_deep) {
       char c = p[i];
       if (in_group and (c == '|' or c == ')')) break;
       if (top_bar and c == '|') break;
@@ -325,16 +320,24 @@ struct PatternParser {
   strv      p;
   bool      ext;
   CompiledPattern::Impl& impl;
-  s::size_t i = 0;
+  s::size_t i  = 0;
+  bool      mb = false;
+  bool      too_deep = false;
 };
 
-char32_t fold(char32_t c, bool nocase, bool mb) noexcept {
-  if (not nocase) return c;
-  if (mb and c >= 0x80) return static_cast<char32_t>(::towlower(static_cast<wint_t>(c)));
-  return static_cast<char32_t>(s::tolower(static_cast<int>(c)));
+// Whether string byte `c` matches pattern byte `pc` under the node's
+// flags: (#i) either case, (#l) a lower-case `pc` either case.
+bool same_char(const Node& n, unsigned char c, unsigned char pc) {
+  if (c == pc) return true;
+  if (n.nocase or (n.lower and s::islower(pc)))
+    return s::tolower(c) == s::tolower(pc);
+  return false;
 }
 
-bool class_has(const Node& n, char32_t c, bool nocase, bool mb) {
+// Whether character `c` is in the class; with `mb` it is a UTF-8
+// character's code point.
+bool class_has(const Node& n, char32_t c, bool mb) {
+  bool nocase = n.nocase or n.lower;
   auto in_ranges = [&](char32_t x) {
     for (auto [lo, hi] : n.ranges)
       if (x >= lo and x <= hi) return true;
@@ -347,25 +350,6 @@ bool class_has(const Node& n, char32_t c, bool nocase, bool mb) {
     char32_t u = mb ? static_cast<char32_t>(::towupper(static_cast<wint_t>(c)))
                     : static_cast<char32_t>(s::toupper(static_cast<int>(c)));
     in = in_ranges(l) or in_ranges(u);
-// Whether string character `c` matches pattern character `pc` under the
-// node's flags: (#i) either case, (#l) a lower-case `pc` either case.
-bool same_char(const Node& n, unsigned char c, unsigned char pc) {
-  if (c == pc) return true;
-  if (n.nocase or (n.lower and s::islower(pc)))
-    return s::tolower(c) == s::tolower(pc);
-  return false;
-}
-
-bool class_has(const Node& n, unsigned char c) {
-  bool nocase = n.nocase or n.lower;
-  bool in = false;
-  for (auto [lo, hi] : n.ranges) {
-    if (c >= lo and c <= hi) { in = true; break; }
-    if (nocase) {
-      unsigned char l = static_cast<unsigned char>(s::tolower(c));
-      unsigned char u = static_cast<unsigned char>(s::toupper(c));
-      if ((l >= lo and l <= hi) or (u >= lo and u <= hi)) { in = true; break; }
-    }
   }
   if (not in)
     for (auto [fn, wt] : n.classes)
@@ -376,6 +360,45 @@ bool class_has(const Node& n, unsigned char c) {
       }
   return in != n.class_negated;
 }
+
+bool single_char(const Node& n) {
+  return n.kind == Kind::Lit or n.kind == Kind::Any or n.kind == Kind::Class;
+}
+
+// The subject both matchers read: s[.., lim), with `s` the whole string so
+// that (#s) and (#e) are its ends.
+struct Subject {
+  // The character at p (< lim) and the position after it.  Under `mb` a
+  // UTF-8 character is one; a byte that starts none, or one cut off by
+  // lim, is a character of its own.
+  char32_t at(s::size_t p, s::size_t& next) const {
+    auto b = static_cast<unsigned char>(s[p]);
+    if (not mb or b < 0x80) { next = p + 1; return b; }
+    s::size_t len = 1;
+    char32_t c = utf8_decode(s, p, len);
+    if (len == 0 or p + len > lim) { next = p + 1; return b; }
+    next = p + len;
+    return c;
+  }
+  // Whether a character may start at p.
+  bool boundary(s::size_t p) const {
+    return not mb or p >= lim or (static_cast<unsigned char>(s[p]) & 0xc0) != 0x80;
+  }
+  // Whether one character of `n` (a Lit, Any or Class) matches at p.
+  bool one(const Node& n, s::size_t p, s::size_t& next) const {
+    if (p >= lim) return false;
+    if (n.kind == Kind::Lit) {
+      next = p + 1;
+      return same_char(n, static_cast<unsigned char>(s[p]), static_cast<unsigned char>(n.ch));
+    }
+    char32_t c = at(p, next);
+    return n.kind == Kind::Any or class_has(n, c, mb);
+  }
+
+  strv      s;
+  s::size_t lim = 0;
+  bool      mb  = false;
+};
 
 // The positions a pattern can have reached in the subject, ascending and
 // without repeats.
@@ -389,39 +412,29 @@ Positions normalized(Positions p) {
   return p;
 }
 
-// Matching runs the pattern over the set of positions it may be at, one
-// node at a time, as a Thompson NFA does: no backtracking, so time is
-// bounded by pattern size times subject length and the stack only grows
-// with the nesting of groups in the pattern, never with the subject.
-struct Matcher {
-  strv s;
-  bool nocase;
-  bool mb;
+Positions joined(const Positions& a, const Positions& b) {
+  Positions out;
+  out.reserve(a.size() + b.size());
+  s::set_union(a.begin(), a.end(), b.begin(), b.end(), s::back_inserter(out));
+  return out;
+}
 
-  // The character at p and the position after it.
-  char32_t at(s::size_t p, s::size_t& next) const {
-    if (not mb) { next = p + 1; return static_cast<unsigned char>(s[p]); }
-    s::size_t len = 1;
-    char32_t c = utf8_decode(s, p, len);
-    next = p + len;
-    return c;
-  }
-  bool boundary(s::size_t p) const {
-    return not mb or p >= s.size() or (static_cast<unsigned char>(s[p]) & 0xc0) != 0x80;
-  }
+Positions without(const Positions& a, const Positions& b) {
+  Positions out;
+  s::set_difference(a.begin(), a.end(), b.begin(), b.end(), s::back_inserter(out));
+  return out;
+}
 
-  // Whether one character of `n` (a Lit, Any or Class) matches at p.
-  bool one(const Node& n, s::size_t p, s::size_t& next) const {
-    if (p >= s.size()) return false;
-    if (n.kind == Kind::Lit) {
-      next = p + 1;
-      return fold(static_cast<unsigned char>(s[p]), nocase, false)
-          == fold(static_cast<unsigned char>(n.ch), nocase, false);
-    }
-    char32_t c = at(p, next);
-    return n.kind == Kind::Any or class_has(n, c, nocase, mb);
-  }
+bool has(const Positions& set, s::size_t p) {
+  return s::binary_search(set.begin(), set.end(), p);
+}
 
+// For patterns without (#b) groups or (#aN): runs the pattern over the
+// set of positions it may be at, one node at a time, as a Thompson NFA
+// does.  No backtracking, so time is bounded by pattern size times
+// subject length and the stack only grows with the nesting of groups in
+// the pattern, never with the subject.
+struct SetMatcher : Subject {
   // The positions after `n` has matched from any of `set`.
   Positions node(const Node& n, const Positions& set) const {
     Positions out;
@@ -430,12 +443,156 @@ struct Matcher {
         for (s::size_t p : set) {
           s::size_t next = 0;
           if (one(n, p, next)) out.push_back(next);
+        }
+        if (mb) out = normalized(s::move(out));
+      break; case Kind::Star:
+        if (set.empty()) break;
+        for (s::size_t p = set.front(), k = 0; p <= lim; ++p) {
+          bool listed = k < set.size() and set[k] == p;
+          if (listed) ++k;
+          if (listed or boundary(p)) out.push_back(p);
+        }
+      break; case Kind::AtStart:
+        if (not set.empty() and set.front() == 0) out.push_back(0);
+      break; case Kind::AtEnd:
+        if (has(set, s.size())) out.push_back(s.size());
+      break; case Kind::Group:
+        // Matching nests as the pattern did; past the stack it fails.
+        if (stack_low()) break;
+        for (s::size_t a = 0; a < n.alts.size(); ++a) {
+          bool negate = a < n.alt_negate.size() and n.alt_negate[a];
+          bool excl   = a < n.alt_excludes.size() and not n.alt_excludes[a].empty();
+          if (not negate and not excl) {
+            out = joined(out, seq(n.alts[a], set));
+            continue;
+          }
+          // `^x` and `x~y` depend on where the alternative started.
+          for (s::size_t p : set) {
+            Positions part = seq(n.alts[a], Positions{p});
+            if (negate) {
+              Positions rest;
+              for (s::size_t e = p; e <= lim; ++e)
+                if (boundary(e) and not has(part, e)) rest.push_back(e);
+              part = s::move(rest);
+            }
+            if (excl)
+              for (const auto& ex : n.alt_excludes[a])
+                part = without(part, seq(ex, Positions{p}));
+            out = joined(out, part);
+          }
+        }
+      break; case Kind::Range:
+        for (s::size_t p : set) {
+          s::uint64_t v = 0;
+          bool big = false;
+          for (s::size_t e = p; e < lim and s::isdigit(static_cast<unsigned char>(s[e])); ++e) {
+            unsigned d = static_cast<unsigned>(s[e] - '0');
+            if (v > (INT64_MAX - d) / 10) big = true;
+            else v = v * 10 + d;
+            s::int64_t x = big ? INT64_MAX : static_cast<s::int64_t>(v);
+            if ((not n.has_lo or x >= n.lo) and (not n.has_hi or x <= n.hi)) out.push_back(e + 1);
+            else if (n.has_hi and x > n.hi) break;
+          }
+        }
+        out = normalized(s::move(out));
+      break; case Kind::Repeat:
+        out = repeat(n, set);
+      break; default:
+        assert(false);  // should never get here
+    }
+    return out;
+  }
+
+  // x# (min 0), x## (min 1) and x(#cN,M): every position after from `min`
+  // to `max` (no limit when negative) matches of the sub-pattern.
+  Positions repeat(const Node& n, const Positions& set) const {
+    const Node& sub = *n.sub;
+    Positions out;
+    if (n.max < 0 and n.min <= 1 and single_char(sub)) {
+      // A run of single characters: from each start, every position up to
+      // where the run ends.  A start inside an earlier run adds nothing.
+      bool any = false;
+      s::size_t done = 0;   // where the last run ended
+      for (s::size_t p : set) {
+        if (any and p <= done) continue;
+        if (n.min == 0) out.push_back(p);
+        s::size_t q = p, next = 0;
+        while (one(sub, q, next)) out.push_back(q = next);
+        done = q;
+        any = true;
+      }
+      return normalized(s::move(out));
+    }
+    Positions cur = set;
+    int count = 0;
+    for (; count < n.min and not cur.empty(); ++count) cur = node(sub, cur);
+    if (count < n.min) return {};
+    if (n.max >= 0) {
+      out = cur;
+      for (; count < n.max and not cur.empty(); ++count) {
+        cur = node(sub, cur);
+        out = joined(out, cur);
+      }
+      return out;
+    }
+    // Any number more: every position reachable from `cur`.
+    vec<bool> seen(lim + 1, false);
+    for (s::size_t p : cur) { seen[p] = true; out.push_back(p); }
+    Positions frontier = s::move(cur);
+    while (not frontier.empty()) {
+      Positions fresh;
+      for (s::size_t p : node(sub, frontier))
+        if (not seen[p]) { seen[p] = true; fresh.push_back(p); }
+      out.insert(out.end(), fresh.begin(), fresh.end());
+      frontier = s::move(fresh);
+    }
+    return normalized(s::move(out));
+  }
+
+  Positions seq(const Seq& q, Positions set) const {
+    for (const auto& n : q) {
+      if (set.empty()) break;
+      set = node(n, set);
+    }
+    return set;
+  }
+};
+
+using Cont = func<bool(s::size_t)>;
+
+// For patterns with (#b) groups or (#aN), which need to know how a match
+// went: a backtracking matcher over s[.., lim).  `errs` counts the (#aN)
+// errors made so far; `caps` the (#b) groups' extents, put back as
+// alternatives fail.  It recurses per character, so a subject too long
+// for the stack fails to match rather than overflowing it.
+struct Matcher : Subject {
+  // A one-character node, with (#aN) the errors it may absorb: a wrong
+  // character, a missing one, an extra one.
+  bool single(const Node& n, s::size_t pos, const Cont& k) const {
+    if (stack_low()) return false;
+    s::size_t next = 0;
+    if (one(n, pos, next) and k(next)) return true;
+    if (n.approx <= errs) return false;
+    if (pos < lim) at(pos, next);
+    ++errs;
+    bool ok = (pos < lim and k(next)) or k(pos)
+           or (pos < lim and single(n, next, k));
+    --errs;
+    return ok;
+  }
+
+  bool node(const Node& n, s::size_t pos, const Cont& k) const {
+    // Each node matched recurses (x# once per repeat), so a subject too
+    // long for the stack fails here rather than overflowing it.
+    if (stack_low()) return false;
+    switch (n.kind) {
+      case Kind::Lit: case Kind::Any: case Kind::Class:
         return single(n, pos, k);
       case Kind::Star:
         // Greedy, as zsh's: the longest run first, so (#b)(*)X(*) on
         // aXbXc gives aXb and c.
         for (s::size_t e = lim + 1; e-- > pos;)
-          if (k(e)) return true;
+          if (boundary(e) and k(e)) return true;
         return false;
       case Kind::AtStart:
         return pos == 0 and k(pos);
@@ -457,107 +614,39 @@ struct Matcher {
           };
           if (a < n.alt_negate.size() and n.alt_negate[a]) {
             for (s::size_t e = lim + 1; e-- > pos;)
-              if (not spans(alt, pos, e) and finish(e)) return true;
+              if (boundary(e) and not spans(alt, pos, e) and finish(e)) return true;
             continue;
           }
           if (seq(alt, 0, pos, finish)) return true;
         }
         return false;
       case Kind::Range: {
-        s::size_t e = pos;
-        while (e < lim and s::isdigit(static_cast<unsigned char>(s[e]))) ++e;
-        for (s::size_t end = e; end > pos; --end) {
-          s::int64_t v = s::strtoll(str(s.substr(pos, end - pos)).c_str(),
-                                    nullptr, 10);
-          if ((not n.has_lo or v >= n.lo) and (not n.has_hi or v <= n.hi) and k(end))
+        // The values of each run of digits from pos, saturating; the
+        // longest is tried first.
+        vec<s::int64_t> vals;
+        s::uint64_t v = 0;
+        bool big = false;
+        for (s::size_t e = pos; e < lim and s::isdigit(static_cast<unsigned char>(s[e])); ++e) {
+          unsigned d = static_cast<unsigned>(s[e] - '0');
+          if (v > (INT64_MAX - d) / 10) big = true;
+          else v = v * 10 + d;
+          vals.push_back(big ? INT64_MAX : static_cast<s::int64_t>(v));
+        }
+        for (s::size_t len = vals.size(); len > 0; --len) {
+          s::int64_t x = vals[len - 1];
+          if ((not n.has_lo or x >= n.lo) and (not n.has_hi or x <= n.hi) and k(pos + len))
             return true;
         }
-        if (mb) out = normalized(s::move(out));
-      break; case Kind::Star:
-        if (set.empty()) break;
-        for (s::size_t p = set.front(), k = 0; p <= s.size(); ++p) {
-          bool listed = k < set.size() and set[k] == p;
-          if (listed) ++k;
-          if (listed or boundary(p)) out.push_back(p);
-        }
-      break; case Kind::Group:
-        // Matching nests as the pattern did; past the stack it fails.
-        if (stack_low()) break;
-        for (const auto& alt : n.alts) {
-          Positions part = seq(alt, set);
-          Positions merged;
-          s::set_union(out.begin(), out.end(), part.begin(), part.end(),
-                       s::back_inserter(merged));
-          out = s::move(merged);
-        }
-      break; case Kind::Range:
-        for (s::size_t p : set) {
-          s::uint64_t v = 0;
-          bool big = false;
-          for (s::size_t e = p; e < s.size() and s::isdigit(static_cast<unsigned char>(s[e])); ++e) {
-            unsigned d = static_cast<unsigned>(s[e] - '0');
-            if (v > (INT64_MAX - d) / 10) big = true;
-            else v = v * 10 + d;
-            s::int64_t x = big ? INT64_MAX : static_cast<s::int64_t>(v);
-            if ((not n.has_lo or x >= n.lo) and (not n.has_hi or x <= n.hi)) out.push_back(e + 1);
-            else if (n.has_hi and x > n.hi) break;
-          }
-        }
-        out = normalized(s::move(out));
-      break; case Kind::Repeat:
-        out = repeat(n, set);
-      break; default:
+        return false;
+      }
+      case Kind::Repeat:
+        return repeat(n, 0, pos, k);
+      default:
         assert(false);  // should never get here
     }
-    return out;
+    return false;
   }
 
-  // x# (min 0) and x## (min 1): every position after `min` or more
-  // matches of the sub-pattern.
-  Positions repeat(const Node& n, const Positions& set) const {
-    const Node& sub = *n.sub;
-    Positions out;
-    if (sub.kind == Kind::Lit or sub.kind == Kind::Any or sub.kind == Kind::Class) {
-      // A run of single characters: from each start, every position up to
-      // where the run ends.  A start inside an earlier run adds nothing.
-      bool any = false;
-      s::size_t done = 0;   // where the last run ended
-      for (s::size_t p : set) {
-        if (any and p <= done) continue;
-        if (n.min == 0) out.push_back(p);
-        s::size_t q = p, next = 0;
-        while (one(sub, q, next)) out.push_back(q = next);
-        done = q;
-        any = true;
-      }
-      return normalized(s::move(out));
-    }
-    vec<bool> seen(s.size() + 1, false);
-    if (n.min == 0)
-      for (s::size_t p : set) { seen[p] = true; out.push_back(p); }
-    Positions frontier = set;
-    while (not frontier.empty()) {
-      Positions fresh;
-      for (s::size_t p : node(sub, frontier))
-        if (not seen[p]) { seen[p] = true; fresh.push_back(p); }
-      out.insert(out.end(), fresh.begin(), fresh.end());
-      frontier = s::move(fresh);
-    }
-    return normalized(s::move(out));
-  }
-
-  Positions seq(const Seq& q, Positions set) const {
-    for (const auto& n : q) {
-      if (set.empty()) break;
-      set = node(n, set);
-    }
-    return set;
-  }
-
-  Positions ends(const Seq& q) const { return seq(q, Positions{0}); }
-  bool whole(const Seq& q) const {
-    Positions e = ends(q);
-    return not e.empty() and e.back() == s.size();
   // Whether `q` matches exactly s[b, e); the captures are left alone.
   bool spans(const Seq& q, s::size_t b, s::size_t e) const {
     auto saved = caps;
@@ -578,34 +667,32 @@ struct Matcher {
     return count >= n.min and k(pos);
   }
 
+  bool plain(const Seq& q, s::size_t j) const {
+    return j < q.size() and q[j].approx == 0 and single_char(q[j]);
+  }
+
   bool seq(const Seq& q, s::size_t i, s::size_t pos, const Cont& k) const {
+    if (stack_low()) return false;
     // Plain one-character nodes (no (#aN) errors allowed) are matched in a
     // loop, without a continuation each: they have one way to match.
-    while (i < q.size() and q[i].approx == 0
-           and (q[i].kind == Kind::Lit or q[i].kind == Kind::Any or q[i].kind == Kind::Class)) {
-      if (pos >= lim or not one_char(q[i], static_cast<unsigned char>(s[pos]))) return false;
-      ++i;
-      ++pos;
-    }
+    for (s::size_t next = 0; plain(q, i); ++i, pos = next)
+      if (not one(q[i], pos, next)) return false;
     if (i == q.size()) return k(pos);
-    auto plain = [&](s::size_t j) {
-      return j < q.size() and q[j].approx == 0
-         and (q[j].kind == Kind::Lit or q[j].kind == Kind::Any or q[j].kind == Kind::Class);
-    };
     // `*` then a plain character: only where that character is.
-    if (q[i].kind == Kind::Star and plain(i + 1)) {
-      for (s::size_t e = lim; e-- > pos;)
-        if (one_char(q[i + 1], static_cast<unsigned char>(s[e])) and seq(q, i + 1, e, k))
-          return true;
+    if (q[i].kind == Kind::Star and plain(q, i + 1)) {
+      for (s::size_t e = lim; e-- > pos;) {
+        s::size_t next = 0;
+        if (boundary(e) and one(q[i + 1], e, next) and seq(q, i + 1, e, k)) return true;
+      }
       return false;
     }
     if (node(q[i], pos, [&](s::size_t e) { return seq(q, i + 1, e, k); })) return true;
     // (#aN): two characters the wrong way round are one error.
     const Node& a = q[i];
+    s::size_t n1 = 0, n2 = 0;
     if (a.approx > errs and a.kind == Kind::Lit and i + 1 < q.size()
         and q[i + 1].kind == Kind::Lit and pos + 1 < lim
-        and one_char(q[i + 1], static_cast<unsigned char>(s[pos]))
-        and one_char(a, static_cast<unsigned char>(s[pos + 1]))) {
+        and one(q[i + 1], pos, n1) and one(a, pos + 1, n2)) {
       ++errs;
       bool ok = seq(q, i + 2, pos + 2, k);
       --errs;
@@ -622,8 +709,6 @@ struct Matcher {
     });
   }
 
-  strv s;
-  s::size_t lim = 0;
   mutable int errs = 0;
   mutable vec<s::pair<s::size_t, s::size_t>> caps;
 };
@@ -635,9 +720,8 @@ bool locale_multibyte() noexcept { return MB_CUR_MAX > 1; }
 CompiledPattern CompiledPattern::compile(strv pattern, bool case_insensitive,
                                          bool extended, bool multibyte) {
   auto impl = s::make_shared<Impl>();
-  impl->nocase    = case_insensitive;
   impl->multibyte = multibyte;
-  PatternParser pp{pattern, extended};
+  PatternParser pp{pattern, extended, *impl};
   pp.mb = multibyte;
   if (extended and pattern.size() > 1 and pattern[0] == '^') {
     impl->negate = true;
@@ -654,23 +738,26 @@ CompiledPattern CompiledPattern::compile(strv pattern, bool case_insensitive,
     alts.push_back(pp.parse_seq(false, fl, true));
     end_approx = impl->end_approx;
     alt_excludes.emplace_back();
-    while (pp.i < pattern.size() and pattern[pp.i] == '~') {
+    while (pp.i < pattern.size() and pattern[pp.i] == '~' and not pp.too_deep) {
       ++pp.i;
       alt_excludes.back().push_back(pp.parse_seq(false, fl, true));
     }
-    if (pp.i >= pattern.size() or pattern[pp.i] != '|') break;
+    if (pp.too_deep or pp.i >= pattern.size() or pattern[pp.i] != '|') break;
     ++pp.i;
   }
   if (pp.too_deep) {
     // The whole pattern as literal text.
-    impl->negate = false;
-    impl->excludes.clear();
-    impl->main.clear();
+    auto lit = s::make_shared<Impl>();
+    lit->multibyte = multibyte;
     for (char c : pattern) {
-      Node lit;
-      lit.ch = c;
-      impl->main.push_back(s::move(lit));
+      Node n;
+      n.ch     = c;
+      n.nocase = case_insensitive;
+      lit->main.push_back(s::move(n));
     }
+    CompiledPattern cp;
+    cp.mImpl = s::move(lit);
+    return cp;
   }
   if (alts.size() == 1) {
     impl->main     = s::move(alts[0]);
@@ -688,49 +775,49 @@ CompiledPattern CompiledPattern::compile(strv pattern, bool case_insensitive,
   return cp;
 }
 
-bool CompiledPattern::matches(strv text) const {
-  Matcher m{text, mImpl->nocase, mImpl->multibyte};
-  if (m.whole(mImpl->main) == mImpl->negate) return false;
-  for (const auto& ex : mImpl->excludes)
-    if (m.whole(ex)) return false;
+// Without (#aN) the position-set matcher decides whether, and how far, a
+// pattern matches: (#b) groups change only what a match reports.  With
+// (#aN) the backtracking matcher decides, and with (#b) it then finds the
+// groups of the match already chosen, so a subject that cannot match
+// costs no backtracking.
+namespace {
+
+bool set_matches(const CompiledPattern::Impl& impl, strv text, s::size_t b, s::size_t e) {
+  SetMatcher m{{text, e, impl.multibyte}};
+  if (has(m.seq(impl.main, Positions{b}), e) == impl.negate) return false;
+  for (const auto& ex : impl.excludes)
+    if (has(m.seq(ex, Positions{b}), e)) return false;
   return true;
 }
 
-s::size_t CompiledPattern::match_prefix(strv text, bool longest) const {
-  Matcher m{text, mImpl->nocase, mImpl->multibyte};
-  Positions ends = m.ends(mImpl->main);
-  if (mImpl->negate) {
+// Where a match from b may end does not depend on where the subject is
+// cut off after it, so one run over all of text gives every prefix that
+// matches.
+s::size_t set_prefix(const CompiledPattern::Impl& impl, strv text, s::size_t b, bool longest) {
+  SetMatcher m{{text, text.size(), impl.multibyte}};
+  Positions ends = m.seq(impl.main, Positions{b});
+  if (impl.negate) {
     // ^pat: the prefixes that pat does not match.
     Positions all;
-    for (s::size_t p = 0, k = 0; p <= text.size(); ++p) {
-      if (k < ends.size() and ends[k] == p) { ++k; continue; }
-      if (m.boundary(p)) all.push_back(p);
-    }
+    for (s::size_t p = b; p <= text.size(); ++p)
+      if (m.boundary(p) and not has(ends, p)) all.push_back(p);
     ends = s::move(all);
   }
-  auto ok = [&](s::size_t len) {
-    Matcher pm{text.substr(0, len), mImpl->nocase, mImpl->multibyte};
-    for (const auto& ex : mImpl->excludes)
-      if (pm.whole(ex)) return false;
-    return true;
-  };
-  if (longest) {
-    for (auto it = ends.rbegin(); it != ends.rend(); ++it)
-      if (ok(*it)) return *it;
-  } else {
-    for (s::size_t e : ends)
-      if (ok(e)) return e;
-bool CompiledPattern::matches(strv text, PatternMatch* info) const {
-  return matches(text, 0, text.size(), info);
+  for (const auto& ex : impl.excludes) ends = without(ends, m.seq(ex, Positions{b}));
+  if (ends.empty()) return strv::npos;
+  return (longest ? ends.back() : ends.front()) - b;
 }
 
-bool CompiledPattern::matches(strv text, s::size_t b, s::size_t e, PatternMatch* info) const {
-  Matcher m{text, e, 0, {}};
-  m.caps.assign(static_cast<s::size_t>(mImpl->captures), {strv::npos, strv::npos});
-  if (m.whole(mImpl->main, mImpl->end_approx, b) == mImpl->negate) return false;
-  for (const auto& ex : mImpl->excludes) {
-    Matcher x{text, e, 0, {}};
-    x.caps.assign(static_cast<s::size_t>(mImpl->captures), {strv::npos, strv::npos});
+// The backtracking matcher on text[b, e): whether it matches, and the
+// (#b) groups into `info`.
+bool backtrack(const CompiledPattern::Impl& impl, strv text, s::size_t b, s::size_t e,
+               PatternMatch* info) {
+  auto none = vec<s::pair<s::size_t, s::size_t>>(static_cast<s::size_t>(impl.captures),
+                                                  {strv::npos, strv::npos});
+  Matcher m{{text, e, impl.multibyte}, 0, none};
+  if (m.whole(impl.main, impl.end_approx, b) == impl.negate) return false;
+  for (const auto& ex : impl.excludes) {
+    Matcher x{{text, e, impl.multibyte}, 0, none};
     if (x.whole(ex, 0, b)) return false;
   }
   if (info) {
@@ -744,16 +831,46 @@ bool CompiledPattern::matches(strv text, s::size_t b, s::size_t e, PatternMatch*
   return true;
 }
 
+// After the set matcher found text[b, e) to match: its (#b) groups.  When
+// the backtracking matcher cannot follow (a subject too long for the
+// stack), the groups took no part.
+void fill_groups(const CompiledPattern::Impl& impl, strv text, s::size_t b, s::size_t e,
+                 PatternMatch* info) {
+  if (not info) return;
+  info->groups.clear();
+  if (impl.captures == 0) return;
+  if (not backtrack(impl, text, b, e, info))
+    info->groups.assign(static_cast<s::size_t>(impl.captures), {strv::npos, strv::npos});
+}
+
+}  // namespace
+
+bool CompiledPattern::matches(strv text, PatternMatch* info) const {
+  return matches(text, 0, text.size(), info);
+}
+
+bool CompiledPattern::matches(strv text, s::size_t b, s::size_t e, PatternMatch* info) const {
+  if (mImpl->approx) return backtrack(*mImpl, text, b, e, info);
+  if (not set_matches(*mImpl, text, b, e)) return false;
+  fill_groups(*mImpl, text, b, e, info);
+  return true;
+}
+
 s::size_t CompiledPattern::match_prefix(strv text, bool longest, PatternMatch* info) const {
   return match_prefix(text, 0, longest, info);
 }
 
 s::size_t CompiledPattern::match_prefix(strv text, s::size_t b, bool longest,
                                         PatternMatch* info) const {
+  if (not mImpl->approx) {
+    s::size_t len = set_prefix(*mImpl, text, b, longest);
+    if (len != strv::npos) fill_groups(*mImpl, text, b, b + len, info);
+    return len;
+  }
   s::size_t room = text.size() - b;
   for (s::size_t n = 0; n <= room; ++n) {
     s::size_t len = longest ? room - n : n;
-    if (matches(text, b, b + len, info)) return len;
+    if (backtrack(*mImpl, text, b, b + len, info)) return len;
   }
   return strv::npos;
 }
@@ -811,7 +928,8 @@ bool has_glob_chars(strv s, bool extended) noexcept {
     // `[` and `(` are pattern characters only when closed; a lone `[` is
     // the test command.
     if (c == '[') {
-      PatternParser pp{s, false, i};
+      CompiledPattern::Impl impl;
+      PatternParser pp{s, false, impl, i};
       Node n;
       if (pp.parse_class(n)) return true;
     }
@@ -846,32 +964,7 @@ GlobPattern GlobPattern::compile(strv pat, GlobFlags flags) {
 }
 
 int collate(const str& a, const str& b, bool numeric) {
-  if (numeric) {
-    auto digit = [](char c) { return s::isdigit(static_cast<unsigned char>(c)) != 0; };
-    s::size_t i = 0;
-    while (i < a.size() and i < b.size() and a[i] == b[i]) ++i;
-    bool da = i < a.size() and digit(a[i]), db = i < b.size() and digit(b[i]);
-    if (da or db) {
-      while (i > 0 and digit(a[i - 1])) --i;
-      s::size_t x = i, y = i;
-      if (x < a.size() and digit(a[x]) and y < b.size() and digit(b[y])) {
-        while (x < a.size() and a[x] == '0') ++x;
-        while (y < b.size() and b[y] == '0') ++y;
-        while (x < a.size() and y < b.size() and digit(a[x]) and a[x] == b[y]) { ++x; ++y; }
-        bool mx = x < a.size() and digit(a[x]), my = y < b.size() and digit(b[y]);
-        if (mx or my) {
-          int cmp = mx and my ? static_cast<unsigned char>(a[x]) - static_cast<unsigned char>(b[y]) : 0;
-          while (x < a.size() and y < b.size() and digit(a[x]) and digit(b[y])) { ++x; ++y; }
-          mx = x < a.size() and digit(a[x]);
-          my = y < b.size() and digit(b[y]);
-          if (mx and not my) return 1;
-          if (my and not mx) return -1;
-          return cmp;
-        }
-      }
-    }
-  }
-  if (int c = ::strcoll(a.c_str(), b.c_str())) return c;
+  if (int c = zstrcmp(a, b, numeric)) return c;
   return a.compare(b);
 }
 
@@ -1363,10 +1456,10 @@ str join_path(const str& dir, strv name) {
   return dir + '/' + str(name);
 }
 
-// Lexical order, except that with NUMERIC_GLOB_SORT runs of digits compare
-// by value.
+// The locale's collation, except that with NUMERIC_GLOB_SORT runs of
+// digits compare by value.
 bool name_less(const str& a, const str& b, bool numeric) {
-  return zstrcmp(a, b, numeric) < 0;
+  return collate(a, b, numeric) < 0;
 }
 
 struct Walker {
@@ -1444,24 +1537,30 @@ Result<vec<str>> glob_expand(
   str        raw = pat.raw;
   bool extended = opts.extended_glob() or (pat.flags & GLOB_EXTGLOB);
   // An unclosed `(` or `[` is a bad pattern, as in zsh (`echo a[b`,
-  // `echo (b`); a `[` alone is the word `[`.
+  // `echo (b`); a `[` alone is the word `[`.  Under NO_BAD_PATTERN the
+  // word stays as it is.
   if (raw != "[") {
     int parens = 0;
-    for (s::size_t i = 0; i < raw.size(); ++i) {
+    bool bad = false;
+    for (s::size_t i = 0; i < raw.size() and not bad; ++i) {
       char c = raw[i];
       if (c == '\\') { ++i; continue; }
       if (c == '[') {
-        s::size_t close = raw.find(']', i + 2);
-        if (close == str::npos)
-          return s::unexpected(qual_error("bad pattern: " + glob_unescape(pat.raw)));
-        i = close;
+        CompiledPattern::Impl impl;
+        PatternParser pp{raw, extended, impl, i};
+        Node n;
+        if (not pp.parse_class(n)) bad = true;
+        else i = pp.i - 1;
       } else if (c == '(') {
         ++parens;
       } else if (c == ')' and parens > 0) {
         --parens;
       }
     }
-    if (parens > 0) return s::unexpected(qual_error("bad pattern: " + glob_unescape(pat.raw)));
+    if (bad or parens > 0) {
+      if (not opts.get(OPT_BADPATTERN)) return vec<str>{glob_unescape(pat.raw)};
+      return s::unexpected(qual_error("bad pattern: " + glob_unescape(pat.raw)));
+    }
   }
   auto split = split_qualifiers(s::move(raw), opts, extended);
   if (not split) return s::unexpected(split.error());
@@ -1495,22 +1594,7 @@ Result<vec<str>> glob_expand(
       }
     }
   }
-  // An unclosed `[` is zsh's "bad pattern", except as the whole word;
-  // under NO_BAD_PATTERN the word stays as it is.
-  if (raw != "[")
-    for (s::size_t i = 0; i < raw.size(); ++i) {
-      if (raw[i] == '\\') { ++i; continue; }
-      if (raw[i] != '[') continue;
-      PatternParser pp{raw, extended, i};
-      Node n;
-      if (not pp.parse_class(n)) {
-        if (not opts.get(OPT_BADPATTERN)) return vec<str>{glob_unescape(pat.raw)};
-        return s::unexpected(ShellError{ErrorKind::BadPattern,
-            "bad pattern: " + glob_unescape(pat.raw)});
-      }
-      i = pp.i - 1;
-    }
-  if (not has_quals and not has_glob_chars(raw, extended))
+  if (not has_quals and excludes.empty() and not has_glob_chars(raw, extended))
     return vec<str>{glob_unescape(raw)};
 
   Walker w{q.dots.value_or((pat.flags & GLOB_DOTFILES) or opts.get(OPT_GLOBDOTS)),
@@ -1616,12 +1700,12 @@ Result<vec<str>> glob_expand(
     if (q.first_n >= 0 and kept.size() >= static_cast<s::size_t>(q.first_n)) break;
   }
 
-  bool numeric = opts.get(OPT_NUMERICGLOBSORT) or q.sort_key == 'n';
-  if (q.sort_key == 0 or q.sort_key == 'n') {
-    collate_sort(cur, numeric);
-    if (q.sort_desc) s::reverse(cur.begin(), cur.end());
-  } else {
-    auto key = [&](const str& p) -> s::int64_t {
+  bool numeric = q.numeric.value_or(opts.get(OPT_NUMERICGLOBSORT));
+  // With Y and no o, the first matches found, unsorted.
+  if (q.sorts.empty() and q.first_n < 0) q.sorts.push_back({'n', false});
+  if (not q.sorts.empty() and q.sorts.front().key != 'N') {
+    struct Times { s::int64_t sec, nsec; };
+    auto value = [](const str& p, char key) -> Times {
       struct stat st{};
       if (::stat(p.c_str(), &st) != 0 and ::lstat(p.c_str(), &st) != 0) return {0, 0};
 #ifdef __APPLE__
@@ -1635,14 +1719,31 @@ Result<vec<str>> glob_expand(
         default:  return {static_cast<s::int64_t>(ts.tv_sec), static_cast<s::int64_t>(ts.tv_nsec)};
       }
     };
-    // zsh's `om` lists the newest first; `oL` the smallest first.
-    bool newest_first = q.sort_key != 'L';
-    s::stable_sort(cur.begin(), cur.end(), [&](const auto& a, const auto& b) {
-      s::int64_t ka = key(a), kb = key(b);
-      if (ka == kb) return collate(a, b, false) < 0;
-      bool lt = newest_first ? ka > kb : ka < kb;
-      return q.sort_desc ? not lt : lt;
-    });
+    // zsh's `om` lists the newest first, `oL` the smallest first, `od`
+    // the deeper paths first; ties go by name.
+    auto cmp = [&](const Match& a, const Match& b) {
+      for (auto [key, desc] : q.sorts) {
+        int r = 0;
+        if (key == 'n') {
+          r = name_less(a.name, b.name, numeric) ? -1 : name_less(b.name, a.name, numeric) ? 1 : 0;
+        } else if (key == 'd') {
+          auto da = s::count(a.file.begin(), a.file.end(), '/');
+          auto db = s::count(b.file.begin(), b.file.end(), '/');
+          r = da > db ? -1 : da < db ? 1 : 0;
+        } else if (key != 'N') {
+          Times va = value(a.file, key), vb = value(b.file, key);
+          bool newest = key == 'a' or key == 'm' or key == 'c';
+          bool same = va.sec == vb.sec and va.nsec == vb.nsec;
+          bool less = va.sec < vb.sec or (va.sec == vb.sec and va.nsec < vb.nsec);
+          r = same ? 0 : less != newest ? -1 : 1;
+        }
+        if (r) return desc ? r > 0 : r < 0;
+      }
+      return name_less(a.name, b.name, numeric);
+    };
+    s::stable_sort(kept.begin(), kept.end(), cmp);
+  } else if (not q.sorts.empty() and q.sorts.front().desc) {
+    s::reverse(kept.begin(), kept.end());
   }
   cur.clear();
   for (auto& m : kept) cur.push_back(s::move(m.name));
