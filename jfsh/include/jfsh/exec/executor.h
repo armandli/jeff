@@ -132,6 +132,9 @@ struct ExecContext {
   HashTable<str>     function_files{};
   // `autoload name`: loaded from $fpath when first called.
   uset<str>          autoloads{};
+  // `disable name`, `disable -f name`: skipped when commands are looked up.
+  uset<str>          disabled_builtins{};
+  uset<str>          disabled_functions{};
   AliasTable         aliases{};
   vec<str>           dirstack{};   // pushd/popd, without $PWD ($dirstack)
   int                source_depth = 0;   // `.`/`source` files being read
@@ -157,11 +160,29 @@ struct ExecContext {
   ShellHooks  hooks{};         // module hooks (zsh/zprof, zsh/watch)
 
   vec<int>    pipestatus{0};   // $pipestatus: each stage of the last pipeline
+  // $funcstack and $functrace: the functions (and eval, sourced files)
+  // being run, outermost first, each with where it was called from.
+  struct Frame { str name, caller; };
+  vec<Frame>  funcstack{};
+  // getopts: $OPTIND, the place in the option word being read, $OPTARG.
+  // A function starts its own count unless POSIX_BUILTINS is set.
+  s::int64_t  optind  = 1;
+  s::size_t   optcind = 0;
+  str         optarg{};
   s::uint32_t lineno = 0;      // $LINENO: line of the command being run
   // The interactive loop added the line being run to the history before
   // running it, so `fc` and `r` leave that entry out.
   bool        hist_current = false;
   LoopState   loop{};
+};
+
+// Pushes a $funcstack frame for `name` while it lives.
+struct FuncFrame {
+  FuncFrame(ExecContext& c, str name);
+  ~FuncFrame() { ctx.funcstack.pop_back(); }
+  FuncFrame(const FuncFrame&) = delete;
+  FuncFrame& operator=(const FuncFrame&) = delete;
+  ExecContext& ctx;
 };
 
 // Gives `ctx.params` the parameters whose values the shell computes:
@@ -181,6 +202,8 @@ struct Assignment {
   // `name[sub]=value`: the subscript, expanded, once `name` has been split
   // off it.
   opt<str> subscript;
+  // An argument of typeset: how many of its other words come before it.
+  s::size_t position = 0;
 };
 
 // A single redirection decoded from the bytecode.  `fd == -1` means the
@@ -191,6 +214,7 @@ struct Redirection {
   int       fd      = -1;
   str       target;
   bool      literal = false;   // here-doc with a quoted delimiter
+  str       varid;             // `{name}>file`: the fd is new, put in $name
 };
 
 // RAII guard that restores a set of fds when it goes out of scope.
@@ -253,6 +277,13 @@ struct Executor {
   // Fills the command hash with every executable in $PATH (`hash -r` is
   // clear, `rehash` refills).
   void fill_command_hash();
+  // The command hash with every command in $PATH, filled when it isn't
+  // already ($commands, as zsh's HASH_LIST_ALL).
+  HashTable<str>& full_command_hash() {
+    auto& hash = command_hash();
+    if (not mHashFull or hash.empty()) fill_command_hash();
+    return mCmdHash;
+  }
   // `typeset_args` are the `name=value` arguments of typeset and its
   // variants: expanded like assignments, then passed on as `name=value`.
   int exec_simple(
@@ -394,10 +425,12 @@ protected:
   // in place (src/exec/subst.cpp does the work); the assignments wait for
   // apply_assigns.  Prints the error and returns false when an expansion
   // fails.  `subst_status` receives the status of the last command
-  // substitution, if any ran.
+  // substitution, if any ran; `counts`, when given, how many words each
+  // of `args` became.
   bool expand_command(vec<str>& args,
                       vec<Redirection>& redirs,
-                      opt<int>&         subst_status);
+                      opt<int>&         subst_status,
+                      vec<s::size_t>*   counts = nullptr);
   // Where apply_assigns puts the assignments: the shell's parameters, or
   // (in front of a command) the current scope, which the caller pushed and
   // pops, optionally exported.
@@ -407,6 +440,13 @@ protected:
   // Prints the error and returns 1 on a failed expansion or a readonly
   // name.  `subst_status` receives the last command substitution's status.
   int  apply_assigns(vec<Assignment>& assigns, AssignTo to, opt<int>& subst_status);
+
+public:
+  // Makes one assignment already expanded (`name=v`, `name[sub]=v`,
+  // `name=(…)`), as for ${name[sub]:=v}.
+  Result<void> assign_expanded(const Assignment& a);
+
+protected:
   // The expanded PS4 that starts each xtrace line ("" when PS4 is unset).
   str  trace_prompt();
   // One xtrace line: PS4, then `text`, written to `fd`.
@@ -469,6 +509,7 @@ private:
   HashTable<str> mCmdHash;     // command name → resolved path
   str            mHashedPath;  // $PATH the hash was built against
   s::uint64_t    mHashedGen = 0;   // ParamTable::path_generation() then
+  bool           mHashFull  = false;   // fill_command_hash() since cleared
   uptr<Zle>              mOwnZle;
   uptr<CompletionEngine> mOwnCompletion;
 };

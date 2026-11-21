@@ -454,5 +454,118 @@ TEST(CompoundM14, SubshellInPipelineRunsInTheStageProcess) {
             "in\nsub\nout\n");
 }
 
+// ---- M15c: shell features compsys needs ------------------------------------------
+
+// (a|b) and (#i) start a word after the command word.
+TEST(Compound15c, GlobGroupArgument) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "setopt extendedglob; f() { echo f; }; f; echo (x|y).c (#i)X.C"),
+            "f\n");
+}
+
+// function {} runs at once with its arguments.
+TEST(Compound15c, AnonymousFunction) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "function { echo $# $1; } a b; () { echo anon $1; } z"),
+            "2 a\nanon z\n");
+}
+
+// case word; in, (…) patterns and <n-m> ranges.
+TEST(Compound15c, CasePatternForms) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "case 5 in; (<1-9>) echo num;; esac; case ab in (a|b)b) echo grp;; "
+                "esac"),
+            "num\ngrp\n");
+}
+
+// {echo hi} and f() {echo } open a brace group.
+TEST(Compound15c, BraceAfterWord) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "{echo hi}; f() {echo fn }; f"),
+            "hi\nfn\n");
+}
+
+// An empty alternative matches the empty string.
+TEST(Compound15c, CaseEmptyAlternative) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "case b in |a|b) echo c1;; esac; case \"\" in |a) echo empty;; "
+                "esac; case \"\" in a|) echo e3;; esac"),
+            "c1\nempty\ne3\n");
+}
+
+// [[ n -gt ((x+4)) ]].
+TEST(Compound15c, CondArithmeticOperandInParens) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "o=1; [[ 6 -gt ((o+4)) ]] && echo c2; "
+                "[[ 2 -gt (( o + 2 )) ]] || echo c4"),
+            "c2\nc4\n");
+}
+
+// foreach takes a do…done or { } body too.
+TEST(Compound15c, ForeachWithDoOrBrace) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "foreach c (x y); do echo $c; done; foreach c (1 2) { echo b$c }"),
+            "x\ny\nb1\nb2\n");
+}
+
+// a ; ; b runs a and b.
+TEST(Compound15c, EmptyCommandsBetweenSeparators) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "echo a; ; echo b"),
+            "a\nb\n");
+}
+
+// ((( … )) && …) is a subshell holding (( … )).
+TEST(Compound15c, TripleParenIsSubshellAndArithmetic) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "a=3; if ((( a == 3 )) && [[ x == x ]]) || [[ -d / ]]; "
+                "then echo yes; fi; ((a) ; echo s) 2>/dev/null"),
+            "yes\ns\n");
+}
+
+// In "${…}" a { doesn't pair, \} is }, ' is plain.
+TEST(Compound15c, BracesInQuotedParameterOperands) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=; "
+                "echo \"${x:-a{b\\}c}\" \"${x:-\\}}\" \"${x:-{a}}\" \"${x:-it's}\" ${x:-{a}}"),
+            "a{b}c } {a} it's {a}\n");
+}
+
+TEST(Compound15c, ProcessSubstitutionArgumentOfAnonymousFunction) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "() { cat $1; } =(echo hi)"),
+            "hi\n");
+}
+
+// {echo} runs echo; {echo hi} too.
+TEST(Compound15c, BraceGroupWordClosesTheGroup) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "{echo}; {echo hi}; {echo a; echo b}"),
+            "\nhi\na\nb\n");
+}
+
+// After the command word !( … ) is one word.
+TEST(Compound15c, BangGroupIsOneWord) {
+  Shell sh;
+  // `(a*)` is a qualifier list there, as in zsh.
+  EXPECT_EQ(sh.run("echo !(a*)").err, "jfsh: number expected\n");
+  EXPECT_EQ(out(sh, "! true; echo $?"), "1\n");
+}
+
+// An unclosed ( or [ is a bad pattern; a lone [ is a word.
+TEST(Compound15c, UnclosedGroupIsABadPattern) {
+  Shell sh;
+  EXPECT_EQ(sh.run("echo a[b").err, "jfsh: bad pattern: a[b\n");
+  EXPECT_EQ(sh.run("echo a (b").err, "jfsh: bad pattern: (b\n");
+  EXPECT_EQ(out(sh, "echo ["), "[\n");
+}
+
+// (a|b) starts a word in for … in and in arrays.
+TEST(Compound15c, GroupWordsInForAndArrays) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "a=( (x|y)z(N) w ); echo $a; for f in (x|y)z(N) v; do echo $f; done"),
+            "w\nv\n");
+}
+
 }  // namespace
 }  // namespace jfsh

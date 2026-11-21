@@ -235,6 +235,11 @@ struct Decompiler {
     str target = next_str();
     RedirType t      = wc_redir_type(w);
     str       fd     = fd_text(w);
+    if (wc_redir_varid(w)) {
+      auto [name, rest] = split_redir_varid(target);
+      fd = "{" + str(name) + "}";
+      target = str(rest);
+    }
     switch (t) {
       case REDIR_READ:       return fd + "< " + target;
       case REDIR_WRITE:      return fd + "> " + target;
@@ -486,6 +491,11 @@ struct Pretty {
     str       target = next_str();
     RedirType t      = wc_redir_type(w);
     str       fd     = fd_text(w);
+    if (wc_redir_varid(w)) {
+      auto [name, rest] = split_redir_varid(target);
+      fd = "{" + str(name) + "}";
+      target = str(rest);
+    }
     switch (t) {
       case REDIR_READ:       return fd + "< " + target;
       case REDIR_WRITE:      return fd + "> " + target;

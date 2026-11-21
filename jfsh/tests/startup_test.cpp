@@ -3,9 +3,18 @@
 // it is zsh 5.9's (`zsh -f`), with "jfsh" for "zsh".
 
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+#include <util.h>
+#else
+#include <pty.h>
+#endif
 
 #include <ctime>
 #include <filesystem>
@@ -586,6 +595,47 @@ TEST(Binary, B54PromptsGoToStderrWithoutATerminal) {
   auto p = jfsh({"-i"}, {"ZDOTDIR=" + home.path.string(), "PS1=P> "}, "echo out\n");
   EXPECT_EQ(p.out, "out\n");
   EXPECT_EQ(p.err.substr(0, 3), "P> ");
+}
+
+// An interactive jfsh on a terminal gives the terminal back to the process
+// group that started it when it exits, as zsh's release_pgrp does.  Before,
+// the second `jfsh -i` found its group in the background and stopped it
+// with SIGTTIN, and a `make test` run from a terminal hung.
+TEST(Binary, InteractiveShellGivesTheTerminalBack) {
+  TempDir home;
+  auto input = home.file("in", "echo a\n", sf::perms::owner_all);
+  int master = -1, slave = -1;
+  ASSERT_EQ(::openpty(&master, &slave, nullptr, nullptr, nullptr), 0);
+  str j = JFSH_BINARY;
+  str cmd = "ZDOTDIR=" + home.path.string() + " " + j + " -i <" + input.string()
+          + " >/dev/null 2>&1; ZDOTDIR=" + home.path.string() + " " + j + " -i <"
+          + input.string() + " >/dev/null 2>&1; echo done";
+  pid_t pid = ::fork();
+  if (pid == 0) {
+    // A session of its own with the pty as its controlling terminal.
+    ::setsid();
+    ::ioctl(slave, TIOCSCTTY, 0);
+    ::dup2(slave, STDOUT_FILENO);
+    ::dup2(slave, STDERR_FILENO);
+    ::close(master);
+    ::execl("/bin/sh", "sh", "-c", cmd.c_str(), static_cast<char*>(nullptr));
+    _exit(127);
+  }
+  ::close(slave);
+  str got;
+  for (int k = 0; k < 100 and got.find("done") == str::npos; ++k) {
+    struct pollfd p{master, POLLIN, 0};
+    if (::poll(&p, 1, 100) <= 0) continue;
+    char buf[256];
+    ssize_t n = ::read(master, buf, sizeof buf);
+    if (n <= 0) break;
+    got.append(buf, static_cast<s::size_t>(n));
+  }
+  ::kill(pid, SIGKILL);
+  ::kill(-pid, SIGKILL);
+  ::waitpid(pid, nullptr, 0);
+  ::close(master);
+  EXPECT_NE(got.find("done"), str::npos) << got;
 }
 
 }  // namespace

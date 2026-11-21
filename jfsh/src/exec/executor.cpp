@@ -157,6 +157,11 @@ static Redirection fetch_redir(ExecState& es) {
   r.fd      = wc_redir_has_fd(w) ? wc_redir_fd(w) : -1;
   r.literal = wc_redir_literal(w);
   r.target  = str(es.fetch_str());
+  if (wc_redir_varid(w)) {
+    auto [name, target] = split_redir_varid(r.target);
+    r.varid  = str(name);
+    r.target = str(target);
+  }
   return r;
 }
 
@@ -258,6 +263,7 @@ int Executor::exec_simple(vec<str> args,
   while (not args.empty() and args[0] == "noglob") {
     args.erase(args.begin());
     noglob = true;
+    for (auto& a : typeset_args) a.position -= a.position > 0 ? 1 : 0;
   }
   bool globbing = mCtx.opts.get(OPT_GLOB);
   if (noglob) mCtx.opts.unset(OPT_GLOB);
@@ -282,7 +288,15 @@ int Executor::exec_simple(vec<str> args,
     ProcSubstResources* outer;
     bool pipe_last;
   } psubst_guard{this, &psubst, s::exchange(mPsubst, &psubst), (flags & EF_PIPELAST) != 0};
-  bool expanded = expand_command(args, redirs, subst_status);
+  // typeset's assignments go back between the words they were among.
+  vec<s::size_t> counts;
+  bool expanded = expand_command(args, redirs, subst_status,
+                                 typeset_args.empty() ? nullptr : &counts);
+  for (auto& a : typeset_args) {
+    s::size_t n = 0;
+    for (s::size_t k = 0; k < a.position and k < counts.size(); ++k) n += counts[k];
+    a.position = n;
+  }
   if (noglob) mCtx.opts.assign(OPT_GLOB, globbing);
   // A failed expansion (`${x?msg}`, NO_UNSET, `$((1/0))`) ends the command
   // line, as zsh's errflag does: a non-interactive shell exits.
@@ -305,6 +319,7 @@ int Executor::exec_simple(vec<str> args,
   str typeset_traced;   // xtrace shows them as assignments
   auto expand_typeset_args = [&] {
     Expander ex{*this, mCtx};
+    s::size_t placed = 0;
     for (auto& a : typeset_args) {
       if (auto r = expand_assignment(ex, a); not r) {
         s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
@@ -314,11 +329,14 @@ int Executor::exec_simple(vec<str> args,
       }
       typeset_traced += ' ' + trace_assigns({a});
       typeset_traced.pop_back();
+      // Earlier ones were put in before it.
+      auto at = args.begin()
+              + static_cast<s::ptrdiff_t>(s::min(a.position + placed++, args.size()));
       if (a.array) {
-        args.push_back(a.name);
+        args.insert(at, a.name);
         typeset_arrays.push_back(s::move(a));
       } else {
-        args.push_back(a.name + (a.append ? "+=" : "=") + a.value);
+        args.insert(at, a.name + (a.append ? "+=" : "=") + a.value);
       }
     }
     return true;
@@ -518,19 +536,27 @@ int Executor::exec_simple(vec<str> args,
   // Functions come before builtins; an autoloaded one is loaded on its
   // first call.  Aliases were expanded by the parser.
   auto fn = mCtx.functions.end();
-  if (only == Only::Any) {
+  if (only == Only::Any and not mCtx.disabled_functions.contains(args[0])) {
     fn = mCtx.functions.find(args[0]);
     if (fn == mCtx.functions.end() and mCtx.autoloads.contains(args[0])) {
       if (not load_autoload(args[0])) return 1;
       fn = mCtx.functions.find(args[0]);
     }
   }
-  auto def = fn == mCtx.functions.end() ? Builtins.find(args[0]) : s::nullopt;
+  bool disabled = mCtx.disabled_builtins.contains(args[0]);
+  auto def = fn == mCtx.functions.end() and not disabled ? Builtins.find(args[0]) : s::nullopt;
   // A loaded module may have contributed the builtin; fall through to that
   // before trying an external command.
   const BuiltinDef* mod_def = nullptr;
-  if (not def and fn == mCtx.functions.end())
+  if (not def and fn == mCtx.functions.end() and not disabled) {
     mod_def = mCtx.modules.find_builtin(args[0]);
+    // An autoloaded builtin: its module comes in now.
+    if (auto mod = mod_def ? s::nullopt : mCtx.modules.autoload_for_builtin(args[0])) {
+      if (auto r = mCtx.modules.load(*mod, &mCtx, true); not r)
+        s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+      mod_def = mCtx.modules.find_builtin(args[0]);
+    }
+  }
   const BuiltinDef* defp = def ? &def->get() : mod_def;
   if (only == Only::Builtin and not defp) {
     s::fprintf(stderr, "jfsh: no such builtin: %s\n", args[0].c_str());
@@ -588,13 +614,26 @@ int Executor::exec_simple(vec<str> args,
       ProgRef body = fn->second;  // the function may redefine itself
       rc = call_function(body, args);
     } else {
+      // `typeset -r a=(…)`: the value goes in although -r was just given.
+      vec<bool> was_readonly;
+      for (const auto& a : typeset_arrays) {
+        auto p = mCtx.params.lookup(a.name);
+        was_readonly.push_back(p and p->get().is_readonly());
+      }
       rc = defp->fn(args, mCtx);
       // A signal the builtin brought on (`kill -USR1 $$`) is handled before
       // its status replaces $?, as in zsh.
       if (mCtx.signals.has_pending()) handle_signals();
-      for (const auto& a : typeset_arrays) {
-        if (rc != 0) break;
-        if (auto r = mCtx.params.set_array(a.name, a.elements, a.append); not r) {
+      for (s::size_t k = 0; k < typeset_arrays.size() and rc == 0; ++k) {
+        const auto& a = typeset_arrays[k];
+        auto p = mCtx.params.lookup(a.name);
+        bool lift = p and p->get().is_readonly() and not was_readonly[k];
+        if (lift) p->get().flags &= ~PM_READONLY;
+        auto r = mCtx.params.set_array(a.name, a.elements, a.append);
+        if (lift) {
+          if (auto q = mCtx.params.lookup(a.name)) q->get().flags |= PM_READONLY;
+        }
+        if (not r) {
           s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
           rc = 1;
         }
@@ -1086,8 +1125,12 @@ int Executor::exec_simple_cmd(ExecState& es, ExecFlags flags) {
   vec<Assignment> typeset_args;
   words.reserve(argc);
   for (WordCode i = 0; i < argc; ++i) {
-    if (wc_code(es.peek()) == WC_ASSIGN) typeset_args.push_back(fetch_assign());
-    else                                 words.emplace_back(es.fetch_str());
+    if (wc_code(es.peek()) == WC_ASSIGN) {
+      typeset_args.push_back(fetch_assign());
+      typeset_args.back().position = words.size();
+    } else {
+      words.emplace_back(es.fetch_str());
+    }
   }
   return exec_simple(s::move(words), s::move(assigns), s::move(redirs),
                      flags, s::move(typeset_args));
@@ -1278,8 +1321,12 @@ int Executor::exec_case(ExecState& es, WordCode head) {
       if (match) break;
       auto pat = ex.pattern(word);
       if (not pat) return fail(pat.error());
-      match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob())
-                  .matches(*subject);
+      auto cp = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob());
+      PatternMatch pm;
+      match = cp.matches(*subject, &pm);
+      if (match)
+        set_match_params(mCtx.params, cp, *subject, 0, subject->size(), pm,
+                         mCtx.opts.get(OPT_KSH_ARRAYS));
     }
     if (not match) {
       es.pc = next;
@@ -1594,7 +1641,11 @@ int Executor::exec_cond_node(ExecState& es, WordCode head) {
     auto pat = ex.pattern(rhs_word);
     if (not pat) return fail(pat.error());
     note(trace_quote(*lhs) + " " + op + " " + trace_pattern(*pat));
-    bool match = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob()).matches(*lhs);
+    auto cp = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob());
+    PatternMatch pm;
+    bool match = cp.matches(*lhs, &pm);
+    if (match)
+      set_match_params(mCtx.params, cp, *lhs, 0, lhs->size(), pm, mCtx.opts.get(OPT_KSH_ARRAYS));
     return finish(match == (op != "!=") ? 0 : 1);
   }
   auto rhs = ex.scalar(rhs_word);
@@ -2040,7 +2091,7 @@ bool Executor::apply_redirects(const vec<Redirection>& redirs,
   // `2>&1` after the command's own redirections.
   if ((flags & EF_STAGEOUT) and multios) streams[1];
   vec<Redirection> stage_err;
-  if (flags & EF_STAGEERR) stage_err.push_back({REDIR_MERGE, 2, "1"});
+  if (flags & EF_STAGEERR) stage_err.push_back({REDIR_MERGE, 2, "1", false, {}});
 
   // Forks the tee of fd's stream, if it was split.
   auto finish = [&](int fd) {
@@ -2165,7 +2216,73 @@ bool Executor::apply_redirects(const vec<Redirection>& redirs,
     return place(fd2, 2, true);
   };
 
+  // `{name}>…`: a new fd of 10 or more, left open after the command, its
+  // number in $name; `{name}>&-` closes the fd $name holds.
+  auto with_varid = [&](const Redirection& r) {
+    bool closing = r.type == REDIR_CLOSE
+                or ((r.type == REDIR_MERGE or r.type == REDIR_IN_DUP) and r.target == "-");
+    if (closing) {
+      auto p = mCtx.params.lookup(r.varid);
+      str v = p and p->get().is_set() ? p->get().scalar() : str{};
+      auto fd = parse_fd_target(v);
+      if (not fd) {
+        s::fprintf(stderr, "jfsh: parameter %s does not contain a file descriptor\n",
+                   r.varid.c_str());
+        return abandon();
+      }
+      if (::close(*fd) != 0) return report(v);
+      return true;
+    }
+    int fd = -1;
+    switch (r.type) {
+      case REDIR_READ:
+        fd = retry([&] { return ::open(r.target.c_str(), O_RDONLY | O_NOCTTY); });
+      break; case REDIR_READWRITE:
+        fd = retry([&] { return ::open(r.target.c_str(), O_RDWR | O_CREAT | O_NOCTTY, 0666); });
+      break; case REDIR_WRITE: case REDIR_CLOBBER: case REDIR_APPEND: case REDIR_APPEND_CLOBBER: {
+        bool append = r.type == REDIR_APPEND or r.type == REDIR_APPEND_CLOBBER;
+        bool force  = r.type == REDIR_CLOBBER or r.type == REDIR_APPEND_CLOBBER;
+        fd = retry([&] { return open_output(mCtx.opts, r.target, append, force); });
+      }
+      break; case REDIR_MERGE: case REDIR_IN_DUP: {
+        // `>&p`/`<&p` name the coprocess, and there is none (no coproc).
+        if (r.target == "p") {
+          s::fprintf(stderr, "jfsh: coprocess: bad file descriptor\n");
+          return abandon();
+        }
+        auto src = parse_fd_target(r.target);
+        if (not src) {
+          s::fprintf(stderr, "jfsh: file number expected\n");
+          return abandon();
+        }
+        fd = ::fcntl(*src, F_DUPFD, 10);
+        if (fd < 0) {
+          s::fprintf(stderr, "jfsh: %d: %s\n", *src, errno_text(errno).c_str());
+          return abandon();
+        }
+      }
+      break; case REDIR_HERESTR:
+        fd = heredoc_body_fd(r.target + '\n');
+      break; default:
+        s::fprintf(stderr, "jfsh: redirection type %d not supported\n", static_cast<int>(r.type));
+        return abandon();
+    }
+    if (fd < 0) return failed_open(r.target);
+    int high = fd >= 10 ? fd : ::fcntl(fd, F_DUPFD, 10);
+    if (high != fd) ::close(fd);
+    if (high < 0) return report("dup");
+    ::fcntl(high, F_SETFD, 0);
+    forget_shell_fd(high);   // the user's now
+    if (auto rr = mCtx.params.set_scalar(r.varid, s::to_string(high)); not rr) {
+      ::close(high);
+      s::fprintf(stderr, "jfsh: %s\n", rr.error().message.c_str());
+      return abandon();
+    }
+    return true;
+  };
+
   auto apply = [&](const Redirection& r) {
+    if (not r.varid.empty()) return with_varid(r);
     int dst = r.fd >= 0 ? r.fd : default_fd(r.type);
     switch (r.type) {
       case REDIR_READ: {
@@ -2206,6 +2323,11 @@ bool Executor::apply_redirects(const vec<Redirection>& redirs,
       break; case REDIR_MERGE: case REDIR_IN_DUP: {
         bool output = r.type == REDIR_MERGE;
         if (r.target == "-") return close_fd(dst);
+        // `>&p`/`<&p` name the coprocess; jfsh has no coproc yet.
+        if (r.target == "p") {
+          s::fprintf(stderr, "jfsh: coprocess: bad file descriptor\n");
+          return abandon();
+        }
         if (auto src = parse_fd_target(r.target)) return dup_fd(*src, dst, output);
         // `>&file` writes the file, as `&>file`.
         if (output) return both(r, dst, false, false);
@@ -2279,7 +2401,8 @@ void Executor::procsubst_release(ProcSubstResources& res) noexcept {
 // redirections of the same kind, which MULTIOS then fans out.
 bool Executor::expand_command(vec<str>& args,
                               vec<Redirection>& redirs,
-                              opt<int>&         subst_status) {
+                              opt<int>&         subst_status,
+                              vec<s::size_t>*   counts) {
   Expander ex{*this, mCtx};
   auto fail = [&](const ShellError& e) {
     s::fprintf(stderr, "jfsh: %s\n", e.message.c_str());
@@ -2288,9 +2411,21 @@ bool Executor::expand_command(vec<str>& args,
   };
   // The arguments are expanded first, then the redirection targets; the
   // assignments come last, as they are made (apply_assigns).
-  auto words = ex.words(args);
-  if (not words) return fail(words.error());
-  args = s::move(*words);
+  if (counts) {
+    vec<str> all;
+    for (const auto& a : args) {
+      auto words = ex.words({a});
+      if (not words) return fail(words.error());
+      counts->push_back(words->size());
+      all.insert(all.end(), s::make_move_iterator(words->begin()),
+                 s::make_move_iterator(words->end()));
+    }
+    args = s::move(all);
+  } else {
+    auto words = ex.words(args);
+    if (not words) return fail(words.error());
+    args = s::move(*words);
+  }
 
   vec<Redirection> out;
   out.reserve(redirs.size());
@@ -2385,9 +2520,6 @@ static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
     p.set(s::move(h));
     return {};
   }
-  auto n = math_eval(key, ctx.params, math_options(ctx.opts),
-                     &ctx.modules.math_funcs());
-  if (not n) return s::unexpected(n.error());
   auto p = ctx.params.lookup(a.name);
   if (p and p->get().is_readonly())
     return s::unexpected(ShellError{ErrorKind::ExecError,
@@ -2399,17 +2531,52 @@ static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
   } else if (p and p->get().is_array()) {
     arr = p->get().array();
   }
-  s::int64_t idx = n->as_int();
-  if (idx < 0) idx += static_cast<s::int64_t>(arr.size()) + 1;
-  if (idx <= 0)
+  auto math = [&](strv text) -> Result<s::int64_t> {
+    auto n = math_eval(text, ctx.params, math_options(ctx.opts), &ctx.modules.math_funcs());
+    if (not n) return s::unexpected(n.error());
+    return n->as_int();
+  };
+  auto size = static_cast<s::int64_t>(arr.size());
+  s::int64_t first, last;
+  if (not key.empty() and key[0] == '(') {
+    // a[(r)pat]=…: the element a search finds, as ${a[(i)pat]} gives it.
+    str flags = key.substr(1, key.find(')') - 1);
+    for (char& c : flags) c = c == 'r' ? 'i' : c == 'R' ? 'I' : c;
+    Expander ex{*ctx.executor, ctx};
+    auto v = ex.scalar("${" + a.name + "[(" + flags + ")" + key.substr(key.find(')') + 1) + "]}");
+    if (not v) return s::unexpected(v.error());
+    first = last = s::strtoll(v->c_str(), nullptr, 10);
+  } else {
+    s::size_t comma = str::npos;
+    for (s::size_t k = 0, depth = 0; k < key.size(); ++k) {
+      if (key[k] == '(' or key[k] == '[') ++depth;
+      else if ((key[k] == ')' or key[k] == ']') and depth > 0) --depth;
+      else if (key[k] == ',' and depth == 0) { comma = k; break; }
+    }
+    auto lo = math(strv(key).substr(0, comma));
+    if (not lo) return s::unexpected(lo.error());
+    first = last = *lo;
+    if (comma != str::npos) {
+      auto hi = math(strv(key).substr(comma + 1));
+      if (not hi) return s::unexpected(hi.error());
+      last = *hi;
+    }
+  }
+  if (first < 0) first += size + 1;
+  if (last < 0) last += size + 1;
+  if (first <= 0)
     return s::unexpected(ShellError{ErrorKind::ExecError,
         a.name + ": assignment to invalid subscript range"});
-  auto at = static_cast<s::size_t>(idx - 1);
+  auto at = static_cast<s::size_t>(first - 1);
   if (arr.size() <= at) arr.resize(at + 1);
-  if (a.array) {
-    arr.erase(arr.begin() + static_cast<s::ptrdiff_t>(at));
-    arr.insert(arr.begin() + static_cast<s::ptrdiff_t>(at),
-               a.elements.begin(), a.elements.end());
+  // The elements first … last go (none for a[i,i-1]), the value comes in.
+  auto end = static_cast<s::size_t>(s::clamp<s::int64_t>(last, first - 1, size));
+  end = s::max(end, at);
+  if (a.array or last != first) {
+    vec<str> value = a.array ? a.elements : vec<str>{a.value};
+    arr.erase(arr.begin() + static_cast<s::ptrdiff_t>(at),
+              arr.begin() + static_cast<s::ptrdiff_t>(s::max(end, at + (last >= first ? 1 : 0))));
+    arr.insert(arr.begin() + static_cast<s::ptrdiff_t>(at), value.begin(), value.end());
   } else {
     arr[at] = a.append ? arr[at] + a.value : a.value;
   }
@@ -2424,6 +2591,21 @@ static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
 // One assignment, expanded: `name=value` on an integer or float is
 // arithmetic, `name+=value` on an array appends an element, as in zsh.
 static Result<void> assign_one(ExecContext& ctx, const Assignment& a) {
+  // `2=x` sets a positional parameter (`0=x` sets $0).
+  if (not a.name.empty() and s::isdigit(static_cast<unsigned char>(a.name[0]))) {
+    if (a.array or a.subscript)
+      return s::unexpected(ShellError{ErrorKind::ExecError,
+                                      a.name + ": attempt to assign array value to non-array"});
+    s::size_t n = s::strtoul(a.name.c_str(), nullptr, 10);
+    if (n == 0) {
+      ctx.arg0 = a.append ? ctx.arg0 + a.value : a.value;
+      return {};
+    }
+    if (ctx.positional.size() < n) ctx.positional.resize(n);
+    str& slot = ctx.positional[n - 1];
+    slot = a.append ? slot + a.value : a.value;
+    return {};
+  }
   if (a.subscript) return assign_element(ctx, a);
   if (a.array) return ctx.params.set_array(a.name, a.elements, a.append);
   if (auto p = ctx.params.lookup(a.name); p and p->get().is_set()) {
@@ -2461,6 +2643,8 @@ static Result<void> prefix_param(ParamTable& params, const str& name, bool expor
   if (exported) p->flags |= PM_EXPORTED;
   return {};
 }
+
+Result<void> Executor::assign_expanded(const Assignment& a) { return assign_one(mCtx, a); }
 
 int Executor::apply_assigns(vec<Assignment>& assigns, AssignTo to,
                             opt<int>& subst_status) {
@@ -2577,13 +2761,17 @@ vec<str> Executor::builtin_names() const {
 }
 
 bool Executor::is_builtin(strv name) const noexcept {
-  return Builtins.find(name).has_value() or mCtx.modules.find_builtin(name) != nullptr;
+  return Builtins.find(name).has_value() or mCtx.modules.find_builtin(name) != nullptr
+      or mCtx.modules.autoload_for_builtin(name).has_value();
 }
 
 int Executor::call_builtin(strv name,
                            vec<str>& args,
                            ExecContext& ctx) {
   if (auto def = Builtins.find(name)) return def->get().fn(args, ctx);
+  if (auto mod = ctx.modules.find_builtin(name) ? s::nullopt
+                                                : ctx.modules.autoload_for_builtin(name))
+    (void)ctx.modules.load(*mod, &ctx, true);
   if (const BuiltinDef* def = ctx.modules.find_builtin(name)) return def->fn(args, ctx);
   return 127;
 }
@@ -2609,6 +2797,7 @@ int Executor::call_function(const ProgRef& body,
     return 1;
   }
 
+  FuncFrame frame{mCtx, args[0]};
   auto saved_positional = s::exchange(
       mCtx.positional, vec<str>(args.begin() + 1, args.end()));
   str saved_arg0 = mCtx.arg0;
@@ -2616,6 +2805,10 @@ int Executor::call_function(const ProgRef& body,
   OptionState saved_opts  = mCtx.opts;
   mCtx.signals.push_trap_frame();
   int saved_noerrreturn = s::exchange(mCtx.noerrreturn, 0);
+  // getopts starts again in the function, as zsh's does.
+  bool own_optind = not mCtx.opts.get(OPT_POSIXBUILTINS);
+  auto saved_optind  = own_optind ? s::exchange(mCtx.optind, 1) : mCtx.optind;
+  auto saved_optcind = own_optind ? s::exchange(mCtx.optcind, 0) : mCtx.optcind;
   ++mCtx.func_depth;
   mCtx.params.push_scope();
   for (const auto& [_, hook] : mCtx.hooks.function) hook(args[0], true);
@@ -2641,6 +2834,10 @@ int Executor::call_function(const ProgRef& body,
   mCtx.params.pop_scope();
   --mCtx.func_depth;
   mCtx.noerrreturn = saved_noerrreturn;
+  if (own_optind) {
+    mCtx.optind  = saved_optind;
+    mCtx.optcind = saved_optcind;
+  }
   if (mCtx.opts.get(OPT_LOCALOPTIONS)) mCtx.opts = saved_opts;
   mCtx.arg0       = s::move(saved_arg0);
   mCtx.positional = s::move(saved_positional);
@@ -2925,6 +3122,7 @@ int Executor::source_file(const str& path, const vec<str>& args, const str& name
   vec<str> saved_positional;
   bool     set_args = not args.empty();
   if (set_args) saved_positional = s::exchange(mCtx.positional, args);
+  FuncFrame frame{mCtx, name};
   str saved_arg0   = mCtx.arg0;
   str saved_source = s::exchange(mCtx.source_name, path);
   if (mCtx.opts.get(OPT_FUNCTIONARGZERO)) mCtx.arg0 = name;
@@ -3013,6 +3211,7 @@ HashTable<str>& Executor::command_hash() {
   s::uint64_t gen = mCtx.params.path_generation();
   if (gen != mHashedGen or path_var != mHashedPath) {
     mCmdHash.clear();
+    mHashFull   = false;
     mHashedPath = path_var;
     mHashedGen  = gen;
   }
@@ -3036,6 +3235,7 @@ void Executor::fill_command_hash() {
     }
     ::closedir(d);
   }
+  mHashFull = true;
 }
 
 // ---- Job control and signals -----------------------------------------------

@@ -16,6 +16,18 @@
 #ifndef JFSH_SYSCONFDIR
 #define JFSH_SYSCONFDIR "/etc"
 #endif
+// The default $fpath: the site directory, then the shipped function
+// library.  A build that isn't installed falls back to the library in the
+// source tree.
+#ifndef JFSH_SITE_FUNCTIONS_DIR
+#define JFSH_SITE_FUNCTIONS_DIR ""
+#endif
+#ifndef JFSH_FUNCTIONS_DIR
+#define JFSH_FUNCTIONS_DIR ""
+#endif
+#ifndef JFSH_SOURCE_FUNCTIONS_DIR
+#define JFSH_SOURCE_FUNCTIONS_DIR ""
+#endif
 
 namespace jfsh {
 
@@ -26,7 +38,8 @@ struct StartupConfig {
 
 // The parameters a new shell sets from its environment: $SHLVL one more
 // than it was, $PWD (kept from the environment when it names the current
-// directory) and $OLDPWD, all exported.
+// directory) and $OLDPWD, all exported; the tied pairs ($PATH and $path,
+// $FPATH and $fpath, …), $fpath defaulting to the function library.
 void init_shell_params(ExecContext& ctx);
 
 // Reads the startup files, in zsh's order:

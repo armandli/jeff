@@ -55,6 +55,10 @@ struct CompCandidate {
   bool line   = false;  // -l: listed on a line of its own
   bool empty  = false;  // -E: fills a place in the listing, never inserted
   bool all    = false;  // -C: inserts all the other matches
+  // compstate[list] had `packed` / `rows` when it was added (zsh's
+  // CMF_PACKED, CMF_ROWS): its group is laid out so if all its matches are.
+  bool packed = false;
+  bool rows   = false;
   bool exact  = false;  // the word on the line, added while compstate[exact] was set
   s::size_t group = 0;  // index in CompletionResult::groups
   // An auto-removable suffix (-q, -r, -R): the characters that remove it
@@ -96,6 +100,7 @@ struct CompAddSpec {
   vec<str> display;              // -d
   vec<str> ignore;               // -F: patterns of words that are not matches
   bool     no_match = false;     // -U: every word is a match
+  bool     extended = false;     // EXTENDED_GLOB, for compstate[pattern_match]
   bool     raw      = false;     // -Q
   bool     files    = false;     // -f
   bool     hidden   = false;     // -n
@@ -133,6 +138,9 @@ struct CompState {
   // in even when it is shorter than the word).
   s::size_t          orig_lpre = 0, orig_lsuf = 0;
   bool               lenchanged = false;
+  // Some matches came from matching the line as a pattern (zsh's
+  // haspattern): compstate[pattern_insert] then decides the insertion.
+  bool               haspattern = false;
 
   // compadd: adds the words (each with the display string in
   // spec.display at the same place) that match $PREFIX and $SUFFIX (with
@@ -216,6 +224,7 @@ struct CompletionResult {
   vec<CompGroup> groups;
   str            unambiguous;          // as it goes into the line
   s::size_t      unambiguous_cursor = 0;
+  bool           haspattern = false;   // see CompState::haspattern
   // The unambiguous string is shorter than the word and the function
   // changed neither the word's prefix nor its suffix: the word stays.
   bool           keep_word = false;

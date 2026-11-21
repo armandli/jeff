@@ -42,6 +42,7 @@ enum ParamFlags : s::uint32_t {
   // zsh/param/private (M11): visible only in the scope that declared it, not to
   // the functions that scope calls.
   PM_PRIVATE   = 0x0001'0000,
+  PM_HIDEVAL   = 0x0002'0000,   // typeset -H: listings show the name only
 };
 
 using ParamValue = s::variant<
@@ -78,6 +79,9 @@ struct Param {
 
   // nullptr for ordinary parameters
   uptr<ParamHandlers> handlers;
+  // A special parameter made local: the value it had, given back through
+  // the handlers when the scope ends.
+  opt<ParamValue> restore;
 
   bool is_set()      const noexcept { return not (flags & PM_UNSET); }
   bool is_exported() const noexcept { return flags & PM_EXPORTED; }
@@ -174,6 +178,12 @@ struct ParamTable {
   // readonly parameter; a name that isn't set is fine.
   Result<void> unset(strv name);
 
+  // typeset -T: ties scalar `scalar` (in the scope it lives in) to the
+  // array `array`, which holds the value: reading the scalar joins the
+  // array with `sep`, assigning it splits the text into the array.  Both
+  // get PM_TIED.
+  void tie(Param& scalar, str array, char sep);
+
   // A `prefix` scope holds the assignments in front of one command:
   // `local`/`typeset` of a new name declare below it.
   void push_scope(bool prefix = false);
@@ -199,7 +209,9 @@ struct ParamTable {
   s::uint64_t path_generation() const noexcept { return mPathGen; }
   // For a caller that stores into a Param itself (typeset): counts the
   // assignment to `name`.
-  void note_assigned(strv name) noexcept { if (name == "PATH") ++mPathGen; }
+  void note_assigned(strv name) noexcept {
+    if (name == "PATH" or name == "path") ++mPathGen;
+  }
 
 private:
 
@@ -208,6 +220,10 @@ private:
   vec<int>              mPrefixScopes;   // indexes of prefix scopes, ascending
   s::uint64_t           mPathGen = 0;
 };
+
+// The type text ${(t)name} and $parameters give: "scalar", "array-local",
+// "scalar-tied-export-special", …
+str param_type_text(const Param& p);
 
 }  // namespace jfsh
 

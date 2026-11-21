@@ -150,7 +150,7 @@ TEST(Subst, Flags) {
             "ABC Abc abc a a b c c b a a b a c\n");
   EXPECT_EQ(out(sh, "echo ${(j:-:)a} \"${(j:/:)a}\""), "b-a-c-a b/a/c/a\n");
   EXPECT_EQ(show(sh, "${(s:,:)c} \"${(s:,:)c}\" \"${(@s:,:)c}\""),
-            "[a][b][c][a b c][a][b][c]");
+            "[a][b][c][a][b][c][a][b][][c]");
   EXPECT_EQ(out(sh, "n=(10 9 100); echo ${(on)n} ${(On)n}"), "9 10 100 100 10 9\n");
   EXPECT_EQ(out(sh, "q='a b'; echo ${(q)q} ${(qq)q} ${(Q)${(qq)q}}"), "a\\ b 'a b' a b\n");
   EXPECT_EQ(out(sh, "ref=x; echo ${(P)ref} ${(t)x} ${(t)a}"), "abc scalar array\n");
@@ -161,7 +161,8 @@ TEST(Subst, NestedSubstitutions) {
   sh.run("x=abc");
   EXPECT_EQ(out(sh, "echo ${${x#a}%c} ${#${x}}"), "b 3\n");
   EXPECT_EQ(show(sh, "${(f)\"$(env printf 'l 1\\nl2')\"}"), "[l 1][l2]");
-  EXPECT_EQ(show(sh, "\"${(f)$(env printf 'l1\\nl2')}\""), "[l1 l2]");
+  // A split stays separate words in double quotes (zsh 5.9).
+  EXPECT_EQ(show(sh, "\"${(f)$(env printf 'l1\\nl2')}\""), "[l1][l2]");
 }
 
 TEST(Subst, PositionalParameters) {
@@ -443,6 +444,276 @@ TEST(Subst, BadSubstitutionIsAnError) {
 
 TEST(Subst, RemoveQuotes) {
   EXPECT_EQ(remove_quotes("a'b c'\"d\\\"e\"\\ f$'\\t'"), "ab cd\"e f\t");
+}
+
+// ---- M15c: shell features compsys needs ------------------------------------------
+
+// $+x and $^x without braces.
+TEST(Subst15c, UnbracedPlusAndCaret) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=1; a=(p q); echo $+x $+nope ${+a[5]}; echo x$^a"),
+            "1 0 0\nxp xq\n");
+}
+
+// $x:h, $x:t:r and $x:s/a/b/ on an unbraced name.
+TEST(Subst15c, UnbracedModifiers) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=/a/b.c; echo $x:h $x:t:r $x:e ${x}:h $x:s/a/Z/ $x:gs/b/Q/; "
+                "a=(/x/y /z/w); echo $a:t"),
+            "/a b c /a/b.c:h /Z/b.c /a/Q.c\ny w\n");
+}
+
+// (k) with (r)/(R) gives the keys of the values found.
+TEST(Subst15c, KeysOfSearchedValues) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "typeset -A h; h=(a 1 b 2 c 2); "
+                "echo ${(k)h[(R)2]} \"|\" ${(k)h[(r)1]} \"|\" ${(kv)h[(R)2]}"),
+            "b c | a | b 2 c 2\n");
+}
+
+// (#b) sets $match, (#m) sets $MATCH.
+TEST(Subst15c, MatchFlagsAndBackrefs) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "setopt extendedglob; x=foobar; "
+                "[[ $x = (#b)(f*)(b*) ]] && echo $match[2] $mbegin[2] $mend[1]; "
+                "echo ${x//(#m)o/<$MATCH>}"),
+            "bar 4 3\nf<o><o>bar\n");
+}
+
+// (#i) and (#a1) in patterns.
+TEST(Subst15c, CaseInsensitiveAndApproximate) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "setopt extendedglob; [[ FOO = (#i)foo ]] && echo i; "
+                "[[ fxo = (#a1)foo ]] && echo a1; [[ fxx = (#a1)foo ]] || echo no"),
+            "i\na1\nno\n");
+}
+
+// (S) shortest match, (B)/(E) positions, (M) matched part.
+TEST(Subst15c, ParamFlagsBSAndMI) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=abcabc; echo ${(S)x#b*c} ${(SB)x#b} ${(SE)x#b} ${(M)x%c*}"),
+            "aabc 2 3 c\n");
+}
+
+// ${x::=v} assigns even when set.
+TEST(Subst15c, ForcedAssignment) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=1; echo ${x::=2} $x"),
+            "2 2\n");
+}
+
+// (n) and (On) sort numerically.
+TEST(Subst15c, NumericSort) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "a=(10 9 100 1); echo ${(n)a} ${(On)a}"),
+            "1 9 10 100 100 10 9 1\n");
+}
+
+// (z) splits like the parser.
+TEST(Subst15c, ZFlagSplitsWords) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x='a \"b c\" d;e'; print -l ${(z)x}"),
+            "a\n\"b c\"\nd\n;\ne\n");
+}
+
+// (P) applies the subscript before indirecting.
+TEST(Subst15c, IndirectSubscript) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "a=(x y); y=Y; echo ${(P)a[2]}"),
+            "Y\n");
+}
+
+// ${h[key]:=v} assigns the element.
+TEST(Subst15c, ElementAssignWithDefault) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "typeset -A h; : ${h[k]:=v}; echo $h[k]"),
+            "v\n");
+}
+
+// a[i,j]=() removes a range.
+TEST(Subst15c, ArrayRangeAssign) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "a=(1 2 3 4 5); a[2,3]=(); echo $a; a[2,2]=(x y); echo $a"),
+            "1 4 5\n1 x y 5\n");
+}
+
+// An unquoted | from $~p separates alternatives.
+TEST(Subst15c, TopLevelBarAlternatives) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "p=\"a|b\"; [[ b = $~p ]] && echo y; words=(a x b); "
+                "echo ${words[(I)a|b]}"),
+            "y\n3\n");
+}
+
+// words[(I)…] in (( … )) reads through the expander.
+TEST(Subst15c, FlaggedSubscriptInArithmetic) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "words=(git commit --amend); "
+                "(( words[(I)-c|--amend] )) && echo yes; echo $(( words[(i)c*] ))"),
+            "yes\n2\n");
+}
+
+// Glob qualifiers, flags and approximate matching (M15c).
+TEST(Subst15c, GlobQualifiersAndFlags) {
+  TempDir dir;
+  Shell sh;
+  EXPECT_EQ(out(sh, "(setopt extendedglob; cd " + dir.path.string() + "; print -n abc > big; "
+                "touch a bb; mkdir d; ln -s a l; "
+                "echo *(.) '|' *(/) '|' *(@) '|' *(.OL[1]) '|' *(^/) '|' *(#q.On) '|' "
+                "*(.:r:u) '|' *(/,@) '|' *(.e:'[[ $REPLY = b* ]]':) '|' x*(N) '|' "
+                "(#i)A* '|' (#a1)bx '|' *(-.))"),
+            "a bb big | d | l | big | a bb big l | big bb a | A BB BIG | d l | bb big | "
+            "| a | bb | a bb big l\n");
+}
+
+// * # ## are greedy, so captures are zsh's.
+TEST(Subst15c, GreedyStarAndRepeats) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "setopt extendedglob; [[ aXbXc = (#b)(*)X(*) ]] && echo $match; "
+                "[[ foo.tar.gz = (#b)(*).(*) ]] && echo $match; "
+                "[[ aaab = (#b)(a##)(*) ]] && echo $match; "
+                "[[ aaab = (#b)(a#)(*) ]] && echo \"[$match[1]] [$match[2]]\"; "
+                "x=foo/bar/baz; echo ${x/(#b)(*)\\/(*)/$match[1]+$match[2]}"),
+            "aXb c\nfoo.tar gz\naaa b\n[aaa] [b]\nfoo/bar+baz\n");
+}
+
+// In double quotes an empty value split is one empty word.
+TEST(Subst15c, QuotedSplitOfEmptyValue) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=; a=(\"${(s: :)x}\"); b=(\"${(f)x}\"); c=(\"${(z)x}\"); "
+                "d=(${(s: :)x}); echo ${#a} ${#b} ${#c} ${#d}; "
+                "for i in \"${(s: :)x}\"; do echo \"<$i>\"; done"),
+            "1 1 1 0\n<>\n");
+}
+
+// A run of separators is one; an empty end field stays.
+TEST(Subst15c, QuotedSplitKeepsEndFields) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "for x in a,,b ,a a, , ,,,a,,,b,,,; do a=(\"${(s:,:)x}\"); "
+                "b=(\"${(@s:,:)x}\"); echo \"${#a} [${(j:|:)a}] ${#b}\"; done"),
+            "2 [a|b] 3\n2 [|a] 2\n2 [a|] 2\n2 [|] 2\n4 [|a|b|] 10\n");
+}
+
+// In zsh ~ binds tighter than |: b~b|a is (b~b)|a.
+TEST(Subst15c, ExclusionBindsTighterThanAlternation) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "setopt extendedglob; p=\"b~b|a\"; [[ a = $~p ]] && echo 1; "
+                "[[ b = $~p ]] || echo 2; p=\"a*~ab|x\"; [[ ab = $~p ]] || echo 3; "
+                "[[ ac = $~p ]] && echo 4"),
+            "1\n2\n3\n4\n");
+}
+
+// (a~b) and (^a) work inside a group; a trailing ~ is plain.
+TEST(Subst15c, ExclusionAndNegationInsideGroups) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "setopt extendedglob; [[ b1 = (*~a*) ]] && echo 1; "
+                "[[ abc = (^a)* ]] && echo 2; [[ abc = (^x) ]] && echo 3; "
+                "[[ a~ = (*~|x) ]] && echo 4; [[ a = (*~) ]] || echo 5"),
+            "1\n2\n3\n4\n5\n");
+}
+
+// ${x//pat/r} tries no empty match at the end of the string.
+TEST(Subst15c, GlobalReplaceStopsAtTheEnd) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "setopt extendedglob; x=aaab; echo ${x//a#/q} ${x/a#/q}; y=ab; "
+                "echo ${y//b#/Q}; z=; echo \"[${z//b#/Q}]\""),
+            "qqb qb\nQaQ\n[Q]\n");
+}
+
+// :s's left side is text unless HIST_SUBST_PATTERN.
+TEST(Subst15c, ModifierSubstitutionIsLiteral) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=abc; echo ${x:gs/[ac]/Y/} ${x:s/b/X/}; z=\"a*b\"; "
+                "echo ${z:s/*/S/}; setopt histsubstpattern; echo ${x:gs/[ac]/Y/}"),
+            "abc aXc\naSb\nYbY\n");
+}
+
+// ${(tP)${…}} gives the named parameter's type.
+TEST(Subst15c, IndirectTypeOfNestedSubject) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=(a b); y=x; echo ${(tP)${:-x}} \"${(P)${:-x}}\" ${(P)${y}}"),
+            "array a b a b\n");
+}
+
+// {1..$n} is a range, as zsh does brace expansion last.
+TEST(Subst15c, BraceRangeAfterExpansion) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "a=(); for i in {1..$#a}; do echo -n \"[$i]\"; done; b=(x y); "
+                "echo {1..$#b} {\"1\"..\"3\"} \"{1..3}\"; x=1..3; echo {$x}; "
+                "z=a,b; echo {$z}"),
+            "[1][0]1 2 1 2 3 {1..3}\n1 2 3\n{a,b}\n");
+}
+
+// typeset +m and +i list names only.
+TEST(Subst15c, TypesetPlusListsNames) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=1; typeset -i y=2; typeset +m '[xy]'; typeset +i | grep '^y$'"),
+            "x\ninteger y\ny\n");
+}
+
+// *(T) marks a plain file with a blank; a word that is all one group is
+// qualifiers (on nothing); `~` inside a group excludes (M15c round 1).
+TEST(Subst15c, GlobTypeMarksGroupsAndExclusions) {
+  TempDir dir;
+  Shell sh;
+  str cd = "(setopt extendedglob; cd " + dir.path.string() + "; ";
+  EXPECT_EQ(out(sh, cd + "touch a1 b1 bar; mkdir d1; print -r -- *(T); "
+                         "echo (b1)(N) x (*~a*) ((b*)~bar) (b*~bar))"),
+            "a1  b1  bar  d1/\nb1 x b1 bar d1 b1 b1\n");
+  EXPECT_EQ(sh.run(cd + "echo (a1))").err, "jfsh: no matches found: (a1)\n");
+}
+
+// (#s) and (#e) anchor to the whole value, not the part tried.
+TEST(Subst15c, AnchorsAreTheWholeStringsEnds) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "setopt extendedglob; x=aab; echo ${x//(#s)a/q}; x=abc; "
+                "echo ${x//(#e)/Z} ${x//(#s)/Z}; x=aab; "
+                "echo ${x/a(#e)/q} ${x#a(#e)} ${x%(#s)b}; x=foo.bar; "
+                "echo ${x/o(#e)/Z}; x=abab; echo ${(S)x/(#s)b/Z} ${(S)x//(#s)a/Z}; "
+                "x=foo/bar; echo ${x//(#s)?/Z}"),
+            "qab\nabcZ Zabc\naab aab aab\nfoo.bar\nabab Zbab\nZoo/bar\n");
+  // A pattern subscript matches each tail on its own, as zsh's getarg:
+  // there (#s) is where the tail starts.
+  EXPECT_EQ(out(sh, "setopt extendedglob; x=abcab; "
+                "echo $x[(r)(#s)b] $x[(i)(#s)b] $x[(I)(#s)a] $x[(I)(#s)b]"),
+            "b 2 4 5\n");
+}
+
+// The empty match at the end is tried unless the step that got there
+// was a match.
+TEST(Subst15c, SubstitutionAtTheEnd) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "setopt extendedglob; x=abcd; echo ${x//(b|(#e))/Z} ${x//(bcd|(#e))/Z}; "
+                "x=abc; echo ${x//((#s)|(#e))/Z} ${x//(a|(#e))/Z} ${x//c#/Z} ${x//x#/Z} "
+                "${x//(#e)/Z} ${x/(#e)/Z} ${x/c#/Z}"),
+            "aZcdZ aZ\nZabcZ ZbcZ ZaZbZ ZaZbZc abcZ abcZ Zabc\n");
+  // `#` and `%` anchor after `//` too.
+  EXPECT_EQ(out(sh, "y=abc; echo \"<${y//#/Z}>\" \"<${y//%/Z}>\" ${y//#a/Z} ${y//%c/Z}"),
+            "<Zabc> <abcZ> Zbc abZ\n");
+}
+
+TEST(Subst15c, AnchorsWithBackreferences) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "setopt extendedglob; x=aXbXc; "
+                "echo ${x/(#b)(*)X(*)(#e)/$match[2]-$match[1]} ${(M)x%%X*(#e)} "
+                "${(S)x/(#b)X(?)/<$match[1]>}; "
+                "g='a(p)'; echo ${g/(#b)\\(((|^)[p=\\*])\\)(#e)/}; x=abab; "
+                "echo ${x//b(#e)/Z} ${x//*(#e)/W}"),
+            "c-aXb XbXc a<b>Xc\na\nabaZ W\n");
+}
+
+// A word ending in ~ is not a pattern (backup files).
+TEST(Subst15c, TrailingTildeIsLiteral) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "setopt extendedglob; echo nofile~ b~; [[ x~ = x~ ]] && echo y; "
+                "[[ \"\" = (~a) ]] && echo y3; x=abc; echo ${x:&}"),
+            "nofile~ b~\ny\ny3\nabc\n");
+  // `~` alone makes no pattern; with a wildcard it excludes.
+  TempDir dir;
+  str cd = "(setopt extendedglob; cd " + dir.path.string() + "; ";
+  EXPECT_EQ(out(sh, cd + "touch foo.c bar.c; echo x~y x~y~ x~y~z foo.c~y *.c~foo*)"),
+            "x~y x~y~ x~y~z foo.c~y bar.c\n");
+  EXPECT_EQ(sh.run(cd + "echo foo.c~f*)").err, "jfsh: no matches found: foo.c~f*\n");
 }
 
 }  // namespace

@@ -25,6 +25,7 @@ struct TypesetAttrs {
   bool        names_only = false;   // a bare `+`
   bool        pattern = false;  // -m
   bool        functions = false;   // -f
+  bool        tie    = false;   // -T
   s::uint32_t on     = 0;   // PM_EXPORTED, PM_READONLY, PM_UPPER, PM_LOWER, …
   s::uint32_t off    = 0;
 };
@@ -71,8 +72,31 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
       (void)ctx.params.set_scalar(name, "");
       p = &ctx.params.lookup(name)->get();
     } else {
-      p = &ctx.params.declare_local(name, PM_SCALAR | (ctx.func_depth ? +PM_LOCAL : 0));
-      p->set(str{});
+      // A special parameter stays special in the function, as in zsh
+      // (unless -h): it starts empty and has its value back at the end.
+      // A view with no setter ($commands) just stays a view.
+      Param* special = outer and (outer->get().flags & PM_SPECIAL) and outer->get().handlers
+                           and not (attrs.on & PM_HIDE)
+                       ? &outer->get() : nullptr;
+      bool settable = special and (special->handlers->set_scalar or special->handlers->set_array);
+      ParamValue saved = special ? special->value : ParamValue{};
+      s::uint32_t kind = special ? special->flags & (PM_SCALAR | PM_INTEGER | PM_FLOAT | PM_ARRAY
+                                                     | PM_HASH)
+                                 : PM_SCALAR;
+      p = &ctx.params.declare_local(name, kind | (ctx.func_depth ? +PM_LOCAL : 0));
+      if (special) {
+        p->handlers = s::make_unique<ParamHandlers>(*special->handlers);
+        p->flags |= PM_SPECIAL;
+        p->value = special->value;
+        if (settable) {
+          p->restore = s::move(saved);
+          if (p->is_array() and p->handlers->set_array) p->handlers->set_array({});
+          else if (p->handlers->set_scalar)
+            p->handlers->set_scalar(p->is_scalar() ? str{} : str("0"));
+        }
+      } else {
+        p->set(str{});
+      }
     }
     if (exported) p->flags |= PM_EXPORTED;
     if (attrs.type == 'i' and not has_value) p->set(s::int64_t{0});
@@ -122,6 +146,8 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
         } else if (p->is_array() or p->is_hash()) {
           s::fprintf(stderr, "jfsh: %s: inconsistent type for assignment\n", name.c_str());
           return 1;
+        } else if (p->handlers and p->handlers->set_scalar) {
+          p->handlers->set_scalar(s::move(value));
         } else {
           p->set(s::move(value));
         }
@@ -141,7 +167,7 @@ str typeset_line(const Param& p, bool global) {
   str flags = param_type_flags(p);
   str head  = flags == "-x" ? str("export")
             : "typeset" + str(global ? " -g" : "") + (flags.empty() ? str{} : " " + flags);
-  if (not p.is_set()) return head + " " + p.name;
+  if (not p.is_set() or (p.flags & PM_HIDEVAL)) return head + " " + p.name;
   return head + " " + p.name + "=" + param_value_text(p);
 }
 
@@ -185,7 +211,12 @@ int typeset_list(const TypesetAttrs& attrs, const vec<str>& patterns, ExecContex
   for (const Param* p : params) {
     if (attrs.print)
       s::printf("%s\n", typeset_line(*p, p->scope < ctx.params.local_scope()).c_str());
-    else if (attrs.names_only)  s::printf("%s%s\n", type_words(*p).c_str(), shell_quote(p->name).c_str());
+    else if (attrs.names_only)
+      s::printf("%s%s\n", attrs.on or attrs.type ? "" : type_words(*p).c_str(),
+                shell_quote(p->name).c_str());
+    else if (p->flags & PM_HIDEVAL)
+      s::printf("%s%s\n", attrs.on or attrs.type ? "" : type_words(*p).c_str(),
+                shell_quote(p->name).c_str());
     else if (attrs.on or attrs.type)
       s::printf("%s=%s\n", shell_quote(p->name).c_str(), param_value_text(*p).c_str());
     else
@@ -195,14 +226,44 @@ int typeset_list(const TypesetAttrs& attrs, const vec<str>& patterns, ExecContex
   return 0;
 }
 
+// typeset -T SCALAR[=text] array [sep]: declares both and ties them; an
+// `array=(…)` value is given by the executor once this returns.
+int typeset_tie(strv cmd, const vec<str>& names, const TypesetAttrs& attrs, ExecContext& ctx) {
+  auto fail = [&](strv msg) {
+    s::fprintf(stderr, "jfsh: %.*s: %.*s\n", static_cast<int>(cmd.size()), cmd.data(),
+               static_cast<int>(msg.size()), msg.data());
+    return 1;
+  };
+  if (names.size() < 2) return fail("-T requires names of scalar and array");
+  if (names.size() > 3) return fail("too many arguments for -T");
+  s::size_t eq = names[0].find('=');
+  str scalar = names[0].substr(0, eq);
+  str array  = names[1].substr(0, names[1].find('='));
+  if (scalar == array) return fail("can't tie a variable to itself: " + scalar);
+  char sep = names.size() == 3 and not names[2].empty() ? names[2][0] : ':';
+  TypesetAttrs plain = attrs;
+  plain.tie = false;
+  plain.type = 'a';
+  plain.on &= PM_UNIQUE;
+  if (typeset_one(cmd, array, plain, ctx) != 0) return 1;
+  plain.type = 0;
+  plain.on = attrs.on & ~PM_UNIQUE;
+  if (typeset_one(cmd, scalar, plain, ctx) != 0) return 1;
+  auto p = ctx.params.lookup_raw(scalar);
+  if (not p) return 1;
+  ctx.params.tie(p->get(), array, sep);
+  if (eq != str::npos) p->get().handlers->set_scalar(names[0].substr(eq + 1));
+  return 0;
+}
+
 }  // namespace
 
-// typeset [±aAEFfgilmprUux] [name[=value] …].  Without -g a name is
+// typeset [±aAEFfgilmprUuxT] [name[=value] …].  Without -g a name is
 // declared in the innermost scope, which inside a function is local to it.
 // A new parameter is set and empty (0 for -i/-F, () for -a/-A).  `implied`
 // holds the options the variant stands for (export is `typeset -gx`).
 // With no names it lists the parameters that have the attributes given.
-// TODO(builtin/typeset): `-T`, `-Z`/`-L`/`-R` padding, `-h`, `-t`.
+// TODO(builtin/typeset): `-Z`/`-L`/`-R` padding, `-t`.
 int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
   strv cmd = args[0];
   TypesetAttrs attrs;
@@ -215,18 +276,23 @@ int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
         return true;
       case 'g': attrs.global = on; return true;
       case 'p': attrs.print = on; return true;
-      case 'm': attrs.pattern = on; return true;
-      case 'f': attrs.functions = on; return true;
+      // ±m and ±f both mean it; +f lists the names only.
+      case 'm': attrs.pattern = true; return true;
+      case 'f': attrs.functions = true; attrs.names_only |= not on; return true;
+      case 'T': attrs.tie = on; return true;
       case 'x': (on ? attrs.on : attrs.off) |= PM_EXPORTED; return true;
       case 'r': (on ? attrs.on : attrs.off) |= PM_READONLY; return true;
       case 'u': (on ? attrs.on : attrs.off) |= PM_UPPER;    return true;
       case 'l': (on ? attrs.on : attrs.off) |= PM_LOWER;    return true;
       case 'U': (on ? attrs.on : attrs.off) |= PM_UNIQUE;   return true;
-      case 'h': case 't': return true;   // accepted, no effect yet
+      case 'H': (on ? attrs.on : attrs.off) |= PM_HIDEVAL;  return true;
+      case 'h': (on ? attrs.on : attrs.off) |= PM_HIDE;     return true;
+      case 't': return true;   // accepted, no effect yet
       default:  return false;
     }
   };
   for (char c : implied) apply(c, true);
+  str plus;   // the options given with `+`: a listing of names only
   s::size_t i = 1;
   for (; i < args.size(); ++i) {
     const str& a = args[i];
@@ -234,6 +300,7 @@ int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
     if (a == "+") { attrs.names_only = true; continue; }
     if (a.size() < 2 or (a[0] != '-' and a[0] != '+')) break;
     for (s::size_t k = 1; k < a.size(); ++k) {
+      if (a[0] == '+') plus += a[k];
       if (not apply(a[k], a[0] == '-')) {
         s::fprintf(stderr, "jfsh: %.*s: bad option: %c%c\n",
                    static_cast<int>(cmd.size()), cmd.data(), a[0], a[k]);
@@ -246,15 +313,23 @@ int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
 
   if (attrs.functions) {
     vec<str> fargs{"functions"};
+    if (attrs.names_only) fargs.emplace_back("+");
     if (attrs.pattern) fargs.emplace_back("-m");
     fargs.insert(fargs.end(), names.begin(), names.end());
     return builtin_functions(fargs, ctx);
   }
   if (names.empty() or attrs.pattern) {
+    // `typeset +i`, `typeset +m pat`: the names only, of the parameters
+    // with the attributes the `+` options name.
+    if (not plus.empty()) {
+      for (char c : plus) apply(c, true);
+      attrs.names_only = true;
+    }
     // `export -p` lists the exported parameters as `export X=…`; plain
     // `export` lists them as `X=…`.
     return typeset_list(attrs, names, ctx);
   }
+  if (attrs.tie) return typeset_tie(cmd, names, attrs, ctx);
   int rc = 0;
   if (attrs.print) {
     for (const auto& name : names) {
@@ -297,6 +372,12 @@ int builtin_readonly(vec<str>& args, ExecContext& ctx) {
   return typeset_common(args, ctx, "gr");
 }
 
+// unfunction [-m] name …: unset -f.
+int builtin_unfunction(vec<str>& args, ExecContext& ctx) {
+  args.insert(args.begin() + 1, "-f");
+  return builtin_unset(args, ctx);
+}
+
 // unset [-fmv] name …: -v (the default) removes parameters, `name[i]` or
 // `name[key]` one element, -f functions, and -m takes patterns.
 int builtin_unset(vec<str>& args, ExecContext& ctx) {
@@ -316,7 +397,8 @@ int builtin_unset(vec<str>& args, ExecContext& ctx) {
       } else if (ctx.functions.contains(name) or ctx.autoloads.contains(name)) {
         victims.push_back(name);
       } else {
-        s::fprintf(stderr, "jfsh: unset: no such hash table element: %s\n", name.c_str());
+        s::fprintf(stderr, "jfsh: %s: no such hash table element: %s\n", args[0].c_str(),
+                   name.c_str());
         rc = 1;
         continue;
       }

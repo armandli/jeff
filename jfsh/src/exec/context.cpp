@@ -1,9 +1,12 @@
 // Special parameters: the ones whose value the shell computes when they are
 // read, as zsh's params.c does with its getfn/setfn pairs.
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <pwd.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -45,6 +48,11 @@ s::int64_t to_int(const str& v) {
 }
 
 }  // namespace
+
+FuncFrame::FuncFrame(ExecContext& c, str name) : ctx(c) {
+  str caller = ctx.funcstack.empty() ? ctx.arg0 : ctx.funcstack.back().name;
+  ctx.funcstack.push_back({s::move(name), caller + ":" + s::to_string(ctx.lineno)});
+}
 
 void install_special_params(ExecContext& ctx) {
   ParamTable& params = ctx.params;
@@ -114,6 +122,102 @@ void install_special_params(ExecContext& ctx) {
       return str(buf);
     },
   });
+
+  special(params, "funcstack", vec<str>{}, PM_ARRAY | PM_READONLY, {
+    .get_array = [&ctx] {
+      vec<str> out;
+      for (auto it = ctx.funcstack.rbegin(); it != ctx.funcstack.rend(); ++it)
+        out.push_back(it->name);
+      return out;
+    },
+  });
+  special(params, "functrace", vec<str>{}, PM_ARRAY | PM_READONLY, {
+    .get_array = [&ctx] {
+      vec<str> out;
+      for (auto it = ctx.funcstack.rbegin(); it != ctx.funcstack.rend(); ++it)
+        out.push_back(it->caller);
+      return out;
+    },
+  });
+
+  // $signals: the signal names by number from 0 (EXIT), then ZERR and
+  // DEBUG.
+  {
+    vec<str> names{"EXIT"};
+    for (int sig = 1; sig < NSIG; ++sig) names.emplace_back(SignalTable::sig_to_name(sig));
+    names.emplace_back("ZERR");
+    names.emplace_back("DEBUG");
+    params.assign("signals", s::move(names), PM_ARRAY | PM_READONLY | PM_SPECIAL);
+  }
+
+  // $argv is the positional parameters.
+  special(params, "argv", vec<str>{}, PM_ARRAY, {
+    .get_array = [&ctx] { return ctx.positional; },
+    .set_array = [&ctx](vec<str> v) { ctx.positional = s::move(v); },
+  });
+
+  special(params, "OPTIND", s::int64_t{1}, PM_INTEGER, {
+    .get_scalar = [&ctx] { return s::to_string(ctx.optind); },
+    .set_scalar = [&ctx](str v) { ctx.optind = to_int(v); },
+  });
+  special(params, "OPTARG", str{}, PM_SCALAR, {
+    .get_scalar = [&ctx] { return ctx.optarg; },
+    .set_scalar = [&ctx](str v) { ctx.optarg = s::move(v); },
+  });
+
+  // Who and where: read when used, as zsh's are.
+  special(params, "UID", s::int64_t{0}, PM_INTEGER, {
+    .get_scalar = [] { return s::to_string(::getuid()); },
+  });
+  special(params, "EUID", s::int64_t{0}, PM_INTEGER, {
+    .get_scalar = [] { return s::to_string(::geteuid()); },
+  });
+  special(params, "GID", s::int64_t{0}, PM_INTEGER, {
+    .get_scalar = [] { return s::to_string(::getgid()); },
+  });
+  special(params, "EGID", s::int64_t{0}, PM_INTEGER, {
+    .get_scalar = [] { return s::to_string(::getegid()); },
+  });
+  special(params, "USERNAME", str{}, PM_SCALAR, {
+    .get_scalar = [] {
+      struct passwd* pw = ::getpwuid(::getuid());
+      return pw and pw->pw_name ? str(pw->pw_name) : str{};
+    },
+  });
+  // $LOGNAME, when the environment has none, as zsh sets it: the login
+  // name, else the user's name.
+  if (auto l = params.lookup("LOGNAME"); not l or not l->get().is_set()) {
+    const char* login = ::getlogin();
+    struct passwd* pw = ::getpwuid(::getuid());
+    str name = login and *login ? str(login) : pw and pw->pw_name ? str(pw->pw_name) : str{};
+    params.assign("LOGNAME", s::move(name), PM_SCALAR | PM_EXPORTED);
+  }
+  // The version of zsh whose behaviour jfsh follows, for the functions
+  // that check it (compinit, is-at-least).
+  params.assign("ZSH_VERSION", str("5.9"));
+  params.assign("ZSH_PATCHLEVEL", str("zsh-5.9-0-g73d3173"));
+  {
+    str name = ctx.arg0.substr(ctx.arg0.rfind('/') == str::npos ? 0 : ctx.arg0.rfind('/') + 1);
+    if (not name.empty() and name[0] == '-') name.erase(0, 1);
+    params.assign("ZSH_NAME", name.empty() ? str("jfsh") : name);
+  }
+  char host[256] = {};
+  if (::gethostname(host, sizeof host - 1) == 0) params.assign("HOST", str(host));
+  // $OSTYPE and friends from uname, in the form configure gives zsh
+  // (`darwin26.0`, `linux-gnu`).
+  struct utsname u{};
+  if (::uname(&u) == 0) {
+    str sys = u.sysname;
+    for (char& c : sys) c = static_cast<char>(s::tolower(static_cast<unsigned char>(c)));
+    str rel = u.release;
+    if (auto dot = rel.find('.'); dot != str::npos) rel = rel.substr(0, rel.find('.', dot + 1));
+    str ostype = sys == "linux" ? str("linux-gnu") : sys + rel;
+    if (not params.lookup("OSTYPE"))   params.assign("OSTYPE", ostype);
+    if (not params.lookup("MACHTYPE")) params.assign("MACHTYPE", str(u.machine));
+    if (not params.lookup("CPUTYPE"))  params.assign("CPUTYPE", str(u.machine));
+    if (not params.lookup("VENDOR"))
+      params.assign("VENDOR", str(sys == "darwin" ? "apple" : sys == "linux" ? "pc" : "unknown"));
+  }
 
   // xtrace's prefix starts as zsh's; unset, there is none.
   if (not params.lookup("PS4")) params.assign("PS4", str("+%N:%i> "));

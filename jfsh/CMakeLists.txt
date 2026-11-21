@@ -175,9 +175,23 @@ set(JFSH_SYSCONFDIR "/etc" CACHE PATH "Directory of jfsh's system-wide startup f
 # resolvable (which is fine for the jfsh/zsh feature set).
 set(JFSH_MODULE_DIR "${CMAKE_INSTALL_PREFIX}/lib/jfsh" CACHE PATH
     "Directory for loadable zsh/* .so modules (empty disables dlopen)")
+# Where zsh's shell function library (compinit, the completion functions,
+# …) is installed: the default $fpath.  Relative to the install prefix
+# unless absolute.  A jfsh run from its build tree, before it is installed,
+# falls back to share/jfsh/functions in the source tree.
+set(JFSH_FUNCTIONS_DIR "share/jfsh/functions" CACHE PATH
+    "Directory for the shipped shell functions (the default $fpath)")
+if(IS_ABSOLUTE "${JFSH_FUNCTIONS_DIR}")
+  set(JFSH_FUNCTIONS_PATH "${JFSH_FUNCTIONS_DIR}")
+else()
+  set(JFSH_FUNCTIONS_PATH "${CMAKE_INSTALL_PREFIX}/${JFSH_FUNCTIONS_DIR}")
+endif()
 target_compile_definitions(jfsh_exec PUBLIC
   JFSH_SYSCONFDIR="${JFSH_SYSCONFDIR}"
-  JFSH_MODULE_DIR="${JFSH_MODULE_DIR}")
+  JFSH_MODULE_DIR="${JFSH_MODULE_DIR}"
+  JFSH_SITE_FUNCTIONS_DIR="${CMAKE_INSTALL_PREFIX}/share/jfsh/site-functions"
+  JFSH_FUNCTIONS_DIR="${JFSH_FUNCTIONS_PATH}"
+  JFSH_SOURCE_FUNCTIONS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/share/jfsh/functions")
 target_link_libraries(jfsh_exec PUBLIC
   jfsh_parser jfsh_glob jfsh_builtins jfsh_history jfsh_prompt jfsh_editor
   jfsh_compiler_options)
@@ -283,6 +297,9 @@ target_link_libraries(jfsh PRIVATE
 )
 
 install(TARGETS jfsh DESTINATION bin)
+# A relative JFSH_FUNCTIONS_DIR stays relative here, so `cmake --install
+# --prefix X` puts the library under X.
+install(DIRECTORY share/jfsh/functions/ DESTINATION "${JFSH_FUNCTIONS_DIR}")
 
 # ---------------------------------------------------------------------------
 # Tests

@@ -9,6 +9,7 @@
 #include <algorithm>
 
 #include <jfsh/core/aliases.h>
+#include <jfsh/core/sort.h>
 #include <jfsh/core/utf8.h>
 #include <jfsh/editor/editor.h>
 #include <jfsh/glob/glob.h>
@@ -659,6 +660,22 @@ int CompState::add(const CompAddSpec& spec, const vec<str>& list, vec<bool>* mat
     MatchRun& m;
     ~EndAdd() { m.end_add(); }
   } end_add{mr};
+  // compstate[list] as the matches are added says how they are laid out
+  // (zsh's complistflags).
+  auto lk = keys.find("list");
+  struct MarkLayout {
+    ~MarkLayout() {
+      for (s::size_t k = first; k < m.size(); ++k) {
+        m[k].packed = packed;
+        m[k].rows   = rows;
+      }
+    }
+    vec<CompCandidate>& m;
+    s::size_t first;
+    bool packed, rows;
+  } mark{matches, matches.size(),
+         lk != keys.end() and lk->second.find("packed") != str::npos,
+         lk != keys.end() and lk->second.find("rows") != str::npos};
   bool domatch = not spec.no_match;
   if (not matched and (not list.empty() or spec.empties or spec.all)) {
     if (domatch) mr.hasmatched = true;
@@ -694,6 +711,15 @@ int CompState::add(const CompAddSpec& spec, const vec<str>& list, vec<bool>* mat
   }
   vec<CompiledPattern> ignore;
   for (const auto& p : spec.ignore) ignore.push_back(CompiledPattern::compile(p));
+  // compstate[pattern_match]: a line with pattern characters is matched as
+  // a pattern, a `*` at the cursor when it says `*` (zsh's comppatmatch).
+  opt<CompiledPattern> line_pattern;
+  if (auto pm = keys.find("pattern_match");
+      domatch and pm != keys.end() and not pm->second.empty()) {
+    str text = lpre + (pm->second[0] == '*' ? "*" : "") + lsuf;
+    if (has_glob_chars(text, spec.extended))
+      line_pattern = CompiledPattern::compile(text, false, spec.extended);
+  }
 
   // A match the group has already (the last one with -1, none with -2)
   // is not added again.
@@ -718,7 +744,13 @@ int CompState::add(const CompAddSpec& spec, const vec<str>& list, vec<bool>* mat
     Cline* lc = nullptr;
     bool isexact = false;
     opt<str> ms;
-    if (domatch) {
+    if (line_pattern) {
+      haspattern = true;
+      if (line_pattern->matches(w)) {
+        ms = qw;
+        lc = mr.plain(qw);
+      }
+    } else if (domatch) {
       ms = mr.comp_match(lpre, lsuf, qw, &lc, &isexact);
     } else {
       ms = qw;
@@ -752,13 +784,18 @@ int CompState::add(const CompAddSpec& spec, const vec<str>& list, vec<bool>* mat
     c.group   = g;
     c.suffix  = spec.has_suffix ? str{} : spec.dir_suffix.empty() ? str(" ") : spec.dir_suffix;
     if (spec.files) {
-      str path = spec.file_prefix + comp_unquote(spec.hpre, quote) + w;
+      // As zsh's addmatch: the -W directory (or ./) and the word; the -p
+      // prefix is not part of it (_path_files passes the path as both).
+      str path = (spec.file_prefix.empty() ? str("./") : spec.file_prefix) + w;
       struct stat st{}, lst{};
       bool exists = ::stat(path.c_str(), &st) == 0;
       bool link   = ::lstat(path.c_str(), &lst) == 0 and S_ISLNK(lst.st_mode);
       bool dir    = exists and S_ISDIR(st.st_mode);
       bool exe    = exists and S_ISREG(st.st_mode) and ::access(path.c_str(), X_OK) == 0;
-      if (not spec.has_suffix) c.suffix = dir ? "/" : exists ? " " : "";
+      // A hidden -s suffix follows the word (`mvd` + `/abx`): no slash or
+      // space of its own then, as in zsh.
+      if (not spec.has_suffix)
+        c.suffix = not spec.hsuf.empty() ? str{} : dir ? "/" : exists ? " " : "";
       c.type = dir ? '/' : link ? '@' : exe ? '*' : (exists and S_ISFIFO(st.st_mode)) ? '|'
              : (exists and S_ISSOCK(st.st_mode)) ? '=' : 0;
     }
@@ -951,6 +988,7 @@ CompletionResult CompletionEngine::run_function(const CompContext& ctx, const st
 
   CompletionResult r;
   r.function = true;
+  r.haspattern = st.haspattern;
   r.quote    = ctx.quote;
   r.start    = s::min(ctx.comp_start + st.qiprefix.size(), ctx.word_end);
   r.end      = s::max(r.start, ctx.word_end - s::min(st.qisuffix.size(), ctx.word_end));
@@ -981,7 +1019,7 @@ CompletionResult CompletionEngine::run_function(const CompContext& ctx, const st
         if (a.all != b.all) return a.all;
         const str& x = grp.by_match or a.display.empty() ? a.word : a.display;
         const str& y = grp.by_match or b.display.empty() ? b.word : b.display;
-        return x < y;
+        return zstrcmp(x, y, false, true) < 0;
       });
     }
     vec<CompCandidate> kept;
@@ -1178,6 +1216,7 @@ void Editor::list_matches(const CompletionResult& r, strv mode) {
     vec<str> heads;
     vec<str> items;
     vec<str> lines;
+    bool packed = true, rows = true;   // all its matches were added so
   };
   vec<Block> blocks;
   int n = 0;
@@ -1189,8 +1228,14 @@ void Editor::list_matches(const CompletionResult& r, strv mode) {
       str shown = m.display.empty() ? m.word : m.display;
       if (types and m.type) shown += m.type;
       if (not m.description.empty()) shown += "  -- " + m.description;
-      if (m.line) b.lines.push_back(s::move(shown));
-      else        b.items.push_back(s::move(shown));
+      if (m.line) {
+        b.lines.push_back(s::move(shown));
+        continue;
+      }
+      b.items.push_back(s::move(shown));
+      // Without a function, compstate[list] (the options) says.
+      b.packed = b.packed and (r.function ? m.packed : mode.find("packed") != strv::npos);
+      b.rows   = b.rows and (r.function ? m.rows : rows_first);
     }
     bool has = not b.items.empty() or not b.lines.empty();
     if (g < r.groups.size()) {
@@ -1210,27 +1255,133 @@ void Editor::list_matches(const CompletionResult& r, strv mode) {
   if (blocks.empty()) return;
 
   vec<str> out;
-  for (const auto& b : blocks) {
-    for (const auto& h : b.heads) out.push_back(h);
-    int width = 0;
-    for (const auto& it : b.items) width = s::max(width, text_width(it));
-    int colw  = width + 2;
-    int count = static_cast<int>(b.items.size());
-    int ncols = s::max(1, s::min(count, (cols + 1) / s::max(colw, 1)));
-    int nrows = (count + ncols - 1) / ncols;
-    for (int row = 0; row < nrows; ++row) {
-      str line;
-      for (int col = 0; col < ncols; ++col) {
-        int idx = rows_first ? row * ncols + col : col * nrows + row;
-        if (idx >= count) continue;
-        const str& it = b.items[static_cast<s::size_t>(idx)];
-        line += it;
-        bool last = rows_first ? (col + 1 >= ncols or idx + 1 >= count) : (idx + nrows >= count);
-        if (not last) line += str(static_cast<s::size_t>(colw - text_width(it)), ' ');
-      }
-      out.push_back(s::move(line));
+  // The columns as zsh's calclist() lays them out: each group in as many
+  // columns of its widest match as fit, all as wide as the widest
+  // group's; a packed group (compstate[list] `packed`) with columns each
+  // as wide as its own widest entry, as many as fit.
+  constexpr int CM_SPACE = 2;
+  struct Lay {
+    vec<int> lens, widths;
+    int dcount = 0, cols = 0, width = 0, shortest = 0, lins = 0, totl = 0;
+  };
+  vec<Lay> lays(blocks.size());
+  int max = 0;
+  for (s::size_t k = 0; k < blocks.size(); ++k) {
+    Lay& g = lays[k];
+    int glong = 1, gshort = cols, totl = 0;
+    for (const auto& it : blocks[k].items) {
+      int l = text_width(it);
+      g.lens.push_back(l);
+      glong = s::max(glong, l);
+      gshort = s::min(gshort, l);
+      totl += l;
     }
+    g.dcount = static_cast<int>(g.lens.size());
+    g.totl = totl + g.dcount * CM_SPACE;
+    g.width = glong + CM_SPACE;
+    g.shortest = gshort + CM_SPACE;
+    g.cols = s::min(cols / g.width, g.dcount);
+    if (g.cols) max = s::max(max, g.cols * g.width - CM_SPACE);
+  }
+  for (auto& g : lays) {
+    if (g.cols) {
+      g.lins = (g.dcount + g.cols - 1) / g.cols;
+      if (g.cols > 1) g.width += (max - (g.width * g.cols - CM_SPACE)) / g.cols;
+    } else {
+      g.cols = 1;
+      g.width = 0;
+      for (int l : g.lens) g.lins += 1 + (l - 1) / cols;
+    }
+  }
+  for (s::size_t k = 0; k < blocks.size(); ++k) {
+    Lay& g = lays[k];
+    if (not blocks[k].packed or not g.width) continue;
+    vec<int> ws(static_cast<s::size_t>(cols), 0);
+    int tlines = g.lins, tcols = g.cols, width = 0;
+    for (tcols = cols / (g.shortest + CM_SPACE); tcols > g.cols; --tcols) {
+      s::fill(ws.begin(), ws.end(), 0);
+      width = 0;
+      if (blocks[k].rows) {
+        tlines = 1;
+        for (int nth = 0, tcol = 0; width < cols and nth < g.dcount; ++nth, ++tcol) {
+          if (tcol == tcols) {
+            tcol = 0;
+            ++tlines;
+          }
+          int len = g.lens[static_cast<s::size_t>(nth)] + (tcol == tcols - 1 ? 0 : CM_SPACE);
+          auto& w = ws[static_cast<s::size_t>(tcol)];
+          if (len > w) {
+            width += len - w;
+            w = len;
+          }
+        }
+        if (width < cols) break;
+      } else {
+        tlines = s::max(1, (g.dcount + tcols - 1) / tcols);
+        int tcol = 0;
+        for (int nth = 0, tline = 0; width < cols and nth < g.dcount; ++nth, ++tline) {
+          if (tline == tlines) {
+            ++tcol;
+            tline = 0;
+          }
+          if (tcol == tcols) {
+            tcol = 0;
+            ++tlines;
+          }
+          int len = g.lens[static_cast<s::size_t>(nth)] + (tcol == tcols - 1 ? 0 : CM_SPACE);
+          auto& w = ws[static_cast<s::size_t>(tcol)];
+          if (len > w) {
+            width += len - w;
+            w = len;
+          }
+        }
+        if (width < cols) {
+          if (++tcol < tcols) tcols = tcol;
+          break;
+        }
+      }
+    }
+    if (tcols <= g.cols) tlines = g.lins;
+    if (tlines != g.lins) {
+      g.lins = tlines;
+      g.cols = tcols;
+      g.totl = width;
+      g.widths.assign(ws.begin(), ws.begin() + tcols);
+      max = s::max(max, width - CM_SPACE);
+    }
+  }
+  for (auto& g : lays) {
+    if (not g.widths.empty()) {
+      int a = (max - g.totl + CM_SPACE) / g.cols;
+      for (int& w : g.widths) w += a;
+    } else if (g.width and g.cols > 1) {
+      g.width += (max - (g.width * g.cols - CM_SPACE)) / g.cols;
+    }
+  }
+  for (s::size_t k = 0; k < blocks.size(); ++k) {
+    const Block& b = blocks[k];
+    const Lay& g = lays[k];
+    for (const auto& h : b.heads) out.push_back(h);
     for (const auto& l : b.lines) out.push_back(l);
+    int left = g.dcount;
+    int step = b.rows ? 1 : g.lins;
+    for (int row = 0, p = 0; left > 0 and row < g.lins; ++row) {
+      str line;
+      int q = p;
+      for (int mc = 0; mc < g.cols and left > 0; ++mc) {
+        if (q >= g.dcount) break;
+        const str& it = b.items[static_cast<s::size_t>(q)];
+        line += it;
+        int wid = g.widths.empty() ? g.width : g.widths[static_cast<s::size_t>(mc)];
+        if (mc + 1 < g.cols)
+          line += str(static_cast<s::size_t>(s::max(0, wid - text_width(it))), ' ');
+        --left;
+        q += step;
+      }
+      while (not line.empty() and line.back() == ' ') line.pop_back();
+      out.push_back(s::move(line));
+      p += b.rows ? g.cols : 1;
+    }
   }
   int nrows = static_cast<int>(out.size());
 
@@ -1257,8 +1408,9 @@ void Editor::list_matches(const CompletionResult& r, strv mode) {
     if (k > 0) rows += '\n';
     rows += out[k];
   }
-  if (nrows + 2 >= height) {
-    // Too tall to keep below the line: print it, and the prompt after.
+  if (nrows + 1 > height) {
+    // Too tall to keep below the line (zsh keeps a listing that fits
+    // with the line on the screen): print it, and the prompt after.
     trash();
     str text;
     for (char c : rows) text += c == '\n' ? str("\r\n") : str(1, c);
@@ -1366,6 +1518,12 @@ bool Editor::apply_completion(CompletionResult& r, bool reverse) {
   opt<str> insert;
   if (auto it = r.keys.find("insert"); it != r.keys.end() and not it->second.empty())
     insert = it->second;
+  // Matches found by matching the line as a pattern go in by menu
+  // completion while compstate[pattern_insert] is `menu` (zsh's default);
+  // otherwise the common prefix goes in, as for other matches.
+  if (r.haspattern and insert and insert->find("unambiguous") != str::npos
+      and r.keys["pattern_insert"] == "menu" and real.size() > 1)
+    insert = "menu";
   str list = r.keys["list"];
   mLastResult = s::make_unique<CompletionResult>(r);
 

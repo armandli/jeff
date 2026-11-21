@@ -55,19 +55,34 @@ EditorMode Editor::mode() const {
   return mZle.keymap("main") == mZle.keymap("viins") ? EditorMode::Vi : EditorMode::Emacs;
 }
 
-void Editor::enter_raw_mode() {
-  tcgetattr(mIn, &OrigTermios);
-  struct termios raw = OrigTermios;
+namespace {
+
+struct termios raw_modes(const struct termios& orig) {
+  struct termios raw = orig;
   raw.c_lflag &= static_cast<tcflag_t>(~(ECHO | ICANON | ISIG | IEXTEN));
   raw.c_iflag &= static_cast<tcflag_t>(~(IXON | ICRNL | BRKINT | INPCK | ISTRIP));
   raw.c_cflag |= CS8;
   raw.c_oflag &= static_cast<tcflag_t>(~OPOST);
   raw.c_cc[VMIN]  = 1;
   raw.c_cc[VTIME] = 0;
+  return raw;
+}
+
+}  // namespace
+
+void Editor::enter_raw_mode() {
+  tcgetattr(mIn, &OrigTermios);
+  struct termios raw = raw_modes(OrigTermios);
   // TCSADRAIN, not TCSAFLUSH: input typed or pasted ahead (the next lines
   // of a multi-line command) must survive the switch.
   tcsetattr(mIn, TCSADRAIN, &raw);
   mRawModeActive = true;
+}
+
+void Editor::resume_raw_mode() {
+  if (not mRawModeActive) return;
+  struct termios raw = raw_modes(OrigTermios);
+  tcsetattr(mIn, TCSANOW, &raw);
 }
 
 // TCSANOW: on macOS TCSADRAIN on a pty waits until the other side has read
