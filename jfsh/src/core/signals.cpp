@@ -335,6 +335,7 @@ void SignalManager::init(bool interactive) {
 
   // Our own process group, unless we already lead one (a session leader
   // can't call setpgid).
+  mOrigPgid = ::getpgrp();
   if (::getpgrp() != ::getpid()) ::setpgid(0, 0);
   mShellPgid = ::getpgrp();
   if (::tcsetpgrp(mTtyFd, mShellPgid) != 0) {
@@ -353,6 +354,13 @@ void SignalManager::give_terminal(Pid pgid) noexcept {
 
 void SignalManager::take_terminal() noexcept {
   if (mTtyFd >= 0 and mShellPgid > 0) ::tcsetpgrp(mTtyFd, mShellPgid);
+}
+
+void SignalManager::release_terminal() noexcept {
+  if (mOrigPgid <= 0 or mOrigPgid == mShellPgid) return;
+  if (mTtyFd >= 0) ::tcsetpgrp(mTtyFd, mOrigPgid);
+  ::setpgid(0, mOrigPgid);
+  mShellPgid = mOrigPgid;
 }
 
 void SignalManager::save_shell_modes() noexcept {
@@ -376,6 +384,7 @@ void SignalManager::child_reset(ChildKind kind) noexcept {
     for (int sig : JOB_CONTROL_SIGNALS) redo[static_cast<s::size_t>(sig)] = true;
 
   mJobControl  = false;
+  mOrigPgid    = -1;
   mInteractive = false;
   if (mTtyFd >= 0) ::close(mTtyFd);
   mTtyFd = -1;

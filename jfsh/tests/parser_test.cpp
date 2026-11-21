@@ -172,7 +172,8 @@ TEST(Parser, ReservedWordsAreArgumentsAfterTheCommandWord) {
 TEST(Parser, RejectsLeftoverAndMisplacedTokens) {
   EXPECT_EQ(listing("echo )"),  "error: parse error near `)'");
   EXPECT_EQ(listing("fi"),      "error: parse error near `fi'");
-  EXPECT_EQ(listing("a ; ;"),   "error: parse error near `;'");
+  // `a ; ;` is an empty command after the first, as in zsh; `;;` is not.
+  EXPECT_EQ(listing("a ;;"),    "error: parse error near `;;'");
   EXPECT_EQ(listing("a &&"),    "error: parse error: unexpected end of input");
 }
 

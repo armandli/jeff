@@ -26,6 +26,7 @@
 #include <jfsh/modules/cap.h>
 #include <jfsh/modules/clone.h>
 #include <jfsh/modules/compctl.h>
+#include <jfsh/modules/computil.h>
 #include <jfsh/modules/curses.h>
 #include <jfsh/modules/datetime.h>
 #include <jfsh/modules/db_gdbm.h>
@@ -121,6 +122,7 @@ struct Shell {
     register_cap_module         (ctx.modules);
     register_deltochar_module   (ctx.modules);
     register_compctl_module     (ctx.modules);
+    register_computil_module    (ctx.modules);
     register_clone_module       (ctx.modules);
     register_watch_module       (ctx.modules);
     register_newuser_module     (ctx.modules);
@@ -128,6 +130,7 @@ struct Shell {
     (void)ctx.modules.load("zsh/mathfunc",  &ctx);
     (void)ctx.modules.load("zsh/parameter", &ctx);
     (void)ctx.modules.load("zsh/zutil",     &ctx);
+    (void)ctx.modules.load("zsh/computil",  &ctx);
     (void)ctx.modules.load("zsh/system",    &ctx);
     // zsh/files, zsh/stat, zsh/pcre are registered but not auto-loaded;
     // tests that want their builtins use `sh.run("zmodload zsh/pcre; …")`.

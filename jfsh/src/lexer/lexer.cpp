@@ -48,7 +48,7 @@ int LexInput::next_char() {
       return static_cast<unsigned char>(top.text[top.pos++]);
     }
     char last = top.text.empty() ? '\0' : top.text.back();
-    if (last == ' ' or last == '\t') mBlankDone = true;
+    if (top.alias and (last == ' ' or last == '\t')) mBlankDone = true;
     mPushed.pop_back();
   }
   mFromRaw.push_back(true);
@@ -76,6 +76,12 @@ void LexInput::unget(int c) {
 
 void LexInput::push(str text, sptr<const vec<str>> names) {
   mPushed.push_back({s::move(text), 0, s::move(names)});
+}
+
+void LexInput::push_back_text(str text) {
+  if (text.empty()) return;
+  sptr<const vec<str>> names = current_aliases();
+  mPushed.push_back({s::move(text), 0, s::move(names), false});
 }
 
 const sptr<const vec<str>>& LexInput::current_aliases() const noexcept {
@@ -157,6 +163,11 @@ static bool slurp_nested_at(InputSource& src, str& text, char open,
                             char close, bool dq) {
   int depth = 1;
   for (int c; (c = src.next_char()) != -1;) {
+    if (c == '#' and comments and not text.empty()
+        and (text.back() == ' ' or text.back() == '\t' or text.back() == '\n')) {
+      while ((c = src.next_char()) != -1 and c != '\n') {}
+      if (c == -1) return false;
+    }
     text += static_cast<char>(c);
     if (c == '\\') {
       int n = src.next_char();
@@ -192,7 +203,7 @@ static bool slurp_nested_at(InputSource& src, str& text, char open,
       } else {
         src.unget(n);
       }
-    } else if (c == open) {
+    } else if (c == open and not (dq and open == '{')) {
       ++depth;
     } else if (c == close and --depth == 0) {
       return true;
@@ -256,12 +267,25 @@ static bool read_assign_subscript(InputSource& src, str& text) {
   return false;
 }
 
+// `{name}` in front of a redirection operator.
+static bool is_varid(strv w) noexcept {
+  if (w.size() < 3 or w.front() != '{' or w.back() != '}') return false;
+  w = w.substr(1, w.size() - 2);
+  if (s::isdigit(static_cast<unsigned char>(w[0]))) return false;
+  for (char c : w)
+    if (not s::isalnum(static_cast<unsigned char>(c)) and c != '_') return false;
+  return true;
+}
+
 // `NAME=` or `NAME+=`: the start of an assignment, where a following `(`
 // opens an array value instead of ending the word.
 static bool is_assignment_prefix(strv w) noexcept {
   if (w.empty() or w.back() != '=') return false;
   w.remove_suffix(1);
   if (not w.empty() and w.back() == '+') w.remove_suffix(1);
+  // `name[sub]=`: one element or a slice.
+  if (not w.empty() and w.back() == ']')
+    if (auto lb = w.find('['); lb != strv::npos and lb > 0) w = w.substr(0, lb);
   if (w.empty() or s::isdigit(static_cast<unsigned char>(w[0]))) return false;
   for (char c : w)
     if (not s::isalnum(static_cast<unsigned char>(c)) and c != '_')
@@ -358,6 +382,12 @@ LexToken Lexer::read_token_raw() {
     }
     if (c == '\n') return newline_token();
     if (c == ' ' or c == '\t') continue;
+    // A backslash-newline between words joins the lines.
+    if (c == '\\') {
+      int n = mSrc.next_char();
+      if (n == '\n') continue;
+      mSrc.unget(n);
+    }
     mTokAliases    = mSrc.current_aliases();
     mTokAfterBlank = mSrc.take_blank_flag();
     switch (c) {
@@ -390,7 +420,10 @@ LexToken Lexer::read_token_raw() {
       case '!': {
         int n = mSrc.next_char();
         mSrc.unget(n);
-        if (n == -1 or is_word_break(n)) return {TokType::TK_BANG, "!", mSrc.line()};
+        // After the command word `!(…)` is one word (a pattern), as in zsh.
+        bool group = n == '(' and (mFlags & LEX_ARGPAREN);
+        if (not group and (n == -1 or is_word_break(n)))
+          return {TokType::TK_BANG, "!", mSrc.line()};
         return read_word(c);
       }
       // `{` and `}` are reserved only as words of their own; otherwise they
@@ -405,8 +438,46 @@ LexToken Lexer::read_token_raw() {
         return read_word(c);
       }
       case '(': {
+        bool group = mFlags & LEX_CASEPAT;
+        if (not group and (mFlags & LEX_ARGPAREN)) {
+          int n = mSrc.next_char();
+          mSrc.unget(n);
+          group = n != -1 and n != ')' and n != ' ' and n != '\t' and n != '\n';
+        }
+        if (group) {
+          str text = "(";
+          if (not slurp_nested(mSrc, text, '(', ')')) mIncomplete = true;
+          int after = mSrc.next_char();
+          if (after == '(' or (after != -1 and not is_word_break(after)))
+            return read_word(after, s::move(text));
+          mSrc.unget(after);
+          return {TokType::TK_WORD, s::move(text), mSrc.line()};
+        }
         int n = mSrc.next_char();
-        if (n == '(' and not (mFlags & LEX_COND)) return {TokType::TK_DLPAREN, "((", mSrc.line()};
+        if (n == '(' and not (mFlags & LEX_COND)) {
+          // `((` is arithmetic when its `)` at depth 0 is followed by
+          // another `)`; otherwise, as zsh's cmd_or_math decides, it is
+          // two subshells: `((( a )) && b)`, `((a) | b)`.
+          str ahead;
+          bool math = true;
+          for (int depth = 0, c2; (c2 = mSrc.next_char()) != -1;) {
+            ahead += static_cast<char>(c2);
+            if (c2 == '(') {
+              ++depth;
+            } else if (c2 == ')' and depth > 0) {
+              --depth;
+            } else if (c2 == ')') {
+              int c3 = mSrc.next_char();
+              if (c3 != -1) ahead += static_cast<char>(c3);
+              math = c3 == ')' or c3 == -1;
+              break;
+            }
+          }
+          mSrc.push_back_text(s::move(ahead));
+          if (math) return {TokType::TK_DLPAREN, "((", mSrc.line()};
+          mSrc.push_back_text("(");
+          return {TokType::TK_LPAREN, "(", mSrc.line()};
+        }
         mSrc.unget(n);
         return {TokType::TK_LPAREN, "(", mSrc.line()};
       }
@@ -415,6 +486,17 @@ LexToken Lexer::read_token_raw() {
       case ')': return {TokType::TK_RPAREN, ")", mSrc.line()};
       case '<':
       case '>': {
+        // `<3->` in a case pattern is a numeric range.
+        if (c == '<' and (mFlags & LEX_CASEPAT)) {
+          str text;
+          if (read_numeric_range(mSrc, text)) {
+            int after = mSrc.next_char();
+            if (after == '(' or (after != -1 and not is_word_break(after)))
+              return read_word(after, s::move(text));
+            mSrc.unget(after);
+            return {TokType::TK_WORD, s::move(text), mSrc.line()};
+          }
+        }
         // A lone `<` or `>` inside [[ ]] compares strings.
         int n = mSrc.next_char();
         mSrc.unget(n);
@@ -459,12 +541,22 @@ opt<str> Lexer::read_arith() {
   return s::nullopt;
 }
 
-opt<str> Lexer::read_cond_pattern() {
+opt<str> Lexer::read_cond_pattern(str prefix) {
   int c = mSrc.next_char();
-  while (c == ' ' or c == '\t') c = mSrc.next_char();
+  // Blanks, and a backslash-newline, before it.
+  for (;;) {
+    if (c == ' ' or c == '\t') {
+      c = mSrc.next_char();
+    } else if (c == '\\' and prefix.empty() and next_is(mSrc, '\n')) {
+      mSrc.next_char();
+      c = mSrc.next_char();
+    } else {
+      break;
+    }
+  }
   if (c == -1) return s::nullopt;
-  str text;
-  int depth = 0;
+  str text = s::move(prefix);
+  int depth = text.empty() ? 0 : 1;
   for (; c != -1; c = mSrc.next_char()) {
     if (depth == 0 and (c == ' ' or c == '\t' or c == '\n' or c == ')' or c == '|'
                         or c == ';' or c == '&')) {
@@ -514,6 +606,7 @@ LexToken Lexer::read_word(int first_char, str prefix) {
   bool in_double = false;
   bool all_digits_so_far =
       text.empty() and s::isdigit(static_cast<unsigned char>(first_char)) != 0;
+  int  braces = 0;   // unquoted `{` of the word not closed yet
   for (;;) {
     if (c == -1) break;
     if (not in_single and not in_double) {
@@ -523,6 +616,12 @@ LexToken Lexer::read_word(int first_char, str prefix) {
       // zsh, `12>f` is the word `12` and a redirection.
       if (all_digits_so_far and text.size() == 1 and not (mFlags & LEX_COND)
           and (c == '<' or c == '>')) {
+        LexToken redir = read_redir(c);
+        redir.text = text + redir.text;
+        return redir;
+      }
+      // `{name}>file`: the fd goes into $name.
+      if ((c == '<' or c == '>') and not (mFlags & LEX_COND) and is_varid(text)) {
         LexToken redir = read_redir(c);
         redir.text = text + redir.text;
         return redir;
@@ -562,7 +661,7 @@ LexToken Lexer::read_word(int first_char, str prefix) {
         mSrc.unget(n);
         if (n != ')' or is_assignment_prefix(text)) {
           text += '(';
-          slurp_nested(mSrc, text, '(', ')');
+          slurp_nested(mSrc, text, '(', ')', is_assignment_prefix(text.substr(0, text.size() - 1)));
           all_digits_so_far = false;
           c = mSrc.next_char();
           continue;
@@ -625,6 +724,23 @@ LexToken Lexer::read_word(int first_char, str prefix) {
       }
     }
     if (not s::isdigit(static_cast<unsigned char>(c))) all_digits_so_far = false;
+    // A `}` that closes no `{` of the word and ends it is a token of its
+    // own, so `echo x}` ends the brace group it is in, as in zsh.
+    if (not in_single and not in_double and not (mFlags & LEX_COND)) {
+      if (c == '{') ++braces;
+      if (c == '}') {
+        if (braces > 0) {
+          --braces;
+        } else if (not text.empty()) {
+          int n = mSrc.next_char();
+          mSrc.unget(n);
+          if (n == -1 or is_word_break(n)) {
+            mSrc.unget(c);
+            break;
+          }
+        }
+      }
+    }
     if (c == '\'' and not in_double) in_single = not in_single;
     if (c == '"'  and not in_single) in_double = not in_double;
     if (c == '\\' and not in_single) {

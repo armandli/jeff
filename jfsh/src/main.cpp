@@ -29,6 +29,7 @@
 #include <jfsh/modules/cap.h>
 #include <jfsh/modules/clone.h>
 #include <jfsh/modules/compctl.h>
+#include <jfsh/modules/computil.h>
 #include <jfsh/modules/curses.h>
 #include <jfsh/modules/datetime.h>
 #include <jfsh/modules/db_gdbm.h>
@@ -116,7 +117,8 @@ str param(jfsh::ParamTable& params, s::string_view name) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-  // The line editor measures characters with wcwidth().
+  // The line editor measures characters with wcwidth(); sorting follows
+  // the locale's collation, as zsh's does.
   std::setlocale(LC_CTYPE, "");
   // Globs and ${(o)a} sort by the locale's collation, as in zsh.
   std::setlocale(LC_COLLATE, "");
@@ -166,6 +168,11 @@ int main(int argc, char* argv[]) {
   }
 
   jfsh::Signals.init(interactive);
+  // However main returns, the terminal goes back to the process group that
+  // started the shell, as zsh's release_pgrp does in zexit.
+  struct ReleaseTerminal {
+    ~ReleaseTerminal() { jfsh::Signals.release_terminal(); }
+  } release_terminal;
 
   jfsh::Router router;
   load_router(router, inv);
@@ -191,6 +198,7 @@ int main(int argc, char* argv[]) {
   jfsh::register_mathfunc_module    (ctx.modules);
   jfsh::register_parameter_module   (ctx.modules);
   jfsh::register_zutil_module       (ctx.modules);
+  jfsh::register_computil_module    (ctx.modules);
   jfsh::register_system_module      (ctx.modules);
   jfsh::register_files_module       (ctx.modules);
   jfsh::register_stat_module        (ctx.modules);
@@ -221,10 +229,16 @@ int main(int argc, char* argv[]) {
   jfsh::register_clone_module       (ctx.modules);
   jfsh::register_watch_module       (ctx.modules);
   jfsh::register_newuser_module     (ctx.modules);
+  // zsh's autoloaded builtins: the first use loads the module.
+  for (auto [mod, builtin] : {s::pair{"zsh/termcap", "echotc"}, s::pair{"zsh/terminfo", "echoti"},
+                              s::pair{"zsh/compctl", "compctl"},
+                              s::pair{"zsh/param/private", "private"}})
+    ctx.modules.mark_autoload(mod, builtin);
   (void)ctx.modules.load("zsh/datetime",  &ctx);
   (void)ctx.modules.load("zsh/mathfunc",  &ctx);
   (void)ctx.modules.load("zsh/parameter", &ctx);
   (void)ctx.modules.load("zsh/zutil",     &ctx);
+  (void)ctx.modules.load("zsh/computil",  &ctx);
   (void)ctx.modules.load("zsh/system",    &ctx);
   // zsh/files, zsh/stat, zsh/pcre, zsh/regex and zsh/example are
   // registered but NOT auto-loaded:

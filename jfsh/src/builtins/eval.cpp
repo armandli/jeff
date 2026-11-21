@@ -84,6 +84,7 @@ int builtin_eval(vec<str>& args, ExecContext& ctx) {
     text += args[i];
   }
   if (text.find_first_not_of(" \t\n") == str::npos) return 0;
+  FuncFrame frame{ctx, "(eval)"};
   return ctx.executor->exec_string(text);
 }
 
@@ -196,5 +197,60 @@ int builtin_functions(vec<str>& args, ExecContext& ctx) {
   }
   return rc;
 }
+
+// enable/disable [-afmprs] [name …]: builtins (the default) and, with -f,
+// shell functions are skipped by command lookup while disabled; -m takes
+// patterns.  With no names, the disabled (enabled) ones are listed.
+// Pattern characters (-p) are always on in jfsh, so `enable -p` does
+// nothing and `disable -p` with names fails; aliases (-a, -s) and
+// reserved words (-r) can't be disabled yet.
+static int enable_common(vec<str>& args, ExecContext& ctx, bool on) {
+  strv cmd = args[0];
+  OptParse o;
+  if (not parse_options(args, "afmprs", "", o)) return 1;
+  vec<str> names(args.begin() + static_cast<s::ptrdiff_t>(o.next), args.end());
+  if (o.has('p') or o.has('a') or o.has('s') or o.has('r')) {
+    if (on or names.empty()) return 0;
+    return builtin_error(cmd, "only builtins and functions can be disabled");
+  }
+  bool funcs = o.has('f');
+  auto& set = funcs ? ctx.disabled_functions : ctx.disabled_builtins;
+  vec<str> all;
+  if (funcs) {
+    for (const auto& [name, body] : ctx.functions) all.push_back(name);
+    for (const auto& name : ctx.autoloads) all.push_back(name);
+  } else {
+    all = ctx.executor->builtin_names();
+  }
+  s::sort(all.begin(), all.end());
+  if (names.empty()) {
+    for (const auto& n : all)
+      if (set.contains(n) != on) s::printf("%s\n", n.c_str());
+    return 0;
+  }
+  int rc = 0;
+  for (const auto& name : names) {
+    vec<str> hits;
+    if (o.has('m')) {
+      auto pat = CompiledPattern::compile(name);
+      for (const auto& n : all)
+        if (pat.matches(n)) hits.push_back(n);
+    } else if (s::binary_search(all.begin(), all.end(), name)) {
+      hits.push_back(name);
+    } else {
+      s::fprintf(stderr, "jfsh: %.*s: no such hash table element: %s\n",
+                 static_cast<int>(cmd.size()), cmd.data(), name.c_str());
+      rc = 1;
+    }
+    for (const auto& h : hits) {
+      if (on) set.erase(h);
+      else    set.insert(h);
+    }
+  }
+  return rc;
+}
+
+int builtin_enable(vec<str>& args, ExecContext& ctx)  { return enable_common(args, ctx, true); }
+int builtin_disable(vec<str>& args, ExecContext& ctx) { return enable_common(args, ctx, false); }
 
 }  // namespace jfsh

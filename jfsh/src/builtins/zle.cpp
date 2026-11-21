@@ -1,15 +1,21 @@
 // Line-editor builtins: bindkey, zle, vared, and the completion ones,
-// compdef, compadd, compinit and the _files/_directories/_command_names
-// helpers.  Also the glue that lets the editor run shell functions (user
+// compdef and the _files/_directories/_command_names helpers (compadd,
+// compset and compquote are in complete.cpp).  These completion ones are
+// jfsh's own simple completion system, there before compinit has run;
+// compinit (zsh's, from the shipped function library) defines functions
+// of the same names, and functions come before builtins.  Also the glue
+// that lets the editor run shell functions (user widgets, completion
 // widgets, compdef functions), with $BUFFER, $CURSOR and friends bound to
 // the editor's state while they run.
 
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <map>
+#include <memory>
 
 #include <jfsh/builtins/builtins.h>
 #include <jfsh/builtins/util.h>
@@ -63,25 +69,35 @@ void bound(ParamTable& params, str name, s::uint32_t flags, func<str()> get,
 }
 
 // $BUFFER, $CURSOR, … for a user widget, live: reading one reads the
-// editor, assigning changes it.
-void bind_editor_params(ExecContext& ctx, Editor& ed) {
+// editor, assigning changes it.  In a completion widget they can only be
+// read.
+void bind_editor_params(ExecContext& ctx, Editor& ed, bool readonly = false) {
   ParamTable& p = ctx.params;
   auto& b = ed.buffer();
   bound(p, "BUFFER", PM_SCALAR, [&b] { return b.text; },
-        [&b](str v) { b.text = s::move(v); b.cursor = s::min(b.cursor, b.text.size()); });
+        [&b, &ed](str v) {
+          ed.fix_suffix();
+          b.text = s::move(v);
+          b.cursor = s::min(b.cursor, b.text.size());
+        });
   bound(p, "CURSOR", PM_INTEGER, [&b] { return s::to_string(byte_to_char(b.text, b.cursor)); },
-        [&b](str v) {
+        [&b, &ed](str v) {
+          ed.fix_suffix();
           long n = s::strtol(v.c_str(), nullptr, 10);
           b.cursor = char_to_byte(b.text, s::max(0L, n));
         });
   bound(p, "LBUFFER", PM_SCALAR, [&b] { return b.text.substr(0, b.cursor); },
-        [&b](str v) {
+        [&b, &ed](str v) {
+          ed.fix_suffix();
           str rest = b.text.substr(b.cursor);
           b.cursor = v.size();
           b.text   = s::move(v) + rest;
         });
   bound(p, "RBUFFER", PM_SCALAR, [&b] { return b.text.substr(b.cursor); },
-        [&b](str v) { b.text = b.text.substr(0, b.cursor) + v; });
+        [&b, &ed](str v) {
+          ed.fix_suffix();
+          b.text = b.text.substr(0, b.cursor) + v;
+        });
   bound(p, "PREBUFFER", PM_SCALAR, [&ed] { return ed.prebuffer(); });
   bound(p, "WIDGET", PM_SCALAR, [&ed] { return ed.widget_name(); });
   bound(p, "LASTWIDGET", PM_SCALAR, [&ed] { return ed.last_widget_name(); });
@@ -97,12 +113,41 @@ void bind_editor_params(ExecContext& ctx, Editor& ed) {
         [&ed](str v) { ed.set_mark(s::strtol(v.c_str(), nullptr, 10)); });
   bound(p, "CUTBUFFER", PM_SCALAR, [&ed] { return ed.cut_buffer(); },
         [&ed](str v) { ed.set_cut_buffer(s::move(v)); });
+  bound(p, "WIDGETSTYLE", PM_SCALAR, [&ed] { return ed.widget_style(); });
   if (auto n = ed.numeric())
     bound(p, "NUMERIC", PM_INTEGER, [&ed] { return s::to_string(ed.numeric().value_or(1)); },
           [&ed](str v) { ed.set_numeric(static_cast<int>(s::strtol(v.c_str(), nullptr, 10))); });
+  if (not readonly) return;
+  for (strv name : {"BUFFER", "CURSOR", "LBUFFER", "RBUFFER", "MARK", "CUTBUFFER", "NUMERIC"}) {
+    if (auto q = p.lookup_local(name)) {
+      q->get().handlers->set_scalar = nullptr;
+      q->get().flags |= PM_READONLY;
+    }
+  }
 }
 
+// The editor's fds 0, 1 and 2 while a widget function runs: `exec
+// </dev/null` in one (compsys's _comp_setup does it) lasts only as long
+// as the function, as in zsh.
+struct KeepStdFds {
+  KeepStdFds() {
+    for (int fd = 0; fd < 3; ++fd) saved[fd] = ::fcntl(fd, F_DUPFD_CLOEXEC, 10);
+  }
+  ~KeepStdFds() {
+    s::fflush(nullptr);
+    for (int fd = 0; fd < 3; ++fd) {
+      if (saved[fd] < 0) continue;
+      ::dup2(saved[fd], fd);
+      ::close(saved[fd]);
+    }
+  }
+  KeepStdFds(const KeepStdFds&) = delete;
+  KeepStdFds& operator=(const KeepStdFds&) = delete;
+  int saved[3] = {-1, -1, -1};
+};
+
 int call_shell_function(ExecContext& ctx, const str& fn, vec<str> args) {
+  KeepStdFds keep;
   auto it = ctx.functions.find(fn);
   if (it == ctx.functions.end() and ctx.autoloads.contains(fn) and ctx.executor->load_autoload(fn))
     it = ctx.functions.find(fn);
@@ -120,10 +165,20 @@ void install_zle_hooks(Executor& ex) {
   ExecContext& ctx = ex.context();
   Zle& zle = *ctx.zle;
   zle.params = &ctx.params;
-  zle.hooks.run_widget = [&ctx](Editor& ed, const str& widget, const str& fn) {
+  // Widget functions running (one runs others with `zle name`): an error
+  // unwinds them all, and only the outermost clears it.
+  auto depth = s::make_shared<int>(0);
+  zle.hooks.run_widget = [&ctx, depth](Editor& ed, const str& widget, const str& fn,
+                                       const vec<str>& args) {
     ctx.params.push_scope();
     bind_editor_params(ctx, ed);
-    int rc = call_shell_function(ctx, fn, {});
+    ctx.abort_line = false;
+    ++*depth;
+    int rc = call_shell_function(ctx, fn, args);
+    ed.resume_raw_mode();
+    // An error throws the line away, as zsh does.
+    if (ctx.aborting) ed.abort_line();
+    if (--*depth == 0) ctx.aborting = ctx.abort_line = false;
     ctx.params.pop_scope();
     if (rc < 0) {
       ed.set_message("No such shell function `" + fn + "'");
@@ -143,15 +198,27 @@ void install_zle_hooks(Executor& ex) {
     for (strv r : RESERVED_WORDS) names.emplace_back(r);
     return names;
   };
-  src.call_function = [&ctx](const str& fn, const CompContext& c) {
+  src.call_function = [&ctx, depth](const str& fn, CompState& st) {
     ctx.params.push_scope();
-    ctx.params.assign("words", c.args, PM_ARRAY | PM_LOCAL);
-    ctx.params.assign("CURRENT", s::int64_t{c.current_arg + 1}, PM_INTEGER | PM_LOCAL);
-    ctx.params.assign("PREFIX", c.prefix, PM_SCALAR | PM_LOCAL);
-    ctx.params.assign("SUFFIX", str{}, PM_SCALAR | PM_LOCAL);
-    ctx.params.assign("service", c.command, PM_SCALAR | PM_LOCAL);
-    call_shell_function(ctx, fn, {});
+    if (Editor* ed = ctx.zle->active; ed and ed->active()) bind_editor_params(ctx, *ed, true);
+    bind_completion_params(ctx, st);
+    ctx.params.assign("service", st.words.empty() ? str{} : st.words[0], PM_SCALAR | PM_LOCAL);
+    ctx.abort_line = false;
+    ++*depth;
+    int rc = call_shell_function(ctx, fn, {});
+    if (Editor* ed = ctx.zle->active) ed->resume_raw_mode();
+    // An error throws away what the function found; an expansion error
+    // the line too.
+    if (ctx.aborting) {
+      st.matches.clear();
+      if (Editor* ed = ctx.zle->active; ed and ctx.abort_line) ed->abort_line();
+    }
+    // Only an expansion error goes on to unwind the widgets that ran this
+    // one; others end here.
+    if (--*depth == 0 or not ctx.abort_line) ctx.aborting = ctx.abort_line = false;
+    unbind_completion_params(ctx);
     ctx.params.pop_scope();
+    return rc;
   };
   zle.completion->set_sources(s::move(src));
 }
@@ -335,18 +402,34 @@ int builtin_zle(vec<str>& args, ExecContext& ctx) {
   OptParse o;
   if (not parse_options(args, "lLaNDARMUKIcCFT", "", o)) return 1;
   vec<str> rest(args.begin() + static_cast<s::ptrdiff_t>(o.next), args.end());
-  if (o.has('N') or o.has('C')) {
-    if (rest.empty() or rest.size() > (o.has('C') ? 3u : 2u))
+  if (o.has('C')) {
+    // zle -C widget completion-widget function
+    if (rest.size() < 3) return builtin_error(cmd, "not enough arguments for -C");
+    static const uset<str> styles = {
+      "complete-word", "expand-or-complete", "expand-or-complete-prefix", "menu-complete",
+      "menu-expand-or-complete", "reverse-menu-complete", "list-choices", "delete-char-or-list"};
+    strv style = strv(rest[1]).starts_with('.') ? strv(rest[1]).substr(1) : strv(rest[1]);
+    if (not styles.contains(str(style)))
+      return builtin_error(cmd, "invalid widget `" + rest[1] + "'");
+    zle.user_widgets[rest[0]] = rest[2];
+    zle.comp_widgets[rest[0]] = rest[1];
+    zle.widget_aliases.erase(rest[0]);
+    return 0;
+  }
+  if (o.has('N')) {
+    if (rest.empty() or rest.size() > 2)
       return builtin_error(cmd, "-N needs a widget name and at most one function");
     str fn = rest.size() > 1 ? rest.back() : rest[0];
     if (rest[0].starts_with('.')) return builtin_error(cmd, "widget name `" + rest[0] + "' is protected");
     zle.user_widgets[rest[0]] = fn;
+    zle.comp_widgets.erase(rest[0]);
     zle.widget_aliases.erase(rest[0]);
     return 0;
   }
   if (o.has('D')) {
     int rc = 0;
     for (const auto& w : rest) {
+      zle.comp_widgets.erase(w);
       if (zle.user_widgets.erase(w) == 0 and zle.widget_aliases.erase(w) == 0)
         rc = builtin_error(cmd, "no such widget `" + w + "'");
     }
@@ -357,6 +440,7 @@ int builtin_zle(vec<str>& args, ExecContext& ctx) {
     if (not zle.is_widget(rest[0])) return builtin_error(cmd, "no such widget `" + rest[0] + "'");
     zle.widget_aliases[rest[1]] = rest[0];
     zle.user_widgets.erase(rest[1]);
+    zle.comp_widgets.erase(rest[1]);
     return 0;
   }
   if (o.has('M')) {
@@ -401,7 +485,11 @@ int builtin_zle(vec<str>& args, ExecContext& ctx) {
   s::sort(names.begin(), names.end());
   names.erase(s::unique(names.begin(), names.end()), names.end());
   for (const auto& w : names) {
-    if (auto u = zle.user_widgets.find(w); u != zle.user_widgets.end()) {
+    if (auto c = zle.comp_widgets.find(w); c != zle.comp_widgets.end()) {
+      const str& fn = zle.user_widgets.at(w);
+      if (o.has('L')) s::printf("zle -C %s %s %s\n", w.c_str(), c->second.c_str(), fn.c_str());
+      else            s::printf("%s -C %s %s\n", w.c_str(), c->second.c_str(), fn.c_str());
+    } else if (auto u = zle.user_widgets.find(w); u != zle.user_widgets.end()) {
       if (o.has('L')) s::printf("zle -N %s%s%s\n", w.c_str(), u->second == w ? "" : " ", u->second == w ? "" : u->second.c_str());
       else if (u->second == w) s::printf("%s\n", w.c_str());
       else s::printf("%s (%s)\n", w.c_str(), u->second.c_str());
@@ -446,6 +534,7 @@ int builtin_vared(vec<str>& args, ExecContext& ctx) {
   PromptRenderer prompt(ctx.params, ctx.opts);
   prompt.set_hooks(ctx.executor->prompt_hooks());
   Editor ed(ctx.opts, hist, prompt, zle);
+  ed.set_vared_name(name);
   if (auto* km = o.arg('M')) ed.select_keymap(*km);
   str ps  = o.arg('p') ? *o.arg('p') : str{};
   str rps = o.arg('r') ? *o.arg('r') : str{};
@@ -464,9 +553,6 @@ int builtin_vared(vec<str>& args, ExecContext& ctx) {
 }
 
 // ---- Completion ------------------------------------------------------------------
-
-// compinit: completion is always on in jfsh; this is for .zshrc files.
-int builtin_compinit(vec<str>&, ExecContext&) { return 0; }
 
 // compdef fn cmd…; compdef -d cmd…
 int builtin_compdef(vec<str>& args, ExecContext& ctx) {
@@ -493,56 +579,31 @@ int builtin_compdef(vec<str>& args, ExecContext& ctx) {
   return 0;
 }
 
-// compadd [-S suf] [-P pre] [-d disparray] [-a] [-U] [-qfQ] [-X expl] [-J/-V grp] [--] words…
-int builtin_compadd(vec<str>& args, ExecContext& ctx) {
-  strv cmd = args[0];
-  CompletionEngine* engine = zle_of(ctx).completion;
-  if (not engine or not engine->collecting())
-    return builtin_error(cmd, "can only be called from completion function");
-  OptParse o;
-  if (not parse_options(args, "SPpdaUqfQ1X2JVxlonkeiIWFrRMEsO/", "SPpdXJVxiIWFrRMEsOo", o)) return 1;
-  vec<str> words(args.begin() + static_cast<s::ptrdiff_t>(o.next), args.end());
-  if (o.has('a')) {
-    vec<str> expanded;
-    for (const auto& n : words) {
-      auto p = ctx.params.lookup(n);
-      if (p and p->get().is_set())
-        for (const auto& w : p->get().is_array() ? p->get().array() : vec<str>{p->get().scalar()})
-          expanded.push_back(w);
-    }
-    words = s::move(expanded);
-  }
-  vec<str> display;
-  if (auto* d = o.arg('d')) {
-    auto p = ctx.params.lookup(*d);
-    if (p) display = p->get().array();
-  }
-  str prefix = o.arg('P') ? *o.arg('P') : str{};
-  for (s::size_t i = 0; i < words.size(); ++i) {
-    CompCandidate c;
-    c.word = prefix + words[i];
-    if (i < display.size()) c.display = display[i];
-    if (auto* suf = o.arg('S')) c.suffix = *suf;
-    if (o.has('/') and c.word.ends_with('/')) c.suffix = "";
-    engine->add(s::move(c));
-  }
-  return words.empty() ? 1 : 0;
-}
-
 namespace {
 
+// _files, _directories: the files (directories) for the end of $PREFIX
+// after its last /, added with the directory part as a hidden prefix.
 int add_files(vec<str>& args, ExecContext& ctx, bool dirs_only) {
   strv cmd = args[0];
   CompletionEngine* engine = zle_of(ctx).completion;
-  if (not engine or not engine->collecting() or not engine->current())
-    return builtin_error(cmd, "can only be called from completion function");
+  CompState* st = engine ? engine->state() : nullptr;
+  if (not st) return builtin_error(cmd, "can only be called from completion function");
   OptParse o;
   if (not parse_options(args, "/g", "gWFPS", o)) return 1;
   str pattern = o.arg('g') ? *o.arg('g') : str{};
-  const CompContext& c = *engine->current();
-  auto found = engine->complete_files(c.prefix, dirs_only or o.has('/'), false, pattern);
-  for (auto& m : found) engine->add(s::move(m));
-  return found.empty() ? 1 : 0;
+  auto slash = st->prefix.rfind('/');
+  CompAddSpec spec;
+  spec.hpre = slash == str::npos ? str{} : st->prefix.substr(0, slash + 1);
+  auto found = engine->complete_files(comp_unquote(st->prefix, st->quote), dirs_only or o.has('/'),
+                                      false, pattern);
+  s::int64_t before = st->nmatches();
+  for (auto& m : found) {
+    spec.dir_suffix = m.suffix == "/" ? "/" : str{};
+    s::size_t n = st->matches.size();
+    st->add(spec, {m.word});
+    if (st->matches.size() > n) st->matches.back().type = m.type;
+  }
+  return st->nmatches() > before ? 0 : 1;
 }
 
 }  // namespace
@@ -552,11 +613,12 @@ int builtin__directories(vec<str>& args, ExecContext& ctx) { return add_files(ar
 
 int builtin__command_names(vec<str>& args, ExecContext& ctx) {
   CompletionEngine* engine = zle_of(ctx).completion;
-  if (not engine or not engine->collecting() or not engine->current())
-    return builtin_error(args[0], "can only be called from completion function");
-  auto found = engine->complete_commands(engine->current()->prefix);
-  for (auto& m : found) engine->add(s::move(m));
-  return found.empty() ? 1 : 0;
+  CompState* st = engine ? engine->state() : nullptr;
+  if (not st) return builtin_error(args[0], "can only be called from completion function");
+  vec<str> names;
+  for (auto& m : engine->complete_commands(comp_unquote(st->prefix, st->quote)))
+    names.push_back(s::move(m.word));
+  return st->add(CompAddSpec{}, names) > 0 ? 0 : 1;
 }
 
 }  // namespace jfsh

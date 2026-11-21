@@ -235,6 +235,11 @@ struct Decompiler {
     str target = next_str();
     RedirType t      = wc_redir_type(w);
     str       fd     = fd_text(w);
+    if (wc_redir_varid(w)) {
+      auto [name, rest] = split_redir_varid(target);
+      fd = "{" + str(name) + "}";
+      target = str(rest);
+    }
     switch (t) {
       case REDIR_READ:       return fd + "< " + target;
       case REDIR_WRITE:      return fd + "> " + target;
@@ -304,6 +309,11 @@ struct Decompiler {
       case WC_COND_AND: { auto a = cond(); return a + " && " + cond(); }
       case WC_COND_OR:  { auto a = cond(); return a + " || " + cond(); }
       case WC_COND_UNARY: { auto o = next_str(); return o + " " + next_str(); }
+      case WC_COND_MOD: {
+        str words = next_str();
+        for (WordCode k = 1; k < wc_cmd_skip(w); ++k) words += " " + next_str();
+        return words;
+      }
       case WC_COND_BINARY: {
         auto o = next_str(); auto l = next_str(); auto r = next_str();
         return l + " " + o + " " + r;
@@ -481,6 +491,11 @@ struct Pretty {
     str       target = next_str();
     RedirType t      = wc_redir_type(w);
     str       fd     = fd_text(w);
+    if (wc_redir_varid(w)) {
+      auto [name, rest] = split_redir_varid(target);
+      fd = "{" + str(name) + "}";
+      target = str(rest);
+    }
     switch (t) {
       case REDIR_READ:       return fd + "< " + target;
       case REDIR_WRITE:      return fd + "> " + target;
@@ -553,6 +568,11 @@ struct Pretty {
       case WC_COND_AND: { auto a = cond(); return a + " && " + cond(); }
       case WC_COND_OR:  { auto a = cond(); return a + " || " + cond(); }
       case WC_COND_UNARY: { auto o = next_str(); return o + " " + next_str(); }
+      case WC_COND_MOD: {
+        str words = next_str();
+        for (WordCode k = 1; k < wc_cmd_skip(w); ++k) words += " " + next_str();
+        return words;
+      }
       case WC_COND_BINARY: {
         auto o = next_str(); auto l = next_str(); auto r = next_str();
         return l + " " + o + " " + r;

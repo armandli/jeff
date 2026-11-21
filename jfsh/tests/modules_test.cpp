@@ -395,7 +395,7 @@ TEST(Modules, ZparseoptsBasicFlag) {
       "zparseopts -a opts f x\n"
       "echo \"$opts\"");
   EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "f  x \n");
+  EXPECT_EQ(r.out, "-f -x\n");
 }
 
 TEST(Modules, ZparseoptsWithArgument) {
@@ -405,7 +405,7 @@ TEST(Modules, ZparseoptsWithArgument) {
       "zparseopts -a opts O: v\n"
       "echo \"${opts[1]} ${opts[2]} ${opts[3]} ${opts[4]}\"");
   EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "O logfile.txt v \n");
+  EXPECT_EQ(r.out, "-O logfile.txt -v \n");
 }
 
 TEST(Modules, ZparseoptsDashDDeletesFromArgv) {
@@ -472,23 +472,24 @@ TEST(Modules, ZformatPercentPercentIsLiteral) {
 
 TEST(Modules, ZformatWidthRightAlign) {
   Shell sh;
-  auto r = sh.run("zformat -f out '[%5x]' x:hi; echo \"$out\"");
+  auto r = sh.run("zformat -f out '[%-5x]' x:hi; echo \"$out\"");
   EXPECT_EQ(r.rc, 0);
   EXPECT_EQ(r.out, "[   hi]\n");
 }
 
 TEST(Modules, ZformatWidthLeftAlign) {
   Shell sh;
-  auto r = sh.run("zformat -f out '[%-5x]' x:hi; echo \"$out\"");
+  auto r = sh.run("zformat -f out '[%5x]' x:hi; echo \"$out\"");
   EXPECT_EQ(r.rc, 0);
   EXPECT_EQ(r.out, "[hi   ]\n");
 }
 
-TEST(Modules, ZformatMissingKeyEmpty) {
+// An unknown %z stays as it is (zsh 5.9).
+TEST(Modules, ZformatMissingKeyStays) {
   Shell sh;
   auto r = sh.run("zformat -f out 'a%zb' x:v; echo $out");
   EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "ab\n");
+  EXPECT_EQ(r.out, "a%zb\n");
 }
 
 // ---------------------------------------------------------------------------

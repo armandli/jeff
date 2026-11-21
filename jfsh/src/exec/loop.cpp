@@ -82,6 +82,11 @@ struct KeepStatus {
   }
 };
 
+constexpr s::pair<strv, strv> TIED_SPECIALS[] = {
+  {"PATH", "path"}, {"FPATH", "fpath"}, {"CDPATH", "cdpath"}, {"MANPATH", "manpath"},
+  {"MAILPATH", "mailpath"}, {"FIGNORE", "fignore"}, {"PSVAR", "psvar"},
+};
+
 s::int64_t int_param(ExecContext& ctx, strv name, s::int64_t def) {
   auto p = ctx.params.lookup(name);
   if (not p or not p->get().is_set()) return def;
@@ -115,6 +120,28 @@ void init_shell_params(ExecContext& ctx) {
   }
   exported("PWD", pwd);
   if (param(ctx, "OLDPWD").empty()) exported("OLDPWD", pwd);
+
+  // zsh's tied specials; an environment value goes into the array.
+  for (auto [scalar, array] : TIED_SPECIALS) {
+    auto p = params.lookup(scalar);
+    bool set = p and p->get().is_set();
+    str text = set ? p->get().scalar() : str{};
+    s::uint32_t flags = set ? p->get().flags & PM_EXPORTED : 0;
+    params.assign(str(array), vec<str>{}, PM_ARRAY | PM_SPECIAL);
+    Param& sp = params.assign(str(scalar), str{}, PM_SCALAR | PM_SPECIAL | flags);
+    params.tie(sp, str(array), ':');
+    if (set) sp.handlers->set_scalar(text);
+  }
+  if (param(ctx, "FPATH").empty()) {
+    vec<str> fpath;
+    if (*JFSH_SITE_FUNCTIONS_DIR) fpath.emplace_back(JFSH_SITE_FUNCTIONS_DIR);
+    struct stat st{};
+    if (*JFSH_FUNCTIONS_DIR and ::stat(JFSH_FUNCTIONS_DIR, &st) == 0)
+      fpath.emplace_back(JFSH_FUNCTIONS_DIR);
+    else if (*JFSH_SOURCE_FUNCTIONS_DIR)
+      fpath.emplace_back(JFSH_SOURCE_FUNCTIONS_DIR);
+    (void)params.set_array("fpath", s::move(fpath));
+  }
 }
 
 void run_startup_files(Executor& ex, const StartupConfig& cfg) {

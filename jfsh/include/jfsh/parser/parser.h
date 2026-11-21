@@ -72,8 +72,11 @@ protected:
   bool par_select();
   bool par_repeat();
   bool par_subsh();
-  bool par_cursh();
+  // `opened`: the `{` was taken already (split_open_brace).
+  bool par_cursh(bool opened = false);
   bool par_funcdef();
+  bool par_anon_function();
+  bool split_open_brace();
   bool par_funcdef_body(vec<str> names);
   // `{ list }`, or any single command (`f() echo hi`).
   bool par_function_body();

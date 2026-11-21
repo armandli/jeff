@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -143,6 +144,7 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
   char   delim   = '\n';
   double timeout = -1;
   int    fd      = STDIN_FILENO;
+  bool   fd_given = false;
   s::size_t i = 1;
   for (; i < args.size(); ++i) {
     const str& a = args[i];
@@ -184,6 +186,7 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
             if (value.empty() or *end != '\0' or n < 0)
               return builtin_error(cmd, "number expected after -u: " + value);
             fd = static_cast<int>(n);
+            fd_given = true;
           }
           k = a.size();
           break;
@@ -198,6 +201,20 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
     }
   }
   vec<str> names(args.begin() + static_cast<s::ptrdiff_t>(i), args.end());
+  // -q and -k read the terminal, not stdin, unless -u says (zsh's SHTTY).
+  struct CloseFd {
+    ~CloseFd() { if (fd >= 0) ::close(fd); }
+    int fd = -1;
+  } opened;
+  if ((query or nchars) and not fd_given) {
+    if (ctx.signals.tty_fd() >= 0) {
+      fd = ctx.signals.tty_fd();
+    } else if ((opened.fd = ::open("/dev/tty", O_RDWR | O_CLOEXEC)) >= 0) {
+      fd = opened.fd;
+    } else {
+      return builtin_error(cmd, "not interactive and can't open terminal");
+    }
+  }
   // `name?prompt`: the prompt is shown when the shell is interactive.
   if (not names.empty())
     if (auto q = names[0].find('?'); q != str::npos) {

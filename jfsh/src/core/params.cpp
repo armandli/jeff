@@ -66,11 +66,12 @@ static void refresh(Param& p) noexcept {
   if (not p.handlers or not p.is_set()) return;
   // A getter that itself reads the parameter table (zsh/parameter's live
   // $parameters, $functions, …) can recurse through for_each → refresh →
-  // get → for_each.  Guard with a per-call-depth thread-local; depth > 1
-  // skips the refresh and lets the reader see the cached value.
-  static thread_local int depth = 0;
-  if (depth > 0) return;
-  ++depth;
+  // get → for_each.  A parameter being refreshed is seen with its cached
+  // value by the getters that run meanwhile; others ($PATH while
+  // $commands is read) are still refreshed.
+  static thread_local vec<const Param*> active;
+  if (s::find(active.begin(), active.end(), &p) != active.end()) return;
+  active.push_back(&p);
   if (p.handlers->get_hash) {
     p.value = p.handlers->get_hash();
   } else if (p.handlers->get_array) {
@@ -80,7 +81,7 @@ static void refresh(Param& p) noexcept {
     if (p.is_integer()) p.value = static_cast<s::int64_t>(s::strtoll(v.c_str(), nullptr, 10));
     else                p.value = s::move(v);
   }
-  --depth;
+  active.pop_back();
 }
 
 // A private parameter (zsh/param/private) is seen only from the scope that
@@ -278,6 +279,12 @@ Result<void> ParamTable::unset(strv name) {
     if (it->second.is_readonly())
       return s::unexpected(ShellError{ErrorKind::ExecError,
           "read-only variable: " + str(name)});
+    // A special parameter that stays set ($PREFIX in a completion
+    // function) says what unsetting it means.
+    if (it->second.handlers and it->second.handlers->unset_fn) {
+      it->second.handlers->unset_fn();
+      return {};
+    }
     if (i == 0) {
       scope.erase(it);
     } else {
@@ -290,6 +297,38 @@ Result<void> ParamTable::unset(strv name) {
   return {};
 }
 
+void ParamTable::tie(Param& scalar, str array, char sep) {
+  auto words = [this, array] {
+    auto a = lookup(array);
+    return a and a->get().is_set() ? a->get().array() : vec<str>{};
+  };
+  scalar.handlers = s::make_unique<ParamHandlers>();
+  scalar.handlers->get_scalar = [words, sep] {
+    str out;
+    auto ws = words();
+    for (s::size_t i = 0; i < ws.size(); ++i) {
+      if (i) out += sep;
+      out += ws[i];
+    }
+    return out;
+  };
+  scalar.handlers->set_scalar = [this, array, sep](str text) {
+    vec<str> ws;
+    for (s::size_t b = 0; not text.empty();) {
+      s::size_t e = text.find(sep, b);
+      ws.push_back(text.substr(b, e == str::npos ? str::npos : e - b));
+      if (e == str::npos) break;
+      b = e + 1;
+    }
+    (void)set_array(array, s::move(ws));
+  };
+  scalar.handlers->unset_fn = [this, array] { (void)set_array(array, {}); };
+  scalar.flags = (scalar.flags & ~(PM_UNSET | PM_ARRAY | PM_HASH | PM_INTEGER | PM_FLOAT))
+               | PM_SCALAR | PM_TIED;
+  scalar.value = scalar.handlers->get_scalar();
+  if (auto a = lookup_raw(array)) a->get().flags |= PM_TIED;
+}
+
 // mScopes[0] is the global scope and is never popped.
 void ParamTable::push_scope(bool prefix) {
   if (mScopes.empty()) mScopes.emplace_back();
@@ -299,7 +338,15 @@ void ParamTable::push_scope(bool prefix) {
 
 void ParamTable::pop_scope() {
   if (mScopes.size() <= 1) return;
-  if (mScopes.back().contains("PATH")) note_assigned("PATH");
+  for (auto& [name, p] : mScopes.back()) {
+    if (not p.restore or not p.handlers) continue;
+    if (auto* a = s::get_if<vec<str>>(&*p.restore); a and p.handlers->set_array)
+      p.handlers->set_array(*a);
+    else if (p.handlers->set_scalar)
+      p.handlers->set_scalar(Param{name, *p.restore, p.flags & ~PM_UNSET, 0, {}, {}}.scalar());
+  }
+  if (mScopes.back().contains("PATH") or mScopes.back().contains("path"))
+    note_assigned("PATH");
   if (not mPrefixScopes.empty() and mPrefixScopes.back() == current_scope())
     mPrefixScopes.pop_back();
   mScopes.pop_back();
@@ -330,6 +377,22 @@ void ParamTable::for_each(func<void(const Param&)> fn) const {
       }
     }
   }
+}
+
+str param_type_text(const Param& p) {
+  str t = p.is_hash() ? "association" : p.is_array() ? "array"
+        : p.is_integer() ? "integer" : p.is_float() ? "float" : "scalar";
+  if (p.flags & PM_LOCAL)    t += "-local";
+  if (p.flags & PM_LOWER)    t += "-lower";
+  if (p.flags & PM_UPPER)    t += "-upper";
+  if (p.is_readonly())       t += "-readonly";
+  if (p.flags & PM_TIED)     t += "-tied";
+  if (p.is_exported())       t += "-export";
+  if (p.flags & PM_UNIQUE)   t += "-unique";
+  if (p.flags & PM_HIDE)     t += "-hide";
+  if (p.flags & PM_HIDEVAL)  t += "-hideval";
+  if (p.flags & PM_SPECIAL)  t += "-special";
+  return t;
 }
 
 }  // namespace jfsh

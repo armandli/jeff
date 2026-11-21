@@ -69,6 +69,10 @@ int builtin_readonly  (vec<str>&, ExecContext&);
 int builtin_return    (vec<str>&, ExecContext&);
 int builtin_set       (vec<str>&, ExecContext&);
 int builtin_shift     (vec<str>&, ExecContext&);
+int builtin_getopts   (vec<str>&, ExecContext&);
+int builtin_unfunction(vec<str>&, ExecContext&);
+int builtin_enable    (vec<str>&, ExecContext&);
+int builtin_disable   (vec<str>&, ExecContext&);
 int builtin_times     (vec<str>&, ExecContext&);
 int builtin_trap      (vec<str>&, ExecContext&);
 int builtin_unset     (vec<str>&, ExecContext&);
@@ -123,9 +127,14 @@ int builtin_functions (vec<str>&, ExecContext&);
 int builtin_whence    (vec<str>&, ExecContext&);
 int builtin_which     (vec<str>&, ExecContext&);
 int builtin_type      (vec<str>&, ExecContext&);
-int builtin_compinit  (vec<str>&, ExecContext&);
 int builtin_compdef   (vec<str>&, ExecContext&);
 int builtin_compadd   (vec<str>&, ExecContext&);
+int builtin_compset   (vec<str>&, ExecContext&);
+int builtin_compquote (vec<str>&, ExecContext&);
+// The completion conditions `[[ -prefix [n] pat ]]`, `-suffix [n] pat`,
+// `-after pat` and `-between pat pat` (zsh/complete).  Returns the status,
+// or -1 when `op` is none of them (or has the wrong number of arguments).
+int cond_completion(strv op, const vec<str>& args, ExecContext& ctx);
 int builtin__files    (vec<str>&, ExecContext&);
 int builtin__directories(vec<str>&, ExecContext&);
 int builtin__command_names(vec<str>&, ExecContext&);

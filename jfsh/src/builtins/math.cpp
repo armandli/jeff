@@ -202,7 +202,11 @@ struct Arith {
     }
     const Param& param = p->get();
     str text;
-    if (v.indexed) {
+    if (v.indexed and not v.sub.empty() and v.sub[0] == '(' and opts.flagged_element) {
+      auto e = opts.flagged_element(v.name, v.sub);
+      if (not e) return {};
+      text = s::move(*e);
+    } else if (v.indexed) {
       if (param.is_hash()) {
         const auto& h = param.hash_ref();
         auto it = h.find(v.sub);

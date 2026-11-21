@@ -12,6 +12,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <jfsh/core/aliases.h>
@@ -205,11 +206,15 @@ inline constexpr int WC_REDIR_TYPE_BITS = 5;
 inline constexpr int WC_REDIR_FD_BITS   = 5;
 inline constexpr WordCode WC_REDIR_HAS_FD_BIT  = 1u << 10;
 inline constexpr WordCode WC_REDIR_LITERAL_BIT = 1u << 11;
+// `{name}>file`: the shell picks the fd and puts it in $name; the target
+// string is the name, a NUL, then the target.
+inline constexpr WordCode WC_REDIR_VARID_BIT   = 1u << 12;
 
 constexpr WordCode make_wc_redir(RedirType type, int fd,
-                                 bool literal = false) noexcept {
+                                 bool literal = false, bool varid = false) noexcept {
   WordCode packed = static_cast<WordCode>(type);
   if (literal) packed |= WC_REDIR_LITERAL_BIT;
+  if (varid) packed |= WC_REDIR_VARID_BIT;
   if (fd >= 0) {
     packed |= WC_REDIR_HAS_FD_BIT;
     packed |= static_cast<WordCode>(fd & 0x1f) << WC_REDIR_TYPE_BITS;
@@ -224,6 +229,15 @@ constexpr bool wc_redir_has_fd(WordCode w) noexcept {
 }
 constexpr bool wc_redir_literal(WordCode w) noexcept {
   return (wc_data(w) & WC_REDIR_LITERAL_BIT) != 0u;
+}
+constexpr bool wc_redir_varid(WordCode w) noexcept {
+  return (wc_data(w) & WC_REDIR_VARID_BIT) != 0u;
+}
+// The name and the target of a `{name}>file` target string.
+constexpr s::pair<strv, strv> split_redir_varid(strv target) noexcept {
+  auto nul = target.find('\0');
+  if (nul == strv::npos) return {strv{}, target};
+  return {target.substr(0, nul), target.substr(nul + 1)};
 }
 constexpr int wc_redir_fd(WordCode w) noexcept {
   return static_cast<int>((wc_data(w) >> WC_REDIR_TYPE_BITS) & 0x1fu);
@@ -264,6 +278,8 @@ inline constexpr WordCode WC_COND_OR     = 2u;
 inline constexpr WordCode WC_COND_UNARY  = 3u;
 inline constexpr WordCode WC_COND_BINARY = 4u;
 inline constexpr WordCode WC_COND_STR    = 5u;
+// -NAME args…: a module's prefix condition (-prefix, -between, …).
+inline constexpr WordCode WC_COND_MOD    = 6u;
 
 inline constexpr WordCode WC_FUNCDEF_NAMED = 0u;
 inline constexpr WordCode WC_FUNCDEF_ANON  = 1u;

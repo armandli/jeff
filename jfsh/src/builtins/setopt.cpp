@@ -165,13 +165,16 @@ int builtin_set(vec<str>& args, ExecContext& ctx) {
   opt<str> array_name;
   bool array_merge = false;
   s::size_t i = 1;
-  for (; i < args.size(); ++i) {
+  for (; i < args.size() and not array_name; ++i) {
     const str& a = args[i];
     if (a == "--") { ++i; positional_given = true; break; }
     if (a == "-" or a == "+") {
-      // `set -`: the end of the options, and off with -x and -v.
-      ctx.opts.unset(OPT_XTRACE);
-      ctx.opts.unset(OPT_VERBOSE);
+      // `set -`: the end of the options, and (but under zsh emulation)
+      // off with -x and -v, as in sh.
+      if (ctx.opts.emulation() != OptionState::Emulation::ZSH) {
+        ctx.opts.unset(OPT_XTRACE);
+        ctx.opts.unset(OPT_VERBOSE);
+      }
       ++i;
       positional_given = true;
       break;
@@ -287,11 +290,35 @@ int builtin_emulate(vec<str>& args, ExecContext& ctx) {
   else if (mode == "ksh")                  e = OptionState::Emulation::KSH;
   else if (mode == "csh")                  e = OptionState::Emulation::CSH;
   else return builtin_error(cmd, "unknown emulation: " + mode);
+  // After the mode: options set on top of it (`-o name`, `+o name`, `-x`)
+  // and `-c cmd`, which must come last.
   opt<str> run;
-  if (i < args.size()) {
-    if (args[i] != "-c" or i + 1 >= args.size())
-      return builtin_error(cmd, "bad argument: " + args[i]);
-    run = args[i + 1];
+  struct Change { bool on; bool named; str name; };
+  vec<Change> changes;
+  for (; i < args.size(); ++i) {
+    const str& a = args[i];
+    if (run or a.size() < 2 or (a[0] != '-' and a[0] != '+'))
+      return builtin_error(cmd, "unknown argument " + a);
+    bool on = a[0] == '-';
+    for (s::size_t k = 1; k < a.size(); ++k) {
+      char c = a[k];
+      if (c == 'c' and on) {
+        if (k + 1 < a.size() or i + 1 >= args.size())
+          return builtin_error(cmd, "argument expected: -c");
+        run = args[++i];
+      } else if (c == 'o') {
+        if (k + 1 < a.size()) {
+          changes.push_back({on, true, a.substr(k + 1)});
+        } else if (i + 1 < args.size()) {
+          changes.push_back({on, true, args[++i]});
+        } else {
+          return builtin_error(cmd, str("argument expected: ") + a[0] + "o");
+        }
+        break;
+      } else {
+        changes.push_back({on, false, str(1, c)});
+      }
+    }
   }
 
   // `emulate -l MODE` lists what `-R MODE` would do, without changing
@@ -312,6 +339,14 @@ int builtin_emulate(vec<str>& args, ExecContext& ctx) {
 
   OptionState saved = ctx.opts;
   ctx.opts.apply_emulation(e, full);
+  for (const auto& c : changes) {
+    bool ok = c.named ? set_named(cmd, c.name, c.on, ctx.opts)
+                      : set_letter(cmd, c.name[0], c.on, ctx.opts);
+    if (not ok) {
+      ctx.opts = s::move(saved);
+      return 1;
+    }
+  }
   if (run) {
     int rc = ctx.executor->exec_string(*run);
     ctx.opts = s::move(saved);
@@ -322,6 +357,78 @@ int builtin_emulate(vec<str>& args, ExecContext& ctx) {
     ctx.opts.set(OPT_LOCALTRAPS);
     ctx.opts.set(OPT_LOCALPATTERNS);
   }
+  return 0;
+}
+
+// getopts optstring name [arg …]: the next option of the args (or the
+// positional parameters) into `name`, as zsh's bin_getopts: `$OPTIND` is
+// the argument being read, a position inside it is kept for clustered
+// options; `+x` gives `+x`.  A leading `:` in optstring reports errors
+// through `name` (`?`, `:`) and $OPTARG instead of a message.
+int builtin_getopts(vec<str>& args, ExecContext& ctx) {
+  strv cmd = args[0];
+  if (args.size() < 3) return builtin_error(cmd, "not enough arguments");
+  strv optstr = args[1];
+  const str& var = args[2];
+  bool quiet = not optstr.empty() and optstr[0] == ':';
+  if (quiet) optstr.remove_prefix(1);
+  vec<str> words = args.size() > 3 ? vec<str>(args.begin() + 3, args.end()) : ctx.positional;
+  if (ctx.optind < 1) {
+    ctx.optind  = 1;
+    ctx.optcind = 0;
+  }
+  auto arg = [&](s::int64_t i) -> const str* {
+    return i >= 1 and static_cast<s::size_t>(i) <= words.size()
+               ? &words[static_cast<s::size_t>(i - 1)] : nullptr;
+  };
+  const str* word = arg(ctx.optind);
+  if (not word or word->empty()) return 1;
+  if (ctx.optcind >= word->size()) {
+    ctx.optcind = 0;
+    if (not arg(ctx.optind++)) return 1;
+    word = arg(ctx.optind);
+    if (not word) return 1;
+  }
+  if (ctx.optcind == 0) {
+    if (word->size() < 2 or ((*word)[0] != '-' and (*word)[0] != '+')) return 1;
+    if (*word == "--") {
+      ++ctx.optind;
+      return 1;
+    }
+    ++ctx.optcind;
+  }
+  char ch = (*word)[ctx.optcind++];
+  str opt = (*word)[0] == '+' ? str{'+', ch} : str(1, ch);
+  auto set = [&](str v) { (void)ctx.params.set_scalar(var, s::move(v)); };
+  auto fail = [&](char kind) {
+    set(quiet ? str(1, kind) : str("?"));
+    if (quiet) {
+      ctx.optarg = opt;
+    } else {
+      str shown{(*word)[0] == '+' ? '+' : '-', ch};
+      builtin_error(cmd, kind == '?' ? "bad option: " + shown
+                                     : "argument expected after " + shown + " option");
+      ctx.optarg.clear();
+    }
+    return 0;
+  };
+  auto at = optstr.find(ch);
+  if (ch == ':' or at == strv::npos) return fail('?');
+  if (at + 1 < optstr.size() and optstr[at + 1] == ':') {
+    if (ctx.optcind == word->size()) {
+      const str* next = arg(ctx.optind + 1);
+      if (not next) return fail(':');
+      ctx.optarg = *next;
+      ++ctx.optind;
+    } else {
+      ctx.optarg = word->substr(ctx.optcind);
+    }
+    ctx.optcind = 0;
+    ++ctx.optind;
+  } else {
+    ctx.optarg.clear();
+  }
+  set(opt);
   return 0;
 }
 

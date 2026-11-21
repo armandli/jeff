@@ -412,9 +412,10 @@ TEST(Read, EndOfInputEmptiesTheNames) {
 
 TEST(Read, MoreOptions) {
   Shell sh;
-  EXPECT_EQ(out(sh, "read -k 3 x <<< abcdef; echo $x"), "abc\n");
-  EXPECT_EQ(out(sh, "read -k x <<< zq; echo $x"), "z\n");
-  EXPECT_EQ(out(sh, "read -q x <<< y; echo rc=$? $x; read -q x <<< n; echo rc=$? $x"),
+  // -k and -q read the terminal unless -u names an fd, as in zsh.
+  EXPECT_EQ(out(sh, "read -u 0 -k 3 x <<< abcdef; echo $x"), "abc\n");
+  EXPECT_EQ(out(sh, "read -u 0 -k x <<< zq; echo $x"), "z\n");
+  EXPECT_EQ(out(sh, "read -u 0 -q x <<< y; echo rc=$? $x; read -u 0 -q x <<< n; echo rc=$? $x"),
             "rc=0 y\nrc=1 n\n");
   EXPECT_EQ(out(sh, "printf 'a,b;c' | { read -d ';' x; echo $x rc=$?; }"), "a,b rc=0\n");
   EXPECT_EQ(out(sh, "read -e <<< line1; read -E y <<< zz; echo y=$y"), "line1\nzz\ny=zz\n");
@@ -814,6 +815,94 @@ TEST(Parse, AsyncThenSemicolonAndKeywordTargets) {
   EXPECT_EQ(out(sh, "echo hi >" + d + "/in; cat <" + d + "/in"), "hi\n");
   CwdGuard g;
   EXPECT_EQ(out(sh, "cd " + d + "; echo kw > in; cat < in"), "kw\n");
+}
+
+// ---- M15c: shell features compsys needs ------------------------------------------
+
+// typeset -H: listings show the name only (M15c).
+TEST(Builtins15c, TypesetHHidesTheValue) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "typeset -H x=1; echo $x; typeset -p x; typeset -H; echo ${(t)x}"),
+            "1\ntypeset x\nx\nscalar-hideval\n");
+}
+
+// typeset -T: the array holds the value, the scalar joins it.
+TEST(Builtins15c, TypesetTTiesAScalarAndAnArray) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "typeset -T FOO foo; foo=(a b); echo $FOO; FOO=x:y; echo $foo[2]; "
+                "typeset -T BAR bar=(1 2) ';'; echo $BAR ${(t)bar} ${(t)BAR}"),
+            "a:b\ny\n1;2 array-tied scalar-tied\n");
+}
+
+TEST(Builtins15c, TypesetTInAFunctionIsLocal) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "f() { typeset -T cc=\"a:b:c\" ccarr; ccarr[2]=X; echo $cc; }; f; "
+                "echo \"[$cc]\""),
+            "a:X:c\n[]\n");
+}
+
+// local OPTIND starts at 0 and gives the value back.
+TEST(Builtins15c, LocalKeepsASpecialSpecial) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "OPTIND=5; f() { local OPTIND; echo \"[$OPTIND]\"; }; f; "
+                "echo $OPTIND"),
+            "[0]\n5\n");
+}
+
+TEST(Builtins15c, GetoptsClustersAndArguments) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "t() { local o; while getopts \"ab:c\" o \"$@\"; "
+                "do echo \"$o ${OPTARG-} $OPTIND\"; done; echo end $OPTIND; }; "
+                "t -a -b val -ca x"),
+            "a  1\nb val 4\nc  4\na  4\nend 5\n");
+}
+
+TEST(Builtins15c, GetoptsQuietReportsInTheName) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "t() { local o; while getopts \":ab:\" o \"$@\"; "
+                "do echo \"$o [$OPTARG]\"; done; }; t -x -b"),
+            "? [x]\n: [b]\n");
+}
+
+TEST(Builtins15c, GetoptsPlusOptionsAndDashDash) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "t() { local o; while getopts \"ab\" o \"$@\"; do echo \"$o\"; "
+                "done; echo $OPTIND; }; t +a -- -b"),
+            "+a\n3\n");
+}
+
+// set -A name: the rest are values, even -x.
+TEST(Builtins15c, SetAStopsAtTheArrayName) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "set -A arr -J x -t; echo $arr; set -sA b c a; echo $b"),
+            "-J x -t\na c\n");
+}
+
+TEST(Builtins15c, Unfunction) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "f() { :; }; unfunction f; whence -w f; "
+                "unfunction nope 2>/dev/null; echo $?"),
+            "f: none\n1\n");
+}
+
+TEST(Builtins15c, EnableDisableFunctions) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "disable -f nope 2>/dev/null; echo $?; f() { echo f; }; "
+                "disable -f f; f 2>/dev/null; echo $?; enable -f f; f"),
+            "1\n127\nf\n");
+}
+
+// 2=x sets $2.
+TEST(Builtins15c, PositionalParameterAssignment) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "set -- a b; 2=X; echo $@; 4=Y; echo $# \"$@\"; 1+=z; echo $1"),
+            "a X\n4 a X  Y\naz\n");
+}
+
+TEST(Builtins15c, ArgvIsThePositionalParameters) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "argv=(--x a b); argv[(r)--x]=(); echo $argv $#"),
+            "a b 2\n");
 }
 
 }  // namespace
