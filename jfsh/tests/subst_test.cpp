@@ -1223,6 +1223,29 @@ TEST(Subst15c, IndirectTypeOfNestedSubject) {
             "array a b a b\n");
 }
 
+// (P) on a nested subject names the parameter once: the value of foo_v,
+// not of the parameter that value names.  Array slices assign as zsh does,
+// and a failing subscript leaves the array alone.
+TEST(SubstMerge, IndirectionOnceAndSliceAssignment) {
+  Shell sh;
+  EXPECT_EQ(out(sh, "n=foo_v; foo_v=1; print -r -- ${(P)${n}} ${(P)${:-n}}"), "1 foo_v\n");
+  EXPECT_EQ(out(sh, "a=(1 2 3 4); a[2,3]=X; print -r -- $a; i=2,3; a=(1 2 3 4); a[$i]=Y; "
+                    "print -r -- $a"),
+            "1 X 4\n1 Y 3 4\n");
+  (void)sh.run("a=(1 2 3)");
+  auto r = sh.run("a[1/0]=x");
+  EXPECT_EQ(r.err, "jfsh: division by zero\n");
+  EXPECT_EQ(out(sh, "print -r -- $a"), "1 2 3\n");
+}
+
+// (S) with (B) (E) counts characters in a multibyte string, as zsh.
+TEST(SubstMerge, MatchPositionsCountCharacters) {
+  Utf8Locale loc{LC_CTYPE};
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  Shell sh;
+  EXPECT_EQ(out(sh, "x=\xc3\xa9\xc3\xa9" "b; print -r -- ${(SB)x#b} ${(SE)x#b}"), "3 4\n");
+}
+
 // {1..$n} is a range, as zsh does brace expansion last.
 TEST(Subst15c, BraceRangeAfterExpansion) {
   Shell sh;

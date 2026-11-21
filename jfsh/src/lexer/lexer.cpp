@@ -96,7 +96,14 @@ static bool is_word_break(int c) noexcept {
 }
 
 static bool slurp_nested(InputSource& src, str& text, char open,
-                         char close, bool dq = false);
+                         char close, bool comments = false, bool dq = false);
+
+// Whether the next character is `c`; nothing is consumed.
+static bool next_is(InputSource& src, int c) {
+  int n = src.next_char();
+  src.unget(n);
+  return n == c;
+}
 
 // Appends a backquoted command substitution up to and including its closing
 // backquote.  A backslash keeps the next character.
@@ -134,7 +141,8 @@ static bool slurp_dquote(InputSource& src, str& text) {
       int n = src.next_char();
       if (n == '(' or n == '{' or n == '[') {
         text += static_cast<char>(n);
-        if (not slurp_nested(src, text, static_cast<char>(n), close_of(n), n == '{'))
+        if (not slurp_nested(src, text, static_cast<char>(n), close_of(n),
+                             n == '(' and not next_is(src, '('), n == '{'))
           return false;
       } else {
         src.unget(n);
@@ -145,22 +153,25 @@ static bool slurp_dquote(InputSource& src, str& text) {
 }
 
 static bool slurp_nested_at(InputSource& src, str& text, char open, char close,
-                            bool dq);
+                            bool comments, bool dq);
 
 // Appends text up to and including the `close` that balances an `open` the
 // caller has already consumed.  Quotes, backslashes, backquotes and nested
-// `$(…)`/`${…}` are tracked so their contents can't close it early; with
-// `dq` the `${` is inside double quotes, where a single quote is an
-// ordinary character, as in zsh.  False when the input ends first.
+// `$(…)`/`${…}`/`$[…]` are tracked so their contents can't close it early.
+// False when the input ends first, or when nesting runs the stack low.
+// With `comments` (the elements of `name=(…)`, the commands of `$(…)`), a
+// comment inside is dropped: its quotes and braces don't count.
+// With `dq` (a ${…} in double quotes) a `{` inside doesn't pair with a
+// `}` and a `'` is an ordinary character, as in zsh: "${x:-a{b\}c}".
 static bool slurp_nested(InputSource& src, str& text, char open,
-                         char close, bool dq) {
+                         char close, bool comments, bool dq) {
   // Nesting that would run the stack out ends the word, unclosed.
   if (stack_low()) return false;
-  return slurp_nested_at(src, text, open, close, dq);
+  return slurp_nested_at(src, text, open, close, comments, dq);
 }
 
 static bool slurp_nested_at(InputSource& src, str& text, char open,
-                            char close, bool dq) {
+                            char close, bool comments, bool dq) {
   int depth = 1;
   for (int c; (c = src.next_char()) != -1;) {
     if (c == '#' and comments and not text.empty()
@@ -184,9 +195,10 @@ static bool slurp_nested_at(InputSource& src, str& text, char open,
       slurp_backquote(src, text);
     } else if (c == '$') {
       int n = src.next_char();
-      if ((n == '(' or n == '{' or n == '[') and n != open) {
+      if ((n == '(' or n == '{' or n == '[') and (n != open or dq)) {
         text += static_cast<char>(n);
-        if (not slurp_nested(src, text, static_cast<char>(n), close_of(n), dq and n == '{'))
+        if (not slurp_nested(src, text, static_cast<char>(n), close_of(n),
+                             n == '(' and not next_is(src, '('), dq and n == '{'))
           return false;
       } else if (n == '\'' and not dq) {
         // $'…', where `\'` doesn't end it.
@@ -585,7 +597,8 @@ opt<str> Lexer::read_cond_pattern(str prefix) {
       int n = mSrc.next_char();
       if (n == '(' or n == '{') {
         text += static_cast<char>(n);
-        if (not slurp_nested(mSrc, text, static_cast<char>(n), close_of(n))) {
+        if (not slurp_nested(mSrc, text, static_cast<char>(n), close_of(n),
+                             n == '(' and not next_is(mSrc, '('))) {
           mIncomplete = true;
           break;
         }
@@ -692,7 +705,7 @@ LexToken Lexer::read_word(int first_char, str prefix) {
           text += '$';
           text += static_cast<char>(n);
           if (not slurp_nested(mSrc, text, static_cast<char>(n), close_of(n),
-                               in_double and n == '{'))
+                               n == '(' and not next_is(mSrc, '('), in_double and n == '{'))
             mIncomplete = true;
           all_digits_so_far = false;
           c = mSrc.next_char();
