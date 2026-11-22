@@ -626,6 +626,11 @@ struct Chars {
   s::size_t pos(s::size_t k) const {
     return at.empty() ? s::min(k, s.size()) : at[s::min(k, size())];
   }
+  // The character that starts at byte `off`.
+  s::size_t index(s::size_t off) const {
+    if (at.empty()) return off;
+    return static_cast<s::size_t>(s::lower_bound(at.begin(), at.end(), off) - at.begin());
+  }
   // `n` characters from character `b`.
   str sub(s::size_t b, s::size_t n) const {
     s::size_t p = pos(b), q = n >= size() ? s.size() : pos(b + n);
@@ -2098,13 +2103,25 @@ struct Scan {
       s::size_t b = cs.pos(k);
       shorter = false;
       search.notstart = false;
+      // With the same flags as the search for the end zsh's reaches first,
+      // the shortest one exists where that does and ends no later: without
+      // groups to take from the first, it answers alone.
+      auto cut_search = [&] {
+        PrefixSearch cut = search;
+        cut.notstart = notstart;
+        cut.notend   = true;
+        return cut;
+      };
+      if (not how.longest and search.notend and not notstart and not pat.backrefs()
+          and pat.ordered_ends()) {
+        PrefixSearch cut = cut_search();
+        return pat.match_prefix(s, b, false, &pm, &cut);
+      }
       s::size_t len = pat.match_prefix(s, b, true, &pm, &search);
       if (len == str::npos or how.longest or len == 0) return len;
       PatternMatch shortest;
-      PrefixSearch cut = search;
-      cut.notstart = notstart;
-      cut.notend = true;
-      cut.below  = b + len;
+      PrefixSearch cut = cut_search();
+      cut.below = b + len;
       s::size_t min = pat.match_prefix(s, b, false, &shortest, &cut);
       search.notend  = true;
       search.gave_up = cut.gave_up;
@@ -2114,9 +2131,10 @@ struct Scan {
       shorter = true;
       return min;
     };
-    auto exists = [&](s::size_t k) {
-      search.notstart = false;
-      return pat.match_prefix(s, cs.pos(k), true, nullptr, &search) != str::npos;
+    // The first start from byte b before `until`, or with `last` the last,
+    // from which there is a match (to the end with `whole`), npos when none.
+    auto first_start = [&](s::size_t b, s::size_t until, bool whole, bool last) {
+      return pat.find_start(s, b, until, whole, last, search, whole ? &pm : nullptr);
     };
     auto empty_at_end = [&] {
       search.notstart = false;
@@ -2141,8 +2159,8 @@ struct Scan {
       if (not how.longest) {
         // zsh gives its tries at the end the byte length as the index.
         if (whole(size, &pm) and --n == 0) return found(size, size, size);
-        for (s::size_t k = chars; k-- > 0 and not search.lost;)
-          if (whole(cs.pos(k), &pm)) return found(cs.pos(k), size, k);
+        if (s::size_t b = first_start(0, size, true, true); b != str::npos)
+          return found(b, size, cs.index(b));
         // zsh tries the empty match at the end again with the (#s) of the
         // last start, so on one character (#s) matches there.
         bool at_start = chars <= 1;
@@ -2151,9 +2169,9 @@ struct Scan {
           return found(size, size, chars);
         return false;
       }
-      for (s::size_t k = 0; k <= chars and not search.lost; ++k)
-        if (whole(cs.pos(k), &pm)) return found(cs.pos(k), size, k);
-      return false;
+      s::size_t b = first_start(0, size + 1, true, false);
+      if (b == str::npos) return false;
+      return found(b, size, cs.index(b));
     }
     if (how.end) {
       // (S)% and (S)%%: the nth start from the end that has a match, or
@@ -2161,13 +2179,16 @@ struct Scan {
       if (empty_at_end() and --n == 0) return found(size, size, size);
       opt<s::size_t> last, nth_last;
       s::int64_t count = 0;
-      for (s::size_t k = chars; k-- > 0 and not search.lost;) {
-        if (not exists(k)) continue;
+      for (s::size_t until = size; not search.lost;) {
+        s::size_t b = first_start(0, until, false, true);
+        if (b == str::npos) break;
+        s::size_t k = cs.index(b);
         if (not last) last = k;
         if (++count == n) {
           nth_last = k;
           break;
         }
+        until = b;
       }
       if (last) {
         // zsh's shortest search here keeps the (#s) and the character
@@ -2187,9 +2208,10 @@ struct Scan {
     s::size_t k = 0;
     do {
       matched = false;
-      for (; k <= chars and not search.lost;) {
+      for (int missed = 0; k <= chars and not search.lost;) {
         s::size_t len = from(k);
         if (len != str::npos) {
+          missed = 0;
           s::size_t b = cs.pos(k), mpos = b + len;
           if (--n == 0 or (n <= 0 and how.global)) {
             if (auto r = found(b, mpos, k); not r) return r;
@@ -2210,7 +2232,15 @@ struct Scan {
           break;
         }
         if (k == chars) break;
-        ++k;
+        // After a few starts without a match (each a short run, mostly),
+        // the next one with a match is found at once.
+        if (++missed < 8) {
+          ++k;
+          continue;
+        }
+        s::size_t b = first_start(cs.pos(k + 1), size + 1, false, false);
+        if (b == str::npos) break;
+        k = cs.index(b);
       }
     } while (matched and k < chars and not search.lost);
     if (search.lost) return false;

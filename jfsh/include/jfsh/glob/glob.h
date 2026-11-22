@@ -127,6 +127,19 @@ struct CompiledPattern {
   // looked for as `search` says.
   s::size_t match_prefix(strv text, s::size_t b, bool longest, PatternMatch* info = nullptr,
                          PrefixSearch* search = nullptr) const;
+  // The first character start p in [from, until), as the matcher reads
+  // characters from `from`, or with `last` the last, from which text[p, …)
+  // matches: with `whole` to its end, as matches() with `search` decides,
+  // else a prefix, as match_prefix() with `search` and longest.  npos when
+  // none; with `whole`, `info` gets the match's groups.  The VM finds it
+  // in one run where trying the starts one at a time would read more; else
+  // each is tried, in order (`search` then changes as with those calls).
+  s::size_t find_start(strv text, s::size_t from, s::size_t until, bool whole, bool last,
+                       PrefixSearch& search, PatternMatch* info = nullptr) const;
+  // Whether, from one place and with one PrefixSearch, a shortest prefix
+  // match exists where a longest one does and ends no later than it (the
+  // VM decides): without groups, the shortest search then answers alone.
+  bool ordered_ends() const noexcept;
   // (#b) groups, and (#m), which set $match … and $MATCH … after a match.
   bool backrefs() const noexcept;
   // Whether (#aN) allows errors somewhere: only the backtracker runs it.

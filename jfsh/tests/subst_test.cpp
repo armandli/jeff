@@ -1749,9 +1749,9 @@ TEST(Pattern13c2, CountsThatCannotReachTheirMaximum) {
             "aa1:3/3 |1 a1:3/2 |1 aaa1:4/4 |1 1:2/1 |1 aaaa1:n |1 \n1\n");
 }
 
-// zsh tries the lengths of a shortest match on the text cut there, whose
-// end is where a character may start, so `*` may end before a byte that
-// continues no character; the VM reads on and checks those places.
+// A byte that continues no character is a character of its own, so `*`
+// may end before it, as zsh's tries of a shortest match on the text cut
+// there end.
 TEST(Pattern13c2, StrayContinuationBytes) {
   Utf8Locale loc{LC_CTYPE};
   if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
@@ -1929,6 +1929,133 @@ TEST(Pattern13c3, LongSubjects) {
   EXPECT_EQ(out(sh, "x=${(l:5000::ab:)}; print ${#${x##(#a2)(ab)#}} ${#${x##(#a1)a#}}; "
                     "x=${(l:5000::a:)}; print ${#${x##(#a1)a#}} ${#${x#(#a1)a#b}}"),
             "0 4997\n0 5000\n");
+}
+
+// M13 Phase 13c.4: the pattern matcher's performance and cleanup; expected
+// values are zsh 5.9's.
+
+// A continuation byte that no character reaches is a character of its own:
+// `*` may end before it.
+TEST(Pattern13c4, StrayBytesAreCharacters) {
+  Utf8Locale loc{LC_CTYPE};
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "for x in $'\\xa9' $'b\\xa9' $'\\xa9\\xa9' $'\\xc3\\xa9'; do [[ $x = *? ]]; "
+                    "print -n $?; [[ $x = b*? ]]; print -n $?; [[ $x = (*~x)? ]]; print -n $?; "
+                    "done; print"),
+            "010000010010\n");
+  EXPECT_EQ(out(sh, "x=$'\\xa9\\xa9A'; print -r -- ${#${x#*?}} ${#${x##*?}} ${#${x%?*}} "
+                    "${(S)x//*?/Z} ${#${(M)x##*?}}; x=$'\\xe2\\x82a'; [[ $x = (#b)(*)(?)a ]] "
+                    "&& print -r -- $mbegin / $mend"),
+            "2 0 2 ZZZ 3\n1 2 / 1 2\n");
+}
+
+// zsh counts the places in a match from its start with a conversion state
+// that a byte starting no character leaves in error: each byte after it
+// counts as a character.
+TEST(Pattern13c4, PlacesAfterAStrayByte) {
+  Utf8Locale loc{LC_CTYPE};
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "[[ $'\\xffb\\xff\\xc3\\xa9a' = (#b)(\?\?\?\?)? ]] && "
+                    "print -r -- $mbegin $mend; x=$'b\\xc3\\xa9\\xff\\xc3\\xa9a'; "
+                    "[[ $x = (#b)(?)(?)(?)(?)(?) ]] && print -r -- $mbegin / $mend"),
+            "1 5\n1 2 3 4 6 / 1 2 3 5 6\n");
+  // From a start after it, as (S) tries them, the count is right; (B) and
+  // (E) count apart.
+  EXPECT_EQ(out(sh, "x=$'\\xffb\\xc3\\xa9a'; : ${(S)x#(#b)(b?)}; print -r -- $mbegin $mend; "
+                    ": ${x#(#b)?(b?)}; print -r -- $mbegin $mend; [[ $x = (#m)*a ]] && "
+                    "print -r -- $MBEGIN $MEND; print -r -- ${(SB)x#a} ${(SE)x#a}"),
+            "2 3\n2 4\n1 5\n4 5\n");
+}
+
+// %, %% and the (S) and ${x/…} searches find the start with a match in one
+// VM run where trying each start in turn would read more.
+TEST(Pattern13c4, SearchesFromEachStart) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "x=abcabcab; print -r -- ${x%b*} ${x%%b*} ${(S)x%b*} ${(S)x%%b*} "
+                    "${(SI:2:)x%b} ${(SBI:2:)x%b} ${(SI:4:)x%b} ${x//c*a/Z} ${(S)x//c*a/Z}"),
+            "abcabca a abcabca abcabca abcacab 5 abcabca abZb abZbZb\n");
+  EXPECT_EQ(out(sh, "x=xaaaayaaayaz; print -r -- ${x//a*y/-} ${(S)x//a*y/-} ${x%a*y*} "
+                    "${x%%a*y*} ${(S)x%a*y} ${(S)x%%a*y} ${(SI:2:)x%a*y}"),
+            "x-az x--az xaaaayaa x xaaaayaaaz xaaaayaaaz xaaaayaaz\n");
+  EXPECT_EQ(out(sh, "x=abcabc; print -r -- ${x%(#b)(b)c*}/$match ${x%%(#b)(b)c*}/$match "
+                    "${(S)x%(#b)(b)c}/$match ${x%%(#m)b*}/$MATCH/$MBEGIN"),
+            "abca/b a/b abca/b a/bcabc/2\n");
+  EXPECT_EQ(out(sh, "x=abcab; print -r -- ${x%(#s)a*} ${(S)x%(#s)?} ${(S)x%(#e)} ${(SB)x#(#e)} "
+                    "${(S)x//?(#e)/Z} ${x%(*~*b)} ${x%%(*~*b)}"),
+            "bcab abcab 1 abcaZ abcab abcab\n");
+  EXPECT_EQ(out(sh, "z=${(l:2000::a:)}y; print ${#${z//a*[y]/Z}} ${#${z%%a*[y]}} "
+                    "${#${z%a*[y]}} ${#${(S)z#a*[y]}} ${#${(S)z%a*[y]}} ${#${(S)z%%a*[y]}} "
+                    "${#${(SB)z#a*[y]}}"),
+            "1 0 1999 0 1999 1999 1\n");
+}
+
+// Time bounds, with room for a loaded machine: each of these took a
+// fraction of a second at most when written, and some were quadratic or
+// exponential before.
+TEST(Pattern13c4, Benchmarks) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  auto seconds = [](auto f) {
+    auto t = s::chrono::steady_clock::now();
+    f();
+    return s::chrono::duration<double>(s::chrono::steady_clock::now() - t).count();
+  };
+  EXPECT_LT(seconds([&] {
+              EXPECT_EQ(out(sh, "x=${(l:30000::ab:)}; print ${#${x//a/b}} ${#${(S)x//a/b}} "
+                                "${#${x//(#b)(a)/<$match>}}"),
+                        "30000 30000 60000\n");
+              EXPECT_EQ(out(sh, "w=${(l:200::a:)}; s=${w}x${w}${w}y${w}; "
+                                "[[ $s = (#b)(*)x(*)(*)(*)y(*) ]] && print $mend; "
+                                "s=${w}y${w}${w}x${w}; [[ $s = (#b)(*)x(*)(*)(*)y(*) ]]; print $?"),
+                        "200 601 601 601 802\n1\n");
+              EXPECT_EQ(out(sh, "x=${(l:2000::a:)}; [[ ${x}c$x = *(^*(^*(^*b)))c ]]; print -n $?; "
+                                "e=${(l:8000::a:)}; [[ ${e}c = *(^*b)c ]]; print $?"),
+                        "10\n");
+              EXPECT_EQ(out(sh, "x=${(l:8000::ab:)}; print ${#${x//(#a1)abc/Z}} "
+                                "${#${x##(#a2)*abc}}; [[ $x = (#a1)*abc ]]; print $?"),
+                        "4000 0\n0\n");
+            }),
+            10.0);
+  // The 200000-character shapes of 13c.2 (zsh's recursion gives out on
+  // some; these are its values on 2000).
+  EXPECT_LT(seconds([&] {
+              EXPECT_EQ(out(sh, "p=b; while (( $#p < 200000 )); do p+=ab/c.d; done; "
+                                "[[ $p = b* ]]; print $? ${#${p%%.*}} ${#${p##*/}} "
+                                "${#${p%.*}} ${#${p#*/}}"),
+                        "0 5 3 200003 200001\n");
+              EXPECT_EQ(out(sh, "z=${(l:200000::a:)}; print ${#${z%%a*}} ${#${z%%a##}} "
+                                "${#${z//a/b}} ${#${z##(a|b)#}}; [[ ${z}c = (*)(*)c ]]; print $?; "
+                                "[[ ${z}c = (#b)(*)(*)c ]] && print $mend; "
+                                "[[ $z = (a|b)(#c1,300000) ]]; print -n $?; "
+                                "[[ $z = *^b ]]; print $?"),
+                        "0 0 200000 0\n0\n200000 200000\n00\n");
+            }),
+            10.0);
+  // One run for all the starts of a search: quadratic before.
+  EXPECT_LT(seconds([&] {
+              EXPECT_EQ(out(sh, "z=${(l:20000::a:)}; print ${#${z//a*[b]/Z}} ${#${z%%a*[b]}} "
+                                "${#${z%a*[b]}} ${#${(S)z#a*[b]}} ${#${(S)z##a*[b]}} "
+                                "${#${(S)z%a*[b]}} ${#${(S)z%%a*[b]}} ${#${(S)z//a*[b]/Z}} "
+                                "${#${z//(#b)(a)*[b]/Z}}"),
+                        "20000 20000 20000 20000 20000 20000 20000 20000 20000\n");
+              EXPECT_EQ(out(sh, "z=${(l:20000::ab:)}; print ${#${(S)z//a*b/Z}} "
+                                "${#${(S)z%%a*c}} ${#${(S)z//(a|b)(#c3)/Z}} ${#${(S)z//a/Z}}"),
+                        "10000 20000 6668 20000\n");
+            }),
+            10.0);
+  // A context whose starts are every other place: one thread for those in
+  // the same states (11.6 s before).
+  EXPECT_LT(seconds([&] {
+              EXPECT_EQ(out(sh, "z=${(l:8000::ab:)}; [[ ${z}z = *(^(ab)#c)z ]]; print -n $?; "
+                                "[[ ${z}cz = *(^(ab)#c)z ]]; print $?"),
+                        "00\n");
+            }),
+            10.0);
 }
 
 }  // namespace

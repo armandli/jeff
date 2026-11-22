@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <jfsh/core/aliases.h>
+#include <jfsh/core/utf8.h>
 #include <jfsh/glob/glob.h>
 
 namespace jfsh {
@@ -740,6 +741,146 @@ TEST(GlobPattern13c3, LongSubjects) {
               EXPECT_TRUE(len == z.size() or len == str::npos);
               EXPECT_EQ(ext("(#a1)a#").matches(z), len == z.size());
               (void)ext("(#a2)(ab)#").matches(x);
+            }),
+            5.0);
+}
+
+// M13 Phase 13c.4: the pattern matcher's performance and cleanup.
+
+// find_start(), which may run the VM once for all the starts, against one
+// call per start.
+// The character starts of x, as the matchers read them: a UTF-8 character
+// under MULTIBYTE, else a byte, and a byte that starts none is one.
+vec<s::size_t> char_starts(strv x, bool mb) {
+  vec<s::size_t> st;
+  for (s::size_t b = 0;; ) {
+    st.push_back(b);
+    if (b == x.size()) return st;
+    s::size_t len = 1;
+    if (mb and static_cast<unsigned char>(x[b]) >= 0x80) utf8_decode(x, b, len);
+    b += len;
+  }
+}
+
+// A subject of characters and of bytes that start none, at least 30 bytes,
+// for a multibyte pass.
+str mb_subject(PatternGen& gen) {
+  static const char* const parts[] = {"a", "b", "A", "\xc3\xa9", "\xa9", "\xc3", "\xe2\x82",
+                                      "\xf0\x9f\x98\x80"};
+  str x;
+  while (x.size() < 30 or gen.pick(3)) x += parts[gen.pick(8)];
+  return x;
+}
+
+// find_start(), which may run the VM once for all the starts, against one
+// call per start.  With `mb`, under MULTIBYTE on subjects with stray bytes,
+// the patterns starting with `*` so that the run for all starts reads far.
+void starts_agree(PatternGen gen, int patterns, bool mb = false) {
+  for (int i = 0; i < patterns; ++i) {
+    str p = (gen.pick(3) ? "(#b)" : "") + str(mb ? "*" : "") + gen.seq(0);
+    if (gen.excl and gen.unit() < 0.15) p = "^" + gen.nested(0, true);
+    auto pat = ext(p, mb);
+    for (int j = 0; j < 6; ++j) {
+      str x = mb ? mb_subject(gen) : gen.subject();
+      vec<s::size_t> st = char_starts(x, mb);
+      for (int mode = 0; mode < 8; ++mode) {
+        bool whole = mode & 1, last = mode & 2, notend = mode & 4;
+        for (s::size_t f = 0; f < st.size(); f += 1 + gen.pick(3)) {
+          s::size_t from = st[f];
+          s::size_t until = gen.pick(2) ? x.size() + 1 : st[f + gen.pick(st.size() - f)] + 1;
+          PrefixSearch search;
+          search.notend = notend;
+          s::size_t want = str::npos;
+          for (s::size_t k = 0; k < st.size(); ++k) {
+            s::size_t b = last ? st[st.size() - 1 - k] : st[k];
+            if (b < from or b >= until) continue;
+            PrefixSearch one;
+            one.notend = notend;
+            bool hit = whole ? pat.matches(x, b, x.size())
+                             : pat.match_prefix(x, b, true, nullptr, &one) != str::npos;
+            if (hit) {
+              want = b;
+              break;
+            }
+          }
+          ASSERT_EQ(pat.find_start(x, from, until, whole, last, search), want)
+              << "'" << p << "' on '" << x << "' mode " << mode << " from " << from
+              << " until " << until;
+        }
+      }
+    }
+  }
+}
+
+TEST(GlobPattern13c4, FindStartAgreesWithEachStart) {
+  PatternGen gen{s::mt19937{41}};
+  gen.length = 24;
+  starts_agree(gen, 200);
+  PatternGen excl{s::mt19937{42}};
+  excl.excl = excl.counts = excl.cases = true;
+  excl.length = 16;
+  starts_agree(excl, 200);
+}
+
+TEST(GlobPattern13c4, FindStartAgreesWithEachStartOnCharacters) {
+  Utf8Ctype loc;
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  PatternGen gen{s::mt19937{43}};
+  starts_agree(gen, 40, true);
+  PatternGen excl{s::mt19937{44}};
+  excl.excl = true;
+  starts_agree(excl, 40, true);
+}
+
+// A continuation byte no character reaches is a character of its own, and
+// a match from a start inside a character reads from there.
+TEST(GlobPattern13c4, StrayBytesAreCharacters) {
+  Utf8Ctype loc;
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  EXPECT_TRUE(ext("*?", true).matches("\xa9"));
+  EXPECT_TRUE(ext("b*?", true).matches("b\xa9"));
+  EXPECT_FALSE(ext("*??", true).matches("\xc3\xa9"));
+  EXPECT_TRUE(ext("*??", true).matches("\xc3\xa9\xa9"));
+  EXPECT_EQ(ext("*?", true).match_prefix("\xa9\xa9" "A", false), 1u);
+  EXPECT_EQ(ext("*", true).match_prefix("\xc3\xa9", 1, false), 0u);
+  EXPECT_EQ(ext("*", true).match_prefix("\xc3\xa9", 1, true), 1u);
+  PatternMatch pm;
+  ASSERT_TRUE(ext("(#b)(*)(?)", true).matches("\xe2\x82\xac\xa9", &pm));
+  EXPECT_EQ(pm.groups, (vec<Span>{{0, 3}, {3, 4}}));
+}
+
+// The VM's steps on long subjects, with the groups, and a context whose
+// starts are every other place.
+TEST(GlobPattern13c4, Benchmarks) {
+  str z(200000, 'a');
+  PatternMatch pm;
+  EXPECT_LT(seconds([&] {
+              for (int i = 0; i < 20; ++i) {
+                ASSERT_TRUE(ext("(#b)(*)(*)c").matches(z + "c", &pm));
+                EXPECT_EQ(pm.groups, (vec<Span>{{0, z.size()}, {z.size(), z.size()}}));
+                EXPECT_EQ(ext("(#b)(a|b)#").match_prefix(z, true, &pm), z.size());
+              }
+            }),
+            5.0);
+  str ab;
+  for (int i = 0; i < 4000; ++i) ab += "ab";
+  EXPECT_LT(seconds([&] {
+              EXPECT_TRUE(ext("*(^(ab)#c)z").matches(ab + "z"));
+              EXPECT_TRUE(ext("*(^(ab)#c)z").matches(ab + "cz"));
+            }),
+            5.0);
+  // find_start() runs once for all the starts.
+  str a(20000, 'a');
+  EXPECT_LT(seconds([&] {
+              PrefixSearch search;
+              EXPECT_EQ(ext("a*[b]").find_start(a, 0, a.size() + 1, false, false, search),
+                        str::npos);
+              EXPECT_EQ(ext("a*[b]").find_start(a, 0, a.size() + 1, true, true, search),
+                        str::npos);
+              EXPECT_EQ(ext("a*[y]").find_start(a + "y", 0, a.size() + 2, true, false, search),
+                        0u);
+              EXPECT_EQ(ext("a*[y]").find_start(a + "y", 0, a.size() + 1, false, true, search),
+                        a.size() - 1);
             }),
             5.0);
 }

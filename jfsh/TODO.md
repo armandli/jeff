@@ -1629,8 +1629,8 @@ expansion list, leaving globbing for the next phases.
   `tests/glob_quals_test.cpp` with every qualifier under temp-file setups
   checked against `zsh -f -c`.
 
-**Phase 13c — pattern matcher: zsh semantics and a linear-time VM**
-(branch `jfsh-pattern-vm`)
+**Phase 13c — done** (branch `jfsh-pattern-vm`): pattern matcher: zsh
+semantics and a linear-time VM.
 
 The M3/M15c merge (7c5d28d) left two matchers in `src/glob/glob.cpp`.
 `SetMatcher` is a position-set NFA that decides matches and prefix
@@ -1936,21 +1936,12 @@ Left after 13c.2:
   32768 instructions loops back to its one copy, so its first repeat's
   other ways come before a repeat from where it ended (not zsh's order;
   only the groups can differ).
-- The routed classes above.  Each prefix call is still a run of its own:
-  `${x//pat/rep}` with a pattern that runs to the end of the subject is
-  quadratic (13c.4's one unanchored run per call).
+- The routed classes above.
 - A (#cN,M) whose M is below the length of what follows it keeps its
   counts apart, so after a `*` it is quadratic (one thread per count:
   `*(a)(#c1,5000)c` on 8000 a's).
-- A context with more than 16 states or 64 start ranges keeps each start
-  apart (classes only for few), so `^` after `*` with a large inner
-  pattern can still be quadratic, and slower than HEAD:
-  `z=${(l:16000::ab:)}; [[ ${z}z = *(^(ab)#c)z ]]` takes 11.6 s, 3.9 s on
-  HEAD and 0.0001 s in zsh.
-- With `^`/`~`, the cut places before stray continuation bytes are each
-  one VM run of the cut text: quadratic on subjects with many of them.
-- Steps with the groups wanted copy the threads' registers: 200k
-  `[[ ${z}c = (#b)(*)(*)c ]]` is 6.3 ms against HEAD's 2.7.
+- (13c.4: the context fallback, the cut texts and the grouped steps are
+  in 13c.4's notes.)
 
 **13c.3 — done** (branch `jfsh-pattern-vm`): `(#aN)` as zsh 5.9's
 pattern.c runs it (read from its source: patmatch's approximation code,
@@ -2072,32 +2063,121 @@ Left after 13c.3:
   keep 13c.1's model (Node::leaks), with the approx tries putting back
   what a count leaks.
 
-**13c.4 — performance and cleanup**
-- Found in the 13c.3 review, not fixed: `Subject::boundary` keeps `*` from
-  ending before a lone continuation byte, so `[[ $'\xa9' = *? ]]` and
-  `[[ $'b\xa9' = b*? ]]` are 0 in zsh and 1 in jfsh; and after `\xff`
-  before a multibyte character zsh's $mend is one higher
-  (`[[ $'\xffb\xff\xc3\xa9a' = (#b)(????)? ]]`: zsh 5, jfsh 4).
-- `get_match` and `substitute` call `matches()`/`match_prefix()` once per
-  start position; on the VM, use one unanchored run per call where
-  zsh's semantics allow it (`%`/`%%` suffix search, `(S)` scans).
-- The `Cont` continuations in the backtracker use a non-owning function
-  reference instead of `std::function`.
-- One `range_ends()` helper for the saturating digit scan.
-- Style (format-cpp): blank lines between `break; case` blocks (done in
-  the VM's switches; the parser's and the backtracker's still lack them);
-  `parse_flags` takes its flags by value and returns them.
-- (S) shortest searches cost about 2.7× base: at each start the
-  first-found search runs before the shortest one.
-- The VM's uncached step costs about 9 ns per thread; runs that are not
-  steady (state registers: counts, contexts, leaked flags) or want the
-  groups stay at that (`(a|b)(#c1,300000)` on 200k: 40 ms; 200k
-  `(#b)(*)(*)c` with groups: 6.3 ms against HEAD's 2.7).
-- Move the VM to `src/glob/pattern_vm.cpp`, with a private
-  `pattern_internal.h` for the Node tree, Subject and Impl it shares with
-  the parser and the backtracker.
-- A benchmark test set with time bounds: 30 KB `${x//a/b}`,
-  `(#b)(*)x(*)(*)(*)y(*)` at N=200, nested `^` after `*`, `(#a1)` on 8 KB.
+**13c.4 — done** (branch `jfsh-pattern-vm`): performance and cleanup.
+- **The split.** `src/glob/pattern.cpp` holds the parser, the routing
+  (`route()`: Impl::stale/marks/vm_leaks), the dispatch and the
+  CompiledPattern API; `pattern_backtrack.cpp` the backtracker (`Matcher`,
+  `backtrack()`, `backtrack_open()`, `repeat_once()` for the VM's leaked
+  flags); `pattern_vm.cpp` the VM; `pattern_internal.h` (namespace
+  `jfsh::pattern`, private, `#include <glob/pattern_internal.h>`) the Node
+  tree, Impl, Subject and the entry points they share.  `glob.cpp` keeps
+  filename generation; `pattern_syntax.h` gives it `pattern::bracket_end()`
+  for its `[` check, apart from the matchers' internals.
+- **Stray bytes.** `Subject::boundary()` lets a character start at a
+  continuation byte that no character reaches (it scans back at most three
+  bytes, not past where the run began, `Subject::origin`), so
+  `[[ $'\xa9' = *? ]]` and `[[ $'b\xa9' = b*? ]]` are 0 as in zsh.  The
+  VM's cut texts (`Vm::cut_match()`, `cut_ends()`) are gone: with the
+  boundaries right a run agrees with zsh's tries on the cut text.  zsh
+  counts the places of a match from its start with a conversion state a
+  byte that starts no character leaves in error (macOS libc), so each byte
+  after one counts as a character for $mbegin/$mend/$MBEGIN/$MEND
+  (`chars_in(…, stray)`): `[[ $'\xffb\xff\xc3\xa9a' = (#b)(????)? ]]`
+  gives $mend 5; (B)/(E)/(N) count apart and are unchanged.
+- **One run for all starts.** `CompiledPattern::find_start()`: the first
+  (or last) character start with a whole or prefix match, and a whole
+  match's groups.  Starts after the last of a character every match has
+  (`VmProgram::needs`) are not tried.  The VM tries the nearest starts one
+  at a time (walking back by `boundary()` for the last) while that has read
+  no more than one run reads, then runs once with a start at every
+  character
+  (`Vm::Starts`: threads in the order of their starts; a match cuts the
+  threads after it, and with ascending starts stops new ones; a thread of
+  a later start at the same state as an earlier one goes, as it has a
+  match where that one has).  Cached steps add the new start (`NEW_START`).
+  Where the backtracker decides, one call per start as before.
+  `scan_match` uses it for `%`, `%%`, (S)% and (S)%% (also with (I:n:))
+  and, after eight starts in a row without a match, for the next start of
+  the (S)#, ${x/…} and ${x//…} scans.
+- **(S) shortest searches**: once (#e) is off for the search and without
+  groups, where the VM decides (`ordered_ends()`), the shortest search
+  answers alone (it ends no later than the first-found one and exists
+  where it does).  `${(S)x//a/Z}` on 20k: 3.9 → 1.6 ms (base 1.6).
+- **VM.** A cached step's copies and ending threads are worked out when
+  it is cached (`record()`, `COPY`, `dfa_dead`; not for runs that follow
+  the states alone); `canon()` works on each
+  register in place (`Inst::live_bits`); a context with many start ranges
+  finds its classes by the states of each start asked for
+  (`Ctx::by_items`), so `*(^(ab)#c)z` keeps one thread per class.
+- Backtracker continuations are `FnRef` (non-owning) instead of
+  std::function; one `Subject::range_ends()` for <lo-hi>'s saturating
+  digit scan; `parse_flags` takes and returns its flags; blank lines
+  between the case blocks of the parser's switch and the routing ones.
+- Tests: `Pattern13c4.*` (4) in `tests/subst_test.cpp` (zsh's values:
+  stray bytes, places after one, searches, benchmarks with time bounds:
+  30 KB `${x//a/b}`, `(#b)(*)x(*)(*)(*)y(*)` at 200, nested `^` after `*`,
+  `(#a1)` on 8 KB, the 200k shapes, the //, %, %% and (S) runs on 20k, the
+  context of every other place); `GlobPattern13c4.*` (3) in
+  `tests/glob_test.cpp` (find_start() against one call per start on 400
+  random patterns, and on 80 under MULTIBYTE with stray bytes and
+  subjects of 30 bytes or more; stray bytes and starts inside a character;
+  time bounds).
+- Differential tests (zsh vs jfsh, lines/cases): gen5 seeds 1-5: 0; gen3
+  `x` 11 seeds: 0; gen6: 1/1/7; gen.py plain 48, (#b) 97, (#b) without
+  `^`/`~` 0; genb 280/293/288; gen7 plain, mb, alt 0, excl 2/3/2/6; gen9 0;
+  outputs byte-identical to 13c.3's on all of them; review6 gen8 (`(#a)`
+  with stray bytes) seeds 21-23: 8/2/1 → 0, its other modes 0.  The
+  review5 engine fuzzer (Auto modes): 0; a find_start() fuzzer (9 modes ×
+  3 seeds × 2000): 0.
+- Timings (release, best of 3 inside the shell, 13c.3 → 13c.4; z 20k a's
+  unless said): `${z//a*[b]/Z}`, `${z%%a*[b]}`, `${z%a*[b]}`,
+  `${(S)z#a*[b]}`, `${(S)z%a*[b]}`, `${(S)z//a*[b]/Z}` 0.36 s → 0.3-0.7 ms
+  each, `${z//(#b)(a)*[b]/Z}` 2.0 s → 1.9 ms, `${z%%(#b)(a)*[b]}` 2.0 s →
+  0.7 ms; z 20k of ab: `${(S)z//a*b/Z}` 0.28 s → 1.8 ms,
+  `${(S)z//(#b)(a*b)/Z}` 1.75 → 1.36 s, `${(S)z%%a*c}` 4.7 → 0.0 ms,
+  `${(SI:5000:)z%%a}` 0.7 → 0.7 ms, `${(SI:500:)z%a*b}` 1.1 → 0.2 ms;
+  `z=${(l:16000::ab:)}; [[ ${z}z = *(^(ab)#c)z ]]` 10.8 → 0.79 s; 200k
+  `(#b)(*)(*)c` 5.1 → 4.4 ms, `(a|b)(#c1,300000)` 41 → 31 ms, `*^b` 73 →
+  49 ms; `${(S)z//a/Z}` 2.9 → 1.6 ms.  On f=/usr/local/lib/foo.tar.gz, 100000
+  times: `%.*` 0.136 → 0.137 s, `%%.*` 0.237 → 0.205, `%/*` 0.169 →
+  0.160, `%u*` 0.207 → 0.187, `%q*` 0.155 → 0.138, `(S)%/` 0.158 →
+  0.146, `(S)%l*b` 0.313 → 0.254, `%[/]*` 0.215 → 0.200, `//\//:` 0.235
+  → 0.221, `##*/` 0.221 → 0.220, `#*/` 0.259 → 0.255, `%%/*` 0.183 →
+  0.181, `%(#b)(.*)` 0.179 → 0.182.  Dense ${x//…}: 30k of ab `//a/b`
+  2.1 → 1.8 ms, `//c/Z` 10.4 → 0.0 ms, `(S)//a/b` 3.2 → 1.8 ms,
+  `//(#b)(a)/b` 5.7 → 5.3 ms; 200k a's `//a/b` 15.2 → 13.7 ms; 20k a's
+  `//a/Z` 1.6 → 1.4 ms.  A VM call no longer allocates (the all-clear
+  state registers and the match's group registers live in the scratch):
+  a short call is 49 ns, 60 on 13c.3.  The other 200k shapes (`b*`,
+  `%%.*`, `##*/`, `%%a*`, `%%a##`, `(*)(*)c`, `##(a|b)#`) are 0.5-1.6 ms
+  on both.
+
+Left after 13c.4 (the phase's open items):
+- From 13c.1: MULTIBYTE dropped in later top-level alternatives, unclosed
+  `(`/`[` as text, `${(qq)a}` of an empty array, leaks reaching earlier
+  literals, mid-literal `(#I)`, HIST_SUBST_PATTERN `\*`, errors inside
+  `eval`, leading flags in later glob segments (above, 13c.1).
+- From 13c.2: set semantics inside `^`/`~`; x## over 32768 instructions;
+  the routed classes (stale counts, marks of nested repeats, some leaks);
+  a (#cN,M) whose M is below what follows keeps its counts apart.
+- From 13c.3: the (#aN) items above.
+- A context of many start ranges is still quadratic in them (its sets of
+  starts are copied per step): `*(^(ab)#c)z` at 16000 is 0.79 s, zsh
+  0.0001 s.
+- (S) shortest searches with groups still run the first-found search at
+  each start (its groups are the answer when the two ends agree).
+- The VM's grouped steps still copy registers per thread (200k
+  `(#b)(*)(*)c` 3.2 ms in the library, the pre-VM build's 2.7).
+- The $mend count after a stray byte copies macOS libc's state after an
+  invalid sequence; on glibc zsh may count characters.
+- Chars and length counting (as on HEAD): zsh counts an incomplete UTF-8
+  sequence as one character for ${#x} and (B)/(E)/(N), jfsh each byte:
+  `x=$'\xe2\x82'; print ${#x}` is 1 in zsh, 2 in jfsh;
+  `x=$'\xe2\x82b'; ${(SBE)x#b}` `2 4` / `3 4`; `x=$'a\xf0\x9f\x98';
+  ${#x} ${(SBE)x%?}` `2 3 3` / `4 4 5`.
+- `%`/`%%` with (#b): find_start() takes the groups from the run of the
+  start it tried alone; one it found in the run for all starts is matched
+  again for its groups.
 
 ### M14. Compound short forms, PCRE `=~`, `BASH_REMATCH` [parser/short], [builtins/cond]
 
