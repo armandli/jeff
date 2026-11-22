@@ -197,6 +197,7 @@ static Result<void> expand_assignment(Expander& ex, Assignment& a) {
       else if (c == ')' or c == ']' or c == '}') --depth;
       else if (c == ',' and depth == 0) { a.subscript_comma = true; break; }
     }
+    a.subscript_whole = raw == "@" or raw == "*";
     auto sub = ex.scalar(raw);
     if (not sub) return s::unexpected(sub.error());
     a.subscript = s::move(*sub);
@@ -1119,11 +1120,11 @@ int Executor::exec_compound(ExecState& es, ExecFlags flags) {
   switch (wc_code(head)) {
     case WC_IF:       return exec_if(es, head);
     case WC_WHILE:    return exec_while(es, head);
-    case WC_FOR:      return exec_for(es, head);
-    case WC_FOR_COND: return exec_for_cond(es, head);
+    case WC_FOR:      return loop_status(exec_for(es, head));
+    case WC_FOR_COND: return loop_status(exec_for_cond(es, head));
     case WC_CASE:     return exec_case(es, head);
     case WC_SELECT:   return exec_select(es, head);
-    case WC_REPEAT:   return exec_repeat(es, head);
+    case WC_REPEAT:   return loop_status(exec_repeat(es, head));
     case WC_SUBSH:    return exec_subsh(es, head, flags);
     case WC_FUNCDEF:  return exec_funcdef(es, head);
     case WC_COND:     return exec_cond(es, head);
@@ -1222,12 +1223,20 @@ int Executor::exec_while(ExecState& es, WordCode head) {
     int status = exec_list(es, EF_NONE);
     --mCtx.noerrexit;
     --mCtx.noerrreturn;
+    // As zsh's execwhile: an error in the condition leaves the last body's
+    // status for `while`, but `until` goes on into the body, which the
+    // error skips, and so ends with 1 as an error in the body does.
+    if (mCtx.aborting and not mCtx.interrupt) {
+      if (until) rc = 1;
+      break;
+    }
     if (interrupted()) {
       if (loop_done()) break;
       continue;
     }
     if ((status == 0) == until) break;
     rc = exec_list(es, EF_NONE);
+    if (mCtx.aborting and not mCtx.interrupt) rc = 1;
     if (loop_done()) break;
   }
   --mCtx.loop_depth;
@@ -1336,6 +1345,20 @@ int Executor::exec_for_cond(ExecState& es, WordCode head) {
   return rc;
 }
 
+// Patterns are compiled once per text and options, as a loop runs the same
+// `case` or `[[ = ]]` again and again.  The reference lasts until the next
+// call.
+const CompiledPattern& Executor::cached_pattern(const str& pat) {
+  bool ext = mCtx.opts.extended_glob(), mb = mCtx.opts.multibyte();
+  str  key = str{ext ? 'e' : '-', mb ? 'm' : '-'} + pat;
+  auto found = mPatterns.find(key);
+  if (found == mPatterns.end()) {
+    if (mPatterns.size() >= 4096) mPatterns.clear();
+    found = mPatterns.emplace(s::move(key), CompiledPattern::compile(pat, false, ext, mb)).first;
+  }
+  return found->second;
+}
+
 // case := WC_CASE(HEAD, skip) WC_STRING(subject) arm*.  After a matching
 // arm, `;;` ends the case, `;&` runs the next arm's body unconditionally
 // and `;|` goes on testing the arms after it.
@@ -1360,16 +1383,7 @@ int Executor::exec_case(ExecState& es, WordCode head) {
       if (match) break;
       auto pat = ex.pattern(word);
       if (not pat) return fail(pat.error());
-      // Compiled once per text and options: a loop runs the same case.
-      bool ext = mCtx.opts.extended_glob(), mb = mCtx.opts.multibyte();
-      str  key = str{ext ? 'e' : '-', mb ? 'm' : '-'} + *pat;
-      auto found = mCasePatterns.find(key);
-      if (found == mCasePatterns.end()) {
-        if (mCasePatterns.size() >= 4096) mCasePatterns.clear();
-        found = mCasePatterns.emplace(s::move(key),
-                                      CompiledPattern::compile(*pat, false, ext, mb)).first;
-      }
-      const CompiledPattern& cp = found->second;
+      const CompiledPattern& cp = cached_pattern(*pat);
       if (cp.bad()) {
         // As in zsh: the command line ends, with status 0.
         s::fprintf(stderr, "jfsh: bad pattern: %s\n", glob_unescape(*pat).c_str());
@@ -1607,13 +1621,11 @@ static str trace_pattern(strv pat) {
   return out.empty() ? str("''") : out;
 }
 
-// `-x` alone, unquoted: zsh reads it as a condition missing its operand.
+// `-x` alone, unquoted: zsh's par_cond_2 reads a two-character word
+// starting with `-` as a condition missing its operand (`[[ -foo ]]` is a
+// string test).
 static bool looks_like_cond_op(strv w) noexcept {
-  if (w.size() < 2 or w[0] != '-' or not s::isalpha(static_cast<unsigned char>(w[1])))
-    return false;
-  return s::all_of(w.begin() + 1, w.end(), [](char c) {
-    return s::isalnum(static_cast<unsigned char>(c)) or c == '-';
-  });
+  return w.size() == 2 and w[0] == '-';
 }
 
 // `!`, `&&` and `||` go down their right side in a loop, so a long chain
@@ -1658,8 +1670,11 @@ int Executor::exec_cond_node(ExecState& es, WordCode head) {
 int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
   s::size_t end = es.pc + wc_cmd_skip(head);
   Expander ex{*this, mCtx};
+  // Status 2 is an error that ends the command line, as zsh's execcond
+  // makes it.
   auto finish = [&](int rc) {
     es.pc = end;
+    if (rc == 2) mCtx.aborting = mCtx.abort_line = true;
     return rc;
   };
   // A failed expansion ends the command line, as for a simple command.
@@ -1716,14 +1731,25 @@ int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
   strv rhs_word = es.fetch_str();
   if (cond_is_numeric(op)) {
     note(str(lhs_word) + " " + op + " " + str(rhs_word));
-    auto l = ex.math(lhs_word);
-    if (not l) return fail(l.error());
-    auto r = ex.math(rhs_word);
-    if (not r) return fail(r.error());
-    bool fl = l->is_float or r->is_float;
-    int cmp = fl ? (l->as_float() < r->as_float() ? -1 : l->as_float() > r->as_float() ? 1 : 0)
-                 : (l->i < r->i ? -1 : l->i > r->i ? 1 : 0);
-    return finish(cond_compare(op, cmp));
+    // The operands are words, expanded and then evaluated.  As in zsh, an
+    // error ends the command line, the failed side counting as 0 in the
+    // comparison that gives the status.
+    MathNum side[2];
+    strv words[2] = {lhs_word, rhs_word};
+    bool error = false;
+    for (int k = 0; k < 2 and not error; ++k) {
+      auto text = ex.scalar(words[k]);
+      if (not text) return fail(text.error());
+      auto v = ex.eval_math(*text);
+      if (v) {
+        side[k] = *v;
+        continue;
+      }
+      s::fprintf(stderr, "jfsh: %s\n", v.error().message.c_str());
+      mCtx.aborting = mCtx.abort_line = true;
+      error = true;
+    }
+    return finish(cond_numeric(op, side[0], side[1]));
   }
   auto lhs = ex.scalar(lhs_word);
   if (not lhs) return fail(lhs.error());
@@ -1731,8 +1757,7 @@ int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
     auto pat = ex.pattern(rhs_word);
     if (not pat) return fail(pat.error());
     note(trace_quote(*lhs) + " " + op + " " + trace_pattern(*pat));
-    auto cp = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob(),
-                                       mCtx.opts.multibyte());
+    const CompiledPattern& cp = cached_pattern(*pat);
     if (cp.bad()) {
       s::fprintf(stderr, "jfsh: bad pattern: %s\n", glob_unescape(*pat).c_str());
       mCtx.aborting = mCtx.abort_line = true;
@@ -1757,12 +1782,6 @@ int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
   // loaded and reports a clear error otherwise.
   if (auto* cd = mCtx.modules.find_cond(op))
     return finish(cd->fn(*lhs, *rhs, mCtx));
-  if (op == "-pcre-match" or op == "-regex-match") {
-    s::fprintf(stderr, "jfsh: [[: %s: module not loaded (zmodload %s)\n",
-               op.c_str(),
-               op == "-pcre-match" ? "zsh/pcre" : "zsh/regex");
-    return finish(2);
-  }
   s::fprintf(stderr, "jfsh: unknown condition: %s\n", op.c_str());
   return finish(2);
 }
@@ -2598,7 +2617,10 @@ bool Executor::expand_command(vec<str>& args,
 static Result<void> set_numeric(ExecContext& ctx, Param& p, const Assignment& a) {
   if (p.is_readonly())
     return s::unexpected(ShellError{ErrorKind::ExecError, "read-only variable: " + a.name});
-  auto v = math_eval(a.value, ctx.params, math_options(ctx.opts), &ctx.modules.math_funcs());
+  int last_base = -1;
+  MathOptions mo = math_options(ctx);
+  mo.last_base = &last_base;
+  auto v = math_eval(a.value, ctx.params, mo, &ctx.modules.math_funcs());
   if (not v) return s::unexpected(v.error());
   MathNum n = *v;
   if (a.append) {
@@ -2611,8 +2633,13 @@ static Result<void> set_numeric(ExecContext& ctx, Param& p, const Assignment& a)
   }
   // $SECONDS, $RANDOM, …: their setter decides what the value means.
   if (p.handlers) return ctx.params.set_scalar(a.name, s::to_string(n.as_int()));
-  if (p.is_float()) p.set(n.as_float());
-  else              p.set(n.as_int());
+  if (p.is_float()) {
+    p.set(n.as_float());
+  } else {
+    p.set(n.as_int());
+    // As zsh's setstrvalue: an integer with no base takes the constants'.
+    if (p.base == 0 and last_base >= 2) p.base = last_base;
+  }
   return {};
 }
 
@@ -2625,7 +2652,7 @@ static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
   auto raw = ctx.params.lookup_raw(a.name);
   if (raw and raw->get().is_hash()) {
     Param& p = raw->get();
-    if (a.array)
+    if (a.array or a.subscript_whole)
       return s::unexpected(ShellError{ErrorKind::ExecError,
           a.name + ": attempt to set slice of associative array"});
     if (p.handlers and p.handlers->readonly_elem and p.handlers->readonly_elem(key))
@@ -2650,23 +2677,50 @@ static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
     p.set(s::move(h));
     return {};
   }
-  auto p = ctx.params.lookup(a.name);
-  if (p and p->get().is_readonly())
+  if (auto p = ctx.params.lookup(a.name); p and p->get().is_readonly()) {
     return s::unexpected(ShellError{ErrorKind::ExecError,
         "read-only variable: " + a.name});
-  bool scalar = p and p->get().is_set() and not p->get().is_array();
-  s::int64_t size = scalar ? static_cast<s::int64_t>(p->get().scalar().size())
-                  : p and p->get().is_array()
-                  ? static_cast<s::int64_t>(p->get().array_ref().size()) : 0;
+  } else if (a.subscript_whole) {
+    // `name[@]=…` is the whole parameter, whatever its type.
+    bool set = p and p->get().is_set();
+    if (set and not p->get().is_array() and a.array)
+      return s::unexpected(ShellError{ErrorKind::ExecError,
+          a.name + ": attempt to assign array value to non-array"});
+    Assignment whole = a;
+    whole.subscript.reset();
+    if (set and (p->get().is_integer() or p->get().is_float()))
+      return set_numeric(ctx, p->get(), whole);
+    if (set and not p->get().is_array())
+      return ctx.params.set_scalar(a.name, a.value, a.append);
+    return ctx.params.set_array(a.name, a.array ? a.elements : vec<str>{a.value}, a.append);
+  } else if (p and p->get().is_set() and (p->get().is_integer() or p->get().is_float())) {
+    // As in zsh, a number has no elements: the whole value is assigned,
+    // once its subscript has been checked (`k=@; i[$k]=5` and `i[0]=5` fail).
+    if (not is_subscript_flags(key)) {
+      auto n = math_eval(key, ctx.params, math_options(ctx), &ctx.modules.math_funcs());
+      if (not n) return s::unexpected(n.error());
+      if (n->as_int() == 0 and not ctx.opts.get(OPT_KSH_ARRAYS)
+          and not ctx.opts.get(OPT_KSH_ZERO_SUBSCRIPT))
+        return s::unexpected(ShellError{ErrorKind::ExecError,
+            a.name + ": assignment to invalid subscript range"});
+    }
+    if (a.array)
+      return s::unexpected(ShellError{ErrorKind::ExecError,
+          a.name + ": attempt to assign array value to non-array"});
+    if (a.append)
+      return s::unexpected(ShellError{ErrorKind::ExecError,
+          "attempt to add to slice of a numeric variable"});
+    Assignment whole = a;
+    whole.subscript.reset();
+    return set_numeric(ctx, p->get(), whole);
+  }
   auto math = [&](strv text) -> Result<s::int64_t> {
-    auto n = math_eval(text, ctx.params, math_options(ctx.opts), &ctx.modules.math_funcs());
+    auto n = math_eval(text, ctx.params, math_options(ctx), &ctx.modules.math_funcs());
     if (not n) return s::unexpected(n.error());
     return n->as_int();
   };
-  // The subscript is worked out before the array is taken out below, so a
-  // failing one leaves the array as it was.
   s::int64_t first, last;
-  if (not key.empty() and key[0] == '(') {
+  if (is_subscript_flags(key)) {
     // a[(r)pat]=…: the element a search finds, as ${a[(i)pat]} gives it.
     str flags = key.substr(1, key.find(')') - 1);
     for (char& c : flags) c = c == 'r' ? 'i' : c == 'R' ? 'I' : c;
@@ -2699,37 +2753,21 @@ static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
       last = *hi;
     }
   }
-  if (first < 0) first += size + 1;
-  if (last < 0) last += size + 1;
-  if (first <= 0)
-    return s::unexpected(ShellError{ErrorKind::ExecError,
-        a.name + ": assignment to invalid subscript range"});
-  vec<str> arr;
-  if (scalar) {
-    for (char c : p->get().scalar()) arr.emplace_back(1, c);
-  } else if (p and p->get().is_array()) {
-    // Moved out and set again below, so one element costs no copy.
-    arr = p->get().handlers ? p->get().array() : p->get().take_array();
+  // KSH_ARRAYS subscripts start at 0; KSH_ZERO_SUBSCRIPT takes a[0] for a[1].
+  if (ctx.opts.get(OPT_KSH_ARRAYS)) {
+    // Wrapping as zsh's does (INT64_MAX + 1 ends up an invalid 0), without
+    // signed overflow.
+    auto up = [](s::int64_t i) {
+      return i >= 0 ? static_cast<s::int64_t>(static_cast<s::uint64_t>(i) + 1) : i;
+    };
+    first = up(first);
+    last  = up(last);
+  } else if (first == 0 and last == 0 and ctx.opts.get(OPT_KSH_ZERO_SUBSCRIPT)) {
+    first = last = 1;
   }
-  auto at = static_cast<s::size_t>(first - 1);
-  if (arr.size() <= at) arr.resize(at + 1);
-  // The elements first … last go (none for a[i,i-1]), the value comes in.
-  auto end = static_cast<s::size_t>(s::clamp<s::int64_t>(last, first - 1, size));
-  end = s::max(end, at);
-  if (a.array or last != first) {
-    vec<str> value = a.array ? a.elements : vec<str>{a.value};
-    arr.erase(arr.begin() + static_cast<s::ptrdiff_t>(at),
-              arr.begin() + static_cast<s::ptrdiff_t>(s::max(end, at + (last >= first ? 1 : 0))));
-    arr.insert(arr.begin() + static_cast<s::ptrdiff_t>(at), value.begin(), value.end());
-  } else {
-    arr[at] = a.append ? arr[at] + a.value : a.value;
-  }
-  if (scalar) {
-    str joined;
-    for (const auto& c : arr) joined += c;
-    return ctx.params.set_scalar(a.name, s::move(joined));
-  }
-  return ctx.params.set_array(a.name, s::move(arr));
+  return ctx.params.set_slice(a.name, first, last,
+                              a.array ? a.elements : vec<str>{a.value}, a.append, a.array,
+                              ctx.opts.multibyte());
 }
 
 // One assignment, expanded: `name=value` on an integer or float is
@@ -2959,7 +2997,7 @@ int Executor::call_function(const ProgRef& body,
   if (auto p = mCtx.params.lookup("FUNCNEST"); p and p->get().is_set()) {
     if (p->get().is_integer()) {
       limit = p->get().integer();
-    } else if (auto n = arith_eval(p->get().scalar(), mCtx.params, math_options(mCtx.opts),
+    } else if (auto n = arith_eval(p->get().scalar(), mCtx.params, math_options(mCtx),
                                    &mCtx.modules.math_funcs())) {
       limit = *n;
     }

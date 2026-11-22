@@ -140,7 +140,7 @@ TEST(Modules, MathfuncUnknownFunctionIsAnError) {
   Shell sh;
   auto r = sh.run("echo $((noSuchFunc(1)))");
   EXPECT_NE(r.rc, 0);
-  EXPECT_NE(r.err.find("unknown math function"), std::string::npos);
+  EXPECT_NE(r.err.find("unknown function"), std::string::npos);
 }
 
 TEST(Modules, MathfuncWrongArityIsAnError) {
@@ -161,7 +161,7 @@ TEST(Modules, MathfuncUnloadRemovesFunctions) {
   EXPECT_EQ(sh.run("zmodload -u zsh/mathfunc").rc, 0);
   auto r = sh.run("echo $((sqrt(4)))");
   EXPECT_NE(r.rc, 0);
-  EXPECT_NE(r.err.find("unknown math function"), std::string::npos);
+  EXPECT_NE(r.err.find("unknown function"), std::string::npos);
 }
 
 TEST(Modules, LetUsesMathfunc) {
@@ -933,7 +933,7 @@ TEST(Modules, CondPcreMatchWithoutModuleReportsClearError) {
   // The parser accepts -pcre-match; the executor refuses it until the
   // module is loaded.
   EXPECT_NE(r.rc, 0);
-  EXPECT_NE(r.err.find("module not loaded"), std::string::npos);
+  EXPECT_NE(r.err.find("unknown condition: -"), std::string::npos);
 }
 
 TEST(Modules, CondPcreMatchTrue) {
@@ -968,7 +968,7 @@ TEST(Modules, CondRegexMatchNeedsModule) {
   Shell sh;
   auto r = sh.run("[[ abc -regex-match '^a' ]] && echo ok");
   EXPECT_NE(r.rc, 0);
-  EXPECT_NE(r.err.find("module not loaded"), std::string::npos);
+  EXPECT_NE(r.err.find("unknown condition: -"), std::string::npos);
 }
 
 TEST(Modules, CondRegexMatchTrue) {
@@ -1067,7 +1067,7 @@ TEST(Modules, ExampleModuleCanBeUnloaded) {
 }
 
 // ---------------------------------------------------------------------------
-// M10 polish: generalised cond_is_binary accepts arbitrary -NAME-match.
+// M10 polish: an infix -NAME-match parses whatever its name.
 // ---------------------------------------------------------------------------
 
 TEST(Modules, UnknownDashNameMatchParsesButErrors) {

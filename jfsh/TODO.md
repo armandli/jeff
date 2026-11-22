@@ -747,7 +747,7 @@ are read-only, also as locals (zsh's other read-only specials may be made local)
 - Job texts lack zsh's `; }` and `do;` details as well as its per-process lines.
 - MULTIOS with a function defined with a redirection, in a pipeline (`f() { … } >
   /dev/stdout; f | cat`), prints once; zsh prints twice.
-- An error inside `eval` ends the caller too (recorded under M13's Left list).
+- Fixed in the M5 review: an error inside `eval` ended the caller too.
 - `typeset -F2 -i8` and `-iF 3` combinations, and `-Z`/`-L`/`-R` padding, are not
   zsh's yet [builtin/typeset].
 - The function call depth is bounded by the C++ stack: a Debug build reaches the default
@@ -769,10 +769,11 @@ and lexer tests in `tests/parser_test.cpp` and `tests/lexer_test.cpp`.
   give integers. `$(( ))` prints floats as zsh does (`10.`, `0.30000000000000004`,
   `1e+20`). Integers wrap on overflow; integer division by zero is an error, float
   division gives `Inf`.
-- The evaluator is now precedence climbing over two tables: zsh's default (shifts and
+- The evaluator works over two precedence tables: zsh's default (shifts and
   bitwise operators bind tighter than `**`, `*` and `+`, which the old evaluator had
-  backwards) and C's under `C_PRECEDENCES`. All assignment operators, including `^^=`;
-  `&&`, `||`, `&&=`, `||=` and `?:` don't evaluate the un-taken side.
+  backwards) and C's under `C_PRECEDENCES`. All assignment operators (`^^=`, as in zsh,
+  computes without assigning); `&&`, `||`, `&&=`, `||=` and `?:` don't evaluate the
+  un-taken side. Since the review it is a port of zsh's math.c (see Review fixes).
 - Literals: `0x`, `0b`, `base#digits`, `_` between digits, `0` octal under
   `OCTAL_ZEROES`; `FORCE_FLOAT` makes integer constants floats. `name[i]` reads and
   assigns array elements (negative indexes, growing the array) and `name[key]`
@@ -800,20 +801,171 @@ and lexer tests in `tests/parser_test.cpp` and `tests/lexer_test.cpp`.
 - **`test` / `[`** (bug B19 for these two): POSIX's rules for up to four arguments (so
   `test = = =` and `test ! = !` compare strings), then `!`, `-a`, `-o` and `( )` by
   precedence. Integers must be decimal (`integer expression expected`, status 2), and `[`
-  needs its `]`.
+  needs its `]`. Since the review `test` is zsh's bin_test (see Review fixes).
 - `OptionState::find` matches exact names before stripping `no` and reports the negation
   (bug B15), so `[[ -o nomatch ]]` and `[[ -o nonomatch ]]` both work.
 - A `!` that isn't a word of its own (`!=`, `!x`) is now part of a word; it used to split
   `test a != b` into `a ! = b`. `${~x}` and `GLOB_SUBST` now make a value active in `case`
   and `[[ = ]]` patterns, as they already did in arguments.
 
+**Review fixes** (branch jfsh-m5-review): `src/builtins/math.cpp` is now a port of
+zsh 5.9's math.c: its lexer (zzlex, lexconstant), checkunary, mathparse and op, with
+zsh's token, precedence and type tables. mathparse's recursion is a loop over a heap
+stack of frames, so nesting is no longer bounded by the C++ stack (200000 nested
+`(`, `!` or `- ` evaluate, where zsh 5.9 crashes and jfsh used to stop at about 8000
+parentheses with "stack overflow"); zsh's own limits are kept: 100 pending values
+("stack overflow", e.g. 100 `2**`) and 256 nested evaluations of parameter values,
+subscripts and arguments ("math recursion limit exceeded", was 64). What this fixed:
+the middle of `?:` is a conditional, not an assignment (`1 ? x = 5 : 6` is "':'
+expected"); `(x)` and assignment results stay lvalues (`(x) = 3`, `(x += 1)++`);
+`^^=` computes without assigning, as zsh's type table says; `&&`, `||`, `^^` and `!`
+take floats as integers (`0.5 && 1` is 0); in an un-taken branch nothing is looked up
+or called (`0 && nosuch(1)`, `0 && zz` under NO_UNSET, `0 && a` with a=b b=a);
+`name[sub]` is resolved once for a read and the write after it (`a[i++] += 7` steps i
+once), picks characters of a scalar (`s[2]`, `(( s[1] = 9 ))`), takes ranges
+(`a[2,3] = 9`), doesn't evaluate the subscript of an unset name, and `a[(r)pat] = v`
+assigns the found element; literals follow zstrtol (`0#0x10`, `010#1`, `16# ff`,
+zsh's truncation check and warning, which shows the rest of the expression); `.`,
+`1.5.3` are "bad floating point constant"; zsh's messages: "illegal character: @",
+"operand/operator expected at `…'" cut to 10 characters with `...`, "unexpected
+')'", "':' without '?'", "imaginary power", "unknown function: f", "wrong number of
+arguments: sqrt(1,2)", and `3 -- 2` names the `2` first; `$` is $$, `?` in operand
+position $?, `#` alone $#, `"` is ignored, `ARGC`/`argv` read the shell's
+(`MathOptions::shell`, `math_options(ctx)`); multibyte letters are name characters;
+zsh's lastbase: an integer with no base takes the base of the constants assigned to it
+(`typeset -i x=16#ff` is `16#FF`, `(( n = 0x10 ))` gives `typeset -i16`). `let` with
+no arguments says "not enough arguments", and an error is reported without `let:` and
+gives status 1. Element assignment (`a[-4]=5` inserts in front, `a[-9,2]=x`, scalars
+by character, KSH_ARRAYS and KSH_ZERO_SUBSCRIPT, which assignments ignored) is one
+helper, `ParamTable::set_slice`, for arithmetic and `name[sub]=value`; zsh/mathfunc's
+`atan` takes two arguments. `[[ ]]`: words are read as zsh's par_cond_2 /
+par_cond_double / triple / multi (`[[ x = ]]` "parse error: condition expected: x",
+`[[ x = y z ]]` "condition expected: x", `[[ -n x -a -n y ]]` an unknown condition
+`-n`, `[[ -foo ]]` a string test, newlines between any words); a status of 2 (unknown
+condition, an unloaded `-pcre-match`, a bad pattern) ends the command line, as zsh's
+execcond; `-eq` operands are expanded words (`[[ 3 -eq '1 + 2' ]]`) and an arithmetic
+error ends the line with the failed side as 0; `-v a[2]`, `-v h[k]`, `-v 1`; `-t`
+takes an arithmetic expression; `-o e` is an option letter, and under POSIX_BUILTINS
+an unknown option is false. `test` / `[` is zsh's bin_test: its testlex tokens and
+par_cond_2's argument counting (`test x y z` "condition expected: y", `test '(' x`
+"argument expected", `test x ')'` and `test -a x` "too many arguments", `test x -a`
+false, `[ -t ]` is `[ -t 1 ]`, integers by zstrtol: `test 1 -eq ''` is false, `' 1 '`
+an error), parsed before anything runs and evaluated without recursion on `-a`/`-o`
+chains. Performance: `$(( ))` text with nothing to expand skips the expander,
+`Expander::scalar` returns plain words as they are, the evaluator's stacks are reused
+from a per-thread pool, `ParamTable::lookup_raw` builds its key once, and `[[ = ]]`
+patterns share `case`'s compiled-pattern cache (`Executor::cached_pattern`). 100000
+`(( i++ ))`: 0.07 s → 0.05 s (zsh 0.04); `[[ $i == *5* ]]` ×100000: 0.18 → 0.09
+(zsh 0.06); `[[ $i -gt 50000 && -n $i ]]` ×100000: 0.13 → 0.09 (zsh 0.06); a
+200000-term `$(( 1+1+… ))` ×20: 0.13 → 0.08 (zsh 0.07); `s=$(( s + i * 2 % 7 ))`
+×100000: 0.16 → 0.12 (zsh 0.08). A `$(` nested past the stack is an error instead of
+literal text. Tests: `MathM5Review.*` in `tests/math_test.cpp`, `CondM5Review.*` and
+`TestM5Review.*` in `tests/cond_test.cpp`. Round 2: `set_slice` keeps indexes in 32
+bits as zsh's int does (`a[9223372036854775807]=x` sets the last element,
+`a[1000000000000]=x` inserts in front; was an abort or a hang) and refuses to grow an
+array past 2^28 elements, a failed allocation being an error too; a range may start
+at 0 (`a[0,2]=x`); `+=` on a subscript adds a word to the last element and inserts an
+array after it (`a[2,3]+=x` is `1 2 3x`, `a[2]+=(x y)` `1 2 x y 3`, `s[2,3]+=X`
+`helXlo`); scalar elements are found by walking the UTF-8 text (`code_point_offset`)
+instead of splitting it into one string per character (2000 `$(( s[i] ))` on a
+20000-character `s`: 0.19 s → 0.02, `s[i]=y`: 0.29 → 0.03); an integer or float
+parameter's subscript assigns the whole value and keeps the type (`integer i=123;
+i[2]=9` is `typeset -i i=9`; `i[1]+=3` is "attempt to add to slice of a numeric
+variable"); KSH_ARRAYS indexes wrap instead of overflowing (INT64_MAX is an invalid
+subscript, as in zsh); `[[ -eq ]]` operands evaluate flagged subscripts
+(`Expander::eval_math`) and compare operator by operator (`cond_numeric`: NaN is
+unequal to everything); an error inside `eval` ends just the eval, which returns its
+status (`${x?}`, zsh's hard error, still ends the line: `ExecContext::hard_error`), and
+a loop an error ended has status 1; `[[ - ]]` is "condition expected: -" and `[[ x !
+]]` a parse error at the `!`; the evaluator's pooled vectors are let go above 4096
+entries; `TestNode` holds one index vector. Tests: `MathM5Review2.*`,
+`CondM5Review2.*`. Round 3: in arithmetic too a subscript on an integer or float is
+the whole value (`integer i=123; (( i[2] += 9 ))` is 132; the subscript is still
+evaluated once), and an array value on a number's or a scalar's subscript is "attempt
+to assign array value to non-array"; scalar subscripts count bytes under
+NO_MULTIBYTE (`set_slice`'s `multibyte`, `MathOptions::multibyte`); a scalar is read
+in place and its length counted only for a negative index (2000 `s[i]=y` on a
+20000-character `é` string: 0.18 s → 0.01, zsh 0.01); arithmetic reads wrap
+subscripts to 32 bits as writes do (`$(( a[4294967297] ))` is a[1]); the loop
+statuses follow zsh's execwhile: an error in `while`'s condition keeps the last
+body's status, `until`'s gives 1, `select` keeps 2; a failed allocation in
+`set_slice` puts the array back. `test::Utf8Ctype` moved to `tests/shell_fixture.h`.
+Tests: `MathM5Review3.*`, `CondM5Review3.*` (with an interactive session for
+`${x?}` in eval). Round 4: `name[@]` / `name[*]` on a set scalar or number is the
+whole parameter, in arithmetic and in assignments, keeping the type (`integer i=123;
+(( i[*] = 5 ))`, `i[@]+=7` is 130, `s[@]=5`); on an array or an unset name it takes
+the words (`a[*]+=y` appends); a subscript is taken as flags only when the
+parentheses hold zsh's flag letters (`is_subscript_flags`), so `a[(1+1)]`,
+`a[(i+1)*1]` and `a[(t=3),3]` are arithmetic, in `$(( ))` and in `a[(1+1)]=9`; an
+illegal character is shown as zsh's nicechar does (`^A`, `^?`, `\M-…`); math.cpp and
+cond.cpp carry zsh's copyright and licence, as the parts derived from zsh 5.9's
+math.c, bin_test, par_cond_2 and evalcond. Tests: `MathM5Review4.*`. Round 5:
+`h[@]` / `h[*]` on an associative array reads its values (in key order, as `$h`)
+and an arithmetic assignment to it leaves the array as it is, as in zsh, where it
+had become a bad key/value list; `h[@]=v` and `h[*]+=v` are "attempt to set slice of
+associative array" instead of a key `@`; a subscript flag the expander rejects
+(`a[(e)2]`) is an error in `$(( ))` instead of 0 (`MathOptions::flagged_element`
+returns a Result); a byte above 0x7f shows as zsh 5.9 does for 0x80–0x82 (`\M-A`
+for 0x81, no `^`); parser.cpp carries zsh's licence for `par_cond_primary`. Tests:
+`MathM5Review5.*` and a `\M-` case in `MathM5Review4.IllegalCharactersShownAsZshDoes`.
+Round 6: an arithmetic write through flags on an associative array leaves it as it
+is and gives the operator's value (`(( h[(r)2]++ ))` is 2; it was a bad key/value
+list or an invalid subscript, and on main a junk key `(r)2`); a whole array or
+association in arithmetic follows zsh's setnparam: `=` replaces an ordinary one with a
+number (`typeset -A h; (( h = 5 ))` is `typeset -i h=5`), while `+=`, `++` … leave an
+association alone and give an array the value as its one element, as does `=` on a
+tied or special array (`tt`, `argv`, `path`); on main all of these became text
+scalars; only `@` / `*` as written is the whole parameter (`Assignment::
+subscript_whole`), so `k=@; h[$k]=5` stores the key `@` again (a round-5
+regression; main did this) and `a[$k]=x` is bad arithmetic; a number's subscript is
+evaluated and checked (`i[0]=5` is an invalid subscript); `sorted_entries` (param.h)
+gives an association's entries in key order for `$h` and `$(( h[@] ))`, reading the
+map in place. Tests: `MathM5Review6.*`, and write-path and `let` cases in
+`MathM5Review5.FlagErrorsReachArithmetic`.
+
 **Left**
-- The zsh/mathfunc functions (`sqrt`, `int`, …) [math/mathfunc], which need `zmodload`;
-  output bases `$(( [#16] x ))` and `C_BASES` [math/output]; `##x` character codes.
-- `REMATCH_PCRE` and `BASH_REMATCH` for `=~`, and module conditions (`-pcre-match`, …).
-  zsh calls a lone `[[ -n ]]` an unknown condition; jfsh tests the string `-n`.
-- `test` accepts `<` and `>` (POSIX 2024) and `test -o option`, where zsh errors.
-- xtrace doesn't print `[[ … ]]` or `(( … ))` commands yet.
+- Done elsewhere: zsh/mathfunc (M10), `##x` character codes (M5), REMATCH_PCRE,
+  BASH_REMATCH, a lone `[[ -n ]]` and xtrace of `[[ ]]` / `(( ))` (M14).
+- Output bases `$(( [#16] x ))`, `[##16]`, C_BASES and the input form `[16]ff`
+  [math/output]; `[` is an illegal character for now.
+- `test` accepts `<` and `>` (POSIX 2024) and `test -o option`, where zsh errors
+  (deliberate, see M14).
+- An error inside a function is reported as `jfsh: …`; zsh names the function
+  (`f: division by zero`). This is how all of jfsh's errors are reported.
+- A `[[ ]]` missing an operand (`[[ ]]`, `[[ x && ]]`) is a parse error near `]]`; zsh
+  names the token its lexer read after the `]]` (`near `;'`).
+- An unbalanced `$((` (`$(( ( 1 ))`, `$(( 1 +` at the end of the input) is taken as a
+  word ("bad pattern"); zsh reports a parse error (the lexer's `$((` scan, M3).
+- zsh's integer `**` multiplies in a loop, so `2 ** (1 << 62)` hangs it; jfsh gives
+  the same value modulo 2^64 at once (deliberate).
+- An array assignment that would grow past 2^28 elements (`(( a[100000000000] = 1 ))`)
+  is "assignment to invalid subscript range"; zsh tries to allocate it (deliberate).
+- `a=(1 2 3); a[-4]+=(x y)` gives `x y 1 2 3`; zsh's `( x y )`, `a[-5]+=(x y)` → `1 2
+  x y 3` and `a[-6]+=(x y)` → `1 x y 2 3` look like a zsh bug (deliberate).
+- `${a[4294967297]}` (the expander's subscripts, M3) doesn't wrap to 32 bits as zsh's
+  int does; assignments and arithmetic do.
+- Under NO_MULTIBYTE a byte above 0x7f that is an illegal character shows as
+  `\M-` and its low seven bits; zsh shows what its metafied form gives (`\M-i` for
+  0xa9, `^)` for 0xe9).
+- Hash keys keep their quotes in zsh 5.9 (`h["@"]=5` stores the key `"@"`, `h['@']`
+  the key `'@'`, `h[\@]` the key `\@`); jfsh removes them (as main did).
+- `typeset -T TT tt; (( tt = 5 ))`: the values match, but `typeset -p TT` prints
+  `typeset TT=5` where zsh prints `typeset -T TT tt=( 5 )` (typeset -p of a tie).
+- `typeset h[@]=5` on an association: zsh's message comes with status 0, jfsh's
+  with 1.
+- A bad subscript in an assignment (`k=@; a[$k]=x`) says "illegal character: @";
+  zsh evaluates it at its argument precedence and says "operand expected at `@'".
+- `(( h[(e)a] = 5 ))` on an association sets h[a] in zsh; jfsh has no `(e)` flag
+  (below) and leaves h as it is, as for other flags.
+- Subscript flags the expander lacks (M3): `e p f n b` on arrays and `(f)` on
+  scalars (`$(( a[(e)2] ))` is now "bad subscript flags", zsh 6; `x=$'1\n2\n3';
+  $(( x[(f)2] ))` zsh 2); `$(( a[(e)] ))` should be "empty string"; assignments
+  through `w`: `a[(s:,:w)2]=q` is an invalid subscript (zsh assigns the word) and
+  `x="a b c"; x[(wr)b]=Q` gives `aQb c` (zsh `a Q c`); `a=(3 4 5); a[(I)9]=1` is an
+  invalid subscript (zsh `1 3 4 5`, also through `(( ))`); `${a[(1+1)]}` and
+  `${a[(i+1)]}` say "unknown subscript flag" (`$(( a[(1+1)] ))` works).
+- Interactive `{ eval "echo \${x?boom}" } always { … }; echo after`: zsh runs `after`
+  (its always block drops a hard error that came through eval); jfsh ends the line.
 
 ### M6. Job control, signals, traps [signals/*], [builtin/bg|fg|jobs|wait|disown|kill]
 
@@ -1864,10 +2016,9 @@ Left after 13c.1:
   flag is on, so `[[ Ba = B(#I)a ]]` fails and `[[ B = B(#I)a ]]` matches.
 - HIST_SUBST_PATTERN: `x=ab; print ${x:s/\*/Z/}` gives `Z` in zsh and `ab`
   in jfsh.
-- An error inside `eval` (a bad pattern, `[[ -n ]]`) ends the whole command
-  line in jfsh; zsh ends only the eval (`eval '[[ a = (#X) ]]'; echo
-  after=$?` prints after=2).  Not a local fix: jfsh's `aborting` covers
-  both such errors and those that must still end the shell (`${x?}`).
+- Fixed in the M5 review (round 2): an error inside `eval` ended the whole
+  command line; now it ends only the eval, and `${x?}` (zsh's hard error,
+  `ExecContext::hard_error`) still ends the line.
 - A leading `(#i)` in a glob does not reach later path segments
   (`print -l (#i)*/*.txt`, `(#i)**/*.txt`): each segment is its own
   pattern.

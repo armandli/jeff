@@ -3,10 +3,12 @@
 #include <cstdlib>
 
 #include <algorithm>
+#include <exception>
 #include <iterator>
 
 #include <jfsh/core/aliases.h>
 #include <jfsh/core/param.h>
+#include <jfsh/core/utf8.h>
 
 namespace jfsh {
 
@@ -105,8 +107,9 @@ static bool hidden_private(const Param& p, int scope, int current) noexcept {
 }
 
 optref<Param> ParamTable::lookup_raw(strv name) noexcept {
+  str key(name);   // made once: find() wants a str
   for (int i = static_cast<int>(mScopes.size()) - 1; i >= 0; --i) {
-    auto it = mScopes[static_cast<s::size_t>(i)].find(str(name));
+    auto it = mScopes[static_cast<s::size_t>(i)].find(key);
     if (it != mScopes[static_cast<s::size_t>(i)].end()) {
       if (hidden_private(it->second, i, local_scope())) continue;
       return s::ref(it->second);
@@ -198,6 +201,92 @@ Result<void> ParamTable::set_scalar(
   p.scope = 0;
   p.set(s::move(value));
   return {};
+}
+
+Result<void> ParamTable::set_slice(
+    strv name, s::int64_t first, s::int64_t last, vec<str> value, bool append,
+    bool array, bool multibyte) {
+  auto p = lookup(name);
+  auto error = [](str msg) {
+    return s::unexpected(ShellError{ErrorKind::ExecError, s::move(msg)});
+  };
+  if (p and p->get().is_readonly()) return error("read-only variable: " + str(name));
+  auto bad_range = [&] { return error(str(name) + ": assignment to invalid subscript range"); };
+  // zsh keeps subscripts in an int, so larger ones wrap around.
+  auto wrap32 = [](s::int64_t i) {
+    return static_cast<s::int64_t>(static_cast<s::int32_t>(static_cast<s::uint32_t>(i)));
+  };
+  first = wrap32(first);
+  last  = wrap32(last);
+  if (first == 0 and last == 0) return bad_range();
+  // A range may start at 0, which is 1.
+  if (first == 0) first = 1;
+  bool scalar = p and p->get().is_set() and not p->get().is_array() and not p->get().is_hash();
+  if (scalar and array) return error(str(name) + ": attempt to assign array value to non-array");
+  str text;
+  vec<str> arr;
+  if (scalar) {
+    text = p->get().scalar();
+  } else if (p and p->get().is_array()) {
+    // Moved out and set again below, so one element costs no copy.
+    arr = p->get().handlers ? p->get().array() : p->get().take_array();
+  }
+  // A scalar's length is counted only for a negative index.
+  if (first < 0 or last < 0) {
+    s::size_t n = not scalar ? arr.size() : multibyte ? code_point_count(text) : text.size();
+    auto size = static_cast<s::int64_t>(n);
+    if (first < 0) first = s::max<s::int64_t>(first + size + 1, 1);
+    if (last < 0) last += size + 1;
+  }
+  last = s::max(last, first - 1);
+  // An append adds a word to element `last` and an array after it; else
+  // first … last are replaced.
+  bool to_last = append and not array and last >= 1;
+  s::int64_t at  = append and (to_last or array) ? last : first - 1;
+  s::int64_t end = append ? at : last;
+  if (scalar) {
+    // Byte offsets of characters, past the end at the end.
+    auto offset = [&](s::int64_t n) {
+      auto k = static_cast<s::size_t>(n);
+      return multibyte ? code_point_offset(text, k) : s::min(k, text.size());
+    };
+    str joined;
+    for (const auto& w : value) joined += w;
+    s::size_t b = offset(at), f = offset(s::max(end, at));
+    text.replace(b, f - b, joined);
+    return set_scalar(name, s::move(text));
+  }
+  // The array goes back as it was when the assignment fails.
+  auto restore = [&] {
+    if (p and p->get().is_array() and not p->get().handlers) p->get().set(s::move(arr));
+    return bad_range();
+  };
+  auto size = static_cast<s::int64_t>(arr.size());
+  // Growing past 2^28 elements would take gigabytes; zsh would try.
+  constexpr s::int64_t MAX_GROWTH = s::int64_t{1} << 28;
+  if (s::max(at, end) > size and s::max(at, end) > MAX_GROWTH) return restore();
+  try {
+    if (to_last) {
+      if (last > size) arr.resize(static_cast<s::size_t>(last));
+      arr[static_cast<s::size_t>(last - 1)] += value.empty() ? str{} : value[0];
+    } else {
+      if (at > size) arr.resize(static_cast<s::size_t>(at));
+      auto from = static_cast<s::size_t>(at);
+      auto to   = static_cast<s::size_t>(
+          s::clamp<s::int64_t>(end, at, static_cast<s::int64_t>(arr.size())));
+      if (not append and value.size() == 1 and to == from + 1) {
+        arr[from] = s::move(value[0]);
+      } else {
+        arr.erase(arr.begin() + static_cast<s::ptrdiff_t>(from),
+                  arr.begin() + static_cast<s::ptrdiff_t>(to));
+        arr.insert(arr.begin() + static_cast<s::ptrdiff_t>(from),
+                   s::make_move_iterator(value.begin()), s::make_move_iterator(value.end()));
+      }
+    }
+  } catch (const s::exception&) {   // length_error, bad_alloc
+    return restore();
+  }
+  return set_array(name, s::move(arr));
 }
 
 Result<void> ParamTable::set_array(
@@ -407,6 +496,14 @@ str param_type_text(const Param& p) {
   if (p.flags & PM_HIDEVAL)  t += "-hideval";
   if (p.flags & PM_SPECIAL)  t += "-special";
   return t;
+}
+
+vec<const s::pair<const str, str>*> sorted_entries(const umap<str, str>& h) {
+  vec<const s::pair<const str, str>*> items;
+  items.reserve(h.size());
+  for (const auto& kv : h) items.push_back(&kv);
+  s::sort(items.begin(), items.end(), [](auto* a, auto* b) { return a->first < b->first; });
+  return items;
 }
 
 }  // namespace jfsh

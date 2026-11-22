@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <utility>
 
 #include <jfsh/builtins/builtins.h>
 #include <jfsh/builtins/math.h>
@@ -57,7 +58,7 @@ opt<int> status_arg(vec<str>& args, ExecContext& ctx) {
     return s::nullopt;
   }
   if (args.size() < 2) return ctx.last_exit;
-  auto v = arith_eval(args[1], ctx.params, math_options(ctx.opts),
+  auto v = arith_eval(args[1], ctx.params, math_options(ctx),
                       &ctx.modules.math_funcs());
   if (not v) {
     builtin_error(args[0], v.error().message);
@@ -86,7 +87,16 @@ int builtin_eval(vec<str>& args, ExecContext& ctx) {
   if (text.find_first_not_of(" \t\n") == str::npos) return 0;
   FuncFrame frame{ctx, "(eval)"};
   ++ctx.code_runs;
-  return ctx.executor->exec_string(text);
+  bool hard = s::exchange(ctx.hard_error, false);
+  int rc = ctx.executor->exec_string(text);
+  // As zsh's eval, an error ends just the evaluated text; an interrupt,
+  // an exit and `${x?}` go on.
+  if (ctx.aborting and not ctx.interrupt and not ctx.exiting and not ctx.hard_error) {
+    ctx.aborting = ctx.abort_line = false;
+    if (rc == 0) rc = 1;
+  }
+  ctx.hard_error = ctx.hard_error or hard;
+  return rc;
 }
 
 // `exec` is handled by the executor as a precommand modifier; this runs

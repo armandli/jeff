@@ -278,7 +278,7 @@ TEST(Subst, LetBuiltin) {
   EXPECT_EQ(sh.get("y"), "42");
   EXPECT_EQ(sh.get("z"), "40");
   EXPECT_EQ(sh.run("let 0").rc, 1);
-  EXPECT_EQ(sh.run("let '1/0'").rc, 2);
+  EXPECT_EQ(sh.run("let '1/0'").rc, 1);
 }
 
 // ---- brace, tilde, equals, $'…' --------------------------------------------------
@@ -711,8 +711,8 @@ TEST(SubstReview, DeepNestingFailsCleanly) {
     r = sh.run("x=a; echo " + nest("\"${", "}\"", deep, "x"));
     EXPECT_TRUE(clean(r)) << r.err;
     str ao(deep, '('), ac(deep, ')');
-    r = sh.run("x='" + ao + "1" + ac + "'; echo $((x))");
-    EXPECT_TRUE(clean(r)) << r.err;
+    // Arithmetic nests on the heap, as zsh's does.
+    EXPECT_EQ(out(sh, "x='" + ao + "1" + ac + "'; echo $((x))"), "1\n");
     r = sh.run("echo " + nest("$((", "))", deep, "1"));
     EXPECT_TRUE(clean(r)) << r.err;
     // A pattern nested past the stack is literal text as a whole.

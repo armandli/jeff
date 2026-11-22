@@ -29,7 +29,7 @@ int builtin_example(vec<str>& args, ExecContext& ctx) {
         s::fprintf(stderr, "jfsh: example: option -m requires an argument\n");
         return 1;
       }
-      auto v = math_eval(args[i], ctx.params, math_options(ctx.opts),
+      auto v = math_eval(args[i], ctx.params, math_options(ctx),
                          &ctx.modules.math_funcs());
       if (not v) {
         s::fprintf(stderr, "jfsh: example: %s\n", v.error().message.c_str());

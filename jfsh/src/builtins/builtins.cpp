@@ -137,7 +137,7 @@ static int loop_control(vec<str>& args, ExecContext& ctx,
   };
   s::int64_t n = 1;
   if (args.size() > 1) {
-    auto v = arith_eval(args[1], ctx.params, math_options(ctx.opts),
+    auto v = arith_eval(args[1], ctx.params, math_options(ctx),
                         &ctx.modules.math_funcs());
     if (not v) {
       s::fprintf(stderr, "jfsh: %s: %s\n", name, v.error().message.c_str());
@@ -377,15 +377,17 @@ int builtin_zmodload(vec<str>& args, ExecContext& ctx) {
 }
 
 // `let expr…`: evaluates each expression; the status is 0 when the last
-// one is non-zero, 1 when it is zero, and 2 on an error.
+// one is non-zero, 1 when it is zero.  As in zsh an error is not fatal: it
+// ends the evaluation with the value 0, and the message has no `let:`.
 int builtin_let(vec<str>& args, ExecContext& ctx) {
+  if (args.size() < 2) return builtin_error(args[0], "not enough arguments");
   MathNum last;
   for (s::size_t i = 1; i < args.size(); ++i) {
-    auto v = math_eval(args[i], ctx.params, math_options(ctx.opts),
+    auto v = math_eval(args[i], ctx.params, math_options(ctx),
                        &ctx.modules.math_funcs());
     if (not v) {
-      s::fprintf(stderr, "jfsh: let: %s\n", v.error().message.c_str());
-      return 2;
+      s::fprintf(stderr, "jfsh: %s\n", v.error().message.c_str());
+      return 1;
     }
     last = *v;
   }

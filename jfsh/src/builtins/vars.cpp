@@ -65,6 +65,7 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
     Assignment a;
     a.name      = s::move(base);
     a.subscript = name.substr(lb + 1, name.size() - lb - 2);
+    a.subscript_whole = *a.subscript == "@" or *a.subscript == "*";
     a.value     = s::move(value);
     a.append    = append;
     if (auto r = ctx.executor->assign_expanded(a); not r) {
@@ -134,9 +135,11 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
   if (append and has_value) value = p->scalar() + value;
   s::uint32_t flags = (p->flags | attrs.on) & ~attrs.off;
   value = fold_case(s::move(value), flags);
+  int last_base = -1;
   auto math = [&](strv text) -> opt<MathNum> {
-    auto v = math_eval(text, ctx.params, math_options(ctx.opts),
-                       &ctx.modules.math_funcs());
+    MathOptions mo = math_options(ctx);
+    mo.last_base = &last_base;
+    auto v = math_eval(text, ctx.params, mo, &ctx.modules.math_funcs());
     if (not v) {
       s::fprintf(stderr, "jfsh: %.*s: %s\n", static_cast<int>(cmd.size()), cmd.data(),
                  v.error().message.c_str());
@@ -195,6 +198,9 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
   if (attrs.base) p->base = *attrs.base;
   else if ((attrs.type == 'i' and not was_integer) or (attrs.type == 'F' and not was_float))
     p->base = 0;
+  // As zsh's setstrvalue: an integer with no base takes the constants'
+  // (`typeset -i x=16#ff` is 16#FF).
+  if (has_value and p->is_integer() and p->base == 0 and last_base >= 2) p->base = last_base;
   if ((p->flags & PM_UNIQUE) and p->is_array()) p->set(unique(p->array()));
   if (has_value) ctx.params.note_assigned(name);
   return 0;
@@ -517,7 +523,7 @@ int builtin_unset(vec<str>& args, ExecContext& ctx) {
         h.erase(key);
         prm.set(s::move(h));
       } else if (prm.is_array()) {
-        auto v = math_eval(key, ctx.params, math_options(ctx.opts),
+        auto v = math_eval(key, ctx.params, math_options(ctx),
                            &ctx.modules.math_funcs());
         if (not v) {
           s::fprintf(stderr, "jfsh: unset: %s\n", v.error().message.c_str());

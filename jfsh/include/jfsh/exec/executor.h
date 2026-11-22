@@ -114,6 +114,9 @@ struct ExecContext {
   // A failed expansion (`${x?}`) set `aborting`: in a widget function it
   // throws away the line being edited too.
   bool abort_line  = false;
+  // Set by `${x?}`, zsh's ERRFLAG_HARD: unlike other errors it ends more
+  // than an `eval` (builtin_eval clears it before running and reads it).
+  bool hard_error  = false;
   // Set with `aborting` by an interrupt (Ctrl-C, a signal trap that
   // failed), as opposed to an error.  Cleared by its two readers before
   // they run their code: `source`, which ends the file on an error but goes
@@ -224,6 +227,9 @@ struct Assignment {
   // The subscript as written has a top-level comma (`a[2,3]=x`), as
   // opposed to one that came from an expansion (`i=2,3; a[$i]=x`).
   bool     subscript_comma = false;
+  // The subscript as written is `@` or `*`, the whole parameter (`h[$k]=x`
+  // with k=@ is the key `@`).
+  bool     subscript_whole = false;
 };
 
 // A single redirection decoded from the bytecode.  `fd == -1` means the
@@ -361,9 +367,14 @@ protected:
   int exec_compound(ExecState& es, ExecFlags);
   int exec_if      (ExecState& es, WordCode head);
   int exec_while   (ExecState& es, WordCode head);
+  // A loop that an error ended has status 1, as in zsh.
+  int loop_status(int rc) const noexcept {
+    return mCtx.aborting and not mCtx.interrupt ? 1 : rc;
+  }
   int exec_for     (ExecState& es, WordCode head);
   int exec_for_cond(ExecState& es, WordCode head);
   int exec_case    (ExecState& es, WordCode head);
+  const CompiledPattern& cached_pattern(const str& pat);
   int exec_select  (ExecState& es, WordCode head);
   int exec_repeat  (ExecState& es, WordCode head);
   int exec_subsh   (ExecState& es, WordCode head, ExecFlags);
@@ -535,9 +546,9 @@ private:
   bool           mExitTrapRan = false;
   bool           mParseFailed = false;   // exec_string hit a parse error (source)
   str*           mCondTrace   = nullptr;   // xtrace text of the [[ ]] being run
-  // `case` patterns compiled, by their text after expansion and the
-  // options compile() takes (exec_case).
-  HashTable<CompiledPattern> mCasePatterns;
+  // `case` and `[[ = ]]` patterns compiled, by their text after expansion
+  // and the options compile() takes (cached_pattern).
+  HashTable<CompiledPattern> mPatterns;
   HashTable<str> mCmdHash;     // command name → resolved path
   str            mHashedPath;  // $PATH the hash was built against
   s::uint64_t    mHashedGen = 0;   // ParamTable::path_generation() then

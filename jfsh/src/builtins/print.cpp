@@ -181,7 +181,7 @@ struct Printf {
       if (a->size() < 2) return MathNum::of(s::int64_t{0});
       return MathNum::of(static_cast<s::int64_t>(static_cast<unsigned char>((*a)[1])));
     }
-    auto v = math_eval(*a, ctx.params, math_options(ctx.opts),
+    auto v = math_eval(*a, ctx.params, math_options(ctx),
                        &ctx.modules.math_funcs());
     if (not v) {
       s::fprintf(stderr, "jfsh: %.*s: %s\n", static_cast<int>(cmd.size()), cmd.data(),
