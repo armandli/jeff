@@ -1,4 +1,6 @@
+#include <chrono>
 #include <clocale>
+#include <random>
 
 #include <gtest/gtest.h>
 
@@ -286,7 +288,7 @@ TEST(GlobPattern13c, EmptyRepeats) {
 }
 
 TEST(GlobPattern13c, CountedRepeatsAgree) {
-  // The set matcher accepts these; zsh's counter, which the backtracker
+  // The VM alone accepts these; zsh's counter, which the backtracker
   // copies, does not, and the backtracker decides.
   EXPECT_FALSE(ext("(?|cb)(#c1,2)").matches("cba"));
   EXPECT_FALSE(ext("(#b)(?|cb)(#c1,2)").matches("cba"));
@@ -331,9 +333,8 @@ TEST(GlobPattern13c, LongSubjects) {
   ASSERT_TRUE(ext("(#b)(a#)").matches(big, &pm));
   EXPECT_EQ(pm.groups, (vec<Span>{{0, big.size()}}));
   EXPECT_EQ(ext("a#").match_prefix(big, true), big.size());
-  // Where the backtracker gives up, the longest end.
+  // The VM, on which the backtracker of 13c.1 gave up.
   EXPECT_EQ(ext("(a|b)#").match_prefix(big, true), big.size());
-  // A search that turns exponential gives up too.
   str some(2000, 'a');
   EXPECT_EQ(ext("*a*a*a*c|a*").match_prefix(some, true), some.size());
 }
@@ -343,6 +344,312 @@ TEST(GlobPattern13c, LongSubjects) {
 TEST(GlobPattern13c, ExclusionsFollowSetSemantics) {
   EXPECT_TRUE(ext("(b|ba)~b").matches("ba"));
   EXPECT_TRUE(ext("(ba|b)~b").matches("ba"));
+}
+
+// M13 Phase 13c.2: the VM against the backtracker, which copies zsh's
+// matcher, on random patterns and subjects.
+
+// Random patterns in the style of the differential tester against zsh.
+// Inside `^` and `~` there are no repeats: there the VM follows the set
+// semantics of the policy (Pattern13c.ExclusionsFollowSetSemantics),
+// and the backtracker, sharing its repeats' marks with the rest of the
+// match, does not quite.
+struct PatternGen {
+  int pick(int n) { return s::uniform_int_distribution<int>(0, n - 1)(rng); }
+  double unit() { return s::uniform_real_distribution<double>(0, 1)(rng); }
+
+  str atom(int depth) {
+    double r = unit();
+    if (depth > 2) r *= 0.6;
+    if (r < 0.28) return str(1, "ab"[pick(2)]);
+    if (r < 0.36) return "*";
+    if (r < 0.42) return "?";
+    if (r < 0.46) return pick(2) ? "[ab]" : "[^a]";
+    if (r < 0.49) return pick(2) ? "(#s)" : "(#e)";
+    if (r < 0.53) return str(1, "ab"[pick(2)]) + (inner ? "" : pick(2) ? "#" : "##");
+    if (r < 0.55) return pick(2) ? "<1-12>" : "<->";
+    if (r < 0.57 and cases) return pick(2) ? "(#i)A" : "B(#I)";
+    int n = 1 + pick(3);
+    str g = "(";
+    for (int a = 0; a < n; ++a) {
+      bool neg = excl and unit() < 0.2;
+      str alt = (neg ? "^" : "") + nested(depth + 1, neg);
+      if (excl and unit() < 0.15 and not alt.empty()) alt += "~" + nested(depth + 1, true);
+      g += (a ? "|" : "") + alt;
+    }
+    g += ")";
+    if (inner or not loops) return g;
+    double q = unit();
+    if (q < 0.2) g += "#";
+    else if (q < 0.3) g += "##";
+    else if (q < 0.4 and counts)
+      g += "(#c" + s::to_string(pick(3)) + "," + s::to_string(1 + pick(3)) + ")";
+    return g;
+  }
+  str seq(int depth) {
+    str q;
+    for (int n = pick(4); n > 0; --n) q += atom(depth);
+    return q;
+  }
+  // A branch, inside `^` or `~` when `in`.
+  str nested(int depth, bool in) {
+    inner += in;
+    str q = seq(depth);
+    inner -= in;
+    return q;
+  }
+  str subject() {
+    str x;
+    for (int n = pick(length + 1); n > 0; --n) x += "abAB1"[pick(5)];
+    return x;
+  }
+
+  s::mt19937 rng;
+  bool       excl   = false;
+  bool       counts = false;
+  bool       cases  = false;
+  bool       loops  = true;   // repeats of groups
+  int        inner  = 0;
+  int        length = 6;      // of subjects, at most
+  bool       groups = true;   // the groups asked for
+};
+
+// Every way of matching, by `pat` and by the backtracker, without the
+// groups (where the VM caches its steps as a DFA's); cases where the
+// backtracker gives up are left out.
+void agree_bare(const CompiledPattern& pat, strv x, const str& what) {
+  auto bt = pat.engine(PatternEngine::Backtrack);
+  PrefixSearch gave;
+  bt.match_prefix(x, 0, true, nullptr, &gave);
+  bt.match_prefix(x, 0, false, nullptr, &gave);
+  if (gave.gave_up) return;
+  ASSERT_EQ(pat.matches(x), bt.matches(x)) << what;
+  for (bool longest : {true, false})
+    ASSERT_EQ(pat.match_prefix(x, longest), bt.match_prefix(x, longest)) << what << " " << longest;
+}
+
+// Every way of matching, by `pat` and by the backtracker; cases where the
+// backtracker gives up are left out.
+void agree(const CompiledPattern& pat, strv x, const str& what) {
+  auto bt = pat.engine(PatternEngine::Backtrack);
+  PatternMatch a, b;
+  PrefixSearch gave;
+  bt.match_prefix(x, 0, true, nullptr, &gave);
+  bt.match_prefix(x, 0, false, nullptr, &gave);
+  if (gave.gave_up) return;
+  bool m = pat.matches(x, &a);
+  ASSERT_EQ(m, bt.matches(x, &b)) << what;
+  if (m) ASSERT_EQ(a.groups, b.groups) << what;
+  for (bool longest : {true, false})
+    for (s::size_t from : {s::size_t{0}, s::size_t{1}}) {
+      if (from > x.size()) continue;
+      PrefixSearch s1, s2;
+      s::size_t e = pat.match_prefix(x, from, longest, &a, &s1);
+      ASSERT_EQ(e, bt.match_prefix(x, from, longest, &b, &s2)) << what << " " << longest << from;
+      if (e != str::npos) ASSERT_EQ(a.groups, b.groups) << what << " " << longest << from;
+    }
+  // A window, with (#e) still at the end of all of x.
+  if (not x.empty()) {
+    bool w = pat.matches(x, 0, x.size() - 1, &a);
+    ASSERT_EQ(w, bt.matches(x, 0, x.size() - 1, &b)) << what << " window";
+    if (w) ASSERT_EQ(a.groups, b.groups) << what << " window";
+  }
+}
+
+void agree_on(PatternGen gen, int patterns, PatternEngine engine = PatternEngine::Auto) {
+  for (int i = 0; i < patterns; ++i) {
+    str p = "(#b)" + gen.seq(0);
+    if (gen.excl and gen.unit() < 0.15) p = "(#b)^" + gen.nested(0, true);
+    if (gen.excl and gen.unit() < 0.15) p += "~" + gen.nested(1, true);
+    auto pat = ext(p).engine(engine);
+    for (int j = 0; j < 6; ++j) {
+      str x = gen.subject();
+      if (gen.groups) agree(pat, x, "'" + p + "' on '" + x + "'");
+      else agree_bare(pat, x, "'" + p + "' on '" + x + "'");
+      if (::testing::Test::HasFatalFailure()) return;
+    }
+  }
+}
+
+// As patterns match (with the VM, or the backtracker where zsh's quirks
+// need it), against the backtracker.
+TEST(GlobPattern13c2, MatchesAsTheBacktracker) {
+  agree_on(PatternGen{s::mt19937{1}}, 4000);
+}
+
+TEST(GlobPattern13c2, MatchesAsTheBacktrackerWithExclusions) {
+  PatternGen gen{s::mt19937{2}};
+  gen.excl = true;
+  agree_on(gen, 4000);
+}
+
+TEST(GlobPattern13c2, MatchesAsTheBacktrackerWithCountsAndCase) {
+  PatternGen gen{s::mt19937{3}};
+  gen.counts = gen.cases = true;
+  agree_on(gen, 4000);
+}
+
+TEST(GlobPattern13c2, MatchesAsTheBacktrackerWithAll) {
+  PatternGen gen{s::mt19937{4}};
+  gen.excl = gen.counts = gen.cases = true;
+  agree_on(gen, 4000);
+}
+
+// On longer subjects, without the groups: the VM's cached steps.
+TEST(GlobPattern13c2, MatchesAsTheBacktrackerOnLongerSubjects) {
+  PatternGen gen{s::mt19937{6}};
+  gen.excl = gen.counts = true;
+  gen.length = 24;
+  gen.groups = false;
+  agree_on(gen, 250);
+}
+
+// The same with the groups: the cached steps' threads and registers.
+TEST(GlobPattern13c2, MatchesAsTheBacktrackerOnLongerSubjectsWithGroups) {
+  // No `^`, `~` or counts: their state registers keep steps from being
+  // cached.
+  PatternGen gen{s::mt19937{7}};
+  gen.length = 40;
+  agree_on(gen, 600);
+}
+
+// Without repeats of groups nothing goes to the backtracker: the VM alone.
+TEST(GlobPattern13c2, VmAloneAgreesWithTheBacktracker) {
+  PatternGen gen{s::mt19937{5}};
+  gen.excl = gen.cases = true;
+  gen.loops = false;
+  agree_on(gen, 4000, PatternEngine::Vm);
+}
+
+// Where zsh's quirks need the backtracker, the VM alone differs: zsh's
+// marks of an inner repeat outlive the outer repeat's, and its counter
+// keeps a stale start.  The expected values are zsh's.
+TEST(GlobPattern13c2, QuirksTheVmLeavesToTheBacktracker) {
+  PatternMatch pm;
+  auto marks = ext("(#b)(((|?)#)|()a)#");
+  ASSERT_TRUE(marks.matches("ba", &pm));
+  EXPECT_EQ(pm.groups, (vec<Span>{{2, 2}, {2, 2}, {2, 2}, {1, 1}}));
+  ASSERT_TRUE(marks.engine(PatternEngine::Vm).matches("ba", &pm));
+  EXPECT_EQ(pm.groups[3], (Span{str::npos, str::npos}));
+  EXPECT_FALSE(ext("(?|cb)(#c1,2)").matches("cba"));
+  EXPECT_TRUE(ext("(?|cb)(#c1,2)").engine(PatternEngine::Vm).matches("cba"));
+}
+
+// How long these take, with room for a slow machine.
+template<typename F>
+double seconds(F f) {
+  auto t = s::chrono::steady_clock::now();
+  f();
+  return s::chrono::duration<double>(s::chrono::steady_clock::now() - t).count();
+}
+
+TEST(GlobPattern13c2, LinearOnLongSubjects) {
+  str z(200000, 'a');
+  str zc = z + "c";
+  PatternMatch pm;
+  EXPECT_LT(seconds([&] {
+              EXPECT_FALSE(ext("(#b)(*)(*)c").matches(z + "b", &pm));
+              ASSERT_TRUE(ext("(#b)(*)(*)c").matches(zc, &pm));
+              EXPECT_EQ(pm.groups, (vec<Span>{{0, z.size()}, {z.size(), z.size()}}));
+              EXPECT_FALSE(ext("(#b)(a#)(a#)c").matches(z + "b", &pm));
+              ASSERT_TRUE(ext("(#b)(a#)(a#)c").matches(zc, &pm));
+              EXPECT_EQ(pm.groups, (vec<Span>{{0, z.size()}, {z.size(), z.size()}}));
+              EXPECT_EQ(ext("(a|b)#").match_prefix(z, true), z.size());
+              EXPECT_EQ(ext("(#b)(a|b)#").match_prefix(z, true, &pm), z.size());
+              EXPECT_EQ(pm.groups, (vec<Span>{{z.size() - 1, z.size()}}));
+            }),
+            5.0);
+  // A large count: a counter, not a set of positions per repeat.
+  EXPECT_LT(seconds([&] {
+              ASSERT_TRUE(ext("(#b)(a|b)(#c1,300000)").matches(z, &pm));
+              EXPECT_EQ(pm.groups, (vec<Span>{{z.size() - 1, z.size()}}));
+              EXPECT_FALSE(ext("(a|b)(#c1,150000)").matches(z));
+              EXPECT_EQ(ext("(a|b)(#c1,150000)").match_prefix(z, true), 150000u);
+            }),
+            5.0);
+  // Flags leaked past a count, on a chain of repeats too long for the
+  // backtracker (zsh: 0).
+  str leak(20000, 'a');
+  EXPECT_LT(seconds([&] { EXPECT_TRUE(ext("((#i)A)(#c1,200000)B").matches(leak + "b")); }), 5.0);
+}
+
+TEST(GlobPattern13c2, PolynomialOnNestedCarets) {
+  // Each `^` after a `*` is one run for all its starts.  ^*(^*b) matches
+  // nothing, so this is *c (zsh agrees on short subjects).
+  str w(1000, 'a');
+  auto pat = ext("*(^*(^*(^*b)))c");
+  EXPECT_LT(seconds([&] {
+              EXPECT_FALSE(pat.matches(w + "c" + w));
+              EXPECT_TRUE(pat.matches(w + "b" + w + "c"));
+            }),
+            10.0);
+}
+
+TEST(GlobPattern13c2, ShapesAfterStars) {
+  str e(8000, 'a');
+  EXPECT_LT(seconds([&] {
+              // A count that cannot reach its maximum is one state.
+              EXPECT_FALSE(ext("*(a)(#c1,100000)c").matches(e + "bc"));
+              EXPECT_TRUE(ext("*(a)(#c1,100000)c").matches(e + "c"));
+              // The starts of a context that go on alike are one.
+              EXPECT_TRUE(ext("*(^*b)c").matches(e + "c"));
+              EXPECT_TRUE(ext("(#b)*(^*b)c").matches(e + "c"));
+              PatternMatch pm;
+              ASSERT_TRUE(ext("(#b)(*)(*~*b)c").matches(e + "c", &pm));
+              EXPECT_EQ(pm.groups, (vec<Span>{{0, e.size()}, {e.size(), e.size()}}));
+            }),
+            5.0);
+  // The usual shapes, as a DFA's steps.
+  str path = "b";
+  while (path.size() < 200000) path += "ab/c.d";
+  str z(200000, 'a');
+  EXPECT_LT(seconds([&] {
+              for (int i = 0; i < 20; ++i) {
+                EXPECT_TRUE(ext("b*").matches(path));
+                EXPECT_EQ(ext("*/").match_prefix(path, true), path.size() - 3);
+                EXPECT_TRUE(ext("(*)(*)c").matches(z + "c"));
+                EXPECT_TRUE(ext("a##").matches(z));
+                PatternMatch pm;
+                ASSERT_TRUE(ext("(#b)(*)(*)c").matches(z + "c", &pm));
+                EXPECT_EQ(pm.groups, (vec<Span>{{0, z.size()}, {z.size(), z.size()}}));
+              }
+            }),
+            5.0);
+}
+
+TEST(GlobPattern13c2, StrayContinuationBytesStayLinear) {
+  Utf8Ctype loc;
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  str x;
+  for (int i = 0; i < 20000; ++i) x += '\xa9';
+  x += 'A';
+  EXPECT_LT(seconds([&] {
+              EXPECT_EQ(ext("*[[:upper:]]", true).match_prefix(x, false), x.size());
+              EXPECT_EQ(ext("*", true).match_prefix(x, false), 0u);
+            }),
+            5.0);
+}
+
+TEST(GlobPattern13c2, PrefixSearchesStayFast) {
+  // ${x//…} tries every start: each is short.
+  str x;
+  for (int i = 0; i < 15000; ++i) x += "ab";
+  EXPECT_LT(seconds([&] {
+              for (strv p : {"a", "(#b)(a)", "(a|ab)"}) {
+                auto pat = ext(p);
+                PatternMatch pm;
+                s::size_t found = 0;
+                for (s::size_t b = 0; b < x.size(); ++b)
+                  if (pat.match_prefix(x, b, true, &pm) != str::npos) ++found;
+                EXPECT_EQ(found, x.size() / 2) << p;
+              }
+              // With a character no match lacks, a start without it is no
+              // run.
+              auto pat = ext("(#b)(*)(*)c");
+              for (s::size_t b = 0; b < x.size(); ++b)
+                EXPECT_EQ(pat.match_prefix(x, b, true), str::npos);
+            }),
+            5.0);
 }
 
 }  // namespace

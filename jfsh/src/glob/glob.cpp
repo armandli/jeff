@@ -13,6 +13,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <functional>
 #include <utility>
 
@@ -94,6 +96,8 @@ struct TailLiteral {
   s::size_t             bytes = 0;   // their length as written
 };
 
+struct VmProgram;
+
 struct CompiledPattern::Impl {
   // One Group: the alternatives at the top level, each with its `~`
   // exclusions.
@@ -106,14 +110,23 @@ struct CompiledPattern::Impl {
   int  end_approx = 0;       // (#aN) in force at the end
   bool multibyte  = false;   // ? [...] and literals take a UTF-8 character
   bool bad        = false;   // zsh's "bad pattern": it matches nothing
-  // A (#cN,M) seen.  zsh's counter keeps where the last repeat began even
-  // as attempts fail, so it rejects some matches the set matcher finds;
-  // with one the backtracker decides.
-  bool counted    = false;
-  // A (#cN,M) whose flags leak; the set matcher cannot follow it, so the
-  // backtracker decides without it.
+  // A (#cN,M) whose operand can match in more than one way from a place.
+  // zsh's counter keeps where the last repeat began even as attempts
+  // fail, so it rejects some matches the VM finds; the backtracker
+  // decides and the VM only filters.
+  bool stale      = false;
+  // A (#cN,M) whose flags leak (Node::leaks), and whether the VM follows
+  // them (vm_follows_leaks()); where it does not, the backtracker decides
+  // without it.
   bool leaky      = false;
+  bool vm_leaks   = false;
+  // A repeat of a group inside another repeat (see nested_repeats()),
+  // where zsh's marks reject some matches the VM finds: the backtracker
+  // decides and the VM only filters.
+  bool marks      = false;
   int  nodes      = 0;       // the pattern's size, for the backtracker's budget
+  // The pattern compiled for the VM (see VmProgram).
+  sptr<const VmProgram> vm;
 };
 
 namespace {
@@ -381,7 +394,6 @@ struct PatternParser {
       hi = number(-1);
     }
     if (k != text.size() or not can_count) { bad = true; return; }
-    impl.counted = true;
     Node rep;
     rep.kind    = Kind::Repeat;
     rep.counted = true;
@@ -656,6 +668,13 @@ struct Subject {
     return q == lim;
   }
 
+  // Takes the flags a VM Leak register holds (VmProgram::RegKind::Leak).
+  void set_leak(s::int64_t v) const {
+    leak_epoch = v <= 0 ? -1 : static_cast<int>((v - 1) >> 2);
+    leak_nocase = v > 0 and ((v - 1) & 1) != 0;
+    leak_lower  = v > 0 and ((v - 1) & 2) != 0;
+  }
+
   strv      s;
   s::size_t lim = 0;
   bool      mb  = false;
@@ -669,171 +688,14 @@ struct Subject {
   mutable bool leak_lower  = false;
 };
 
-// The positions a pattern can have reached in the subject, ascending and
-// without repeats.
-using Positions = vec<s::size_t>;
-
-Positions normalized(Positions p) {
-  if (s::is_sorted(p.begin(), p.end()) and s::adjacent_find(p.begin(), p.end()) == p.end())
-    return p;
-  s::sort(p.begin(), p.end());
-  p.erase(s::unique(p.begin(), p.end()), p.end());
-  return p;
-}
-
-Positions joined(const Positions& a, const Positions& b) {
-  Positions out;
-  out.reserve(a.size() + b.size());
-  s::set_union(a.begin(), a.end(), b.begin(), b.end(), s::back_inserter(out));
-  return out;
-}
-
-Positions without(const Positions& a, const Positions& b) {
-  Positions out;
-  s::set_difference(a.begin(), a.end(), b.begin(), b.end(), s::back_inserter(out));
-  return out;
-}
-
-bool has(const Positions& set, s::size_t p) {
-  return s::binary_search(set.begin(), set.end(), p);
-}
-
-// For patterns without (#aN): runs the pattern over the set of positions
-// it may be at, one node at a time, as a Thompson NFA does.  It decides
-// whether, and where, a match ends; (#b) groups and which end zsh's greedy
-// search reaches first come from the backtracker.  No backtracking, so
-// time is bounded by pattern size times subject length (times it again
-// for each `^` and `~`), and the stack only grows with the nesting of
-// groups in the pattern, never with the subject.
-struct SetMatcher : Subject {
-  // The positions after `n` has matched from any of `set`.
-  Positions node(const Node& n, const Positions& set) const {
-    Positions out;
-    switch (n.kind) {
-      case Kind::Lit: case Kind::Any: case Kind::Class:
-        for (s::size_t p : set) {
-          s::size_t next = 0;
-          if (one(n, p, next)) out.push_back(next);
-        }
-        if (mb) out = normalized(s::move(out));
-      break; case Kind::Star:
-        if (set.empty()) break;
-        for (s::size_t p = set.front(), k = 0; p <= lim; ++p) {
-          bool listed = k < set.size() and set[k] == p;
-          if (listed) ++k;
-          if (listed or boundary(p)) out.push_back(p);
-        }
-      break; case Kind::AtStart:
-        if (not notstart and not set.empty() and set.front() == 0) out.push_back(0);
-      break; case Kind::AtEnd:
-        if (not notend and has(set, s.size())) out.push_back(s.size());
-      break; case Kind::Group:
-        // Matching nests as the pattern did; past the stack it fails.
-        if (stack_low()) break;
-        for (s::size_t a = 0; a < n.alts.size(); ++a) {
-          bool excl = not n.alt_excludes[a].empty();
-          if (not n.negate and not excl) {
-            out = joined(out, seq(n.alts[a], set));
-            continue;
-          }
-          // `^x` and `x~y` depend on where the alternative started.
-          for (s::size_t p : set) {
-            Positions part = seq(n.alts[a], Positions{p});
-            if (n.negate) {
-              Positions rest;
-              for (s::size_t e = p; e <= lim; ++e)
-                if (boundary(e) and not has(part, e)) rest.push_back(e);
-              part = s::move(rest);
-            }
-            for (const auto& ex : n.alt_excludes[a])
-              part = without(part, seq(ex, Positions{p}));
-            out = joined(out, part);
-          }
-        }
-      break; case Kind::Range:
-        for (s::size_t p : set) {
-          s::uint64_t v = 0;
-          bool big = false;
-          for (s::size_t e = p; e < lim and s::isdigit(static_cast<unsigned char>(s[e])); ++e) {
-            unsigned d = static_cast<unsigned>(s[e] - '0');
-            if (v > (INT64_MAX - d) / 10) big = true;
-            else v = v * 10 + d;
-            s::int64_t x = big ? INT64_MAX : static_cast<s::int64_t>(v);
-            if ((not n.has_lo or x >= n.lo) and (not n.has_hi or x <= n.hi)) out.push_back(e + 1);
-            else if (n.has_hi and x > n.hi) break;
-          }
-        }
-        out = normalized(s::move(out));
-      break; case Kind::Repeat:
-        out = repeat(n, set);
-      break; default:
-        assert(false);  // should never get here
-    }
-    return out;
-  }
-
-  // x# (min 0), x## (min 1) and x(#cN,M): every position after from `min`
-  // to `max` (no limit when negative) matches of the sub-pattern.
-  Positions repeat(const Node& n, const Positions& set) const {
-    const Node& sub = *n.sub;
-    Positions out;
-    if (n.max < 0 and n.min <= 1 and single_char(sub)) {
-      // A run of single characters: from each start, every position up to
-      // where the run ends.  A start the previous run went through adds
-      // nothing; one inside a character of it (after a byte literal) may.
-      bool any = false;
-      s::size_t done = 0;   // where the last run ended
-      for (s::size_t p : set) {
-        if (any and p <= done and boundary(p)) continue;
-        if (n.min == 0) out.push_back(p);
-        s::size_t q = p, next = 0;
-        while (one(sub, q, next)) out.push_back(q = next);
-        done = q;
-        any = true;
-      }
-      return normalized(s::move(out));
-    }
-    Positions cur = set;
-    int count = 0;
-    for (; count < n.min and not cur.empty(); ++count) cur = node(sub, cur);
-    if (count < n.min) return {};
-    if (n.max >= 0) {
-      out = cur;
-      for (; count < n.max and not cur.empty(); ++count) {
-        cur = node(sub, cur);
-        out = joined(out, cur);
-      }
-      return out;
-    }
-    // Any number more: every position reachable from `cur`.
-    vec<bool> seen(lim + 1, false);
-    for (s::size_t p : cur) { seen[p] = true; out.push_back(p); }
-    Positions frontier = s::move(cur);
-    while (not frontier.empty()) {
-      Positions fresh;
-      for (s::size_t p : node(sub, frontier))
-        if (not seen[p]) { seen[p] = true; fresh.push_back(p); }
-      out.insert(out.end(), fresh.begin(), fresh.end());
-      frontier = s::move(fresh);
-    }
-    return normalized(s::move(out));
-  }
-
-  Positions seq(const Seq& q, Positions set) const {
-    for (const auto& n : q) {
-      if (set.empty()) break;
-      set = node(n, set);
-    }
-    return set;
-  }
-};
-
 using Cont = func<bool(s::size_t)>;
 
 // A backtracking matcher over s[.., lim) that tries the ways to match in
 // the order zsh's does: alternatives left to right, `*`, repeats and
-// <lo-hi> longest first.  It gives the (#b) groups of a match, the end
-// zsh's search reaches first, and runs (#aN).  `errs` counts the (#aN)
+// <lo-hi> longest first.  It runs (#aN), and decides the patterns whose
+// zsh quirks the VM does not follow (see backtracked()); tests compare the
+// VM with it.  It gives the (#b) groups of a match and the end zsh's
+// search reaches first.  `errs` counts the (#aN)
 // errors made so far; `caps` the (#b) groups' extents, put back as
 // alternatives fail.  It recurses per node matched, so on a subject too
 // long for the stack, or after so many steps that the search is
@@ -1146,6 +1008,1785 @@ struct Matcher : Subject {
   mutable bool      spent = false;
 };
 
+// Whether node n, matched from a place, goes on from at most one end, in
+// one way.  Then zsh's (#cN,M) of it always knows where its last repeat
+// began: its stale start differs from the true one only after another
+// way of matching a repeat was tried.  Conservative: alternatives must
+// start with literals that no one character matches both of.
+bool calls_once(const Node& n, bool mb);
+
+bool seq_once(const Seq& q, bool mb) {
+  return s::all_of(q.begin(), q.end(), [&](const Node& n) { return calls_once(n, mb); });
+}
+
+// The characters, folded for case, that branch q may start with: false
+// when it may start otherwise.
+bool first_keys(const Seq& q, bool mb, vec<s::uint64_t>& out) {
+  if (q.empty() or q[0].kind != Kind::Lit) return false;
+  const Node& l = q[0];
+  if (l.bad) {
+    out.push_back((s::uint64_t{1} << 40) | l.ch);
+    return true;
+  }
+  if (not mb) {
+    out.push_back(static_cast<s::uint64_t>(s::tolower(static_cast<int>(l.ch))));
+    return true;
+  }
+  auto fold = [](char32_t c) {
+    auto w = static_cast<wint_t>(c);
+    return static_cast<s::uint64_t>(::iswupper(w) ? ::towlower(w) : w);
+  };
+  out.push_back(fold(l.ch));
+  if (l.lower and ::iswlower(static_cast<wint_t>(l.ch)))
+    out.push_back(fold(static_cast<char32_t>(::towupper(static_cast<wint_t>(l.ch)))));
+  return true;
+}
+
+bool calls_once(const Node& n, bool mb) {
+  switch (n.kind) {
+    case Kind::Lit: case Kind::Any: case Kind::Class: case Kind::AtStart: case Kind::AtEnd:
+      return true;
+    case Kind::Repeat:
+      return n.counted and n.min == n.max and calls_once(*n.sub, mb);
+    case Kind::Group: {
+      if (n.negate) return false;
+      for (s::size_t a = 0; a < n.alts.size(); ++a)
+        if (not n.alt_excludes[a].empty() or not seq_once(n.alts[a], mb)) return false;
+      if (n.alts.size() < 2) return true;
+      vec<s::uint64_t> all;
+      for (const auto& alt : n.alts) {
+        vec<s::uint64_t> keys;
+        if (not first_keys(alt, mb, keys)) return false;
+        s::sort(keys.begin(), keys.end());
+        keys.erase(s::unique(keys.begin(), keys.end()), keys.end());
+        all.insert(all.end(), keys.begin(), keys.end());
+      }
+      s::sort(all.begin(), all.end());
+      return s::adjacent_find(all.begin(), all.end()) == all.end();
+    }
+    default:
+      return false;
+  }
+}
+
+// Whether n may match nothing.
+bool nullable(const Node& n) {
+  switch (n.kind) {
+    case Kind::Lit: case Kind::Any: case Kind::Class: case Kind::Range:
+      return false;
+    case Kind::Repeat:
+      return n.min == 0 or nullable(*n.sub);
+    case Kind::Group:
+      if (n.negate) return true;
+      for (const auto& alt : n.alts)
+        if (s::all_of(alt.begin(), alt.end(), [](const Node& x) { return nullable(x); }))
+          return true;
+      return false;
+    default:
+      return true;
+  }
+}
+
+// Whether, outside the programs of `^` and `~`, a repeat of a group (zsh's
+// P_WBRANCH, with marks) is in the operand of another repeat (`inside`).
+// zsh keeps the inner one's marks across the outer one's repeats: a
+// repeat of the inner one is not tried again from a place an attempt that
+// failed already tried it from, even where what follows differs: on ba,
+// (#b)(((|?)#)|()a)# matches the a with ()a, the inner repeat having been
+// tried from there.  The VM does not follow.
+bool nested_repeats(const Node& n, bool inside) {
+  if (n.kind == Kind::Repeat) {
+    if (inside and not n.counted and not single_char(*n.sub)) return true;
+    return nested_repeats(*n.sub, true);
+  }
+  if (n.kind != Kind::Group or n.negate) return false;
+  for (const auto& alt : n.alts)
+    for (const auto& x : alt)
+      if (nested_repeats(x, inside)) return true;
+  return false;
+}
+
+// Whether a (#cN,M) under n repeats something that calls_once() is not
+// sure of.
+bool has_stale_count(const Node& n, bool mb) {
+  if (n.kind == Kind::Repeat)
+    return (n.counted and not calls_once(*n.sub, mb)) or has_stale_count(*n.sub, mb);
+  if (n.kind != Kind::Group) return false;
+  auto any = [&](const Seq& q) {
+    return s::any_of(q.begin(), q.end(), [&](const Node& x) { return has_stale_count(x, mb); });
+  };
+  for (s::size_t a = 0; a < n.alts.size(); ++a) {
+    if (any(n.alts[a])) return true;
+    for (const auto& ex : n.alt_excludes[a])
+      if (any(ex)) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// The pattern VM, for patterns without (#aN): a Pike VM.  The pattern is
+// compiled to instructions and run over the subject one character at a
+// time with all its threads at once, so time is the subject's length
+// times the program's, and the stack grows with neither.  The threads are
+// kept in the order zsh's backtracking tries them (alternatives left to
+// right; `*`, x#, (#cN,M) and <lo-hi> longest first), so the first thread
+// to match is the match zsh finds, with its (#b) groups, and with the end
+// left open the first to get to the end of the pattern gives the end
+// zsh's ##, / and // take.  Two threads at the same instruction with the
+// same state go on alike, so only the first is kept.
+//
+// `^x` and the exclusions of `x~y` run as programs of their own (contexts)
+// beside the one they are in, as sets: each of their states carries the
+// starts it was reached from, so the starts that pile up after a `*`
+// share one run, and *(^*(^*b))c stays a low power of the subject's
+// length.
+// ---------------------------------------------------------------------------
+
+struct VmProgram {
+  enum class Op : s::uint8_t {
+    Char,        // a character `node` (a Lit, Any or Class) matches, then x
+    AnyChar,     // any character, then x
+    Digit,       // a digit of a <lo-hi>, read by range x in state y
+    Split,       // x, then y
+    Loop,        // x#, `*`, ^'s body: x (another repeat), then y; in reg (if
+                 // >= 0) where the repeat began.  As zsh's marks (P_WBRANCH),
+                 // arriving again at a position goes to y.
+    Jmp,         // x
+    Boundary,    // a character may start here
+    Save,        // group register x = the position
+    AtStart,     // (#s)
+    AtEnd,       // (#e)
+    CountInit,   // (#cN,M) of `node`, counter in reg: no repeats yet
+    CountTest,   // another repeat (x) or what follows (y)
+    CountInc,    // a repeat matched; then x
+    CtxStart,    // starts context x here, its start in reg
+    NegExit,     // ^: a boundary where context x from reg does not match
+    ExclCheck,   // ~: context x from reg does not match up to here
+    Tail,        // TailLiteral x matches the rest: a whole match
+    Match,
+  };
+  // What a state register holds: a (#cN,M)'s count, where its (or an
+  // x#'s) repeat being tried began, where a context started, or the case
+  // flags a (#cN,M) leaked (0 none; else 1 + 4 * its leak_epoch + 1 for
+  // (#i) + 2 for (#l)).
+  enum class RegKind : s::uint8_t { Count, Iter, Ctx, Leak };
+
+  struct Inst {
+    Op          op    = Op::Match;
+    s::int32_t  x     = 0;
+    s::int32_t  y     = 0;
+    s::int32_t  reg   = 0;
+    const Node* node  = nullptr;
+    // The state registers that matter here: live[live, live + nlive).
+    s::uint32_t live  = 0;
+    s::uint32_t nlive = 0;
+  };
+  struct Reg {
+    RegKind    kind = RegKind::Count;
+    int        min  = 0;    // Count: its (#cN,M)'s bounds
+    int        max  = -1;
+    s::int32_t ctx  = -1;   // Ctx: which context
+  };
+  // A <lo-hi> as an automaton over digits: [pc0 + 2s] decides whether
+  // state s may end the number, [pc0 + 2s + 1] reads another digit.
+  struct Range {
+    vec<s::array<s::int32_t, 10>> next;   // -1: no number in range follows
+    vec<char>                     accepting;
+    s::int32_t                    pc0 = 0;
+  };
+  // A program run beside the one it is in: the x of `^x`, or the
+  // exclusions of a branch.
+  struct Context {
+    s::int32_t entry = 0;
+  };
+
+  vec<Inst>       code;
+  vec<s::int32_t> live;
+  vec<Reg>        regs;       // the state registers
+  vec<Range>      ranges;
+  vec<Context>    ctxs;         // inner ones after those they are in
+  s::int32_t      whole  = 0;   // a whole match, with the TailLiteral forms
+  s::int32_t      prefix = 0;   // a match of a prefix
+  int             caps   = 0;   // the group registers, two per group
+  bool            tails  = false;  // `whole` has TailLiteral forms
+  s::int32_t      leak   = -1;  // the Leak register, live everywhere, if any
+  // ASCII characters that every match has as a literal without case flags:
+  // where one is missing there is nothing to run.
+  vec<char>       needs;
+};
+
+namespace {
+
+using Op   = VmProgram::Op;
+using Inst = VmProgram::Inst;
+
+// The automaton of `<lo-hi>`: the digits of a number, with any leading
+// zeros, whose value (saturating at INT64_MAX, as zsh's) is in range.
+VmProgram::Range range_automaton(const Node& n) {
+  // A saturated value is in range of an upper bound of INT64_MAX, and no
+  // value is below a lower bound of 0.
+  bool has_hi = n.has_hi and n.hi < INT64_MAX;
+  bool has_lo = n.has_lo and n.lo > 0;
+  str lo = has_lo ? s::to_string(n.lo) : str();
+  str hi = has_hi ? s::to_string(n.hi) : str();
+  int cap = static_cast<int>(s::max(lo.size(), hi.size())) + 1;
+  // A state: whether a digit was read, how many significant digits were,
+  // and how they compare with as many digits of lo and of hi.
+  struct State {
+    bool any = false;
+    int  k   = 0;
+    int  clo = 0, chi = 0;
+  };
+  auto cmp = [](int k, int c, const str& v) {
+    int len = static_cast<int>(v.size());
+    return k < len ? -1 : k > len ? 1 : c;
+  };
+  auto id_of = [&](const State& st) {
+    return ((static_cast<int>(st.any) * 64 + st.k) * 3 + st.clo + 1) * 3 + st.chi + 1;
+  };
+  VmProgram::Range r;
+  vec<State> states{State{}};
+  umap<int, s::int32_t> ids{{id_of(State{}), 0}};
+  for (s::size_t i = 0; i < states.size(); ++i) {
+    State st = states[i];
+    s::array<s::int32_t, 10> next{};
+    for (int d = 0; d < 10; ++d) {
+      // A leading zero leaves the value 0.
+      State t;
+      t.any = true;
+      if (st.k > 0 or d > 0) {
+        auto digit_cmp = [&](int c, const str& v) {
+          if (c != 0 or st.k >= static_cast<int>(v.size())) return c;
+          int w = v[static_cast<s::size_t>(st.k)] - '0';
+          return d < w ? -1 : d > w ? 1 : 0;
+        };
+        t.k   = s::min(st.k + 1, cap);
+        t.clo = digit_cmp(st.clo, lo);
+        t.chi = digit_cmp(st.chi, hi);
+      }
+      if (has_hi and cmp(t.k, t.chi, hi) > 0) {
+        next[static_cast<s::size_t>(d)] = -1;
+        continue;
+      }
+      auto [it, fresh] = ids.try_emplace(id_of(t), static_cast<s::int32_t>(states.size()));
+      if (fresh) states.push_back(t);
+      next[static_cast<s::size_t>(d)] = it->second;
+    }
+    r.next.push_back(next);
+  }
+  for (const auto& st : states)
+    r.accepting.push_back(st.any and (not has_lo or cmp(st.k, st.clo, lo) >= 0)
+                          and (not has_hi or cmp(st.k, st.chi, hi) <= 0));
+  return r;
+}
+
+// Compiles a pattern's tree for the VM.
+struct VmCompiler {
+  // A context's program, compiled after the code it is started from.
+  struct Pending {
+    s::int32_t      ctx;
+    vec<const Seq*> seqs;   // it matches when one of them does
+  };
+  // How long the operand of x## may be and still be compiled twice.
+  static constexpr s::int32_t MAX_CODE = 1 << 15;
+
+  s::int32_t at() const { return static_cast<s::int32_t>(p.code.size()); }
+
+  s::int32_t emit(Op op, s::int32_t x = 0, s::int32_t y = 0, s::int32_t reg = 0,
+                  const Node* node = nullptr) {
+    Inst in;
+    in.op    = op;
+    in.x     = x;
+    in.y     = y;
+    in.reg   = reg;
+    in.node  = node;
+    in.live  = static_cast<s::uint32_t>(p.live.size());
+    in.nlive = static_cast<s::uint32_t>(live.size());
+    p.live.insert(p.live.end(), live.begin(), live.end());
+    p.code.push_back(in);
+    return at() - 1;
+  }
+
+  // The first of `targets` that matches, in order.
+  s::int32_t chain(const vec<s::int32_t>& targets) {
+    if (targets.size() == 1) return targets[0];
+    s::int32_t first = at();
+    for (s::size_t a = 0; a + 1 < targets.size(); ++a) {
+      s::int32_t pc = at();
+      emit(Op::Split, targets[a], a + 2 < targets.size() ? pc + 1 : targets[a + 1]);
+    }
+    return first;
+  }
+
+  s::int32_t reg(VmProgram::Reg r) {
+    p.regs.push_back(r);
+    return static_cast<s::int32_t>(p.regs.size() - 1);
+  }
+
+  // A context that matches when one of `seqs` does, and its start's
+  // register.
+  s::pair<s::int32_t, s::int32_t> context(vec<const Seq*> seqs) {
+    auto c = static_cast<s::int32_t>(p.ctxs.size());
+    p.ctxs.push_back({0});
+    pending.push_back({c, s::move(seqs)});
+    return {c, reg({VmProgram::RegKind::Ctx, 0, -1, c})};
+  }
+
+  void seq(const Seq& q, bool caps) {
+    for (const auto& n : q) node(n, caps);
+  }
+
+  // Node n; with `caps`, saving its groups.
+  void node(const Node& n, bool caps) {
+    switch (n.kind) {
+      case Kind::Lit: case Kind::Any: case Kind::Class: {
+        s::int32_t pc = emit(Op::Char, 0, 0, 0, &n);
+        p.code[static_cast<s::size_t>(pc)].x = pc + 1;
+      }
+
+      break; case Kind::Star: {
+        // Greedy: another character first, and an end only where a
+        // character may start.
+        s::int32_t l = emit(Op::Loop, 0, 0, -1);
+        emit(Op::AnyChar, l);
+        emit(Op::Boundary);
+        p.code[static_cast<s::size_t>(l)].x = l + 1;
+        p.code[static_cast<s::size_t>(l)].y = l + 2;
+      }
+
+      break; case Kind::AtStart: emit(Op::AtStart);
+
+      break; case Kind::AtEnd: emit(Op::AtEnd);
+
+      break; case Kind::Range: range(n);
+
+      break; case Kind::Group: group(n, caps);
+
+      break; case Kind::Repeat: repeat(n, caps);
+
+      break; default:
+        assert(false);  // should never get here
+    }
+  }
+
+  void range(const Node& n) {
+    auto r = range_automaton(n);
+    r.pc0 = at();
+    auto states = static_cast<s::int32_t>(r.next.size());
+    s::int32_t exit = r.pc0 + 2 * states;
+    auto idx = static_cast<s::int32_t>(p.ranges.size());
+    for (s::int32_t st = 0; st < states; ++st) {
+      s::int32_t read = r.pc0 + 2 * st + 1;
+      if (r.accepting[static_cast<s::size_t>(st)]) emit(Op::Split, read, exit);
+      else emit(Op::Jmp, read);
+      emit(Op::Digit, idx, st);
+    }
+    p.ranges.push_back(s::move(r));
+  }
+
+  void group(const Node& g, bool caps) {
+    bool saves = caps and g.capture >= 0;
+    if (saves) emit(Op::Save, 2 * g.capture);
+    if (g.negate) {
+      // Anything, longest first, but where the context of the one branch
+      // matches.
+      auto [c, r] = context({&g.alts[0]});
+      emit(Op::CtxStart, c, 0, r);
+      live.push_back(r);
+      s::int32_t l = emit(Op::Loop, 0, 0, -1);
+      emit(Op::AnyChar, l);
+      emit(Op::NegExit, c, 0, r);
+      live.pop_back();
+      p.code[static_cast<s::size_t>(l)].x = l + 1;
+      p.code[static_cast<s::size_t>(l)].y = l + 2;
+    } else {
+      vec<s::int32_t> jumps;
+      for (s::size_t a = 0; a < g.alts.size(); ++a) {
+        s::int32_t split = a + 1 < g.alts.size() ? emit(Op::Split) : -1;
+        branch(g, a, caps);
+        jumps.push_back(emit(Op::Jmp));
+        if (split >= 0) {
+          p.code[static_cast<s::size_t>(split)].x = split + 1;
+          p.code[static_cast<s::size_t>(split)].y = at();
+        }
+      }
+      for (s::int32_t j : jumps) p.code[static_cast<s::size_t>(j)].x = at();
+    }
+    if (saves) emit(Op::Save, 2 * g.capture + 1);
+  }
+
+  // Branch a of group g, with its exclusions.
+  void branch(const Node& g, s::size_t a, bool caps) {
+    const auto& ex = g.alt_excludes[a];
+    if (ex.empty()) {
+      seq(g.alts[a], caps);
+      return;
+    }
+    vec<const Seq*> seqs;
+    for (const auto& q : ex) seqs.push_back(&q);
+    auto [c, r] = context(s::move(seqs));
+    emit(Op::CtxStart, c, 0, r);
+    live.push_back(r);
+    seq(g.alts[a], caps);
+    emit(Op::ExclCheck, c, 0, r);
+    live.pop_back();
+  }
+
+  void repeat(const Node& n, bool caps) {
+    const Node& sub = *n.sub;
+    if (n.counted) {
+      // zsh's P_COUNT: a counter, and where the repeat being tried began,
+      // so that one that matched nothing ends the count.
+      auto [it, fresh] = counters.try_emplace(&n, 0);
+      if (fresh) {
+        it->second = reg({VmProgram::RegKind::Count, n.min, n.max, -1});
+        reg({VmProgram::RegKind::Iter, 0, -1, -1});
+      }
+      s::int32_t r = it->second;
+      emit(Op::CountInit, 0, 0, r, &n);
+      live.push_back(r);
+      live.push_back(r + 1);
+      s::int32_t t = emit(Op::CountTest, 0, 0, r, &n);
+      p.code[static_cast<s::size_t>(t)].x = at();
+      node(sub, caps);
+      emit(Op::CountInc, t, 0, r, &n);
+      live.pop_back();
+      live.pop_back();
+      p.code[static_cast<s::size_t>(t)].y = at();
+      return;
+    }
+    // x## is x then x#.  Compiled twice, the first x and the repeats are
+    // tried as zsh tries them: a repeat from where the first one ended
+    // before the first one's other ways.
+    s::int32_t first = at();
+    if (n.min > 0) {
+      node(sub, caps);
+      if (at() + (at() - first) > MAX_CODE) {
+        emit(Op::Loop, first, at() + 1, -1);
+        return;
+      }
+    }
+    // A repeat that may match nothing notes where it began: its states are
+    // not those of a repeat that began before (zsh's are other frames),
+    // and one that ends where it began arrives at the loop again.
+    s::int32_t iter = -1;
+    if (nullable(sub)) {
+      auto [it, fresh] = counters.try_emplace(&n, 0);
+      if (fresh) it->second = reg({VmProgram::RegKind::Iter, 0, -1, -1});
+      iter = it->second;
+    }
+    s::int32_t l = emit(Op::Loop, 0, 0, iter);
+    if (iter >= 0) live.push_back(iter);
+    p.code[static_cast<s::size_t>(l)].x = at();
+    node(sub, caps);
+    emit(Op::Jmp, l);
+    if (iter >= 0) live.pop_back();
+    p.code[static_cast<s::size_t>(l)].y = at();
+  }
+
+  // The whole pattern: the main program's two entries, then the contexts.
+  void top(const CompiledPattern::Impl& impl, bool leaks) {
+    const Node& g = impl.main.front();
+    p.caps = 2 * impl.captures;
+    if (leaks) {
+      p.leak = reg({VmProgram::RegKind::Leak, 0, -1, -1});
+      live.push_back(p.leak);
+    }
+    vec<s::int32_t> alts, wholes, jumps;
+    for (s::size_t a = 0; a < g.alts.size(); ++a) {
+      alts.push_back(at());
+      branch(g, a, true);
+      jumps.push_back(emit(Op::Jmp));
+    }
+    for (s::size_t a = 0; a < g.alts.size(); ++a) {
+      const auto& t = impl.tails[a];
+      if (not t) {
+        wholes.push_back(alts[a]);
+        continue;
+      }
+      wholes.push_back(at());
+      p.tails = true;
+      seq(t->head, true);
+      emit(Op::Tail, static_cast<s::int32_t>(a));
+    }
+    s::int32_t m = emit(Op::Match);
+    for (s::int32_t j : jumps) p.code[static_cast<s::size_t>(j)].x = m;
+    p.prefix = chain(alts);
+    p.whole  = chain(wholes);
+    // Contexts met while compiling these are added as they are met.
+    for (s::size_t i = 0; i < pending.size(); ++i) {
+      Pending d = pending[i];
+      vec<s::int32_t> starts, ends;
+      for (const Seq* q : d.seqs) {
+        starts.push_back(at());
+        seq(*q, false);
+        ends.push_back(emit(Op::Jmp));
+      }
+      s::int32_t done = emit(Op::Match);
+      for (s::int32_t j : ends) p.code[static_cast<s::size_t>(j)].x = done;
+      p.ctxs[static_cast<s::size_t>(d.ctx)].entry = chain(starts);
+    }
+  }
+
+  VmProgram&                    p;
+  vec<s::int32_t>               live;      // the registers live where code goes
+  umap<const Node*, s::int32_t> counters;  // per (#cN,M) and x#, its registers
+  vec<Pending>                  pending;
+};
+
+// A set of keys of `width` words, emptied in constant time.
+struct KeyTable {
+  void reset(s::size_t w) {
+    width = w;
+    keys.clear();
+    count = 0;
+    if (++stamp == 0) {
+      s::fill(marks.begin(), marks.end(), 0);
+      stamp = 1;
+    }
+  }
+
+  // The index of `key`; `fresh` when it was added just now.
+  s::uint32_t find(const s::int64_t* key, bool& fresh) {
+    if ((count + 1) * 2 > slots.size()) grow();
+    s::size_t mask = slots.size() - 1;
+    for (s::size_t h = hash(key) & mask;; h = (h + 1) & mask) {
+      if (marks[h] != stamp) {
+        marks[h] = stamp;
+        slots[h] = count;
+        keys.insert(keys.end(), key, key + width);
+        fresh = true;
+        return count++;
+      }
+      if (s::equal(key, key + width, keys.begin() + static_cast<s::ptrdiff_t>(slots[h] * width))) {
+        fresh = false;
+        return slots[h];
+      }
+    }
+  }
+
+  const s::int64_t* key(s::uint32_t i) const { return keys.data() + i * width; }
+
+  s::size_t hash(const s::int64_t* key) const {
+    s::uint64_t h = 0x9e3779b97f4a7c15u;
+    for (s::size_t i = 0; i < width; ++i) {
+      h ^= static_cast<s::uint64_t>(key[i]);
+      h *= 0xff51afd7ed558ccdu;
+      h ^= h >> 32;
+    }
+    return static_cast<s::size_t>(h);
+  }
+
+  void grow() {
+    s::size_t n = s::max<s::size_t>(16, slots.size() * 2);
+    slots.assign(n, 0);
+    marks.assign(n, 0);
+    stamp = 1;
+    for (s::uint32_t i = 0; i < count; ++i) {
+      s::size_t h = hash(key(i)) & (n - 1);
+      while (marks[h] == stamp) h = (h + 1) & (n - 1);
+      marks[h] = stamp;
+      slots[h] = i;
+    }
+  }
+
+  vec<s::uint32_t> slots, marks;
+  vec<s::int64_t>  keys;
+  s::size_t        width = 1;
+  s::uint32_t      count = 0, stamp = 1;
+};
+
+// Starts of a context, as offsets from where the VM run began: inclusive
+// ranges, ascending, apart.  Those that pile up after a `*` are one.
+struct Span {
+  s::uint32_t lo, hi;
+};
+using Spans = vec<Span>;
+
+// out = a without b.
+void spans_minus(const Spans& a, const Spans& b, Spans& out) {
+  out.clear();
+  s::size_t j = 0;
+  for (Span x : a) {
+    while (j < b.size() and b[j].hi < x.lo) ++j;
+    s::uint32_t lo = x.lo;
+    bool rest = true;
+    for (s::size_t k = j; k < b.size() and b[k].lo <= x.hi; ++k) {
+      if (b[k].lo > lo) out.push_back({lo, b[k].lo - 1});
+      if (b[k].hi >= x.hi) {
+        rest = false;
+        break;
+      }
+      lo = s::max(lo, b[k].hi + 1);
+    }
+    if (rest) out.push_back({lo, x.hi});
+  }
+}
+
+// out = a with b.
+void spans_union(const Spans& a, const Spans& b, Spans& out) {
+  out.clear();
+  s::size_t i = 0, j = 0;
+  while (i < a.size() or j < b.size()) {
+    Span x = j == b.size() or (i < a.size() and a[i].lo <= b[j].lo) ? a[i++] : b[j++];
+    if (not out.empty() and x.lo <= out.back().hi + 1) out.back().hi = s::max(out.back().hi, x.hi);
+    else out.push_back(x);
+  }
+}
+
+bool spans_have(const Spans& a, s::uint32_t q) {
+  auto it = s::upper_bound(a.begin(), a.end(), q,
+                           [](s::uint32_t v, const Span& x) { return v < x.lo; });
+  return it != a.begin() and q <= (it - 1)->hi;
+}
+
+// Starts gathered at one position: kept in order when they come in order
+// (a start here comes after all others), sorted when asked otherwise.
+struct StartList {
+  void clear() {
+    spans.clear();
+    sorted = true;
+  }
+  void add(const Spans& more) {
+    for (Span x : more) {
+      if (sorted and (spans.empty() or x.lo > spans.back().hi + 1)) {
+        spans.push_back(x);
+      } else if (sorted and x.lo >= spans.back().lo) {
+        spans.back().hi = s::max(spans.back().hi, x.hi);
+      } else {
+        spans.push_back(x);
+        sorted = false;
+      }
+    }
+  }
+  bool has(s::uint32_t q) { return spans_have(in_order(), q); }
+  const Spans& in_order() {
+    if (not sorted) {
+      s::sort(spans.begin(), spans.end(), [](Span a, Span b) { return a.lo < b.lo; });
+      s::size_t n = 0;
+      for (Span x : spans) {
+        if (n > 0 and x.lo <= spans[n - 1].hi + 1) spans[n - 1].hi = s::max(spans[n - 1].hi, x.hi);
+        else spans[n++] = x;
+      }
+      spans.resize(n);
+      sorted = true;
+    }
+    return spans;
+  }
+
+  Spans spans;
+  bool  sorted = true;
+};
+
+// A context's states at one position: (instruction, state registers),
+// each with the starts it was reached from.
+struct CtxStates {
+  void clear(s::size_t width) {
+    table.reset(width);
+    set_of.clear();
+    reading.clear();
+    nsets = 0;
+  }
+  s::uint32_t new_set() {
+    if (nsets == sets.size()) sets.emplace_back();
+    sets[nsets].clear();
+    return static_cast<s::uint32_t>(nsets++);
+  }
+
+  KeyTable         table;
+  vec<s::uint32_t> set_of;    // per state, its starts' set
+  vec<Spans>       sets;
+  s::size_t        nsets = 0;
+  vec<s::uint32_t> reading;   // the states that read a character
+};
+
+struct VmThread {
+  s::int32_t pc;
+  s::int32_t slot;   // its registers: groups, then state
+};
+
+// A thread the closure has yet to follow, with the group registers it
+// set at this position.
+struct VmPending {
+  s::int32_t  pc;
+  s::int32_t  slot;
+  s::uint32_t saved;
+};
+
+// Where a thread a step added came from: the thread of the list read, and
+// the group registers set to the new position (bits).
+struct VmMade {
+  s::uint32_t src;
+  s::uint32_t saved;
+};
+
+// What VM runs reuse, so that once grown a step allocates nothing.
+struct VmScratch {
+  struct Ctx {
+    // Starts lo..hi go on as `rep` does (Vm::rep()).
+    struct Class {
+      s::uint32_t lo, hi, rep;
+    };
+
+    CtxStates cur, old;
+    // The starts it matched from up to here, and those it has a state
+    // for here or matched from.
+    StartList  acc, alive;
+    s::int64_t injected = -1;   // the position it was last started at
+    // Its starts' classes here, when there are few states (`few`), and
+    // whether the states changed since they were made.
+    vec<Class> classes;
+    bool       few     = false;
+    bool       changed = true;
+  };
+  // A state a context's closure has yet to follow.
+  struct Work {
+    s::int32_t  pc;
+    s::uint32_t regs;   // in wregs
+    s::uint32_t set;    // in tmp
+  };
+
+  vec<Ctx>              ctxs;
+  vec<s::int64_t>       slab;
+  vec<s::int32_t>       free_slots;
+  vec<VmThread>         clist, nlist;
+  vec<VmPending>        stack;
+  vec<VmMade>           made;   // for nlist
+  vec<VmPending>        deferred;   // Vm::cut_match()'s
+  vec<VmThread>         forced;
+  vec<s::uint32_t>      seen;
+  s::uint32_t           gen = 0;
+  KeyTable              keys;
+  vec<s::int64_t>       key, keep;
+  vec<Work>             work;
+  vec<s::int64_t>       wregs;
+  vec<Spans>            tmp;
+  s::size_t             ntmp = 0;
+  Spans                 merged;
+  // Vm::classify()'s.
+  vec<const Spans*>                         items;
+  vec<s::uint32_t>                          cuts;
+  vec<s::pair<s::uint32_t, s::uint32_t>>    reps;
+  // The DFA of steady runs (Vm::cacheable()): per state its threads'
+  // instructions, dfa_pcs[dfa_start[i], dfa_start[i + 1]), and its steps
+  // on each ASCII byte (-1 unknown).
+  vec<s::int32_t>                 dfa_pcs;
+  vec<s::uint32_t>                dfa_start;
+  vec<char>                       dfa_matches;   // per state, a thread matches
+  vec<s::int32_t>                 dfa_next;
+  vec<s::uint32_t>                dfa_made_at;   // per step, where in dfa_made
+  vec<VmMade>                     dfa_made;
+  vec<char>                       taken;   // Vm::cached_step()'s
+  // The states by their instructions' hash: open addressing, -1 free,
+  // four times as many slots as states can be.
+  vec<s::int32_t>                 dfa_index;
+  bool                  busy = false;
+};
+
+// The scratch of this thread, or one of its own for a run inside another.
+struct ScratchLease {
+  ScratchLease() {
+    static thread_local VmScratch shared;
+    if (shared.busy) {
+      own = s::make_unique<VmScratch>();
+      sc  = own.get();
+    } else {
+      sc = &shared;
+    }
+    sc->busy = true;
+  }
+  ~ScratchLease() { sc->busy = false; }
+  ScratchLease(const ScratchLease&) = delete;
+  ScratchLease& operator=(const ScratchLease&) = delete;
+
+  VmScratch*       sc = nullptr;
+  uptr<VmScratch>  own;
+};
+
+struct Vm : Subject {
+  enum class Mode : s::uint8_t {
+    Whole,      // s[b, lim) matches
+    First,      // the match zsh's search finds first, the end left open
+    Shortest,   // the shortest prefix of s[b, lim) that matches
+    Ends,       // every end of a match from b
+  };
+  // See count_test().
+  struct CountChoice {
+    bool more, done, empty;
+  };
+  // What leaked() was asked: the count, its repeats so far, where, and
+  // the flags leaked before.
+  struct LeakKey {
+    const Node* n;
+    s::int64_t  c;
+    s::size_t   e;
+    s::int64_t  leak;
+    bool operator==(const LeakKey&) const = default;
+  };
+  struct LeakHash {
+    s::size_t operator()(const LeakKey& k) const {
+      s::size_t h = s::hash<const void*>{}(k.n);
+      for (auto v : {static_cast<s::size_t>(k.c), k.e, static_cast<s::size_t>(k.leak)})
+        h = h * 0x100000001b3u ^ v;
+      return h;
+    }
+  };
+
+  Vm(Subject subject, const CompiledPattern::Impl& impl, VmScratch& scratch, Mode how,
+     bool want_caps)
+      : Subject{subject}, p{*impl.vm}, impl{impl}, sc{scratch}, mode{how}, want{want_caps},
+        nstate{p.regs.size()}, stride{static_cast<s::size_t>(p.caps) + p.regs.size()} {
+    if (stride == 0) stride = 1;
+  }
+
+  // Runs the program from `entry` at b.  Whether it matched; the match
+  // ends at `end`, with the group registers in `caps`.
+  bool run(s::size_t b, s::int32_t entry) {
+    base = here = b;
+    steady  = nstate == 0 and not (entry == p.whole and p.tails);
+    cutting = mb and p.ctxs.empty() and (mode == Mode::Shortest or mode == Mode::Ends);
+    sc.slab.clear();
+    sc.free_slots.clear();
+    sc.clist.clear();
+    sc.nlist.clear();
+    sc.stack.clear();
+    sc.deferred.clear();
+    sc.key.assign(1 + nstate, 0);
+    sc.keep.assign(nstate + 1, 0);
+    zeros.assign(nstate + 1, 0);
+    if (sc.seen.size() < p.code.size()) sc.seen.resize(p.code.size(), 0);
+    if (sc.ctxs.size() < p.ctxs.size()) sc.ctxs.resize(p.ctxs.size());
+    for (s::size_t c = 0; c < p.ctxs.size(); ++c) {
+      auto& cx = sc.ctxs[c];
+      cx.cur.clear(1 + nstate);
+      cx.old.clear(1 + nstate);
+      cx.injected = -1;
+    }
+    position();
+    s::int32_t slot = alloc();
+    s::int64_t* r = regs(slot);
+    s::fill(r, r + p.caps, -1);
+    s::fill(r + p.caps, r + stride, 0);
+    add(sc.clist, entry, slot);
+    if (cutting and cut_match() and cut_found()) return true;
+    clear_cache();
+    // Short runs (most of those of ${x//…}) do not pay for the cache.
+    static constexpr int UNCACHED_STEPS = 8;
+    for (int steps = 0;; ++steps) {
+      if (sc.clist.empty()) break;
+      // The threads as a cached state, and the steps cached from it.
+      s::int32_t from = -1;
+      if (steady and steps >= UNCACHED_STEPS) {
+        from = intern(sc.clist);
+        // Without the groups, the states alone, the threads made at the end.
+        bool bare = not want or p.caps == 0, moved = false;
+        while (from >= 0 and here < lim and cacheable(here)) {
+          s::size_t k = static_cast<s::size_t>(from) * 128 + static_cast<unsigned char>(s[here]);
+          s::int32_t to = sc.dfa_next[k];
+          if (to < 0) break;
+          if (not bare) {
+            if (auto done = cached_step(from, to, sc.dfa_made_at[k])) return *done;
+          } else {
+            if (not moved) {
+              for (const auto& t : sc.clist) release(t.slot);
+              sc.clist.clear();
+              moved = true;
+            }
+            if (state_matched(from, here)) return true;
+            ++here;
+            auto at = static_cast<s::size_t>(to);
+            if (sc.dfa_start[at] == sc.dfa_start[at + 1]) return found;
+          }
+          from = to;
+        }
+        if (moved) {
+          for (s::uint32_t i = sc.dfa_start[static_cast<s::size_t>(from)];
+               i < sc.dfa_start[static_cast<s::size_t>(from) + 1]; ++i) {
+            s::int32_t fresh = alloc();
+            s::fill(regs(fresh), regs(fresh) + stride, 0);
+            sc.clist.push_back({sc.dfa_pcs[i], fresh});
+          }
+        }
+        if (sc.clist.empty()) break;
+      }
+      s::size_t pos = here, next = pos;
+      bool more = pos < lim;
+      if (more) {
+        at(pos, next);
+        here = next;
+        position();
+        // Inner contexts first: the outer ones read what they found.
+        for (s::size_t c = p.ctxs.size(); c-- > 0;) step(c, pos);
+      }
+      sc.nlist.clear();
+      sc.made.clear();
+      for (s::size_t i = 0; i < sc.clist.size(); ++i) {
+        VmThread t = sc.clist[i];
+        const Inst& in = p.code[static_cast<s::size_t>(t.pc)];
+        if (in.op == Op::Match or in.op == Op::Tail) {
+          if (matched(t.slot, pos)) return true;
+          release(t.slot);
+          if (mode == Mode::Ends) continue;
+          // The threads after it come after it in zsh's search.
+          for (s::size_t j = i + 1; j < sc.clist.size(); ++j) release(sc.clist[j].slot);
+          break;
+        }
+        s::int32_t target = 0;
+        if (p.leak >= 0) set_leak(state(t.slot)[p.leak]);
+        if (more and consume(in, pos, target))
+          add(sc.nlist, target, t.slot, static_cast<s::uint32_t>(i));
+        else
+          release(t.slot);
+      }
+      if (not more) break;
+      if (cutting and cut_match() and cut_found()) return true;
+      // A step that depended on nothing but the threads' instructions and
+      // the byte read is cached, with where each thread came from.
+      if (from >= 0 and cacheable(pos)) {
+        s::int32_t to = intern(sc.nlist);
+        if (to >= 0) {
+          s::size_t k = static_cast<s::size_t>(from) * 128 + static_cast<unsigned char>(s[pos]);
+          sc.dfa_next[k]    = to;
+          sc.dfa_made_at[k] = static_cast<s::uint32_t>(sc.dfa_made.size());
+          sc.dfa_made.insert(sc.dfa_made.end(), sc.made.begin(), sc.made.end());
+        }
+      }
+      s::swap(sc.clist, sc.nlist);
+    }
+    return found;
+  }
+
+  // zsh tries the lengths of a shortest match on the text cut there, whose
+  // end counts as a place where a character may start; the run reads on,
+  // where a byte that continues no character follows and `*` may not end.
+  // So for those places the threads a Boundary stopped are followed again
+  // with it open, reading nothing: whether that matches here.  (With `^`
+  // or `~`, whose programs a cut text changes too, vm_prefix() tries the
+  // cut text instead.)
+  bool cut_match() {
+    if (sc.deferred.empty()) return false;
+    forcing = true;
+    position();
+    s::size_t made = sc.made.size();
+    sc.forced.clear();
+    for (const auto& d : sc.deferred) add(sc.forced, d.pc, d.slot);
+    sc.deferred.clear();
+    sc.made.resize(made);
+    forcing = false;
+    bool hit = false;
+    for (const auto& t : sc.forced) {
+      hit = hit or p.code[static_cast<s::size_t>(t.pc)].op == Op::Match;
+      release(t.slot);
+    }
+    return hit;
+  }
+
+  // A cut text matched here: notes it as a match, and whether the run is
+  // over.
+  bool cut_found() { return matched(-1, here); }
+
+  // The thread at `slot` matched at pos: notes it, and whether the run is
+  // over (a shortest match, or any whole one when its groups are not
+  // wanted).
+  bool matched(s::int32_t slot, s::size_t pos) {
+    found = true;
+    if (mode == Mode::Ends) {
+      if (ends.empty() or ends.back() != pos) ends.push_back(pos);
+      return false;
+    }
+    end = pos;
+    // A match a cut text or a cached state found has no thread (-1);
+    // those come only where the groups are not wanted.
+    assert(slot >= 0 or not want);
+    if (want and slot >= 0) caps.assign(regs(slot), regs(slot) + p.caps);
+    return mode == Mode::Shortest or (mode == Mode::Whole and not want);
+  }
+
+  // Steady runs (no state registers, no TailLiteral) depend on the
+  // threads' instructions alone, but for the group registers, which only
+  // ever take the position: their lists are the states of a DFA built as
+  // the run goes, whose steps on ASCII bytes are cached where the position
+  // does not matter (not at lim, and where a character starts after the
+  // byte), each with where its threads come from and which group
+  // registers it sets.
+  bool cacheable(s::size_t pos) const {
+    return static_cast<unsigned char>(s[pos]) < 0x80 and pos + 1 < lim and boundary(pos + 1);
+  }
+
+  void clear_cache() {
+    if (sc.dfa_start.empty()) return;
+    sc.dfa_pcs.clear();
+    sc.dfa_start.clear();
+    sc.dfa_matches.clear();
+    sc.dfa_next.clear();
+    sc.dfa_made_at.clear();
+    sc.dfa_made.clear();
+    s::fill(sc.dfa_index.begin(), sc.dfa_index.end(), -1);
+  }
+
+  // The cached state of the threads in `list`, -1 when there are too many.
+  s::int32_t intern(const vec<VmThread>& list) {
+    s::uint64_t h = 0x9e3779b97f4a7c15u;
+    for (const auto& t : list) h = (h ^ static_cast<s::uint64_t>(t.pc)) * 0xff51afd7ed558ccdu;
+    auto same = [&](s::size_t id) {
+      s::size_t b = sc.dfa_start[id], e = sc.dfa_start[id + 1];
+      if (e - b != list.size()) return false;
+      for (s::size_t i = 0; i < list.size(); ++i)
+        if (sc.dfa_pcs[b + i] != list[i].pc) return false;
+      return true;
+    };
+    static constexpr s::size_t MAX_STATES = 256;
+    static constexpr s::size_t SLOTS      = 1024;
+    if (sc.dfa_index.size() != SLOTS) sc.dfa_index.assign(SLOTS, -1);
+    s::size_t at = static_cast<s::size_t>(h) & (SLOTS - 1);
+    for (; sc.dfa_index[at] >= 0; at = (at + 1) & (SLOTS - 1))
+      if (same(static_cast<s::size_t>(sc.dfa_index[at]))) return sc.dfa_index[at];
+    if (sc.dfa_start.size() > MAX_STATES) return -1;
+    if (sc.dfa_start.empty()) sc.dfa_start.push_back(0);
+    auto id = static_cast<s::int32_t>(sc.dfa_start.size() - 1);
+    bool any = false;
+    for (const auto& t : list) {
+      sc.dfa_pcs.push_back(t.pc);
+      Op op = p.code[static_cast<s::size_t>(t.pc)].op;
+      any = any or op == Op::Match or op == Op::Tail;
+    }
+    sc.dfa_matches.push_back(any);
+    sc.dfa_start.push_back(static_cast<s::uint32_t>(sc.dfa_pcs.size()));
+    sc.dfa_next.resize(sc.dfa_next.size() + 128, -1);
+    sc.dfa_made_at.resize(sc.dfa_made_at.size() + 128, 0);
+    sc.dfa_index[at] = id;
+    return id;
+  }
+
+  // The matches of cached state `id` at pos, as a step there notes them
+  // when the groups are not wanted; whether the run is over.
+  bool state_matched(s::int32_t id, s::size_t pos) {
+    if (not sc.dfa_matches[static_cast<s::size_t>(id)]) return false;
+    for (s::uint32_t i = sc.dfa_start[static_cast<s::size_t>(id)];
+         i < sc.dfa_start[static_cast<s::size_t>(id) + 1]; ++i) {
+      Op op = p.code[static_cast<s::size_t>(sc.dfa_pcs[i])].op;
+      if (op != Op::Match and op != Op::Tail) continue;
+      if (matched(-1, pos)) return true;
+      if (mode != Mode::Ends) break;
+    }
+    return false;
+  }
+
+  // The cached step from the threads in clist, at here, to state `to`,
+  // whose threads came as dfa_made[made, ...) says.  A run that ends
+  // there, or a shortest or whole match found, gives its answer.
+  opt<bool> cached_step(s::int32_t from_state, s::int32_t to, s::uint32_t made) {
+    s::size_t pos = here++;
+    // The step finds the first match; those after it it leaves out.
+    if (sc.dfa_matches[static_cast<s::size_t>(from_state)])
+      for (const auto& t : sc.clist) {
+        Op op = p.code[static_cast<s::size_t>(t.pc)].op;
+        if (op != Op::Match and op != Op::Tail) continue;
+        if (matched(t.slot, pos)) return true;
+        if (mode != Mode::Ends) break;
+      }
+    s::uint32_t b = sc.dfa_start[static_cast<s::size_t>(to)];
+    s::uint32_t e = sc.dfa_start[static_cast<s::size_t>(to) + 1];
+    sc.nlist.clear();
+    // A thread's registers go to the first thread made from it, copies to
+    // the others.
+    if (sc.taken.size() < sc.clist.size()) sc.taken.resize(sc.clist.size());
+    s::fill_n(sc.taken.begin(), sc.clist.size(), 0);
+    for (s::uint32_t i = b; i < e; ++i) {
+      const VmMade& m = sc.dfa_made[made + (i - b)];
+      s::int32_t slot = sc.clist[m.src].slot;
+      if (sc.taken[m.src]) slot = clone(slot);
+      sc.taken[m.src] = 1;
+      sc.nlist.push_back({sc.dfa_pcs[i], slot});
+    }
+    // Then the group registers set here, the copies made.
+    for (s::uint32_t i = b; i < e; ++i) {
+      s::int64_t* r = regs(sc.nlist[i - b].slot);
+      for (s::uint32_t bits = sc.dfa_made[made + (i - b)].saved; bits != 0; bits &= bits - 1)
+        r[s::countr_zero(bits)] = static_cast<s::int64_t>(here);
+    }
+    for (s::size_t i = 0; i < sc.clist.size(); ++i)
+      if (not sc.taken[i]) release(sc.clist[i].slot);
+    s::swap(sc.clist, sc.nlist);
+    if (sc.clist.empty()) return found;
+    return s::nullopt;
+  }
+
+  s::int64_t* regs(s::int32_t slot) {
+    return sc.slab.data() + static_cast<s::size_t>(slot) * stride;
+  }
+  // The state registers, after the group ones.
+  s::int64_t* state(s::int32_t slot) { return regs(slot) + p.caps; }
+
+  s::int32_t alloc() {
+    if (not sc.free_slots.empty()) {
+      s::int32_t slot = sc.free_slots.back();
+      sc.free_slots.pop_back();
+      return slot;
+    }
+    sc.slab.resize(sc.slab.size() + stride);
+    return static_cast<s::int32_t>(sc.slab.size() / stride - 1);
+  }
+  s::int32_t clone(s::int32_t slot) {
+    s::int32_t copy = alloc();
+    // A few registers: a loop, not a call.
+    const s::int64_t* from = regs(slot);
+    s::int64_t* to = regs(copy);
+    for (s::size_t k = 0; k < stride; ++k) to[k] = from[k];
+    return copy;
+  }
+  void release(s::int32_t slot) { sc.free_slots.push_back(slot); }
+
+  // A new position: nothing visited there yet.
+  void position() {
+    if (++sc.gen == 0) {
+      s::fill(sc.seen.begin(), sc.seen.end(), 0);
+      sc.gen = 1;
+    }
+    sc.keys.reset(1 + nstate);
+    for (s::size_t c = 0; c < p.ctxs.size(); ++c) {
+      sc.ctxs[c].acc.clear();
+      sc.ctxs[c].alive.clear();
+      sc.ctxs[c].changed = true;
+    }
+  }
+
+  // Whether context c started at `from` matched up to here, and whether
+  // it still may.
+  bool accepted(s::int32_t c, s::int64_t from) {
+    return from >= 0 and sc.ctxs[static_cast<s::size_t>(c)].acc.has(start(from));
+  }
+  bool alive(s::int32_t c, s::int64_t from) {
+    return from >= 0 and sc.ctxs[static_cast<s::size_t>(c)].alive.has(start(from));
+  }
+
+  // Context c's start `from` as the first of the starts that go on alike
+  // from here: in the same states, and matching up to here or not alike
+  // (so `*(^*b)c` keeps one thread in the `^`, not one per start); -1 when
+  // it can no longer match.  With many states, `from` itself.
+  s::int64_t rep(s::int32_t c, s::int64_t from) {
+    if (from < 0) return -1;
+    auto& cx = sc.ctxs[static_cast<s::size_t>(c)];
+    if (cx.changed) classify(cx);
+    if (not cx.few) return alive(c, from) ? from : -1;
+    s::uint32_t q = start(from);
+    auto it = s::upper_bound(cx.classes.begin(), cx.classes.end(), q,
+                             [](s::uint32_t v, const auto& k) { return v < k.lo; });
+    if (it == cx.classes.begin() or q > (it - 1)->hi) return -1;
+    return static_cast<s::int64_t>(base) + (it - 1)->rep;
+  }
+
+  // Splits context cx's starts into the classes rep() gives: ranges
+  // between the ends of its states' starts, by the states they are in.
+  void classify(VmScratch::Ctx& cx) {
+    static constexpr s::size_t MAX_ITEMS = 16;
+    static constexpr s::size_t MAX_CUTS  = 128;
+    cx.changed = false;
+    cx.few     = false;
+    cx.classes.clear();
+    auto& items = sc.items;
+    items.clear();
+    for (s::uint32_t st : cx.cur.reading) items.push_back(&cx.cur.sets[cx.cur.set_of[st]]);
+    items.push_back(&cx.acc.in_order());
+    if (items.size() > MAX_ITEMS) return;
+    auto& cuts = sc.cuts;
+    cuts.clear();
+    for (const Spans* set : items)
+      for (Span x : *set) {
+        cuts.push_back(x.lo);
+        cuts.push_back(x.hi + 1);
+      }
+    if (cuts.size() > MAX_CUTS) return;
+    s::sort(cuts.begin(), cuts.end());
+    cuts.erase(s::unique(cuts.begin(), cuts.end()), cuts.end());
+    auto& reps = sc.reps;
+    reps.clear();
+    for (s::size_t k = 0; k + 1 < cuts.size(); ++k) {
+      s::uint32_t in = 0;
+      for (s::size_t i = 0; i < items.size(); ++i)
+        if (spans_have(*items[i], cuts[k])) in |= s::uint32_t{1} << i;
+      if (in == 0) continue;
+      auto r = s::find_if(reps.begin(), reps.end(), [&](const auto& x) { return x.first == in; });
+      if (r == reps.end()) r = reps.insert(reps.end(), {in, cuts[k]});
+      cx.classes.push_back({cuts[k], cuts[k + 1] - 1, r->second});
+    }
+    cx.few = true;
+  }
+  // A context's start at position `from`, as its runs keep it.
+  s::uint32_t start(s::int64_t from) const {
+    return static_cast<s::uint32_t>(from - static_cast<s::int64_t>(base));
+  }
+
+  // State registers `r` at `in` in their canonical form, so that states
+  // that go on alike compare equal: those not live there are cleared, a
+  // count beyond what matters is clamped, where a repeat began and a
+  // context started are forgotten when it no longer matters.
+  void canon(const Inst& in, s::int64_t* r) {
+    s::int64_t* keep = sc.keep.data();
+    for (s::uint32_t i = 0; i < in.nlive; ++i) keep[i] = r[p.live[in.live + i]];
+    s::fill(r, r + nstate, 0);
+    for (s::uint32_t i = 0; i < in.nlive; ++i) {
+      auto reg = static_cast<s::size_t>(p.live[in.live + i]);
+      const auto& ri = p.regs[reg];
+      s::int64_t v = keep[i];
+      switch (ri.kind) {
+        case VmProgram::RegKind::Count:
+          v = count_class(ri.min, ri.max, v, here);
+
+        break; case VmProgram::RegKind::Iter:
+          if (v != static_cast<s::int64_t>(here)) v = -1;
+
+        break; case VmProgram::RegKind::Ctx:
+          v = rep(ri.ctx, v);
+
+        break; case VmProgram::RegKind::Leak:
+
+        break; default:
+          assert(false);  // should never get here
+      }
+      r[reg] = v;
+    }
+  }
+
+  // Count v of a (#cN,M) at position `at`, as one of the counts that go on
+  // alike: past N, one that can no longer reach M before the end (an
+  // empty repeat counts too, and ends the count) is as good as any.
+  s::int64_t count_class(int min, int max, s::int64_t v, s::size_t at) const {
+    s::int64_t enough = s::max(min, 1);
+    auto room = static_cast<s::int64_t>(lim - at) + 1;
+    return v >= enough and (max < 0 or max - v > room) ? enough : v;
+  }
+
+  // Whether a thread at pc, with state registers r, is the first there.
+  bool visit(s::int32_t pc, const Inst& in, s::int64_t* r) {
+    if (nstate > 0) canon(in, r);
+    if (in.nlive == 0) {
+      auto& seen = sc.seen[static_cast<s::size_t>(pc)];
+      if (seen == sc.gen) return false;
+      seen = sc.gen;
+      return true;
+    }
+    sc.key[0] = pc;
+    s::copy_n(r, nstate, sc.key.data() + 1);
+    bool fresh = false;
+    sc.keys.find(sc.key.data(), fresh);
+    return fresh;
+  }
+
+  // Whether `in` reads the character at pos (< lim), and where it goes.
+  bool consume(const Inst& in, s::size_t pos, s::int32_t& target) const {
+    switch (in.op) {
+      case Op::Char: {
+        s::size_t next = 0;
+        if (not one(*in.node, pos, next)) return false;
+        target = in.x;
+        return true;
+      }
+      case Op::AnyChar:
+        target = in.x;
+        return true;
+      case Op::Digit: {
+        auto c = static_cast<unsigned char>(s[pos]);
+        if (not s::isdigit(c)) return false;
+        const auto& rg = p.ranges[static_cast<s::size_t>(in.x)];
+        s::int32_t st = rg.next[static_cast<s::size_t>(in.y)][c - '0'];
+        if (st < 0) return false;
+        target = rg.pc0 + 2 * st;
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  // Adds the thread at pc with registers `slot` to `list`, here: follows
+  // what reads no character, in zsh's order, and adds the threads that
+  // read one or match.
+  // The threads added go with (in sc.made) the thread of the list read
+  // that made them (`src`) and the group registers set here.
+  void add(vec<VmThread>& list, s::int32_t pc0, s::int32_t slot0, s::uint32_t src = 0) {
+    auto& st = sc.stack;
+    st.push_back({pc0, slot0, 0});
+    while (not st.empty()) {
+      auto [pc, slot, saved] = st.back();
+      st.pop_back();
+      for (bool go = true; go;) {
+        const Inst& in = p.code[static_cast<s::size_t>(pc)];
+        if (not visit(pc, in, state(slot))) {
+          // As zsh's marks: a repeat tried from here already ends.
+          if (in.op == Op::Loop) {
+            pc = in.y;
+            continue;
+          }
+          release(slot);
+          break;
+        }
+        switch (in.op) {
+          case Op::Char: case Op::AnyChar: case Op::Digit:
+            keep(list, pc, slot, src, saved);
+            go = false;
+
+          break; case Op::Match:
+            if (mode == Mode::Whole and here != lim) release(slot);
+            else keep(list, pc, slot, src, saved);
+            go = false;
+
+          break; case Op::Tail:
+            if (p.leak >= 0) set_leak(state(slot)[p.leak]);
+            if (tail_matches(*impl.tails[static_cast<s::size_t>(in.x)], here))
+              keep(list, pc, slot, src, saved);
+            else
+              release(slot);
+            go = false;
+
+          break; case Op::Jmp:
+            pc = in.x;
+
+          break; case Op::Split:
+            st.push_back({in.y, clone(slot), saved});
+            pc = in.x;
+
+          break; case Op::Loop:
+            st.push_back({in.y, clone(slot), saved});
+            if (in.reg >= 0) state(slot)[in.reg] = static_cast<s::int64_t>(here);
+            pc = in.x;
+
+          break; case Op::Boundary:
+            if (cutting and not forcing and not boundary(here)) {
+              // A text cut here may yet match (see cut_match()).
+              sc.deferred.push_back({pc + 1, slot, saved});
+              go = false;
+            } else {
+              go = pass(forcing or boundary(here), slot);
+              ++pc;
+            }
+
+          break; case Op::Save:
+            regs(slot)[in.x] = static_cast<s::int64_t>(here);
+            saved |= s::uint32_t{1} << in.x;
+            ++pc;
+
+          break; case Op::AtStart:
+            go = pass(here == 0 and not notstart, slot);
+            ++pc;
+
+          break; case Op::AtEnd:
+            go = pass(here == s.size() and not notend, slot);
+            ++pc;
+
+          break; case Op::CountInit: {
+            s::int64_t* r = state(slot);
+            r[in.reg]     = 0;
+            r[in.reg + 1] = -1;
+            ++pc;
+          }
+
+          break; case Op::CountTest: {
+            auto [more, done, empty] = count_test(in, state(slot));
+            if (empty) {
+              pc = in.y;
+            } else if (more) {
+              if (done) {
+                s::int32_t exit = clone(slot);
+                if (p.leak >= 0 and not in.node->leaks.empty()) leak_past(in, state(exit));
+                st.push_back({in.y, exit, saved});
+              }
+              state(slot)[in.reg + 1] = static_cast<s::int64_t>(here);
+              pc = in.x;
+            } else if (done) {
+              pc = in.y;
+            } else {
+              release(slot);
+              go = false;
+            }
+          }
+
+          break; case Op::CountInc: {
+            s::int64_t& n = state(slot)[in.reg];
+            n = s::min<s::int64_t>(n + 1, INT32_MAX);
+            pc = in.x;
+          }
+
+          break; case Op::CtxStart:
+            inject(in.x);
+            state(slot)[in.reg] = static_cast<s::int64_t>(here);
+            ++pc;
+
+          break; case Op::NegExit:
+            go = pass(boundary(here) and not accepted(in.x, state(slot)[in.reg]), slot);
+            ++pc;
+
+          break; case Op::ExclCheck:
+            go = pass(not accepted(in.x, state(slot)[in.reg]), slot);
+            ++pc;
+
+          break; default:
+            assert(false);  // should never get here
+        }
+      }
+    }
+  }
+
+  // What follows (#cN,M) `in` here, after its count in r, should another
+  // repeat fail: zsh's counter leaves on the case flags that repeat
+  // changed last (Node::leaks), in r's Leak register.
+  void leak_past(const Inst& in, s::int64_t* r) {
+    const Node& n = *in.node;
+    if (const auto* fp = leaked(n, r[in.reg], here, r[p.leak]))
+      r[p.leak] = 1 + 4 * s::int64_t{n.leak_epoch} + (fp->nocase ? 1 : 0) + (fp->lower ? 2 : 0);
+  }
+
+  // The change of the flags the repeats of n from e, after c, pass last
+  // before they fail, with the flags leaked so far `leak` (zsh's `last` in
+  // Matcher::counted()).  The operand matches in one way (calls_once()),
+  // so the repeats are one chain, walked once ahead with the backtracker
+  // and remembered for each repeat on it.
+  const Node::FlagPoint* leaked(const Node& n, s::int64_t c, s::size_t e, s::int64_t leak) {
+    struct Step {
+      s::int64_t             c;
+      s::size_t              e;
+      const Node::FlagPoint* notes;   // the last change its own path passed
+    };
+    vec<Step> chain;
+    const Node::FlagPoint* last = nullptr;
+    Subject sub{*this};
+    sub.set_leak(leak);
+    for (;;) {
+      if (auto it = leak_memo.find(LeakKey{&n, c, e, leak}); it != leak_memo.end()) {
+        last = it->second;
+        break;
+      }
+      // At the maximum no repeat is tried, nor changes watched.
+      if (n.max >= 0 and c >= n.max) break;
+      Matcher m{sub, impl};
+      m.watch  = &n;
+      m.passed = nullptr;
+      s::size_t after = strv::npos;
+      bool ok = m.node(*n.sub, e, [&](s::size_t x) {
+        after = x;
+        return true;
+      });
+      if (not ok) {
+        last = m.passed;
+        leak_memo[LeakKey{&n, c, e, leak}] = last;
+        break;
+      }
+      chain.push_back({c, e, m.passed});
+      s::int64_t next = count_class(n.min, n.max, s::min<s::int64_t>(c + 1, INT32_MAX), after);
+      // A repeat that matched nothing ends the count, watching nothing.
+      if (next >= n.min and after == e) break;
+      c = next;
+      e = after;
+    }
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+      if (not last) last = it->notes;
+      leak_memo[LeakKey{&n, it->c, it->e, leak}] = last;
+    }
+    return last;
+  }
+
+  void keep(vec<VmThread>& list, s::int32_t pc, s::int32_t slot, s::uint32_t src,
+            s::uint32_t saved) {
+    list.push_back({pc, slot});
+    sc.made.push_back({src, saved});
+  }
+
+  // Whether the thread at `slot` goes on (`ok`); else it ends.
+  bool pass(bool ok, s::int32_t slot) {
+    if (not ok) release(slot);
+    return ok;
+  }
+
+  // zsh's P_COUNT after the count in r: whether another repeat is tried,
+  // whether what follows may come, and whether the last repeat matched
+  // nothing, which ends the count.
+  CountChoice count_test(const Inst& in, const s::int64_t* r) const {
+    const Node& n = *in.node;
+    s::int64_t cur = r[in.reg];
+    bool done = cur >= n.min;
+    if (cur > 0 and done and r[in.reg + 1] == static_cast<s::int64_t>(here))
+      return {false, true, true};
+    return {n.max < 0 or cur < n.max, done, false};
+  }
+
+  // Context c's run from pos to here: its states that read the character
+  // at pos.
+  void step(s::size_t c, s::size_t pos) {
+    auto& cx = sc.ctxs[c];
+    s::swap(cx.cur, cx.old);
+    cx.cur.clear(1 + nstate);
+    for (s::uint32_t st : cx.old.reading) {
+      const s::int64_t* key = cx.old.table.key(st);
+      s::int32_t target = 0;
+      if (not consume(p.code[static_cast<s::size_t>(key[0])], pos, target)) continue;
+      s::size_t mark = sc.ntmp;
+      s::uint32_t set = new_tmp();
+      sc.tmp[set] = cx.old.sets[cx.old.set_of[st]];
+      sub_add(c, target, key + 1, set);
+      sc.ntmp = mark;
+    }
+  }
+
+  // Starts context c here.
+  void inject(s::int32_t c) {
+    auto& cx = sc.ctxs[static_cast<s::size_t>(c)];
+    if (cx.injected == static_cast<s::int64_t>(here)) return;
+    cx.injected = static_cast<s::int64_t>(here);
+    s::size_t mark = sc.ntmp;
+    s::uint32_t set = new_tmp();
+    s::uint32_t q = start(static_cast<s::int64_t>(here));
+    sc.tmp[set].push_back({q, q});
+    sub_add(static_cast<s::size_t>(c), p.ctxs[static_cast<s::size_t>(c)].entry, zeros.data(), set);
+    sc.ntmp = mark;
+  }
+
+  s::uint32_t new_tmp() {
+    if (sc.ntmp == sc.tmp.size()) sc.tmp.emplace_back();
+    sc.tmp[sc.ntmp].clear();
+    return static_cast<s::uint32_t>(sc.ntmp++);
+  }
+
+  // Adds to context c's states here those its program reaches from pc,
+  // with state registers r, for the starts in tmp[set].
+  void sub_add(s::size_t c, s::int32_t pc0, const s::int64_t* r0, s::uint32_t set0) {
+    s::size_t wbase = sc.work.size(), rbase = sc.wregs.size(), tbase = sc.ntmp;
+    // A state to follow, with a copy of the registers at wregs[from].
+    auto push = [&](s::int32_t pc, s::uint32_t from, s::uint32_t set) {
+      auto ro = static_cast<s::uint32_t>(sc.wregs.size());
+      sc.wregs.resize(ro + nstate);
+      s::copy_n(sc.wregs.data() + from, nstate, sc.wregs.data() + ro);
+      sc.work.push_back({pc, ro, set});
+    };
+    auto ro = static_cast<s::uint32_t>(sc.wregs.size());
+    sc.wregs.insert(sc.wregs.end(), r0, r0 + nstate);
+    sc.work.push_back({pc0, ro, set0});
+    while (sc.work.size() > wbase) {
+      auto w = sc.work.back();
+      sc.work.pop_back();
+      s::int32_t  pc  = w.pc;
+      s::uint32_t set = w.set;
+      auto work_regs = [&] { return sc.wregs.data() + w.regs; };
+      for (bool go = true; go;) {
+        const Inst& in = p.code[static_cast<s::size_t>(pc)];
+        if (nstate > 0) canon(in, work_regs());
+        sc.key[0] = pc;
+        s::copy_n(work_regs(), nstate, sc.key.data() + 1);
+        auto& states = sc.ctxs[c].cur;
+        bool fresh = false;
+        s::uint32_t st = states.table.find(sc.key.data(), fresh);
+        if (fresh) states.set_of.push_back(states.new_set());
+        // The starts that get here for the first time.
+        s::uint32_t d = new_tmp();
+        {
+          auto& have = states.sets[states.set_of[st]];
+          auto& out = sc.tmp[d];
+          spans_minus(sc.tmp[set], have, out);
+          if (out.empty()) break;
+          spans_union(have, out, sc.merged);
+          s::swap(have, sc.merged);
+        }
+        set = d;
+        switch (in.op) {
+          case Op::Char: case Op::AnyChar: case Op::Digit:
+            if (fresh) states.reading.push_back(st);
+            mark(c, set, false);
+            go = false;
+
+          break; case Op::Match:
+            mark(c, set, true);
+            go = false;
+
+          break; case Op::Tail:
+            go = false;
+
+          break; case Op::Jmp:
+            pc = in.x;
+
+          break; case Op::Split: case Op::Loop:
+            push(in.y, w.regs, set);
+            if (in.op == Op::Loop and in.reg >= 0)
+              work_regs()[in.reg] = static_cast<s::int64_t>(here);
+            pc = in.x;
+
+          break; case Op::Boundary:
+            go = boundary(here);
+            ++pc;
+
+          break; case Op::Save:
+            ++pc;
+
+          break; case Op::AtStart:
+            go = here == 0 and not notstart;
+            ++pc;
+
+          break; case Op::AtEnd:
+            go = here == s.size() and not notend;
+            ++pc;
+
+          break; case Op::CountInit:
+            work_regs()[in.reg]     = 0;
+            work_regs()[in.reg + 1] = -1;
+            ++pc;
+
+          break; case Op::CountTest: {
+            auto [more, done, empty] = count_test(in, work_regs());
+            if (empty) {
+              pc = in.y;
+            } else if (more) {
+              if (done) push(in.y, w.regs, set);
+              work_regs()[in.reg + 1] = static_cast<s::int64_t>(here);
+              pc = in.x;
+            } else if (done) {
+              pc = in.y;
+            } else {
+              go = false;
+            }
+          }
+
+          break; case Op::CountInc:
+            work_regs()[in.reg] = s::min<s::int64_t>(work_regs()[in.reg] + 1, INT32_MAX);
+            pc = in.x;
+
+          break; case Op::CtxStart:
+            inject(in.x);
+            work_regs()[in.reg] = static_cast<s::int64_t>(here);
+            ++pc;
+
+          break; case Op::NegExit:
+            go = boundary(here) and not accepted(in.x, work_regs()[in.reg]);
+            ++pc;
+
+          break; case Op::ExclCheck:
+            go = not accepted(in.x, work_regs()[in.reg]);
+            ++pc;
+
+          break; default:
+            assert(false);  // should never get here
+        }
+      }
+    }
+    sc.wregs.resize(rbase);
+    sc.ntmp = tbase;
+  }
+
+  // The starts in tmp[set] have a state here in context c, or (`acc`)
+  // match up to here.
+  void mark(s::size_t c, s::uint32_t set, bool acc) {
+    auto& cx = sc.ctxs[c];
+    cx.alive.add(sc.tmp[set]);
+    if (acc) cx.acc.add(sc.tmp[set]);
+    cx.changed = true;
+  }
+
+  const VmProgram&                 p;
+  const CompiledPattern::Impl&     impl;
+  VmScratch&                       sc;
+  Mode                             mode;
+  bool                             want;    // the groups are wanted
+  s::size_t                        nstate;  // state registers
+  s::size_t                        stride;  // registers per thread
+  s::size_t                        base = 0, here = 0;
+  bool                             found = false;
+  s::size_t                        end   = 0;
+  vec<s::int64_t>                  caps;
+  vec<s::size_t>                   ends;
+  vec<s::int64_t>                  zeros;   // state registers all clear
+  bool                             steady  = false;   // see cacheable()
+  bool                             cutting = false;   // see cut_match()
+  bool                             forcing = false;
+  umap<LeakKey, const Node::FlagPoint*, LeakHash> leak_memo;   // leaked()'s answers
+};
+
+// Whether there is a repeat at or under n.
+bool has_repeat(const Node& n) {
+  if (n.kind == Kind::Repeat) return true;
+  if (n.kind != Kind::Group) return false;
+  for (const auto& alt : n.alts)
+    for (const auto& x : alt)
+      if (has_repeat(x)) return true;
+  return false;
+}
+
+// Whether the VM follows the flags that the (#cN,M) under n leak
+// (Node::leaks): each repeats something that matches in one way and holds
+// no repeat, inside no repeat, and there is no `^` or `~`, whose programs
+// run apart from the threads that carry the flags.
+bool vm_follows_leaks(const Node& n, bool inside) {
+  switch (n.kind) {
+    case Kind::Repeat:
+      if (not n.leaks.empty() and (inside or has_repeat(*n.sub))) return false;
+      return vm_follows_leaks(*n.sub, true);
+    case Kind::Group:
+      if (n.negate) return false;
+      for (s::size_t a = 0; a < n.alts.size(); ++a) {
+        if (not n.alt_excludes[a].empty()) return false;
+        for (const auto& x : n.alts[a])
+          if (not vm_follows_leaks(x, inside)) return false;
+      }
+      return true;
+    default:
+      return true;
+  }
+}
+
+// The ASCII characters, compared exactly, that every match of n has: a
+// bit each.
+using CharSet = s::array<s::uint64_t, 2>;
+
+CharSet needed(const Node& n) {
+  CharSet out{};
+  auto seq = [](const Seq& q) {
+    CharSet all{};
+    for (const auto& x : q) {
+      CharSet c = needed(x);
+      all[0] |= c[0];
+      all[1] |= c[1];
+    }
+    return all;
+  };
+  switch (n.kind) {
+    case Kind::Lit:
+      if (not n.bad and n.ch < 0x80 and not n.nocase and not n.lower)
+        out[n.ch >> 6] |= s::uint64_t{1} << (n.ch & 63);
+      return out;
+    case Kind::Repeat:
+      return n.min > 0 ? needed(*n.sub) : out;
+    case Kind::Group:
+      if (n.negate) return out;
+      out = {~s::uint64_t{0}, ~s::uint64_t{0}};
+      for (const auto& alt : n.alts) {
+        CharSet c = seq(alt);
+        out[0] &= c[0];
+        out[1] &= c[1];
+      }
+      return out;
+    default:
+      return out;
+  }
+}
+
+// Compiles `impl`, parsed, for the VM.
+void compile_vm(CompiledPattern::Impl& impl) {
+  // (#aN) has only the backtracker.
+  if (impl.approx) return;
+  const Node& top = impl.main.front();
+  impl.stale     = has_stale_count(top, impl.multibyte);
+  impl.marks     = nested_repeats(top, false);
+  impl.vm_leaks  = impl.leaky and vm_follows_leaks(top, false);
+  auto prog = s::make_shared<VmProgram>();
+  VmCompiler{*prog, {}, {}, {}}.top(impl, impl.vm_leaks);
+  // Leaked flags may fold a literal's case.
+  if (not impl.leaky) {
+    CharSet c = needed(top);
+    for (int ch = 0; ch < 128; ++ch)
+      if ((c[static_cast<s::size_t>(ch >> 6)] >> (ch & 63)) & 1)
+        prog->needs.push_back(static_cast<char>(ch));
+  }
+  impl.vm = s::move(prog);
+}
+
 }  // namespace
 
 bool locale_multibyte() noexcept { return MB_CUR_MAX > 1; }
@@ -1184,6 +2825,7 @@ CompiledPattern CompiledPattern::compile(strv pattern, bool case_insensitive,
     }
     lit->main.push_back(s::move(all));
     lit->tails.resize(1);
+    compile_vm(*lit);
     cp.mImpl = s::move(lit);
     return cp;
   }
@@ -1191,41 +2833,22 @@ CompiledPattern CompiledPattern::compile(strv pattern, bool case_insensitive,
     impl->tails.push_back(top.alt_excludes[a].empty() ? tail_literal(top.alts[a], multibyte)
                                                       : s::nullopt);
   impl->main.push_back(s::move(top));
+  compile_vm(*impl);
   cp.mImpl = s::move(impl);
   return cp;
 }
 
-// Without (#aN) the position-set matcher decides whether, and how far, a
-// pattern matches; the backtracking matcher then finds the (#b) groups of
-// the match already chosen, or the end zsh's search reaches first, so a
-// subject that cannot match costs no backtracking.  With (#aN) the
-// backtracking matcher decides.
+// Without (#aN) the VM decides whether, and how far, a pattern matches,
+// and finds its (#b) groups, except where zsh's counter keeps a stale
+// start, its marks of a repeat inside another matter, or its flags leak
+// where the VM does not follow (Impl::stale, Impl::marks, Impl::leaky;
+// see backtracked()): there the backtracker decides, the VM filtering
+// where it can and answering when the backtracker gives up.  With (#aN)
+// the backtracker decides.
 namespace {
 
-bool set_matches(const CompiledPattern::Impl& impl, strv text, s::size_t b, s::size_t e) {
-  SetMatcher m{{text, e, impl.multibyte}};
-  const Node& top = impl.main.front();
-  for (s::size_t a = 0; a < top.alts.size(); ++a) {
-    if (const auto& t = impl.tails[a]) {
-      for (s::size_t x : m.seq(t->head, Positions{b}))
-        if (m.tail_matches(*t, x)) return true;
-      continue;
-    }
-    Positions part = m.seq(top.alts[a], Positions{b});
-    for (const auto& ex : top.alt_excludes[a]) part = without(part, m.seq(ex, Positions{b}));
-    if (has(part, e)) return true;
-  }
-  return false;
-}
-
-// Every end of a match from b.  Where a match may end does not depend on
-// where the subject is cut off after it, so one run over all of text
-// gives every prefix that matches.
-Positions prefix_ends(const CompiledPattern::Impl& impl, strv text, s::size_t b,
-                      bool notstart, bool notend) {
-  SetMatcher m{{text, text.size(), impl.multibyte, notstart, notend}};
-  return m.node(impl.main.front(), Positions{b});
-}
+// The ends of matches from a place, ascending.
+using Positions = vec<s::size_t>;
 
 // What the backtracking matcher found.
 enum class Verdict : s::uint8_t { No, Yes, GaveUp };
@@ -1233,37 +2856,159 @@ enum class Verdict : s::uint8_t { No, Yes, GaveUp };
 // The backtracking matcher on text[b, e), and the (#b) groups of a match
 // into `info`.  With `tails`, as a whole match; else as a prefix match
 // that ends at e.
+// When it gives up, `spent` says whether on steps (else on the stack).
 Verdict backtrack(const CompiledPattern::Impl& impl, strv text, s::size_t b, s::size_t e,
                   PatternMatch* info, bool tails = true, bool notstart = false,
-                  bool notend = false) {
+                  bool notend = false, bool* spent = nullptr) {
   Matcher m{{text, e, impl.multibyte, notstart, notend}, impl};
-  if (not m.whole(impl, b, tails)) return m.deep ? Verdict::GaveUp : Verdict::No;
+  bool ok = m.whole(impl, b, tails);
+  if (spent) *spent = m.spent;
+  // Given up inside an exclusion's test, it may have found a match that
+  // is none.
+  if (m.deep) return Verdict::GaveUp;
+  if (not ok) return Verdict::No;
   if (info) m.report(b, *info);
   return Verdict::Yes;
+}
+
+// The backtracking matcher with the end left open: the end zsh's search
+// reaches first, npos when there is none, and nothing when it gave up
+// (`spent` when on steps).
+opt<s::size_t> backtrack_open(const CompiledPattern::Impl& impl, strv text, s::size_t b,
+                              PatternMatch* info, const PrefixSearch& how, bool& spent) {
+  Matcher m{{text, text.size(), impl.multibyte, how.notstart, how.notend}, impl};
+  s::size_t found = strv::npos;
+  m.node(impl.main.front(), b, [&](s::size_t e) {
+    found = e;
+    return true;
+  });
+  spent = m.spent;
+  if (m.deep) return s::nullopt;
+  if (found != strv::npos and info) {
+    info->groups.clear();
+    if (impl.captures > 0) m.report(b, *info);
+  }
+  return found;
 }
 
 void no_groups(const CompiledPattern::Impl& impl, PatternMatch* info) {
   if (info) info->groups.assign(static_cast<s::size_t>(impl.captures), {strv::npos, strv::npos});
 }
 
-// After the set matcher found text[b, e) to match: whether the
-// backtracking matcher agrees, and the (#b) groups.  It decides only with
-// a (#cN,M); when it gives up, the match stands and the groups took no
-// part.
-bool confirm(const CompiledPattern::Impl& impl, strv text, s::size_t b, s::size_t e,
-             PatternMatch* info, bool tails = true, bool notstart = false, bool notend = false) {
-  if (info) info->groups.clear();
-  if (impl.captures == 0 and not impl.counted) return true;
-  switch (backtrack(impl, text, b, e, info, tails, notstart, notend)) {
-    case Verdict::Yes: return true;
-    case Verdict::No:
-      if (impl.counted) return false;
-      no_groups(impl, info);
-      return true;
-    default:
-      no_groups(impl, info);
-      return true;
+// A VM run from b on `subject`; `tails` takes the whole-match forms.  The
+// groups of a match go to `info`, every end to `ends`, the position where
+// the run stopped to `reached`.
+opt<s::size_t> vm_run(const CompiledPattern::Impl& impl, Subject subject, Vm::Mode mode,
+                      s::size_t b, bool tails, PatternMatch* info, Positions* ends = nullptr,
+                      s::size_t* reached = nullptr) {
+  if (ends) ends->clear();
+  if (reached) *reached = b;
+  strv rest = subject.s.substr(b, subject.lim - b);
+  for (char c : impl.vm->needs)
+    if (rest.find(c) == strv::npos) return s::nullopt;
+  ScratchLease lease;
+  Vm vm{subject, impl, *lease.sc, mode, info and impl.captures > 0};
+  bool found = vm.run(b, tails ? impl.vm->whole : impl.vm->prefix);
+  if (ends) *ends = s::move(vm.ends);
+  if (reached) *reached = vm.here;
+  if (not found) return s::nullopt;
+  if (info) {
+    info->groups.clear();
+    for (int g = 0; g < impl.captures; ++g) {
+      s::int64_t gb = vm.caps[static_cast<s::size_t>(2 * g)];
+      s::int64_t ge = vm.caps[static_cast<s::size_t>(2 * g + 1)];
+      if (gb < 0 or ge < 0) info->groups.emplace_back(strv::npos, strv::npos);
+      else info->groups.emplace_back(static_cast<s::size_t>(gb) - b, static_cast<s::size_t>(ge) - b);
+    }
   }
+  return vm.end;
+}
+
+// The VM: whether text[b, e) matches (with `tails`, as a whole match).
+bool vm_matches(const CompiledPattern::Impl& impl, strv text, s::size_t b, s::size_t e,
+                PatternMatch* info, bool tails = true, bool notstart = false, bool notend = false) {
+  Subject subject{text, e, impl.multibyte, notstart, notend};
+  return vm_run(impl, subject, Vm::Mode::Whole, b, tails, info).has_value();
+}
+
+// The places from b where a match could end: after each character, as
+// the matchers read them (a byte that starts none is one).
+Positions char_ends(const CompiledPattern::Impl& impl, strv text, s::size_t b) {
+  Subject subject{text, text.size(), impl.multibyte};
+  Positions ends;
+  for (s::size_t e = b;;) {
+    ends.push_back(e);
+    if (e >= text.size()) return ends;
+    subject.at(e, e);
+  }
+}
+
+// zsh tries each length of a prefix as a match of the text cut there,
+// whose end is a place where a character may start; the VM reads on.
+// They differ only at the places, up to `until`, before a byte that
+// continues no character, where `*` may end in the cut text, and so may
+// an exclusion: those places.  Without `^` and `~` the VM's run decides
+// them itself (Vm::cut_match()); with them, a match of each cut text,
+// one run per place.
+Positions cut_ends(const CompiledPattern::Impl& impl, const Subject& subject, s::size_t b,
+                   s::size_t until) {
+  Positions cut;
+  if (not impl.multibyte) return cut;
+  for (s::size_t e = b; e < until and e < subject.s.size();) {
+    if (not subject.boundary(e)) cut.push_back(e);
+    subject.at(e, e);
+  }
+  return cut;
+}
+
+// The VM: every end of a match from b, and (with `^` or `~`) the places
+// of cut_ends() where a cut text may match.
+Positions vm_ends(const CompiledPattern::Impl& impl, strv text, s::size_t b,
+                  const PrefixSearch& how) {
+  Subject subject{text, text.size(), impl.multibyte, how.notstart, how.notend};
+  Positions ends;
+  s::size_t reached = b;
+  vm_run(impl, subject, Vm::Mode::Ends, b, false, nullptr, &ends, &reached);
+  if (impl.vm->ctxs.empty()) return ends;
+  Positions cut = cut_ends(impl, subject, b, reached + 1);
+  if (cut.empty()) return ends;
+  Positions all;
+  s::set_union(ends.begin(), ends.end(), cut.begin(), cut.end(), s::back_inserter(all));
+  return all;
+}
+
+// The VM: the length of the prefix from b that match_prefix() takes.
+s::size_t vm_prefix(const CompiledPattern::Impl& impl, strv text, s::size_t b, bool longest,
+                    PatternMatch* info, const PrefixSearch& how) {
+  Subject subject{text, text.size(), impl.multibyte, how.notstart, how.notend};
+  if (longest) {
+    auto end = vm_run(impl, subject, Vm::Mode::First, b, false, info);
+    return end ? *end - b : strv::npos;
+  }
+  // The shortest end; its groups are those of a whole match up to there.
+  s::size_t reached = b;
+  auto end = vm_run(impl, subject, Vm::Mode::Shortest, b, false, nullptr, nullptr, &reached);
+  Positions cut;
+  if (not impl.vm->ctxs.empty()) cut = cut_ends(impl, subject, b, (end ? *end : reached) + 1);
+  if (not cut.empty()) {
+    // Where the cut text decides, a match of it there.
+    Positions ends = vm_ends(impl, text, b, how);
+    end = s::nullopt;
+    for (s::size_t e : ends)
+      if (subject.boundary(e)
+          or vm_matches(impl, text, b, e, nullptr, false, how.notstart, how.notend)) {
+        end = e;
+        break;
+      }
+  }
+  if (not end) return strv::npos;
+  if (info) {
+    info->groups.clear();
+    if (impl.captures > 0 and not vm_matches(impl, text, b, *end, info, false, how.notstart,
+                                             how.notend))
+      no_groups(impl, info);
+  }
+  return *end - b;
 }
 
 // The characters in text[b, e) as the matcher counts them: under MULTIBYTE
@@ -1283,64 +3028,97 @@ s::size_t chars_in(strv text, s::size_t b, s::size_t e, bool mb) {
   return n;
 }
 
-// match_prefix() for a pattern whose (#cN,M) leaks flags: the
-// backtracker alone decides, the set matcher only when it gives up.
-s::size_t leaky_prefix(const CompiledPattern::Impl& impl, strv text, s::size_t b, bool longest,
-                       PatternMatch* info, PrefixSearch& how) {
-  if (longest and not how.gave_up) {
-    Matcher m{{text, text.size(), impl.multibyte, how.notstart, how.notend}, impl};
-    s::size_t found = strv::npos;
-    m.node(impl.main.front(), b, [&](s::size_t e) {
-      found = e;
-      return true;
-    });
-    if (not m.deep) {
-      if (found != strv::npos and info) {
-        info->groups.clear();
-        if (impl.captures > 0) m.report(b, *info);
-      }
-      return found == strv::npos ? found : found - b;
+
+// Whether the backtracker decides for `impl`: zsh's counter keeps a stale
+// start, its marks matter, or its flags leak where the VM does not follow.
+bool backtracked(const CompiledPattern::Impl& impl) {
+  return impl.stale or impl.marks or (impl.leaky and not impl.vm_leaks);
+}
+
+// Whether the VM's matches include all zsh's, so that where it finds none
+// there is none: zsh's stale start and its marks only reject matches,
+// leaked flags the VM does not follow may allow more.
+bool vm_filters(const CompiledPattern::Impl& impl) {
+  return not impl.leaky or impl.vm_leaks;
+}
+
+// match_prefix() where the backtracker decides (see backtracked()), or
+// with `all` (for tests) for every pattern.  When it gives up, the VM's
+// answer.
+s::size_t backtracked_prefix(const CompiledPattern::Impl& impl, strv text, s::size_t b,
+                             bool longest, PatternMatch* info, PrefixSearch& how, bool all) {
+  bool filter = not all and vm_filters(impl);
+  // Once the backtracker ran out of steps in this search, the VM.
+  if (how.gave_up) return vm_prefix(impl, text, b, longest, info, how);
+  if (longest) {
+    PatternMatch found;
+    s::size_t len = strv::npos;
+    if (filter) {
+      len = vm_prefix(impl, text, b, true, info ? &found : nullptr, how);
+      if (len == strv::npos) return len;
     }
-    if (m.spent) how.gave_up = true;
-  } else if (not longest) {
-    bool gave_up = false;
-    for (s::size_t e = b; e <= text.size() and not gave_up; ++e) {
-      if (impl.multibyte and e < text.size()
-          and (static_cast<unsigned char>(text[e]) & 0xc0) == 0x80)
-        continue;
-      auto v = backtrack(impl, text, b, e, info, false, how.notstart, how.notend);
-      if (v == Verdict::Yes) return e - b;
-      gave_up = v == Verdict::GaveUp;
-    }
-    if (not gave_up) return strv::npos;
+    bool spent = false;
+    if (auto end = backtrack_open(impl, text, b, info, how, spent))
+      return *end == strv::npos ? *end : *end - b;
+    if (spent) how.gave_up = true;
+    // Given up: the VM's answer, found already when it filtered.
+    if (not filter) return vm_prefix(impl, text, b, true, info, how);
+    if (info) *info = s::move(found);
+    return len;
   }
-  Positions ends = prefix_ends(impl, text, b, how.notstart, how.notend);
-  if (ends.empty()) return strv::npos;
-  no_groups(impl, info);
-  return (longest ? ends.back() : ends.front()) - b;
+  // The shortest end the backtracker agrees with.
+  Positions ends = filter ? vm_ends(impl, text, b, how) : char_ends(impl, text, b);
+  for (s::size_t e : ends) {
+    bool spent = false;
+    if (not how.gave_up) {
+      switch (backtrack(impl, text, b, e, info, false, how.notstart, how.notend, &spent)) {
+        case Verdict::Yes: return e - b;
+        case Verdict::No: continue;
+        default: break;
+      }
+      if (spent) how.gave_up = true;
+    }
+    // Given up: the VM's answer, there (where the VM found an end or the
+    // cut text may match) or, without a filter, for the whole search.
+    if (not filter) return vm_prefix(impl, text, b, false, info, how);
+    if (vm_matches(impl, text, b, e, info, false, how.notstart, how.notend)) return e - b;
+  }
+  return strv::npos;
 }
 
 }  // namespace
+
+CompiledPattern CompiledPattern::engine(PatternEngine e) const {
+  CompiledPattern cp = *this;
+  cp.mEngine = e;
+  return cp;
+}
 
 bool CompiledPattern::matches(strv text, PatternMatch* info) const {
   return matches(text, 0, text.size(), info);
 }
 
 bool CompiledPattern::matches(strv text, s::size_t b, s::size_t e, PatternMatch* info) const {
-  if (mImpl->bad) return false;
-  if (mImpl->approx) return backtrack(*mImpl, text, b, e, info) == Verdict::Yes;
-  if (mImpl->leaky) {
-    // The set matcher could reject a match the leaked flags allow, so it
-    // is asked only when the backtracker gives up.
-    switch (backtrack(*mImpl, text, b, e, info)) {
+  const Impl& impl = *mImpl;
+  if (impl.bad) return false;
+  if (impl.approx) return backtrack(impl, text, b, e, info) == Verdict::Yes;
+  bool all = mEngine == PatternEngine::Backtrack;
+  if (all or (mEngine == PatternEngine::Auto and backtracked(impl))) {
+    bool filter = not all and vm_filters(impl);
+    PatternMatch found;
+    if (filter and not vm_matches(impl, text, b, e, info ? &found : nullptr)) return false;
+    switch (backtrack(impl, text, b, e, info)) {
       case Verdict::Yes: return true;
       case Verdict::No: return false;
-      default:
-        no_groups(*mImpl, info);
-        return set_matches(*mImpl, text, b, e);
+      default: break;
+    }
+    // Given up: the VM's answer, found already when it filtered.
+    if (filter) {
+      if (info) *info = s::move(found);
+      return true;
     }
   }
-  return set_matches(*mImpl, text, b, e) and confirm(*mImpl, text, b, e, info);
+  return vm_matches(impl, text, b, e, info);
 }
 
 s::size_t CompiledPattern::match_prefix(strv text, bool longest, PatternMatch* info) const {
@@ -1362,45 +3140,11 @@ s::size_t CompiledPattern::match_prefix(strv text, s::size_t b, bool longest,
     }
     return strv::npos;
   }
-  if (impl.leaky) return leaky_prefix(impl, text, b, longest, info, how);
-  Positions ends = prefix_ends(impl, text, b, how.notstart, how.notend);
-  if (ends.empty()) return strv::npos;
-  if (not longest) {
-    // With a (#cN,M), the shortest end the backtracker agrees with.
-    for (s::size_t e : ends) {
-      if (confirm(impl, text, b, e, info, false, how.notstart, how.notend)) return e - b;
-    }
-    return strv::npos;
-  }
-  if ((ends.size() > 1 or impl.counted) and not how.gave_up) {
-    // The backtracker with the end left open finds where zsh's greedy
-    // search first gets to the end of the pattern.  Should it give up,
-    // the longest end, and the rest of this search does not try again.
-    Matcher m{{text, text.size(), impl.multibyte, how.notstart, how.notend}, impl};
-    s::size_t found = strv::npos;
-    m.node(impl.main.front(), b, [&](s::size_t e) {
-      found = e;
-      return true;
-    });
-    if (not m.deep) {
-      if (found == strv::npos) return strv::npos;
-      if (info) {
-        info->groups.clear();
-        if (impl.captures > 0) m.report(b, *info);
-      }
-      return found - b;
-    }
-    if (m.spent) how.gave_up = true;
-  }
-  s::size_t end = ends.back();
-  if (ends.size() > 1 or impl.counted) no_groups(impl, info);
-  else if (info) {
-    info->groups.clear();
-    if (impl.captures > 0 and backtrack(impl, text, b, end, info, false, how.notstart,
-                                        how.notend) != Verdict::Yes)
-      no_groups(impl, info);
-  }
-  return end - b;
+  if (mEngine == PatternEngine::Backtrack)
+    return backtracked_prefix(impl, text, b, longest, info, how, true);
+  if (mEngine == PatternEngine::Auto and backtracked(impl))
+    return backtracked_prefix(impl, text, b, longest, info, how, false);
+  return vm_prefix(impl, text, b, longest, info, how);
 }
 
 bool CompiledPattern::backrefs() const noexcept { return mImpl->captures > 0; }

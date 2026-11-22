@@ -76,10 +76,18 @@ struct PrefixSearch {
   // matcher has its PAT_NOTSTART or PAT_NOTEND left set.
   bool notstart = false;
   bool notend   = false;
-  // The backtracker ran out of steps finding the end zsh's search reaches
-  // first; the calls after it take the longest end instead of trying.
+  // The backtracker, which decides the patterns whose zsh quirks the VM
+  // does not follow (a stale (#cN,M) start, marks of nested repeats,
+  // some leaked flags), ran out of steps in this search, longest or
+  // shortest; the calls after it take the VM's answer instead of trying.
   bool gave_up  = false;
 };
+
+// Which matcher decides: normally (Auto) the VM, and the backtracker where
+// zsh's quirks need it, with the VM's answer where it gives up.  Tests
+// compare the two: Backtrack has the backtracker decide for every
+// pattern, Vm the VM for every pattern without (#aN).
+enum class PatternEngine : s::uint8_t { Auto, Backtrack, Vm };
 
 struct CompiledPattern {
   struct Node;
@@ -115,9 +123,12 @@ struct CompiledPattern {
   bool bad() const noexcept;
   // Whether characters may take several bytes, as compile() was told.
   bool multibyte() const noexcept;
+  // The same pattern matched as `e` says (for tests).
+  CompiledPattern engine(PatternEngine e) const;
 
 private:
   sptr<const Impl> mImpl;
+  PatternEngine    mEngine = PatternEngine::Auto;
 };
 
 // After `pat` matched `len` bytes of `text` from `start`: with (#b) sets

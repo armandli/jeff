@@ -1555,8 +1555,8 @@ TEST(Pattern13c, GetmatchQuirks) {
 }
 
 // (#cN,M) runs as zsh's counter, which keeps where the last repeat began
-// as attempts fail; the backtracker decides such matches, so the set
-// matcher only filters.
+// as attempts fail; the backtracker decides such matches, and the VM only
+// filters.
 TEST(Pattern13c, CountedRepeats) {
   Shell sh;
   sh.opts.set(OPT_EXTENDEDGLOB);
@@ -1626,16 +1626,17 @@ TEST(Pattern13c, CountSyntax) {
   }
 }
 
-// Giving up on one element of an array does not change the others.
+// The search state of one element of an array does not change the
+// others.
 TEST(Pattern13c, SearchStateIsPerCall) {
   Shell sh;
   sh.opts.set(OPT_EXTENDEDGLOB);
   EXPECT_EQ(out(sh, "h=${(l:300::a:)}c${(l:300::a:)}; a=(aaaca $h aaaca); "
-                    "r=(${a##*a*a*a(c|ca)}); print -r -- \"<$r[1]> <$r[3]>\""),
-            "<a> <a>\n");
-  // A stopgap until 13c.2: the backtracker gives up on the middle one and
-  // takes the longest end; zsh prints 300.
-  EXPECT_EQ(out(sh, "x=${(l:300::a:)}c${(l:300::a:)}; print ${#${x##*a*a*a(c|ca)}}"), "299\n");
+                    "r=(${a##*a*a*a(c|ca)}); print -r -- \"<$r[1]> <${#r[2]}> <$r[3]>\""),
+            "<a> <300> <a>\n");
+  // The VM finds the end zsh's search reaches first where the backtracker
+  // of 13c.1 gave up and took the longest (299).
+  EXPECT_EQ(out(sh, "x=${(l:300::a:)}c${(l:300::a:)}; print ${#${x##*a*a*a(c|ca)}}"), "300\n");
 }
 
 // Inside a group, `~` exclusions and the text after `^` start with the
@@ -1695,6 +1696,82 @@ TEST(Pattern13c, ExclusionsFollowSetSemantics) {
   EXPECT_EQ(out(sh, "for s in x '' a; do [[ $s = ((^)#~b) ]] && print -rn -- \"<$s>\"; done; "
                     "print"),
             "<x><><a>\n");
+}
+
+// M13 Phase 13c.2: patterns without (#aN) run on a VM, linear in the
+// subject; expected values are zsh 5.9's.
+
+TEST(Pattern13c2, LongSubjects) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "z=${(l:2000::a:)}c; [[ $z = (#b)(*)(*)c ]] && print -r -- $mbegin / $mend; "
+                    "[[ $z = (#b)(a#)(a#)c ]] && print -r -- $mbegin / $mend; y=${z##(a|b)#}; "
+                    "print ${#y}"),
+            "1 2001 / 2000 2000\n1 2001 / 2000 2000\n1\n");
+  // As zsh on 2000 characters; on 200000 its recursion gives out.
+  EXPECT_EQ(out(sh, "z=${(l:200000::a:)}; [[ ${z}c = (#b)(*)(*)c ]] && print -r -- $mend; "
+                    "y=${z##(a|b)#}; print ${#y}; [[ $z = (#b)(a|b)(#c1,300000) ]] && "
+                    "print -r -- $mbegin $mend; [[ ${z}b = (a|b)(#c1,150000) ]] || print no"),
+            "200000 200000\n0\n200000 200000\nno\n");
+}
+
+// Flags leaked past (#cN,M) on a chain of repeats too long for the
+// backtracker, which 13c.1 left to the set matcher (1), and its shortest
+// searches.
+TEST(Pattern13c2, LeakedFlagsOnLongChains) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "x=${(l:20000::a:)}b; [[ $x = ((#i)A)(#c1,200000)B ]]; print $?; "
+                    "print ${#${x#*((#i)A)(#c1,2)b}}; x=${(l:10000::a:)}c; "
+                    "print ${#${(S)x#*((#i)A)(#c1,2)c}} ${#${(S)x#((#i)A)(#c1,2)*c}}"),
+            "0\n0\n0 0\n");
+}
+
+TEST(Pattern13c2, NestedCarets) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "x=${(l:200::a:)}; for s in $x ${x}c ${x}bc ${x}c$x; do "
+                    "[[ $s = *(^*(^*(^*b)))c ]]; print -n $?; [[ $s = *(^*(^b))c ]]; print -n $?; "
+                    "done; print"),
+            "11010111\n");
+}
+
+// A count past N that can no longer reach M is as good as any; an empty
+// repeat counts and ends it.
+TEST(Pattern13c2, CountsThatCannotReachTheirMaximum) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "for x in aa1 a1 aaa1 1 aaaa1; do [[ $x = (#b)(|?)(#c2,4) ]] && "
+                    "print -rn -- \"$x:$mbegin/$mend \" || print -rn -- \"$x:n \"; "
+                    "print -rn -- \"${(M)x##(#b)(|?)(#c2,4)}|$mbegin \"; done; print; "
+                    "e=${(l:8000::a:)}; [[ ${e}bc = *(a)(#c1,100000)c ]]; print $?"),
+            "aa1:3/3 |1 a1:3/2 |1 aaa1:4/4 |1 1:2/1 |1 aaaa1:n |1 \n1\n");
+}
+
+// zsh tries the lengths of a shortest match on the text cut there, whose
+// end is where a character may start, so `*` may end before a byte that
+// continues no character; the VM reads on and checks those places.
+TEST(Pattern13c2, StrayContinuationBytes) {
+  Utf8Locale loc{LC_CTYPE};
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "x=$'\\xa9A'; print -r -- ${#${(M)x#*}} ${#${(M)x##*}} ${#${(M)x#?}} "
+                    "${#${x#*}} ${#${(M)x#*A}}; p='*~?'; print -r -- \"<${(MBE)x#$~p}> "
+                    "<${#${(M)x##$~p}} ${(BE)x##$~p}>\""),
+            "0 2 1 2 2\n< 1 1> <2 1 3>\n");
+}
+
+// zsh's marks of a repeat inside another outlive the outer one's repeats;
+// the backtracker decides such patterns.
+TEST(Pattern13c2, MarksOfInnerRepeats) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "p='(#b)(((|?)#)|()a)#'; [[ ba = $~p ]] && print -r -- $mbegin / $mend"),
+            "3 3 3 2 / 2 2 2 1\n");
+  EXPECT_EQ(out(sh, "for x in ab aab bb; do [[ $x = ((a|)#b)# ]] && print -n y; "
+                    "[[ $x = ((a|)#)# ]] || print -n n; done; print"),
+            "ynynyn\n");
 }
 
 }  // namespace
