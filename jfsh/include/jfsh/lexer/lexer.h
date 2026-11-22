@@ -63,6 +63,9 @@ struct LexToken {
   // blank, which makes it eligible for alias expansion too.
   sptr<const vec<str>> aliases = {};
   bool                 after_alias_blank = false;
+  // A TK_LPAREN directly followed by `)`: zsh's INOUTPAR, `()` as opposed
+  // to `( )`.
+  bool                 inout = false;
 
   bool is_word()    const noexcept { return type == TokType::TK_WORD; }
   bool is_newline() const noexcept { return type == TokType::TK_NEWLINE; }
@@ -194,6 +197,9 @@ struct Lexer {
   // The input ended inside a quote, after a trailing backslash, or before
   // a here-document's delimiter line: more input would continue it.
   bool incomplete() const noexcept { return mIncomplete; }
+  // The text of the last token consumed ("\n" for a newline), which zsh
+  // names in a parse error at the end of the input; empty before any.
+  const str& last_text() const noexcept { return mLastText; }
 
 protected:
   LexToken read_token();
@@ -216,6 +222,7 @@ private:
 
   LexInput          mSrc;
   opt<LexToken>     mPeeked;
+  str               mLastText;
   // Captured as each token starts (see read_token).
   sptr<const vec<str>> mTokAliases;
   bool                 mTokAfterBlank = false;

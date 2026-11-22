@@ -24,6 +24,7 @@
 #include <jfsh/core/signals.h>
 #include <jfsh/core/types.h>
 #include <jfsh/core/wordcode.h>
+#include <jfsh/glob/glob.h>
 #include <jfsh/modules/module.h>
 #include <jfsh/prompt/prompt.h>
 
@@ -103,6 +104,9 @@ struct ExecContext {
   int  return_val  = 0;
   bool exiting     = false;
   int  exit_val    = 0;
+  // The exit leaves at once, without unwinding through `always` blocks:
+  // `exit` outside a function, and ERR_EXIT (zsh's zexit).
+  bool exit_now    = false;
   // Ctrl-C under job control, or a TRAPxxx function that failed: unwind
   // the command line.  An interactive shell goes back to the prompt, any
   // other shell exits.
@@ -110,6 +114,16 @@ struct ExecContext {
   // A failed expansion (`${x?}`) set `aborting`: in a widget function it
   // throws away the line being edited too.
   bool abort_line  = false;
+  // Set with `aborting` by an interrupt (Ctrl-C, a signal trap that
+  // failed), as opposed to an error.  Cleared by its two readers before
+  // they run their code: `source`, which ends the file on an error but goes
+  // on unwinding on an interrupt, and `always` ($TRY_BLOCK_INTERRUPT).
+  bool interrupt   = false;
+  // $TRY_BLOCK_ERROR and $TRY_BLOCK_INTERRUPT: whether the `{ … }` of the
+  // `always` block being run ended in an error (or an interrupt); -1
+  // outside one.
+  s::int64_t try_error     = -1;
+  s::int64_t try_interrupt = -1;
   bool hangup      = false; // SIGHUP reached an interactive shell
   // Under job control, the process group of a pipeline whose last stage
   // runs in the shell: it keeps the terminal while that stage runs, so a
@@ -124,6 +138,9 @@ struct ExecContext {
   // from a condition still returns on a failure inside it (zsh 5.9).
   int  noerrreturn = 0;
   bool err_reported = false; // ZERR already ran for the status in hand
+  // Counts the function bodies, evals and sourced files run: a `! f` whose
+  // f ran commands is not exempt from ERR_EXIT and ZERR, as in zsh 5.9.
+  s::uint64_t code_runs = 0;
   bool ran_jobs    = false; // `jobs` ran (lets exit go on with stopped jobs)
 
   HashTable<ProgRef> functions{};  // shell functions: name → body
@@ -353,6 +370,7 @@ protected:
   int exec_funcdef (ExecState& es, WordCode head);
   int exec_cond    (ExecState& es, WordCode head);
   int exec_cond_node(ExecState& es, WordCode head);
+  int exec_cond_leaf(ExecState& es, WordCode head);
   // `[[ s =~ re ]]`: PCRE under REMATCH_PCRE, else a POSIX ERE; with
   // BASH_REMATCH the match goes to $BASH_REMATCH alone.
   int cond_rematch(const str& lhs, const str& re);
@@ -451,6 +469,10 @@ public:
   // Makes one assignment already expanded (`name=v`, `name[sub]=v`,
   // `name=(…)`), as for ${name[sub]:=v}.
   Result<void> assign_expanded(const Assignment& a);
+  // `name=value` as for, select and read make it: as an assignment does
+  // (an integer parameter evaluates the value, `2` sets $2).  A failure is
+  // reported and, as in zsh, ends the command line.
+  bool assign_var(str name, str value);
 
 protected:
   // The expanded PS4 that starts each xtrace line ("" when PS4 is unset).
@@ -511,7 +533,11 @@ private:
   int            mTrapDepth  = 0;     // traps being run
   int            mStringDepth = 0;   // nested exec_string calls
   bool           mExitTrapRan = false;
+  bool           mParseFailed = false;   // exec_string hit a parse error (source)
   str*           mCondTrace   = nullptr;   // xtrace text of the [[ ]] being run
+  // `case` patterns compiled, by their text after expansion and the
+  // options compile() takes (exec_case).
+  HashTable<CompiledPattern> mCasePatterns;
   HashTable<str> mCmdHash;     // command name → resolved path
   str            mHashedPath;  // $PATH the hash was built against
   s::uint64_t    mHashedGen = 0;   // ParamTable::path_generation() then

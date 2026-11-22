@@ -174,7 +174,7 @@ str text_of(str src) {
 
 TEST(JobText, PipelinesAndSimpleCommandsAsWritten) {
   EXPECT_EQ(text_of("sleep 30 | cat"), "sleep 30 | cat");
-  EXPECT_EQ(text_of("a |& b"), "a |& b");
+  EXPECT_EQ(text_of("a |& b"), "a 2>&1 | b");
   EXPECT_EQ(text_of("x=1 echo \"$y\" >out 2>&1"), "x=1 echo \"$y\" > out 2>&1");
   EXPECT_EQ(text_of("cat <(ls) <<< $w"), "cat <(ls) <<< $w");
   EXPECT_EQ(text_of("typeset -i n=3"), "typeset -i n=3");
@@ -189,7 +189,7 @@ TEST(JobText, CompoundCommandsOnOneLine) {
             "if a; then b; elif c; then d; else e; fi");
   EXPECT_EQ(text_of("for x in a b; do echo $x; done"), "for x in a b; do echo $x; done");
   EXPECT_EQ(text_of("case $x in a|b) echo y;; c) ;& esac"),
-            "case $x in (a|b) echo y ;; (c)  ;& esac");
+            "case $x in (a | b) echo y ;; (c)  ;& esac");
   EXPECT_EQ(text_of("[[ -f x && $a == b* ]]"), "[[ -f x && $a == b* ]]");
   EXPECT_EQ(text_of("(( i++ ))"), "(( i++ ))");
   EXPECT_EQ(text_of("{ a } always { b }"), "{ a } always { b }");

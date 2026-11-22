@@ -82,9 +82,7 @@ protected:
   bool par_function_body();
   bool wrap_body_redirs(s::size_t start);
   bool par_cond();
-  bool par_cond_or();
-  bool par_cond_and();
-  bool par_cond_not();
+  bool par_cond_expr();
   bool par_cond_primary();
   // An operand inside [[ ]]: a word, or a reserved word used as one, but
   // not the closing `]]`.
@@ -97,6 +95,11 @@ protected:
     mProg->prog.insert(mProg->prog.begin() + at, w);
     mProg->line_map.insert(mProg->line_map.begin() + at,
                            static_cast<s::uint32_t>(mLex.line()));
+    for (auto& m : mRedirMoves) {
+      if (m.start >= start) ++m.start;
+      if (m.mid >= start) ++m.mid;
+      if (m.end >= start) ++m.end;
+    }
   }
   bool par_arith();
   bool par_redir();
@@ -112,10 +115,13 @@ protected:
   // One sublist wrapped as a body (`f() cmd`, `for x (a b) cmd`).
   bool par_sublist_body();
   // `for`/`select` after the keyword: names, then the value list.
+  bool par_loop_names(vec<str>& names, bool one);
   bool par_for_words(s::size_t head, WordCode op);
   // Redirections after a compound command that starts at `start`, moved in
-  // front of it.
+  // front of it once the whole input is parsed (apply_redir_moves), so
+  // nesting doesn't move the same words again at each level.
   bool par_trailing_redirs(s::size_t start);
+  void apply_redir_moves();
   void emit_words(vec<str> words);
 
   // When the next token is an alias that applies here (any alias in
@@ -156,12 +162,22 @@ private:
   const AliasTable* mAliases = nullptr;
   bool             mLineMode = false;   // parse_line: stop at a newline
   vec<s::size_t> mPendingHeredocs;   // strs indices awaiting bodies
+  // Redirections at [mid, end) that go in front of the command at start.
+  struct RedirMove {
+    s::size_t start, mid, end;
+  };
+  vec<RedirMove> mRedirMoves;
 };
 
 // True when `src` is the start of a program cut off too early: an open
 // `if`, loop, brace, quote or here-document.  An interactive shell then
 // reads more lines; `comments` says whether `#` starts a comment.
 bool is_incomplete(strv src, bool comments = true);
+
+// A here-document's delimiter as the end line is matched: `raw` (the word
+// after `<<`) without its quotes; `quoted` says whether it had any, which
+// makes the body literal.
+str heredoc_delimiter(strv raw, bool& quoted);
 
 // Human-readable listing of the bytecode, one instruction per line
 // (src/parser/text.cpp).  Used by tests and for debugging.

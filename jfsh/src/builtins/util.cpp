@@ -147,7 +147,7 @@ str param_type_flags(const Param& p) {
   str f;
   if (p.is_array()) f += 'a';
   if (p.is_hash()) f += 'A';
-  if (p.is_integer()) f += 'i';
+  if (p.is_integer()) f += 'i' + (p.base > 0 ? s::to_string(p.base) : str{});
   if (p.is_float()) f += (p.flags & PM_EFLOAT) ? 'E' : 'F';
   if (p.flags & PM_LOWER) f += 'l';
   if (p.is_readonly()) f += 'r';

@@ -77,14 +77,25 @@ void install_special_params(ExecContext& ctx) {
     .set_scalar = [rng](str v) { rng->seed(static_cast<s::uint32_t>(to_int(v))); },
   });
 
-  special(params, "LINENO", s::int64_t{0}, PM_INTEGER, {
+  // Read-only, as in zsh (also for `local LINENO`).
+  special(params, "LINENO", s::int64_t{0}, PM_INTEGER | PM_READONLY, {
     .get_scalar = [&ctx] { return s::to_string(ctx.lineno); },
-    .set_scalar = [&ctx](str v) { ctx.lineno = static_cast<s::uint32_t>(to_int(v)); },
+  });
+
+  // $TRY_BLOCK_ERROR / $TRY_BLOCK_INTERRUPT: set for an `always` block;
+  // clearing TRY_BLOCK_ERROR there cancels the error (Executor::exec_always).
+  special(params, "TRY_BLOCK_ERROR", s::int64_t{-1}, PM_INTEGER, {
+    .get_scalar = [&ctx] { return s::to_string(ctx.try_error); },
+    .set_scalar = [&ctx](str v) { ctx.try_error = to_int(v); },
+  });
+  special(params, "TRY_BLOCK_INTERRUPT", s::int64_t{-1}, PM_INTEGER, {
+    .get_scalar = [&ctx] { return s::to_string(ctx.try_interrupt); },
+    .set_scalar = [&ctx](str v) { ctx.try_interrupt = to_int(v); },
   });
 
   // $HISTCMD: the history number of the command being run; 0 without
   // history.
-  special(params, "HISTCMD", s::int64_t{0}, PM_INTEGER, {
+  special(params, "HISTCMD", s::int64_t{0}, PM_INTEGER | PM_READONLY, {
     .get_scalar = [&ctx] {
       return s::to_string(ctx.history ? ctx.history->last_num() : 0u);
     },

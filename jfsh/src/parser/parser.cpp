@@ -22,6 +22,7 @@ Result<ProgRef> Parser::parse() {
   mProg  = prog.get();
   mError = {};
   mIncomplete = false;
+  mRedirMoves.clear();
   bool ok = par_list();
   if (ok and not at(TokType::TK_EOF)) ok = error_near(mLex.peek());
   if (not ok and mError.message.empty()) error_near(mLex.peek());
@@ -32,8 +33,9 @@ Result<ProgRef> Parser::parse() {
   }
   auto bodies = mLex.take_heredocs();
   for (s::size_t i = 0; i < mPendingHeredocs.size() and i < bodies.size(); ++i)
-    prog->strs[mPendingHeredocs[i]] = s::move(bodies[i]);
+    prog->strs[mPendingHeredocs[i]] += bodies[i];
   mPendingHeredocs.clear();
+  apply_redir_moves();
   emit(make_wc(WC_END, 0));
   mProg = nullptr;
   return prog;
@@ -44,6 +46,7 @@ Result<ProgRef> Parser::parse_line() {
   mProg  = prog.get();
   mError = {};
   mIncomplete = false;
+  mRedirMoves.clear();
   mLineMode = true;
   // A line of only `;` is an empty command, as in zsh.
   while (eat(TokType::TK_NEWLINE) or eat(TokType::TK_SEMI)) {}
@@ -61,8 +64,9 @@ Result<ProgRef> Parser::parse_line() {
   if (at(TokType::TK_NEWLINE)) mLex.consume();
   auto bodies = mLex.take_heredocs();
   for (s::size_t i = 0; i < mPendingHeredocs.size() and i < bodies.size(); ++i)
-    prog->strs[mPendingHeredocs[i]] = s::move(bodies[i]);
+    prog->strs[mPendingHeredocs[i]] += bodies[i];
   mPendingHeredocs.clear();
+  apply_redir_moves();
   emit(make_wc(WC_END, 0));
   mProg = nullptr;
   return prog;
@@ -195,7 +199,10 @@ bool Parser::at_list_terminator() const noexcept {
 
 bool Parser::error_near(const LexToken& tok) {
   mIncomplete = tok.is_eof();
-  if (tok.is_eof())          error("parse error: unexpected end of input");
+  // At the end of the input zsh names the last token it read.
+  if (tok.is_eof() and not mLex.last_text().empty())
+    error("parse error near `" + mLex.last_text() + "'");
+  else if (tok.is_eof())     error("parse error: unexpected end of input");
   else if (tok.is_newline()) error("parse error near `\\n'");
   else                       error("parse error near `" + tok.text + "'");
   return false;
@@ -322,6 +329,15 @@ bool Parser::par_cmd() {
         ok = par_cursh(true);
         break;
       }
+      // `{}` there is an empty group, which the lexer reads as one word.
+      if (mLex.peek().text == "{}") {
+        mLex.consume();
+        s::size_t head = emit(make_wc_cmd(WC_CURSH, 0, 0));
+        emit(make_wc(WC_END, 0));
+        patch(head, make_wc_cmd(WC_CURSH, 0, words_after(*mProg, head)));
+        ok = true;
+        break;
+      }
       if (mLex.peek().text != "[[") return tag_line(par_simple());
       ok = par_cond();
       break; default: return tag_line(par_simple());
@@ -335,13 +351,44 @@ bool Parser::par_trailing_redirs(s::size_t start) {
     if (is_procsubst(mLex.peek().text)) return error_near(mLex.peek());
     if (not par_redir()) return false;
   }
-  auto& prog = mProg->prog;
-  auto& lines = mProg->line_map;
-  auto from = static_cast<s::ptrdiff_t>(start);
-  auto to   = static_cast<s::ptrdiff_t>(mid);
-  s::rotate(prog.begin() + from, prog.begin() + to, prog.end());
-  s::rotate(lines.begin() + from, lines.begin() + to, lines.end());
+  if (mProg->prog.size() > mid) mRedirMoves.push_back({start, mid, mProg->prog.size()});
   return true;
+}
+
+// Puts each command's trailing redirections in front of it, in one pass
+// over the program.  The moves keep every construct's length, so the skip
+// counts written while parsing stay right.
+void Parser::apply_redir_moves() {
+  if (mRedirMoves.empty()) return;
+  auto& moves = mRedirMoves;
+  s::stable_sort(moves.begin(), moves.end(),
+                 [](const RedirMove& a, const RedirMove& b) { return a.start < b.start; });
+  auto& prog  = mProg->prog;
+  auto& lines = mProg->line_map;
+  vec<s::size_t> skip_to(prog.size(), 0);   // a block's first word → its end
+  for (const auto& m : moves) skip_to[m.mid] = m.end;
+  vec<WordCode>    code;
+  vec<s::uint32_t> where;
+  code.reserve(prog.size());
+  where.reserve(prog.size());
+  s::size_t k = 0;
+  for (s::size_t i = 0; i < prog.size();) {
+    for (; k < moves.size() and moves[k].start == i; ++k)
+      for (s::size_t j = moves[k].mid; j < moves[k].end; ++j) {
+        code.push_back(prog[j]);
+        where.push_back(lines[j]);
+      }
+    if (skip_to[i]) {
+      i = skip_to[i];
+      continue;
+    }
+    code.push_back(prog[i]);
+    where.push_back(lines[i]);
+    ++i;
+  }
+  prog  = s::move(code);
+  lines = s::move(where);
+  moves.clear();
 }
 
 // `NAME=value` or `NAME+=value` with an unquoted identifier before the `=`.
@@ -578,15 +625,38 @@ bool Parser::par_while() {
   return true;
 }
 
+// A name `for`, `select` and `foreach` may set, as zsh's isident: an
+// identifier (bytes past ASCII count as letters) or a positional
+// parameter's number.
+static bool is_loop_name(strv w) noexcept {
+  if (w.empty()) return false;
+  auto digit = [](char c) { return c >= '0' and c <= '9'; };
+  if (s::all_of(w.begin(), w.end(), digit)) return true;
+  if (digit(w[0])) return false;
+  return s::all_of(w.begin(), w.end(), [&](char c) {
+    return digit(c) or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_'
+        or static_cast<unsigned char>(c) >= 0x80;
+  });
+}
+
+// The names of a for, select (just one) or foreach loop; the first may be
+// `in` (`for in in a b`).  A word that isn't a name is a parse error.
+bool Parser::par_loop_names(vec<str>& names, bool one) {
+  while (at(TokType::TK_WORD) or (names.empty() and at(TokType::TK_IN))) {
+    if (not is_loop_name(mLex.peek().text)) return error_near(mLex.peek());
+    names.push_back(mLex.peek().text);
+    mLex.consume();
+    if (one) break;
+  }
+  if (names.empty()) return error_near(mLex.peek());
+  return true;
+}
+
 // The rest of `for`/`select` after the keyword (head already emitted):
 //   names in words ;    names ( words )    names [;]   (loops over "$@")
 bool Parser::par_for_words(s::size_t head, WordCode op) {
   vec<str> names;
-  while (at(TokType::TK_WORD)) {
-    names.push_back(mLex.peek().text);
-    mLex.consume();
-  }
-  if (names.empty()) return error_near(mLex.peek());
+  if (not par_loop_names(names, op == WC_SELECT)) return false;
   skip_newlines();
   WordCode type = WC_FOR_IN;
   vec<str> values;
@@ -629,11 +699,7 @@ bool Parser::par_foreach() {
   mLex.consume();  // foreach
   s::size_t head = emit(make_wc_cmd(WC_FOR, WC_FOR_IN, 0));
   vec<str> names;
-  while (at(TokType::TK_WORD)) {
-    names.push_back(mLex.peek().text);
-    mLex.consume();
-  }
-  if (names.empty()) return error_near(mLex.peek());
+  if (not par_loop_names(names, false)) return false;
   vec<str> values;
   if (eat(TokType::TK_IN)) {
     while (at_list_word() and not at(TokType::TK_END)) {
@@ -811,6 +877,7 @@ bool Parser::par_case() {
     else if (eat(TokType::TK_SEMIBAR)) type = WC_CASE_TESTNEXT;
     else if (not eat(TokType::TK_DSEMI) and not at(TokType::TK_ESAC))
       return error_near(mLex.peek());
+    if (closed) type |= WC_CASE_GROUPED;
     patch(arm, make_wc_cmd(WC_CASE, type, words_after(*mProg, arm)));
   }
   patch(head, make_wc_cmd(WC_CASE, WC_CASE_HEAD, words_after(*mProg, head)));
@@ -840,8 +907,10 @@ bool Parser::par_repeat() {
 // subsh := WC_SUBSH(0, skip) body, or `() { … } args`, an anonymous
 // function called at once: WC_FUNCDEF(ANON, skip) body words(args).
 bool Parser::par_subsh() {
+  // `()` is an anonymous function; `( )`, with a blank, an empty subshell.
+  bool inout = mLex.peek().inout;
   mLex.consume();  // (
-  if (eat(TokType::TK_RPAREN)) return par_anon_function();
+  if (inout and eat(TokType::TK_RPAREN)) return par_anon_function();
   s::size_t head = emit(make_wc_cmd(WC_SUBSH, 0, 0));
   if (not par_body() or not expect(TokType::TK_RPAREN)) return false;
   patch(head, make_wc_cmd(WC_SUBSH, 0, words_after(*mProg, head)));
@@ -919,7 +988,8 @@ bool Parser::split_open_brace() {
 }
 
 bool Parser::par_function_body() {
-  skip_newlines();
+  // As in zsh, separators may come before the body: `f(); echo hi`.
+  while (eat(TokType::TK_NEWLINE) or eat(TokType::TK_SEMI)) {}
   if (split_open_brace()) {
     s::size_t start = mProg->prog.size();
     return par_body() and expect(TokType::TK_RBRACE) and wrap_body_redirs(start);
@@ -961,12 +1031,11 @@ bool Parser::wrap_body_redirs(s::size_t start) {
 // words.  Newlines may come between the parts.
 //   or      := and (|| and)*
 //   and     := not (&& not)*
-//   not     := ! not | primary
-//   primary := ( or ) | word | unop word | word binop word
+//   not     := ! not | ( or ) | primary
 bool Parser::par_cond() {
   mLex.consume();  // [[
   mLex.push_state(static_cast<LexFlags>(mLex.state() | LEX_COND));
-  bool ok = par_cond_or();
+  bool ok = par_cond_expr();
   if (ok) {
     skip_newlines();
     if (at(TokType::TK_WORD) and mLex.peek().text == "]]") {
@@ -980,40 +1049,105 @@ bool Parser::par_cond() {
   return ok;
 }
 
-// cond := WC_COND(OR, skip) cond cond, left-associative; the header goes in
-// front of the left side once the `||` is seen.
-bool Parser::par_cond_or() {
+// cond := WC_COND(NOT, skip) cond | WC_COND(AND|OR, skip) cond cond | a
+// primary.  Read without recursion, so neither a long chain nor deep
+// nesting uses up the C++ stack: the primaries are emitted as they come,
+// the operators wait on a stack (`&&` and `||` group to the right, as in
+// zsh), and the tree they make is then laid out with each header in front
+// of its operands.
+bool Parser::par_cond_expr() {
+  struct Node {
+    WordCode  type;          // WC_COND_NOT, _AND, _OR, or _STR for a primary
+    s::size_t begin, size;   // a primary's words; any node's size laid out
+    s::size_t left = 0, right = 0;
+  };
+  vec<Node>      nodes;
+  vec<s::size_t> operands;   // nodes waiting for their operator
+  vec<char>      ops;        // `(`, `!`, `&` and `|`
+  int depth = 0;             // `(`s on ops
   s::size_t start = mProg->prog.size();
-  if (not par_cond_and()) return false;
+  auto take = [&] {
+    s::size_t n = operands.back();
+    operands.pop_back();
+    return n;
+  };
+  auto apply = [&] {
+    char op = ops.back();
+    ops.pop_back();
+    Node n{op == '!' ? WC_COND_NOT : op == '&' ? WC_COND_AND : WC_COND_OR, 0, 1};
+    if (op != '!') n.right = take();
+    n.left = take();
+    n.size += nodes[n.left].size + (op == '!' ? 0 : nodes[n.right].size);
+    nodes.push_back(n);
+    operands.push_back(nodes.size() - 1);
+  };
+  auto apply_nots = [&] { while (not ops.empty() and ops.back() == '!') apply(); };
   for (;;) {
     skip_newlines();
-    if (not eat(TokType::TK_PIPEPIPE)) return true;
+    if (eat(TokType::TK_BANG)) {
+      ops.push_back('!');
+      continue;
+    }
+    if (eat(TokType::TK_LPAREN)) {
+      ops.push_back('(');
+      ++depth;
+      continue;
+    }
+    s::size_t begin = mProg->prog.size();
+    if (not par_cond_primary()) return false;
+    nodes.push_back({WC_COND_STR, begin, mProg->prog.size() - begin});
+    operands.push_back(nodes.size() - 1);
+    apply_nots();
+    // An operator, or a `)`, or the end.
     skip_newlines();
-    if (not par_cond_and()) return false;
-    insert(start, make_wc_cmd(WC_COND, WC_COND_OR,
-                              static_cast<WordCode>(mProg->prog.size() - start)));
+    while (depth > 0 and eat(TokType::TK_RPAREN)) {
+      while (ops.back() != '(') apply();
+      ops.pop_back();
+      --depth;
+      apply_nots();
+      skip_newlines();
+    }
+    if (eat(TokType::TK_AMPAMP)) {
+      ops.push_back('&');
+      continue;
+    }
+    if (eat(TokType::TK_PIPEPIPE)) {
+      while (not ops.empty() and ops.back() == '&') apply();
+      ops.push_back('|');
+      continue;
+    }
+    if (depth > 0) return error_near(mLex.peek());
+    break;
   }
-}
-
-bool Parser::par_cond_and() {
-  s::size_t start = mProg->prog.size();
-  if (not par_cond_not()) return false;
-  for (;;) {
-    skip_newlines();
-    if (not eat(TokType::TK_AMPAMP)) return true;
-    skip_newlines();
-    if (not par_cond_not()) return false;
-    insert(start, make_wc_cmd(WC_COND, WC_COND_AND,
-                              static_cast<WordCode>(mProg->prog.size() - start)));
+  while (not ops.empty()) apply();
+  if (nodes.size() == 1) return true;
+  // Lay the tree out in prefix order; the primaries keep their order.
+  vec<WordCode>    code;
+  vec<s::uint32_t> lines;
+  auto& prog = mProg->prog;
+  auto& line_map = mProg->line_map;
+  code.reserve(prog.size() - start + nodes.size());
+  lines.reserve(code.capacity());
+  vec<s::size_t> todo{operands.back()};
+  while (not todo.empty()) {
+    const Node& n = nodes[todo.back()];
+    todo.pop_back();
+    if (n.type == WC_COND_STR) {
+      code.insert(code.end(), prog.begin() + static_cast<s::ptrdiff_t>(n.begin),
+                  prog.begin() + static_cast<s::ptrdiff_t>(n.begin + n.size));
+      lines.insert(lines.end(), line_map.begin() + static_cast<s::ptrdiff_t>(n.begin),
+                   line_map.begin() + static_cast<s::ptrdiff_t>(n.begin + n.size));
+      continue;
+    }
+    code.push_back(make_wc_cmd(WC_COND, n.type, static_cast<WordCode>(n.size - 1)));
+    lines.push_back(line_map[start]);
+    if (n.type != WC_COND_NOT) todo.push_back(n.right);
+    todo.push_back(n.left);
   }
-}
-
-bool Parser::par_cond_not() {
-  skip_newlines();
-  if (not eat(TokType::TK_BANG)) return par_cond_primary();
-  s::size_t head = emit(make_wc_cmd(WC_COND, WC_COND_NOT, 0));
-  if (not par_cond_not()) return false;
-  patch(head, make_wc_cmd(WC_COND, WC_COND_NOT, words_after(*mProg, head)));
+  prog.resize(start);
+  line_map.resize(start);
+  prog.insert(prog.end(), code.begin(), code.end());
+  line_map.insert(line_map.end(), lines.begin(), lines.end());
   return true;
 }
 
@@ -1027,16 +1161,12 @@ static bool is_cond_binary_op(strv op) noexcept {
       or op == "-lt" or op == "-le" or op == "-gt" or op == "-ge";
 }
 
+// primary := word | unop word | word binop word | -NAME args…
 bool Parser::par_cond_primary() {
-  skip_newlines();
-  if (eat(TokType::TK_LPAREN)) {
-    if (not par_cond_or()) return false;
-    skip_newlines();
-    return expect(TokType::TK_RPAREN);
-  }
   if (not at_cond_word()) return error_near(mLex.peek());
   str w1 = mLex.peek().text;
   mLex.consume();
+  skip_newlines();
   // A single word: true when it is not empty.
   if (not at_cond_word()) {
     emit(make_wc_cmd(WC_COND, WC_COND_STR, 1));
@@ -1162,7 +1292,7 @@ static bool op_to_redir_type(strv op, RedirType& out) noexcept {
 // was there (which makes the body literal).  Inside '…' everything is
 // literal; inside "…" a backslash escapes only " $ ` and \; elsewhere
 // it escapes any character.  `'EOF'` → EOF, `E\\OF` → E\OF.
-static str heredoc_unquote(strv raw, bool& quoted) {
+str heredoc_delimiter(strv raw, bool& quoted) {
   str out;
   quoted = false;
   char in = 0;   // the quote we are inside of, if any
@@ -1261,12 +1391,12 @@ bool Parser::par_redir() {
 
   if (type == REDIR_HEREDOC or type == REDIR_HEREDOCD) {
     bool quoted = false;
-    str delim = heredoc_unquote(target, quoted);
+    str delim = heredoc_delimiter(target, quoted);
     mLex.register_heredoc(delim, type == REDIR_HEREDOCD, not quoted);
     // The lexer reads the body once it reaches the end of this line;
-    // parse() fills the placeholder in.
+    // parse() adds it after the delimiter as written (split_heredoc).
     emit(make_wc_redir(type, fd, quoted));
-    mPendingHeredocs.push_back(emit_str({}));
+    mPendingHeredocs.push_back(emit_str(target + '\0'));
     return true;
   }
 

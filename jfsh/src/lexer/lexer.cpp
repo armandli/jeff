@@ -312,12 +312,15 @@ bool Lexer::is_keyword(strv s) const noexcept {
 }
 
 LexToken Lexer::next_token() {
+  LexToken t;
   if (mPeeked) {
-    auto t = s::move(*mPeeked);
+    t = s::move(*mPeeked);
     mPeeked.reset();
-    return t;
+  } else {
+    t = read_token();
   }
-  return read_token();
+  if (not t.is_eof()) mLastText = t.is_newline() ? "\\n" : t.text;
+  return t;
 }
 
 const LexToken& Lexer::peek() {
@@ -325,10 +328,7 @@ const LexToken& Lexer::peek() {
   return *mPeeked;
 }
 
-void Lexer::consume() {
-  if (mPeeked) mPeeked.reset();
-  else         read_token();
-}
+void Lexer::consume() { (void)next_token(); }
 
 vec<str> Lexer::take_heredocs() {
   // Input that ends before the bodies (`cat <<EOF` alone) gets empty ones.
@@ -346,12 +346,7 @@ void Lexer::read_heredoc_bodies() {
     str line_buf;
     for (;;) {
       int c = mSrc.next_char();
-      if (c == -1) {
-        if (line_buf != spec.delim) mIncomplete = true;
-        if (not line_buf.empty() and line_buf != spec.delim) body += line_buf;
-        break;
-      }
-      if (c != '\n') {
+      if (c != '\n' and c != -1) {
         line_buf += static_cast<char>(c);
         continue;
       }
@@ -359,6 +354,13 @@ void Lexer::read_heredoc_bodies() {
       if (spec.strip_tabs)
         while (not check.empty() and check.front() == '\t') check.remove_prefix(1);
       if (check == spec.delim) break;
+      if (c == -1) {
+        // The input ended without the end line (a last line without its
+        // newline counts).
+        mIncomplete = true;
+        body += check;
+        break;
+      }
       body += str(check) + '\n';
       line_buf.clear();
     }
@@ -394,10 +396,15 @@ LexToken Lexer::read_token_raw() {
     }
     if (c == '\n') return newline_token();
     if (c == ' ' or c == '\t') continue;
-    // A backslash-newline between words joins the lines.
+    // A backslash-newline between words joins the lines, also with the
+    // next line still to come.
     if (c == '\\') {
       int n = mSrc.next_char();
-      if (n == '\n') continue;
+      if (n == '\n') {
+        if (not next_is(mSrc, -1)) continue;
+        mIncomplete = true;
+        return {TokType::TK_EOF, {}, mSrc.line()};
+      }
       mSrc.unget(n);
     }
     mTokAliases    = mSrc.current_aliases();
@@ -491,7 +498,9 @@ LexToken Lexer::read_token_raw() {
           return {TokType::TK_LPAREN, "(", mSrc.line()};
         }
         mSrc.unget(n);
-        return {TokType::TK_LPAREN, "(", mSrc.line()};
+        LexToken t{TokType::TK_LPAREN, "(", mSrc.line()};
+        t.inout = n == ')';
+        return t;
       }
       // `))` is two tokens, so `(a; (b))` closes both subshells; the end of
       // an arithmetic `(( … ))` is found by read_arith instead.
@@ -555,9 +564,10 @@ opt<str> Lexer::read_arith() {
 
 opt<str> Lexer::read_cond_pattern(str prefix) {
   int c = mSrc.next_char();
-  // Blanks, and a backslash-newline, before it.
+  // Blanks, newlines (as between any parts of a condition), and a
+  // backslash-newline, before it.
   for (;;) {
-    if (c == ' ' or c == '\t') {
+    if (c == ' ' or c == '\t' or (c == '\n' and prefix.empty())) {
       c = mSrc.next_char();
     } else if (c == '\\' and prefix.empty() and next_is(mSrc, '\n')) {
       mSrc.next_char();
@@ -673,8 +683,10 @@ LexToken Lexer::read_word(int first_char, str prefix) {
         int n = mSrc.next_char();
         mSrc.unget(n);
         if (n != ')' or is_assignment_prefix(text)) {
+          // An array assignment the input ends in goes on on the next line.
+          bool array = is_assignment_prefix(text);
           text += '(';
-          slurp_nested(mSrc, text, '(', ')', is_assignment_prefix(text.substr(0, text.size() - 1)));
+          if (not slurp_nested(mSrc, text, '(', ')', array) and array) mIncomplete = true;
           all_digits_so_far = false;
           c = mSrc.next_char();
           continue;
@@ -761,7 +773,11 @@ LexToken Lexer::read_word(int first_char, str prefix) {
       c = mSrc.next_char();
       if (c == -1) mIncomplete = true;
       else         text += static_cast<char>(c);
-      c = mSrc.next_char();
+      // A backslash-newline at the end of the input: the word goes on on
+      // the next line.
+      int n = mSrc.next_char();
+      if (c == '\n' and n == -1) mIncomplete = true;
+      c = n;
       continue;
     }
     text += static_cast<char>(c);

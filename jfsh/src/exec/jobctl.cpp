@@ -84,7 +84,7 @@ int wait_foreground_job(ExecContext& ctx, int jid) {
   const Process& last = j.procs.back();
   if (interrupted) {
     // Ctrl-C ends the whole command line, not just this command.
-    ctx.aborting = true;
+    ctx.aborting = ctx.interrupt = true;
   } else if (last.status == ProcStatus::Killed and last.stop_sig != SIGPIPE) {
     s::fprintf(stderr, "jfsh: %s  %s\n", pad9(j.status_text()).c_str(), j.text.c_str());
   }

@@ -76,6 +76,9 @@ struct Param {
   ParamValue  value;
   s::uint32_t flags    = PM_SCALAR | PM_UNSET;
   int         scope    = 0;
+  // typeset -i N: the base the value is shown in; -F/-E N: the digits
+  // shown.  0 is the default (10, and 10 digits).
+  int         base     = 0;
 
   // nullptr for ordinary parameters
   uptr<ParamHandlers> handlers;
@@ -92,8 +95,9 @@ struct Param {
   bool is_float()    const noexcept { return flags & PM_FLOAT; }
   bool is_scalar()   const noexcept { return flags & PM_SCALAR; }
 
-  // An integer or float renders as text: floats as `typeset -F` (10
-  // decimals) or, with PM_EFLOAT, `typeset -E` (10 significant digits).
+  // An integer or float renders as text: an integer in `base` (`16#FF`),
+  // floats as `typeset -F` (`base` or 10 decimals) or, with PM_EFLOAT,
+  // `typeset -E` (`base` or 10 significant digits).
   str             scalar()  const noexcept;
   s::int64_t      integer() const noexcept;
   double          floatv()  const noexcept;
