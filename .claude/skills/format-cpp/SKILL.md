@@ -1,6 +1,6 @@
 ---
 name: format-cpp
-description: Formats C++ code according to 34 specific style rules covering whitespace, braces, preprocessor directives, namespaces, types, formatting, semantic transformations, naming conventions, and comments. Use when user asks to "format my C++ code", "apply C++ style rules", "clean up this C++ file", or "run format-cpp on X". Run refactor-cpp before this skill. Do NOT use for explaining C++ code, debugging, or writing new C++ code from scratch.
+description: Formats C++ code according to 36 specific style rules covering whitespace, braces, preprocessor directives, namespaces, types, formatting, semantic transformations, naming conventions, and comments. Use when user asks to "format my C++ code", "apply C++ style rules", "clean up this C++ file", or "run format-cpp on X". Run refactor-cpp before this skill. Do NOT use for explaining C++ code, debugging, or writing new C++ code from scratch.
 argument-hint: "[file or directory path]"
 ---
 
@@ -20,7 +20,7 @@ If `$ARGUMENTS` is provided, use it as the target path. Otherwise, ask the user 
 3. `.clang-format`, `compile_commands.json`, or other tooling config
 4. If no standard can be determined, ask the user
 
-Rules D3, G1, and G3 require C++17 or later. If the project targets C++14 or earlier, skip those rules and note it in the report.
+Rules D3, G1, and G3 require C++17 or later. If the project targets C++14 or earlier, skip those rules and note it in the report. Rule E9 requires C++20 or later; skip it for C++17 and earlier.
 
 ### Step 2: Format Each File
 
@@ -127,6 +127,29 @@ template<class T>      // no
 - **Remove** it where it is redundant: member functions defined inside the class body, `constexpr`/`consteval` functions, function templates, and `static constexpr` data members (C++17) are already inline.
 - **Remove** it from functions defined in a `.cpp` file. If such a function is used only in that file and is not declared in any header, also move it into an anonymous namespace (or make it `static`).
 - **Keep** it on non-template functions and variables defined in a header, on member functions defined outside the class body but still in a header, and on explicit specializations of function templates defined in a header. Removing it there causes "multiple definition" link errors as soon as two `.cpp` files include the header.
+
+**E8 — Order data members largest to smallest.** Within each access section (E2), declare data members from largest alignment to smallest, so members of the same size sit together and the compiler inserts no padding between them. `struct A { int a; bool b; int c; bool d; };` is 16 bytes, because each `bool` is padded out to the next `int`'s 4-byte alignment; `struct A { int a; int c; bool b; bool d; };` is 12 bytes, a quarter smaller.
+- **Sort key is alignment, then size.** On the usual 64-bit targets: 8 bytes for pointers, references, `std::size_t`, `int64_t`, `double` and most library types (`std::string`, `std::vector`, `std::unique_ptr`, `std::optional<T>` of those); 4 for `int`, `float`, `char32_t`, and enums with a 4-byte underlying type (E6); 2 for `int16_t`; 1 for `bool`, `char`, `uint8_t` and byte-sized enums. An array or a nested struct sorts by its element's or its own alignment, not its total size. Among members of equal alignment, keep the original order.
+- **Reorder the initializers too.** Members are initialized in declaration order, whatever the member-initializer list says. Rewrite each constructor's initializer list in the new order (otherwise `-Wreorder` fires), and check that no member's initializer reads a member that now comes after it.
+- **Update brace-initialized uses.** `A{1, true, 2, false}` and designated initializers `A{.a = 1, .b = true}` follow declaration order; rewrite every such initialization of the type.
+
+**Exceptions — do NOT reorder:**
+- A layout fixed from outside: types read or written as raw bytes (`memcpy`, `reinterpret_cast`, file or network formats), `extern "C"` or other ABI-bound structs, and types mirroring a hardware or library layout.
+- Types whose declaration order carries meaning: a defaulted `operator<=>` or `operator==` (compares members in declaration order), structured bindings (`auto [x, y] = a;`), or members whose constructors or destructors must run in a set order (a lock before what it guards, a resource before its user).
+- Deliberate layouts: `alignas` padding against false sharing, hot fields grouped together for cache locality, and bit-fields.
+- Types with no padding to remove. Do not churn a struct whose size the reorder would not change.
+
+**E9 — One `operator<=>` instead of the relational operators. (C++20)** Give a type its ordering with the three-way comparison operator, and delete hand-written `operator<`, `>`, `<=`, `>=` and `!=`. The compiler rewrites `a < b` as `(a <=> b) < 0` and `a != b` as `not (a == b)`, and also tries the reversed argument order, so a mixed comparison like `5 < w` works without a second overload.
+- **Default it when the comparison is memberwise.** `auto operator<=>(const T&) const = default;` is then the only comparison operator the type needs: a defaulted `<=>` also declares a defaulted `operator==`, so all six operators work. It compares bases, then members, in declaration order (see E8's exceptions).
+- **A custom `<=>` needs `operator==` too.** Equality is never synthesized from a user-written `<=>`, because `==` can often stop early where an ordering cannot (different lengths). Pair it with `bool operator==(const T&) const = default;` or a custom `==`. That makes two operators, the fewest that work.
+- **Return the weakest ordering category the members allow.** Use `std::strong_ordering` when equal values are interchangeable, `std::weak_ordering` when equivalent values can still differ (case-insensitive keys), and `std::partial_ordering` when some values are unordered (floating-point members). Return `auto` from a defaulted `<=>` and the category is deduced. Inside a custom `<=>`, chain members with `if (auto c = a <=> b; c != 0) return c;`. Add `#include <compare>` when the code names a category type.
+- **Members without `<=>`** (pre-C++20 third-party types with only `<` and `==`): a defaulted `<=>` still works if it declares a concrete return type such as `std::weak_ordering`, which tells the compiler to build the result from `<` and `==`.
+- **Write it as a member or a hidden friend.** Use a hidden friend (`friend auto operator<=>(const T&, const T&) = default;`) only when the left operand needs implicit conversions.
+
+**Exceptions — do NOT convert:**
+- Projects targeting C++17 or earlier: `<=>` doesn't exist there. Leave the legacy operators as they are and note it in the report.
+- An `operator<` whose meaning disagrees with `==`, such as a sort-key order where unequal values compare equivalent, unless the replacement returns `std::weak_ordering` and keeps that meaning exactly.
+- Types the project does not own, and comparisons whose signatures are fixed from outside (`virtual` comparison methods, comparators passed to a library as function objects).
 
 ### Group F: Formatting
 
@@ -330,6 +353,7 @@ void MemoryTool::rewrite(std::string_view notes);
 - **No build file found**: Warn the user but continue formatting; include paths may need manual adjustment
 - **Template-heavy code**: Be extra cautious with G1 and G3 in heavily templated code; prefer skipping over breaking
 - **C++17 required**: Rules D3, G1, and G3 require C++17 or later. If the standard cannot be detected, ask the user before applying these rules
+- **C++20 required**: Rule E9 requires C++20 or later. If the standard cannot be detected, ask the user before applying it
 - **Never break compilation**: If applying a rule would introduce a compile error, skip it
 - **`inline` in a `.cpp` file (E7)**: Only move a function into an anonymous namespace when no header declares it and no other file refers to it; if you cannot check every file, just drop the keyword
 - **Callers out of reach (G4)**: If a function with an in-out parameter is called from code you cannot see or update (a public library API, other repositories), skip it and note it in the report rather than breaking those callers

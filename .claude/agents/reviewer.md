@@ -1,6 +1,6 @@
 ---
 name: reviewer
-description: Independently reviews an implementation of a plan section on the current branch for bugs, non-optimal solutions, deviations from the plan and format-cpp style violations, and returns an APPROVE or CHANGES_REQUESTED verdict. Read-only; used by the /implement skill.
+description: Independently reviews an implementation of a plan section on the current branch for bugs, non-optimal solutions, data structure layout and packing, deviations from the plan and format-cpp style violations, and returns an APPROVE or CHANGES_REQUESTED verdict. Read-only; used by the /implement skill.
 tools: Read, Grep, Glob, Bash
 ---
 
@@ -37,10 +37,38 @@ implementer's report and, after the first round, earlier findings.
 6. **Look for non-optimal solutions**: duplicated logic where a helper
    exists, needless copies or repeated work in hot paths, an abstraction
    heavier than the problem, a simpler correct approach.
-7. **Check style** of the added C++ against
+7. **Check data layout** of every struct, class and container the change
+   adds or rewrites:
+   - **Struct of arrays for scans.**  When a loop scans a collection
+     reading only one or a few fields of each element, the hot fields
+     should live in their own arrays (`vec<int> priorities;
+     vec<str> names;`) rather than an array of whole objects
+     (`vec<Job>`), so the scan walks contiguous memory without loading
+     the fields it skips.  Keep an array of objects when most accesses
+     use most fields of one element at a time.
+   - **Split by usage correlation.**  Members used together on the same
+     path belong in the same object; members used rarely or on a
+     different path (error detail, debug info, cold configuration) go in
+     a separate object, held by value or by pointer, so the hot object
+     stays small and fits more per cache line.  Flag a struct that mixes
+     hot and cold members, and related members scattered across objects
+     that are always accessed together.
+   - **Member packing (format-cpp E8).**  Members ordered from largest to
+     smallest alignment, members of the same size grouped, no padding the
+     order could remove.  Prove it with `sizeof`: compile a probe that
+     includes the header and `static_assert`s the size, or build with
+     `-Wpadded`, and compare with the reordered layout.  Respect E8's
+     exceptions (wire formats, defaulted `<=>`, deliberate `alignas`).
+
+   Packing violations are **style** findings.  Struct-of-arrays and
+   usage-splitting findings are **major** when the type is on a hot path
+   (a loop over many elements, per-character or per-token work) and
+   **minor** otherwise; give the access pattern you found as evidence.
+8. **Check style** of the added C++ against
    `.claude/skills/format-cpp/SKILL.md`, whose rules (A1 to I) cover the
    cases the script cannot judge: naming (H1 to H4), struct ordering
-   (E2), `break; case` style (F3), in-out parameters (G4), comments.  Only
+   (E2), member packing (E8), comparison operators (E9), `break; case`
+   style (F3), in-out parameters (G4), comments.  Only
    judge lines the change added or rewrote, not untouched code.
 
 ## Severity

@@ -563,6 +563,137 @@ template<> inline std::string describe(const int& v) {     // explicit specializ
 Dropping any of these makes the second `.cpp` file that includes the header fail to link with
 "multiple definition of ...". Adding `inline` to make code faster is never a reason to keep it.
 
+### E8 — Order data members largest to smallest
+
+```cpp
+// BEFORE: 16 bytes (4 + 1 + 3 padding + 4 + 1 + 3 padding)
+struct A {
+  int a;
+  bool b;
+  int c;
+  bool d;
+};
+
+// AFTER: 12 bytes (4 + 4 + 1 + 1 + 2 padding)
+struct A {
+  int a;
+  int c;
+  bool b;
+  bool d;
+};
+```
+
+**Mixed sizes, with a constructor:**
+```cpp
+// BEFORE: 24 bytes
+struct Job {
+  Job(double weight, int priority)
+      : mDone(false), mWeight(weight), mPriority(priority), mRetries(0) {}
+
+private:
+  bool mDone;              // 1 + 7 padding
+  double mWeight;          // 8
+  int mPriority;           // 4
+  uint8_t mRetries;        // 1 + 3 tail padding
+};
+
+// AFTER: 16 bytes; the initializer list follows the new declaration order
+struct Job {
+  Job(double weight, int priority)
+      : mWeight(weight), mPriority(priority), mRetries(0), mDone(false) {}
+
+private:
+  double mWeight;          // 8
+  int mPriority;           // 4
+  uint8_t mRetries;        // 1
+  bool mDone;              // 1 + 2 tail padding
+};
+```
+
+**Left alone:**
+```cpp
+struct WireHeader {        // written to the socket with memcpy: layout is the protocol
+  uint8_t version;
+  uint32_t length;
+};
+
+struct Version {           // defaulted <=> compares major, then minor, then patch
+  uint8_t major;
+  uint16_t minor;
+  uint32_t patch;
+  auto operator<=>(const Version&) const = default;
+};
+```
+
+### E9 — One `operator<=>` instead of the relational operators (C++20)
+
+**Memberwise: a single defaulted operator gives all six:**
+```cpp
+// BEFORE
+struct Point {
+  int x;
+  int y;
+
+  bool operator==(const Point& o) const { return x == o.x and y == o.y; }
+  bool operator!=(const Point& o) const { return not (*this == o); }
+  bool operator<(const Point& o) const {
+    return x < o.x or (x == o.x and y < o.y);
+  }
+  bool operator>(const Point& o) const { return o < *this; }
+  bool operator<=(const Point& o) const { return not (o < *this); }
+  bool operator>=(const Point& o) const { return not (*this < o); }
+};
+
+// AFTER
+struct Point {
+  int x;
+  int y;
+
+  auto operator<=>(const Point&) const = default;   // also declares a defaulted ==
+};
+```
+
+**Custom ordering: `<=>` plus `==`, nothing else:**
+```cpp
+// BEFORE
+struct Version {
+  int major;
+  int minor;
+  std::string label;   // build metadata: ignored by ordering and equality
+
+  bool operator==(const Version& o) const {
+    return major == o.major and minor == o.minor;
+  }
+  bool operator!=(const Version& o) const { return not (*this == o); }
+  bool operator<(const Version& o) const {
+    return major != o.major ? major < o.major : minor < o.minor;
+  }
+};
+
+// AFTER
+#include <compare>
+
+struct Version {
+  int major;
+  int minor;
+  std::string label;   // build metadata: ignored by ordering and equality
+
+  std::weak_ordering operator<=>(const Version& o) const {
+    if (auto c = major <=> o.major; c != 0) return c;
+    return minor <=> o.minor;
+  }
+  bool operator==(const Version& o) const {
+    return major == o.major and minor == o.minor;
+  }
+};
+```
+
+The result is `std::weak_ordering`, not `std::strong_ordering`: two `Version`s with different
+`label`s compare equivalent but are not interchangeable. A defaulted `<=>` would compare `label`
+too, so this one has to be written by hand.
+
+**Exception — pre-C++20 project (NOT converted):** the legacy operators stay as they are.
+
 ---
 
 ## Group F: Formatting
