@@ -71,6 +71,9 @@ struct Expander {
   // first, then the text is evaluated.  Used by `(( ))`, `for ((;;))`,
   // `[[ -eq ]]`, and as an integer by `repeat` and subscripts.
   Result<MathNum>    math(strv expr);
+  // Text that is already expanded (an operand of `[[ -eq ]]`), evaluated
+  // as math() does, flagged subscripts (`a[(i)x]`) included.
+  Result<MathNum>    eval_math(strv text);
   Result<s::int64_t> arith(strv expr);
 
   // Status of the last command substitution run, if any.

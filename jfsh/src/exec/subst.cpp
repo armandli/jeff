@@ -933,7 +933,10 @@ struct Scan {
     if (n >= w.size()) { put('$', dq or mode != Mode::Word); ++i; return {}; }
     char c = w[n];
     if (c == '(') {
+      CloseTooDeep = false;
       s::size_t e = find_close(w, n);
+      // Unclosed, `$(` is text; nested past the stack, an error.
+      if (e == strv::npos and CloseTooDeep) return s::unexpected(unclosed_error());
       if (e == strv::npos) { put('$', true); ++i; return {}; }
       i = e + 1;
       // $((expr)) — but $( (subshell) ) and $((a) | b) are commands.
@@ -1088,16 +1091,21 @@ struct Scan {
   }
 
   // Quotes come off before the arithmetic, as in zsh: (( "5" > x )).
-  Result<MathNum> math(strv expr) {
-    auto text = expand_scalar(expr, Mode::Arith);
-    if (not text) return s::unexpected(text.error());
-    MathOptions mo = math_options(opts());
-    mo.flagged_element = [this](const str& name, const str& sub) -> opt<str> {
-      auto r = expand_scalar("${" + name + "[" + sub + "]}", Mode::Scalar);
-      if (not r) return s::nullopt;
-      return *r;
+  // Without `expand` the text is already expanded.
+  Result<MathNum> math(strv expr, bool expand = true) {
+    // Text with nothing to expand (`i++`, `i < n`) is evaluated as it is.
+    str expanded;
+    if (expand and expr.find_first_of("\"\\$`") != strv::npos) {
+      auto text = expand_scalar(expr, Mode::Arith);
+      if (not text) return s::unexpected(text.error());
+      expanded = s::move(*text);
+      expr = expanded;
+    }
+    MathOptions mo = math_options(ctx());
+    mo.flagged_element = [this](const str& name, const str& sub) -> Result<str> {
+      return expand_scalar("${" + name + "[" + sub + "]}", Mode::Scalar);
     };
-    return math_eval(*text, ctx().params, s::move(mo), &ctx().modules.math_funcs());
+    return math_eval(expr, ctx().params, mo, &ctx().modules.math_funcs());
   }
 
   Result<s::int64_t> arith(strv expr) {
@@ -1118,7 +1126,7 @@ struct Scan {
       else if (c == ')' or c == ']') --depth;
       else if (c == ',' and depth == 0) { text->resize(k); break; }
     }
-    auto v = math_eval(*text, ctx().params, math_options(opts()), &ctx().modules.math_funcs());
+    auto v = math_eval(*text, ctx().params, math_options(ctx()), &ctx().modules.math_funcs());
     if (not v) return s::unexpected(v.error());
     return v->as_int();
   }
@@ -1175,12 +1183,8 @@ struct Scan {
     const Param& param = p->get();
     v.set = true;
     if (param.is_hash()) {
-      const auto& h = param.hash_ref();
-      vec<const s::pair<const str, str>*> items;
-      for (auto& kv : h) items.push_back(&kv);
-      s::sort(items.begin(), items.end(), [](auto* a, auto* b) { return a->first < b->first; });
       vec<str> out;
-      for (auto* kv : items) {
+      for (auto* kv : sorted_entries(param.hash_ref())) {
         if (fl.keys) out.push_back(kv->first);
         if (fl.values or not fl.keys) out.push_back(kv->second);
       }
@@ -2848,6 +2852,7 @@ struct Scan {
               // zsh 5.9 prints the word as written: no expansion, no
               // quote removal (`${x:?'boom'}` says `x: 'boom'`).
               str msg = word.empty() ? str("parameter not set") : nice_text(word);
+              ctx().hard_error = true;
               // A shell that isn't interactive exits at once, as zsh's
               // does: `always` blocks don't run.
               if (not opts().interactive()) {
@@ -3208,7 +3213,7 @@ struct Scan {
     // as zsh does when a non-numeric word appears in arithmetic context.
     if (fl.arith) {
       each(v, [&](const str& s) -> str {
-        auto r = math_eval(s, ctx().params, math_options(opts()),
+        auto r = math_eval(s, ctx().params, math_options(ctx()),
                            &ctx().modules.math_funcs());
         if (not r) return "0";
         return format_math(*r);
@@ -3981,6 +3986,8 @@ const GlobHooks& Expander::glob_hooks() {
 }
 
 Result<str> Expander::scalar(strv word, bool assignment) {
+  // Plain text (a number, a name) has nothing to expand.
+  if (word.find_first_of("$`\\'\"~<>(=") == strv::npos) return str(word);
   Scan scan{*this, Mode::Scalar};
   scan.top = true;
   if (auto r = scan.scan(word); not r) return s::unexpected(r.error());
@@ -4033,6 +4040,11 @@ Result<s::int64_t> Expander::arith(strv expr) {
 Result<MathNum> Expander::math(strv expr) {
   Scan scan{*this, Mode::Heredoc};
   return scan.math(expr);
+}
+
+Result<MathNum> Expander::eval_math(strv text) {
+  Scan scan{*this, Mode::Heredoc};
+  return scan.math(text, false);
 }
 
 Result<str> Expander::pattern(strv word) {

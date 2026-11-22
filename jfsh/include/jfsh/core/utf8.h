@@ -41,6 +41,12 @@ s::size_t prev_char(strv s, s::size_t pos) noexcept;
 // Number of characters (as next_char counts them) in `s`.
 s::size_t char_count(strv s) noexcept;
 
+// Code points (each decoded as utf8_decode does, combining marks on their
+// own, as zsh's subscripts count them) in `s`, and the byte offset of the
+// `n`th one (0-based; s.size() past the end).
+s::size_t code_point_count(strv s) noexcept;
+s::size_t code_point_offset(strv s, s::size_t n) noexcept;
+
 }  // namespace jfsh
 
 #endif  // JFSH_CORE_UTF8_H

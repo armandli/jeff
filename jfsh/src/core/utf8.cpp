@@ -160,4 +160,16 @@ s::size_t char_count(strv s) noexcept {
   return n;
 }
 
+s::size_t code_point_count(strv s) noexcept {
+  s::size_t n = 0;
+  for (s::size_t i = 0, len = 1; i < s.size(); i += len, ++n) (void)utf8_decode(s, i, len);
+  return n;
+}
+
+s::size_t code_point_offset(strv s, s::size_t n) noexcept {
+  s::size_t i = 0;
+  for (s::size_t len = 1; i < s.size() and n > 0; i += len, --n) (void)utf8_decode(s, i, len);
+  return i;
+}
+
 }  // namespace jfsh

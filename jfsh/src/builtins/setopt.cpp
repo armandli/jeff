@@ -446,7 +446,7 @@ int builtin_shift(vec<str>& args, ExecContext& ctx) {
     return is_identifier(w) and p and p->get().is_array();
   };
   if (i < args.size() and not names_array(args[i])) {
-    auto v = arith_eval(args[i], ctx.params, math_options(ctx.opts),
+    auto v = arith_eval(args[i], ctx.params, math_options(ctx),
                         &ctx.modules.math_funcs());
     if (not v) return builtin_error(cmd, v.error().message);
     n = *v;

@@ -7,6 +7,7 @@
 #include <jfsh/core/aliases.h>
 #include <jfsh/core/utf8.h>
 #include <jfsh/glob/glob.h>
+#include <shell_fixture.h>
 
 namespace jfsh {
 namespace {
@@ -171,17 +172,7 @@ TEST(GlobUnescape, RemovesBackslashes) {
 
 // M13 Phase 13c.1: zsh 5.9's semantics; expected values are zsh's.
 
-// A UTF-8 LC_CTYPE for one test, for towlower() and friends.
-struct Utf8Ctype {
-  Utf8Ctype() : saved{s::setlocale(LC_CTYPE, nullptr)} {
-    for (const char* name : {"en_US.UTF-8", "C.UTF-8", "en_US.utf8"})
-      if (s::setlocale(LC_CTYPE, name)) { ok = true; break; }
-  }
-  ~Utf8Ctype() { s::setlocale(LC_CTYPE, saved.c_str()); }
-
-  str  saved;
-  bool ok = false;
-};
+using test::Utf8Ctype;
 
 CompiledPattern ext(strv p, bool mb = false) {
   return CompiledPattern::compile(p, false, true, mb);

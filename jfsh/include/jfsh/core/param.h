@@ -177,6 +177,26 @@ struct ParamTable {
     vec<str> words,
     bool append = false);
 
+  // `name[first,last]=value`: elements first … last (zsh's 1-based
+  // indexes, a negative one counting from the end, kept in 32 bits as
+  // zsh's int) of an array, or the characters of a scalar, are replaced by
+  // `value`, the array growing to fit.  first > last inserts before
+  // `first`, as does a negative index that lands before the start; a range
+  // may start at 0, a single index may not.  With `append` a word is added
+  // to element `last` and an array (`array`) inserted after it.  An unset
+  // name becomes an array.  Fails on a readonly parameter, and when the
+  // array would grow past 2^28 elements, and for an array value on a
+  // scalar.  A scalar's characters are code points with `multibyte`
+  // (MULTIBYTE), else bytes.
+  Result<void> set_slice(
+    strv name,
+    s::int64_t first,
+    s::int64_t last,
+    vec<str> value,
+    bool append = false,
+    bool array = false,
+    bool multibyte = true);
+
   // Declare local — creates in the innermost scope that isn't a command's
   // prefix scope, without setting.
   Param& declare_local(
@@ -238,6 +258,10 @@ private:
 // The type text ${(t)name} and $parameters give: "scalar", "array-local",
 // "scalar-tied-export-special", …
 str param_type_text(const Param& p);
+
+// An associative array's entries in key order, the order $h, ${(k)h} and
+// ${(kv)h} give them.  The pointers are into `h`.
+vec<const s::pair<const str, str>*> sorted_entries(const umap<str, str>& h);
 
 }  // namespace jfsh
 

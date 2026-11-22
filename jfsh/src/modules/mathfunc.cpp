@@ -52,6 +52,13 @@ Result<MathNum> fn_abs(const vec<MathNum>& a) {
   return MathNum::of(static_cast<s::int64_t>(absv));
 }
 
+// atan(y) or, as zsh's, atan(y, x) = atan2(y, x).
+Result<MathNum> fn_atan(const vec<MathNum>& a) {
+  if (a.size() == 1) return MathNum::of(s::atan(a[0].as_float()));
+  if (a.size() == 2) return MathNum::of(s::atan2(a[0].as_float(), a[1].as_float()));
+  return err("wrong number of arguments");
+}
+
 Result<MathNum> fn_signgam(const vec<MathNum>& a) {
   if (not a.empty()) return err("wrong number of arguments");
   return MathNum::of(static_cast<s::int64_t>(signgam));
@@ -74,7 +81,7 @@ void register_mathfunc_module(ModuleManager& mm) {
     add("acosh",   f1<s::acosh>,1);
     add("asin",    f1<s::asin>, 1);
     add("asinh",   f1<s::asinh>,1);
-    add("atan",    f1<s::atan>, 1);
+    out.mathfuncs.push_back(MathFuncDef{"atan", fn_atan, 1, 2});
     add("atan2",   f2<s::atan2>,2);
     add("cbrt",    f1<s::cbrt>, 1);
     add("ceil",    f1<s::ceil>, 1);

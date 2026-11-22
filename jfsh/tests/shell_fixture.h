@@ -3,6 +3,7 @@
 // Test helpers shared by the executor and expansion tests: an in-process
 // shell whose stdout/stderr are captured, and a scratch directory.
 
+#include <clocale>
 #include <cstdio>
 #include <cstdlib>
 #include <pthread.h>
@@ -57,6 +58,18 @@
 #include <jfsh/modules/zutil.h>
 
 namespace jfsh::test {
+
+// A UTF-8 LC_CTYPE for one test, for towlower(), MB_CUR_MAX and friends.
+struct Utf8Ctype {
+  Utf8Ctype() : saved{s::setlocale(LC_CTYPE, nullptr)} {
+    for (const char* name : {"en_US.UTF-8", "C.UTF-8", "en_US.utf8"})
+      if (s::setlocale(LC_CTYPE, name)) { ok = true; break; }
+  }
+  ~Utf8Ctype() { s::setlocale(LC_CTYPE, saved.c_str()); }
+
+  str  saved;
+  bool ok = false;
+};
 
 namespace sf = s::filesystem;
 

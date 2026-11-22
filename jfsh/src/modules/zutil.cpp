@@ -628,7 +628,7 @@ struct ZFormat {
             actval = right ? testval < width : testval >= width;
           } else {
             if (right) testval = -testval;
-            auto v = math_eval(*spec, ctx.params, math_options(ctx.opts),
+            auto v = math_eval(*spec, ctx.params, math_options(ctx),
                                &ctx.modules.math_funcs());
             actval = (v ? v->as_int() : 0) - testval != 0;
           }

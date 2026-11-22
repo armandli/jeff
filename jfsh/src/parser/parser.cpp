@@ -1,3 +1,34 @@
+// Only Parser::par_cond_primary in this file (the word rules of `[[ ]]`
+// conditions) is derived from zsh 5.9's par_cond_2, par_cond_double,
+// par_cond_triple and par_cond_multi (Src/parse.c); the rest of the file is
+// not.  zsh's copyright and licence:
+//
+// The Z Shell is copyright (c) 1992-2017 Paul Falstad, Richard Coleman,
+// Zoltán Hidvégi, Andrew Main, Peter Stephenson, Sven Wischnowsky, and
+// others.  All rights reserved.  Individual authors, whether or not
+// specifically named, retain copyright in all changes; in what follows, they
+// are referred to as `the Zsh Development Group'.  This is for convenience
+// only and this body has no legal status.  The Z shell is distributed under
+// the following licence; any provisions made in individual files take
+// precedence.
+//
+// Permission is hereby granted, without written agreement and without
+// licence or royalty fees, to use, copy, modify, and distribute this
+// software and to distribute modified versions of this software for any
+// purpose, provided that the above copyright notice and the following
+// two paragraphs appear in all copies of this software.
+//
+// In no event shall the Zsh Development Group be liable to any party for
+// direct, indirect, special, incidental, or consequential damages arising out
+// of the use of this software and its documentation, even if the Zsh
+// Development Group have been advised of the possibility of such damage.
+//
+// The Zsh Development Group specifically disclaim any warranties, including,
+// but not limited to, the implied warranties of merchantability and fitness
+// for a particular purpose.  The software provided hereunder is on an "as is"
+// basis, and the Zsh Development Group have no obligation to provide
+// maintenance, support, updates, enhancements, or modifications.
+
 #include <jfsh/parser/parser.h>
 
 #include <cctype>
@@ -1161,65 +1192,95 @@ static bool is_cond_binary_op(strv op) noexcept {
       or op == "-lt" or op == "-le" or op == "-gt" or op == "-ge";
 }
 
-// primary := word | unop word | word binop word | -NAME args…
+// primary := word | unop word | word binop word | -NAME args…, read as
+// zsh's par_cond_2: by the number of words, with par_cond_double for two,
+// par_cond_triple for three and par_cond_multi for more.  A two-character
+// `-x` as the second word ends the primary (`[[ -n -a ]]`).
 bool Parser::par_cond_primary() {
   if (not at_cond_word()) return error_near(mLex.peek());
   str w1 = mLex.peek().text;
   mLex.consume();
   skip_newlines();
-  // A single word: true when it is not empty.
-  if (not at_cond_word()) {
+  // A single word: true when it is not empty.  A `!` after it is no
+  // operand (`[[ x ! ]]` is a parse error at the `!`), and a lone `-` is
+  // par_cond_multi's error.
+  if (not at_cond_word() or at(TokType::TK_BANG)) {
+    if (w1 == "-") {
+      error("condition expected: -");
+      return false;
+    }
     emit(make_wc_cmd(WC_COND, WC_COND_STR, 1));
     emit_str(s::move(w1));
     return true;
   }
-  str w2 = mLex.peek().text;
-  // `-x arg`, unless the second word is an operator (`-n = -n`).  An
-  // unknown `-x` is reported when the condition runs, as zsh does.
-  bool binary = is_cond_binary_op(w2)
-             or ((w1.size() < 2 or w1[0] != '-') and w2.size() > 1 and w2[0] == '-');
-  if (not binary) {
-    if (w1.size() < 2 or w1[0] != '-') {
-      error("parse error: condition expected: " + w1);
+  auto dash = [](strv w) { return w.size() > 1 and w[0] == '-'; };
+  auto emit_mod = [&](str name, vec<str>& args) {
+    emit(make_wc_cmd(WC_COND, WC_COND_MOD, static_cast<WordCode>(args.size() + 1)));
+    emit_str(s::move(name));
+    for (auto& a : args) emit_str(s::move(a));
+    return true;
+  };
+  // Two words: `-x word`, or a module's `-NAME word`.
+  auto two = [&](str a, str b) {
+    if (not dash(a)) {
+      error("parse error: condition expected: " + a);
       return false;
     }
-    mLex.consume();
-    if (w1.size() > 2) {
-      // `-NAME -x word`: zsh reads -x as an infix condition, which isn't
-      // one here.
-      if (w2.size() > 1 and w2[0] == '-' and at_cond_word()) return error_near(mLex.peek());
-      // -NAME arg…: a condition a module defines, with its arguments.
-      vec<str> args{s::move(w2)};
-      for (;;) {
-        // A pattern argument may start with a group: `-prefix 1 (f|ht)tp:`.
-        if (at(TokType::TK_LPAREN)) {
-          mLex.consume();
-          auto pat = mLex.read_cond_pattern("(");
-          if (not pat) return error_near(mLex.peek());
-          args.push_back(s::move(*pat));
-          continue;
-        }
-        if (not at_cond_word()) break;
-        args.push_back(mLex.peek().text);
-        mLex.consume();
-      }
-      emit(make_wc_cmd(WC_COND, WC_COND_MOD, static_cast<WordCode>(args.size() + 1)));
-      emit_str(s::move(w1));
-      for (auto& a : args) emit_str(s::move(a));
+    if (a.size() == 2) {
+      emit(make_wc_cmd(WC_COND, WC_COND_UNARY, 2));
+      emit_str(s::move(a));
+      emit_str(s::move(b));
       return true;
     }
-    emit(make_wc_cmd(WC_COND, WC_COND_UNARY, 2));
-    emit_str(s::move(w1));
-    emit_str(s::move(w2));
+    vec<str> args{s::move(b)};
+    return emit_mod(s::move(a), args);
+  };
+  // A module condition's argument: a word, or a pattern starting with a
+  // group (`-prefix 1 (f|ht)tp:`).
+  auto mod_arg = [&](vec<str>& args) {
+    if (at(TokType::TK_LPAREN)) {
+      mLex.consume();
+      auto pat = mLex.read_cond_pattern("(");
+      if (not pat) return error_near(mLex.peek());
+      args.push_back(s::move(*pat));
+      skip_newlines();
+      return true;
+    }
+    args.push_back(mLex.peek().text);
+    mLex.consume();
+    skip_newlines();
     return true;
-  }
+  };
+  str w2 = mLex.peek().text;
   mLex.consume();
+  if (not is_cond_pattern_op(w2)) skip_newlines();
+  // `a op b`: a comparison, a pattern match or an infix module condition
+  // (`-nt`, `-pcre-match`, …; unknown ones fail when run).
+  bool infix = is_cond_binary_op(w2) or (dash(w2) and w2.size() > 2);
+  if (not infix) {
+    if (w2.size() == 2 and w2[0] == '-') return two(s::move(w1), s::move(w2));
+    if (not at_cond_word() and not (dash(w1) and at(TokType::TK_LPAREN)))
+      return two(s::move(w1), s::move(w2));
+    if (not dash(w1)) {
+      // zsh names the operator it wanted with three words, the first
+      // word with more.
+      mLex.consume();
+      skip_newlines();
+      error("condition expected: " + (at_cond_word() ? w1 : w2));
+      return false;
+    }
+    vec<str> args{s::move(w2)};
+    while (at_cond_word() or at(TokType::TK_LPAREN))
+      if (not mod_arg(args)) return false;
+    return emit_mod(s::move(w1), args);
+  }
   str w3;
   if (is_cond_pattern_op(w2)) {
     auto pat = mLex.read_cond_pattern();
     if (not pat or *pat == "]]") {
       if (pat) mLex.unread({TokType::TK_WORD, *pat, mLex.line()});
-      return error_near(mLex.peek());
+      if (not pat or w2 == "<" or w2 == ">") return error_near(mLex.peek());
+      return two(s::move(w1), s::move(w2));
     }
     w3 = s::move(*pat);
   } else if (at(TokType::TK_LPAREN)) {
@@ -1228,10 +1289,24 @@ bool Parser::par_cond_primary() {
     auto pat = mLex.read_cond_pattern("(");
     if (not pat) return error_near(mLex.peek());
     w3 = s::move(*pat);
+  } else if (not at_cond_word()) {
+    if (w2 == "<" or w2 == ">") return error_near(mLex.peek());
+    return two(s::move(w1), s::move(w2));
   } else {
-    if (not at_cond_word()) return error_near(mLex.peek());
     w3 = mLex.peek().text;
     mLex.consume();
+  }
+  skip_newlines();
+  if (at_cond_word() and w2 != "<" and w2 != ">") {
+    // Four or more words: only a module condition takes them.
+    if (not dash(w1)) {
+      error("condition expected: " + w1);
+      return false;
+    }
+    vec<str> args{s::move(w2), s::move(w3)};
+    while (at_cond_word() or at(TokType::TK_LPAREN))
+      if (not mod_arg(args)) return false;
+    return emit_mod(s::move(w1), args);
   }
   emit(make_wc_cmd(WC_COND, WC_COND_BINARY, 3));
   emit_str(s::move(w2));
