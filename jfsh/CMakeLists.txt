@@ -67,8 +67,10 @@ target_link_libraries(jfsh_parser PUBLIC jfsh_lexer jfsh_compiler_options)
 add_library(jfsh_glob STATIC
   src/glob/glob.cpp
   src/glob/pattern.cpp
+  src/glob/pattern_backtrack.cpp
+  src/glob/pattern_vm.cpp
 )
-target_include_directories(jfsh_glob PUBLIC include)
+target_include_directories(jfsh_glob PUBLIC include PRIVATE src)
 target_link_libraries(jfsh_glob PUBLIC jfsh_core jfsh_compiler_options)
 
 # ---------------------------------------------------------------------------

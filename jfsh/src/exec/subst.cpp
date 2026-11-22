@@ -37,6 +37,11 @@ namespace {
 constexpr strv DEFAULT_IFS = strv(" \t\n\0", 4);
 constexpr strv PATTERN_CHARS = "*?[]()|<>^#~\\";
 
+// zsh's error for a pattern it cannot compile.
+ShellError bad_pattern(strv pat) {
+  return ShellError{ErrorKind::BadPattern, "bad pattern: " + glob_unescape(pat)};
+}
+
 ShellError subst_error(str msg) {
   return ShellError{ErrorKind::BadSubstitution, s::move(msg)};
 }
@@ -621,6 +626,11 @@ struct Chars {
   s::size_t pos(s::size_t k) const {
     return at.empty() ? s::min(k, s.size()) : at[s::min(k, size())];
   }
+  // The character that starts at byte `off`.
+  s::size_t index(s::size_t off) const {
+    if (at.empty()) return off;
+    return static_cast<s::size_t>(s::lower_bound(at.begin(), at.end(), off) - at.begin());
+  }
   // `n` characters from character `b`.
   str sub(s::size_t b, s::size_t n) const {
     s::size_t p = pos(b), q = n >= size() ? s.size() : pos(b + n);
@@ -693,6 +703,10 @@ Result<void> tilde_expand(Field& f, bool assign_like, ExecContext& ctx);
 struct Scan {
   Expander& ex;
   Mode      mode;
+  // With literal_bar: the unquoted `(` written and not yet closed.  It
+  // sits in the padding after `mode`, so that a Scan, one on the stack per
+  // nested substitution, does not grow.
+  int       parens = 0;
   vec<Field> fields{1};
   // After ${^x}, fields[rc_from..] are the copies of the word, one per
   // element; text that follows goes onto every one of them.
@@ -700,6 +714,10 @@ struct Scan {
   // Unquoted parameter values are pattern text, as in a subscript flag's
   // pattern: ${a[(r)$p]}.
   bool glob_values = false;
+  // The operand of ${x#…} or ${x/…}: a `|` written there outside
+  // parentheses is text, as zsh's lexer leaves it; one from $~var still
+  // separates alternatives.
+  bool literal_bar = false;
   // Scanning a word as written (not the inside of ${…}): an unquoted
   // `<(…)` / `>(…)`, or `=(…)` at its start, is a process substitution.
   bool top = false;
@@ -879,6 +897,15 @@ struct Scan {
         if (s::size_t j = find_close(w, i + 1); j != strv::npos) {
           put(strv(ex.exec().procsubst(c, w.substr(i + 2, j - i - 2))), true);
           i = j + 1;
+          continue;
+        }
+      }
+      if (literal_bar and not dq) {
+        if (c == '(') ++parens;
+        else if (c == ')' and parens > 0) --parens;
+        else if (c == '|' and parens == 0) {
+          put(c, true);
+          ++i;
           continue;
         }
       }
@@ -1406,13 +1433,16 @@ struct Scan {
   // work in double quotes too, as in zsh, so `dq` is passed as false.
   Result<CompiledPattern> operand_pattern(strv word, bool dq) {
     Scan sub{ex, Mode::Scalar};
+    sub.literal_bar = true;
     if (auto r = sub.scan(word, dq); not r) return s::unexpected(r.error());
     str pat;
     for (s::size_t k = 0; k < sub.fields.size(); ++k) {
       if (k) pat += ' ';
       pat += sub.fields[k].as_pattern();
     }
-    return CompiledPattern::compile(pat, false, opts().extended_glob(), opts().multibyte());
+    auto cp = CompiledPattern::compile(pat, false, opts().extended_glob(), opts().multibyte());
+    if (cp.bad()) return s::unexpected(bad_pattern(pat));
+    return cp;
   }
 
   // `name[key]` where `name` has a get_elem handler and `key` is not @
@@ -1766,7 +1796,7 @@ struct Scan {
       // As zsh's getarg: each tail is a string of its own, so (#s) is
       // where it starts.
       strv rest = strv(v.scalar).substr(cs.pos(static_cast<s::size_t>(k - 1)));
-      return exact ? rest.starts_with(text) : pat.match_prefix(rest, false) != strv::npos;
+      return exact ? rest.starts_with(text) : pat.match_prefix(rest, true) != strv::npos;
     };
     bool backward = kind == 'R' or kind == 'I' or kind == 'K';
     s::int64_t from = backward ? n : 1;
@@ -1921,18 +1951,29 @@ struct Scan {
           repl_text = *last_repl;
           mods.remove_prefix(2);
         }
-        // The left side is plain text unless HIST_SUBST_PATTERN is set.
-        if (not opts().get(OPT_HISTSUBSTPATTERN)) {
-          str lit;
-          for (char ch : pat_text) {
-            if (PATTERN_CHARS.find(ch) != strv::npos) lit += '\\';
+        // The left side is plain text unless HIST_SUBST_PATTERN is set; even
+        // then a `|` outside parentheses is text, as in ${x/…}.
+        str lit;
+        int depth = 0;
+        bool pattern = opts().get(OPT_HISTSUBSTPATTERN);
+        for (s::size_t k = 0; k < pat_text.size(); ++k) {
+          char ch = pat_text[k];
+          if (pattern and ch == '\\' and k + 1 < pat_text.size()) {
             lit += ch;
+            lit += pat_text[++k];
+            continue;
           }
-          pat_text = s::move(lit);
+          if (ch == '(') ++depth;
+          else if (ch == ')' and depth > 0) --depth;
+          if (not pattern ? PATTERN_CHARS.find(ch) != strv::npos : ch == '|' and depth == 0)
+            lit += '\\';
+          lit += ch;
         }
+        pat_text = s::move(lit);
         bool mb = opts().multibyte();
         auto cp = CompiledPattern::compile(pat_text, false,
                                            opts().get(OPT_EXTENDEDGLOB), mb);
+        if (cp.bad()) return s::unexpected(bad_pattern(pat_text));
         bool g = global;
         each(v, [&](const str& s) {
           return replace(s, cp, repl_text, g, /*anchor=*/0, mb);
@@ -1998,142 +2039,297 @@ struct Scan {
     return arith(fl.nth);
   }
 
+  // How zsh's igetmatch looks for a match: its SUB_END (at the end),
+  // SUB_LONG, SUB_SUBSTR (anywhere: (S), and ${x/…}) and SUB_GLOBAL flags.
+  struct MatchHow {
+    bool end = false, longest = false, substr = false, global = false;
+  };
+  // A match of s[b, e), `b_char` characters into s.
+  using HitFn = func<Result<void>(s::size_t b, s::size_t e, s::size_t b_char,
+                                  const PatternMatch& pm)>;
+
+  // zsh's igetmatch: finds the match of `pat` in `s` that ${x#pat},
+  // ${x%pat} and ${x/pat/…} take (with `global` each one, left to right)
+  // and calls `hit` for it.  `nth` is (I:n:).  Matches are tried at
+  // character starts only.  False when there is none.  Its quirks are
+  // kept: (S) finds an empty match at the end first and reports it at the
+  // start (${(SB)x#(#e)} is 1), after it has looked for a shortest match
+  // (#e) fails, and in (S)% and % some searches keep the (#s) and the
+  // character index of another start.
+  static Result<bool> find_match(const str& s, const CompiledPattern& pat, MatchHow how,
+                                 s::int64_t nth, bool mb, const HitFn& hit) {
+    if (not pat.approximate()) {
+      PrefixSearch search;
+      return scan_match(s, pat, how, nth, mb, hit, search);
+    }
+    // With (#aN) a backtracker that gave up anywhere leaves the answer
+    // unknown: no match, the calls after it skipped, and `hit` called only
+    // once the scan is done.
+    struct Hit {
+      s::size_t    b, e, k;
+      PatternMatch pm;
+    };
+    vec<Hit> hits;
+    PrefixSearch search;
+    auto r = scan_match(s, pat, how, nth, mb,
+                        [&](s::size_t b, s::size_t e, s::size_t k,
+                            const PatternMatch& pm) -> Result<void> {
+                          hits.push_back({b, e, k, pm});
+                          return {};
+                        },
+                        search);
+    if (search.lost) return false;
+    if (not r) return r;
+    for (const auto& h : hits)
+      if (auto x = hit(h.b, h.e, h.k, h.pm); not x) return s::unexpected(x.error());
+    return r;
+  }
+
+  // find_match()'s search; `search` is shared by its calls: (#e) off after
+  // a shortest search, and whether the backtracker gave up.
+  static Result<bool> scan_match(const str& s, const CompiledPattern& pat, MatchHow how,
+                                 s::int64_t nth, bool mb, const HitFn& hit,
+                                 PrefixSearch& search) {
+    Chars cs{s, mb};
+    s::size_t size = s.size(), chars = cs.size();
+    s::int64_t n = s::max<s::int64_t>(nth, 1);
+    PatternMatch pm;
+    // Whether the last from() found a shorter match than the first one.
+    bool shorter = false;
+    // The length of the match from character k: the end zsh's search
+    // reaches first, or the shortest, which zsh looks for with (#e) off
+    // and (#s) as `notstart` says.
+    auto from = [&](s::size_t k, bool notstart = false) {
+      s::size_t b = cs.pos(k);
+      shorter = false;
+      search.notstart = false;
+      // With the same flags as the search for the end zsh's reaches first,
+      // the shortest one exists where that does and ends no later: without
+      // groups to take from the first, it answers alone.
+      auto cut_search = [&] {
+        PrefixSearch cut = search;
+        cut.notstart = notstart;
+        cut.notend   = true;
+        return cut;
+      };
+      if (not how.longest and search.notend and not notstart and not pat.backrefs()
+          and pat.ordered_ends()) {
+        PrefixSearch cut = cut_search();
+        return pat.match_prefix(s, b, false, &pm, &cut);
+      }
+      s::size_t len = pat.match_prefix(s, b, true, &pm, &search);
+      if (len == str::npos or how.longest or len == 0) return len;
+      PatternMatch shortest;
+      PrefixSearch cut = cut_search();
+      cut.below = b + len;
+      s::size_t min = pat.match_prefix(s, b, false, &shortest, &cut);
+      search.notend  = true;
+      search.gave_up = cut.gave_up;
+      search.lost    = cut.lost;
+      if (min == str::npos or min >= len) return len;
+      pm = s::move(shortest);
+      shorter = true;
+      return min;
+    };
+    // The first start from byte b before `until`, or with `last` the last,
+    // from which there is a match (to the end with `whole`), npos when none.
+    auto first_start = [&](s::size_t b, s::size_t until, bool whole, bool last) {
+      return pat.find_start(s, b, until, whole, last, search, whole ? &pm : nullptr);
+    };
+    auto empty_at_end = [&] {
+      search.notstart = false;
+      return pat.match_prefix(s, size, true, &pm, &search) == 0;
+    };
+    auto found = [&](s::size_t b, s::size_t e, s::size_t k) -> Result<bool> {
+      if (search.lost) return false;
+      if (auto r = hit(b, e, k, pm); not r) return s::unexpected(r.error());
+      return true;
+    };
+    auto whole = [&](s::size_t b, PatternMatch* info) {
+      return pat.matches(s, b, size, info, search);
+    };
+    if (not how.end and not how.substr) {
+      s::size_t len = from(0);
+      if (len == str::npos) return false;
+      return found(0, len, 0);
+    }
+    if (not how.substr) {
+      // Anchored at the end: the shortest is from the last start that
+      // matches, the longest from the first.
+      if (not how.longest) {
+        // zsh gives its tries at the end the byte length as the index.
+        if (whole(size, &pm) and --n == 0) return found(size, size, size);
+        if (s::size_t b = first_start(0, size, true, true); b != str::npos)
+          return found(b, size, cs.index(b));
+        // zsh tries the empty match at the end again with the (#s) of the
+        // last start, so on one character (#s) matches there.
+        bool at_start = chars <= 1;
+        if (search.lost) return false;
+        if (at_start ? pat.matches(strv(s).substr(size), &pm) : whole(size, &pm))
+          return found(size, size, chars);
+        return false;
+      }
+      s::size_t b = first_start(0, size + 1, true, false);
+      if (b == str::npos) return false;
+      return found(b, size, cs.index(b));
+    }
+    if (how.end) {
+      // (S)% and (S)%%: the nth start from the end that has a match, or
+      // with fewer the last one.
+      if (empty_at_end() and --n == 0) return found(size, size, size);
+      opt<s::size_t> last, nth_last;
+      s::int64_t count = 0;
+      for (s::size_t until = size; not search.lost;) {
+        s::size_t b = first_start(0, until, false, true);
+        if (b == str::npos) break;
+        s::size_t k = cs.index(b);
+        if (not last) last = k;
+        if (++count == n) {
+          nth_last = k;
+          break;
+        }
+        until = b;
+      }
+      if (last) {
+        // zsh's shortest search here keeps the (#s) and the character
+        // index of the last start it tried: the match, when a second pass
+        // found the nth, else the end.
+        s::size_t k = nth_last.value_or(*last);
+        bool second = n > 1 and nth_last;
+        s::size_t len = from(k, (second ? k : chars - 1) != 0);
+        return found(cs.pos(k), cs.pos(k) + len, shorter and not second ? chars : k);
+      }
+      if (how.longest and empty_at_end() and --n == 0) return found(size, size, size);
+      return false;
+    }
+    if (not how.longest and not how.global and empty_at_end() and --n == 0)
+      return found(0, 0, 0);
+    bool any = false, matched = false;
+    s::size_t k = 0;
+    do {
+      matched = false;
+      for (int missed = 0; k <= chars and not search.lost;) {
+        s::size_t len = from(k);
+        if (len != str::npos) {
+          missed = 0;
+          s::size_t b = cs.pos(k), mpos = b + len;
+          if (--n == 0 or (n <= 0 and how.global)) {
+            if (auto r = found(b, mpos, k); not r) return r;
+            any = true;
+            // After an empty match the character there is kept.
+            if (len == 0 and k < chars) mpos = cs.pos(k + 1);
+          }
+          if (not how.global) {
+            if (n > 0) {
+              ++k;
+              continue;
+            }
+            return true;
+          }
+          matched = true;
+          if (k == chars) break;
+          while (k < chars and cs.pos(k) < mpos) ++k;
+          break;
+        }
+        if (k == chars) break;
+        // After a few starts without a match (each a short run, mostly),
+        // the next one with a match is found at once.
+        if (++missed < 8) {
+          ++k;
+          continue;
+        }
+        s::size_t b = first_start(cs.pos(k + 1), size + 1, false, false);
+        if (b == str::npos) break;
+        k = cs.index(b);
+      }
+    } while (matched and k < chars and not search.lost);
+    if (search.lost) return false;
+    if (how.longest and not how.global and empty_at_end() and --n == 0) return found(0, 0, 0);
+    return any;
+  }
+
   // zsh's getmatch for ${x#pat} ${x##pat} ${x%pat} ${x%%pat}: the match,
-  // anchored at the start (or, for `end`, the end) or with (S) anywhere,
-  // the first (last for `end`) or (I:n:) nth; then what the flags ask
-  // for: (M) the match, (R) the rest (the default), (B) (E) (N) its
-  // start, end and length.  No match is an empty one at the start.
-  // Matches are tried at character starts only, and (B) (E) (N) count
-  // characters.
+  // anchored at the start (or, for `end`, the end) or with (S) anywhere;
+  // then what the flags ask for: (M) the match, (R) the rest (the
+  // default), (B) (E) (N) its start, end and length.  No match is an
+  // empty one at the start.  (B) (E) (N) count characters.  `hit`, when
+  // given, is called for the match.
   static str get_match(const str& s, const CompiledPattern& pat, bool end, bool longest,
-                       const ParamFlags& fl, s::int64_t nth, bool multibyte) {
+                       const ParamFlags& fl, s::int64_t nth, bool multibyte,
+                       const HitFn* hit = nullptr) {
     Chars cs{s, multibyte};
     s::size_t n = cs.size(), mb = 0, me = 0;
-    if (not fl.m_substr) {
-      if (not end) {
-        s::size_t len = pat.match_prefix(s, longest);
-        if (len != str::npos) me = len;
-      } else {
-        for (s::size_t k = 0; k <= n; ++k) {
-          s::size_t b = cs.pos(longest ? k : n - k);
-          if (pat.matches(s, b, s.size())) {
-            mb = b;
-            me = s.size();
-            break;
-          }
-        }
-      }
-    } else {
-      for (s::size_t k = 0; k <= n; ++k) {
-        s::size_t b = cs.pos(end ? n - k : k);
-        s::size_t len = pat.match_prefix(s, b, longest);
-        if (len == str::npos or --nth > 0) continue;
-        mb = b;
-        me = b + len;
-        break;
-      }
-    }
+    MatchHow how;
+    how.end     = end;
+    how.longest = longest;
+    how.substr  = fl.m_substr;
+    (void)find_match(s, pat, how, nth, multibyte,
+                     [&](s::size_t b, s::size_t e, s::size_t b_char,
+                         const PatternMatch& pm) -> Result<void> {
+                       mb = b;
+                       me = e;
+                       if (hit) return (*hit)(b, e, b_char, pm);
+                       return {};
+                     });
+    // As zsh's get_match_ret, the parts asked for are separated by a
+    // space even when empty.
     str out;
+    bool any = false;
+    auto part = [&](strv t) {
+      if (any) out += ' ';
+      out += t;
+      any = true;
+    };
     bool rest = fl.m_rest or not (fl.match_mode or fl.m_begin or fl.m_end or fl.m_len);
-    if (fl.match_mode) out += s.substr(mb, me - mb);
-    if (rest) out += s.substr(0, mb) + s.substr(me);
+    if (fl.match_mode) part(strv(s).substr(mb, me - mb));
+    if (rest) part(s.substr(0, mb) + s.substr(me));
     // The character a byte offset falls in.
     auto char_at = [&](s::size_t off) {
       s::size_t k = 0;
       while (k < n and cs.pos(k + 1) <= off) ++k;
       return off >= s.size() ? n : k;
     };
-    auto num = [&](s::size_t v) {
-      if (not out.empty()) out += ' ';
-      out += s::to_string(v);
-    };
-    if (fl.m_begin) num(char_at(mb) + 1);
-    if (fl.m_end) num(char_at(me) + 1);
-    if (fl.m_len) num(char_at(me) - char_at(mb));
+    if (fl.m_begin) part(s::to_string(char_at(mb) + 1));
+    if (fl.m_end) part(s::to_string(char_at(me) + 1));
+    if (fl.m_len) part(s::to_string(char_at(me) - char_at(mb)));
     return out;
   }
 
-  // The replacement for a match of s[b, b + len), whose backreferences
-  // are in the PatternMatch.
-  using ReplaceFn = func<Result<str>(s::size_t, s::size_t, const PatternMatch&)>;
+  // The replacement for a match of s[b, b + len), `b_char` characters into
+  // s, whose backreferences are in the PatternMatch.
+  using ReplaceFn = func<Result<str>(s::size_t, s::size_t, s::size_t, const PatternMatch&)>;
 
   // zsh's igetmatch for ${x/pat/r}: `anchor` is 'w' (the whole value),
   // '#' (the start), '%' (the end) or 0 (anywhere); `shortest` is (S),
-  // `nth` (I:n:) skips the matches before it.  Matches are tried at
-  // character starts only.
+  // `nth` (I:n:) skips the matches before it.
   static Result<str> substitute(const str& s, const CompiledPattern& pat, bool global,
                                 char anchor, bool shortest, s::int64_t nth, bool mb,
                                 const ReplaceFn& repl) {
-    s::size_t n = s.size();
-    PatternMatch pm;
     if (anchor == 'w') {
+      PatternMatch pm;
       if (not pat.matches(s, &pm)) return s;
-      return repl(0, n, pm);
+      return repl(0, s.size(), 0, pm);
     }
-    if (anchor == '#') {
-      s::size_t len = pat.match_prefix(s, not shortest, &pm);
-      if (len == str::npos) return s;
-      auto r = repl(0, len, pm);
-      if (not r) return r;
-      return *r + s.substr(len);
-    }
-    Chars cs{s, mb};
-    s::size_t chars = cs.size();
-    if (anchor == '%') {
-      for (s::size_t k = 0; k <= chars; ++k) {
-        s::size_t b = cs.pos(shortest ? chars - k : k);
-        if (pat.matches(s, b, n, &pm)) {
-          auto r = repl(b, n - b, pm);
-          if (not r) return r;
-          return s.substr(0, b) + *r;
-        }
-      }
-      return s;
-    }
+    MatchHow how;
+    how.longest = not shortest;
+    how.global  = global;
+    how.end     = anchor == '%';
+    how.substr  = anchor == 0;
     str out;
-    // `last_hit`: the step that got to `b` was a match (one, or an empty
-    // one and the character after it).  As in zsh, the empty match at the
-    // end is tried unless that step reached it, and, without `global`,
-    // only when nothing matched: ${x//(b|(#e))/Z} on `abcd` is `aZcdZ`,
-    // ${x//a#/q} on `aaab` is `qqb`.
-    bool done = false, any = false, last_hit = false;
-    // After a match of `len` from character k: the first character start
-    // at or after its end, past one character for an empty match.
-    auto after = [&](s::size_t k, s::size_t len) {
-      s::size_t e = cs.pos(k) + len, j = k + 1;
-      while (j < chars and cs.pos(j) < e) ++j;
-      return j;
-    };
-    for (s::size_t k = 0; k < chars;) {
-      s::size_t b = cs.pos(k);
-      s::size_t len = done ? str::npos : pat.match_prefix(s, b, not shortest, &pm);
-      if (len == str::npos) {
-        out += cs.sub(k, 1);
-        ++k;
-        last_hit = false;
-        continue;
-      }
-      any = last_hit = true;
-      s::size_t next = after(k, len);
-      if (nth > 1) {
-        --nth;
-        out += s.substr(b, cs.pos(next) - b);
-        k = next;
-        continue;
-      }
-      auto r = repl(b, len, pm);
-      if (not r) return r;
-      out += *r;
-      if (not global) done = true;
-      if (len == 0) out += cs.sub(k, 1);
-      k = next;
-    }
-    if (not last_hit and (global or not any) and nth <= 1
-        and pat.match_prefix(s, n, false, &pm) == 0) {
-      auto r = repl(n, 0, pm);
-      if (not r) return r;
-      out += *r;
-    }
+    s::size_t done = 0;
+    auto r = find_match(s, pat, how, nth, mb,
+                        [&](s::size_t b, s::size_t e, s::size_t b_char,
+                            const PatternMatch& pm) -> Result<void> {
+                          auto t = repl(b, e - b, b_char, pm);
+                          if (not t) return s::unexpected(t.error());
+                          out.append(s, done, b - done);
+                          out += *t;
+                          done = e;
+                          return {};
+                        });
+    if (not r) return s::unexpected(r.error());
+    if (not *r) return s;
+    out.append(s, done);
     return out;
   }
 
@@ -2159,8 +2355,9 @@ struct Scan {
                            bool global, char anchor, bool shortest, s::int64_t nth) {
     bool ksh = opts().get(OPT_KSH_ARRAYS);
     return substitute(s, pat, global, anchor, shortest, nth, opts().multibyte(),
-                      [&](s::size_t b, s::size_t len, const PatternMatch& pm) -> Result<str> {
-                        set_match_params(ctx().params, pat, s, b, len, pm, ksh);
+                      [&](s::size_t b, s::size_t len, s::size_t b_char,
+                          const PatternMatch& pm) -> Result<str> {
+                        set_match_params(ctx().params, pat, s, b, len, pm, ksh, b_char);
                         return replacement(repl_text, dq);
                       });
   }
@@ -2170,7 +2367,7 @@ struct Scan {
                      const str& repl, bool global, char anchor, bool mb,
                      bool shortest = false, s::int64_t nth = 1) {
     auto r = substitute(s, pat, global, anchor, shortest, nth, mb,
-                        [&](s::size_t, s::size_t, const PatternMatch&) -> Result<str> {
+                        [&](s::size_t, s::size_t, s::size_t, const PatternMatch&) -> Result<str> {
                           return repl;
                         });
     return r ? *r : s;
@@ -2664,8 +2861,12 @@ struct Scan {
         join_dq();
         auto pat = operand_pattern(rest.substr(1), /*dq=*/false);
         if (not pat) return s::unexpected(pat.error());
+        bool refs = pat->backrefs() or pat->sets_match();
         auto keep = [&](const str& s) {
-          bool m = pat->matches(s);
+          PatternMatch pm;
+          bool m = pat->matches(s, &pm);
+          if (m and refs)
+            set_match_params(ctx().params, *pat, s, 0, s.size(), pm, opts().get(OPT_KSH_ARRAYS), 0);
           return fl.match_mode ? m : not m;
         };
         if (v.array) {
@@ -2696,7 +2897,17 @@ struct Scan {
         auto nth = nth_match(fl);
         if (not nth) return s::unexpected(nth.error());
         bool mb = opts().multibyte();
-        each(v, [&](const str& s) { return get_match(s, *pat, o == '%', longest, fl, *nth, mb); });
+        // (#b) and (#m) set $match and $MATCH to the match.
+        bool refs = pat->backrefs() or pat->sets_match();
+        each(v, [&](const str& s) {
+          HitFn set_refs = [&](s::size_t b, s::size_t e, s::size_t b_char,
+                               const PatternMatch& pm) -> Result<void> {
+            set_match_params(ctx().params, *pat, s, b, e - b, pm, opts().get(OPT_KSH_ARRAYS),
+                             b_char);
+            return {};
+          };
+          return get_match(s, *pat, o == '%', longest, fl, *nth, mb, refs ? &set_refs : nullptr);
+        });
       } else if (o == '/') {
         join_dq();
         strv body = rest.substr(1);

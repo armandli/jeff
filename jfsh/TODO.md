@@ -1629,6 +1629,556 @@ expansion list, leaving globbing for the next phases.
   `tests/glob_quals_test.cpp` with every qualifier under temp-file setups
   checked against `zsh -f -c`.
 
+**Phase 13c — done** (branch `jfsh-pattern-vm`): pattern matcher: zsh
+semantics and a linear-time VM.
+
+The M3/M15c merge (7c5d28d) left two matchers in `src/glob/glob.cpp`.
+`SetMatcher` is a position-set NFA that decides matches and prefix
+lengths. `Matcher` is a backtracker that fills in `(#b)` groups and runs
+`(#aN)`. A review against zsh 5.9 found that `##`, `/` and `//` pick the
+longest match where zsh picks the first end its greedy search reaches,
+that a `^` past the start of a branch is literal text, that `$mbegin`
+and friends count bytes, and that `(#aN)`, case folding and empty
+repeats differ from zsh. It also found patterns that are still
+super-linear. The reviewer's reproducers and a differential tester
+against `zsh -f -c` are in the review scratch directory; every item
+below adds its cases to `tests/glob_test.cpp` / `tests/subst_test.cpp`
+with expected values from zsh 5.9.
+
+```mermaid
+flowchart LR
+  A["13c.1 zsh semantics<br/>^ anywhere, first-found end,<br/>flags, | in operands"] --> B["13c.2 Pike VM<br/>decide + capture + end<br/>in one linear pass"]
+  B --> C["13c.3 (#aN) to zsh's rules<br/>on the backtracker"]
+  B --> D["13c.4 performance<br/>and cleanup"]
+  C --> D
+```
+
+Policy decisions:
+- **`~` exclusions follow the documented set semantics.** zsh tests an
+  exclusion at the first point its backtracking reaches it, so
+  `[[ ba = (b|ba)~b ]]` fails in zsh and matches in jfsh. That order has
+  no linear-time form. Tests pin the jfsh result, with a comment naming
+  the zsh difference.  zsh compiles `^x` as `*~x`, so `^` falls under the
+  same policy.
+- **The `(S)` + `(#s)`/`(#e)` quirks** (`x=abc; ${(SB)x#(#e)}` is `1` in
+  zsh) are pinned the same way unless 13c.1 finds their cause in zsh's
+  getmatch and they come out of the same rule.  (13c.1 found it: they come
+  from igetmatch's structure and its stale PAT_NOTSTART/PAT_NOTEND, and
+  are now copied.)
+- **`(#aN)` stays on a backtracker.** A linear form (NFA states × error
+  count) is possible, but matching zsh's exact error placement and
+  capture order is risky, and `(#a)` is rare and used on short input.
+
+**13c.1 — done** (branch `jfsh-pattern-vm`): zsh semantics on the current
+matchers.
+- **`^` anywhere under EXTENDED_GLOB** negates the rest of its branch, up to
+  `|`, `)` or `~` (`a^x`, `*^b`, `(#i)^*.txt`, `a|^b`, `a~^b`), as a
+  one-alternative negated Group.  The top level is one Group too, so
+  `Impl::negate`/`excludes` are gone.
+- **First-found end.** `match_prefix(longest)` runs the backtracker with
+  the end left open and returns the end zsh's greedy search reaches first;
+  the set matcher still filters out subjects with no match and gives the
+  shortest end.  The backtracker gives up (`deep`) on a stack nearly used
+  up or after 2^22 + 16·(n+1)·(pattern size) steps, and then the longest
+  end is used; a `PrefixSearch`, kept by the caller for one search (one
+  ${x//…}), remembers a give-up on steps so later positions do not pay it
+  again.  (13c.2: the VM finds the end itself, so
+  `x=${(l:300::a:)}c${(l:300::a:)}; ${#${x##*a*a*a(c|ca)}}`, 299 here, is
+  zsh's 300.)
+- **zsh's igetmatch.** `get_match`/`substitute` go through one
+  `find_match`, shaped as igetmatch: (S)% and (S)%% scan for the nth start
+  from the end; (S)#'s empty match at the end is reported at the start
+  (${(SB)x#(#e)} is 1); a shortest search leaves (#e) failing after it and
+  (S)% looks for its shortest with the (#s) and the character index of the
+  last start scanned, and % retries the empty match at the end with the
+  (#s) of the last start (so on one character (#s) matches there) — the
+  stale PAT_NOTEND/PAT_NOTSTART and ioff, so the (S) quirks of the policy
+  above come out of the same rule; zsh's tries at the end take the byte
+  length as their index; (B)/(E)/(N)/(M)/(R) join with spaces even when
+  empty.  `${x#…}`, `${x%…}` and `${x:#…}` now set $match/$MATCH for
+  (#b)/(#m), as zsh does.
+- **Character positions.** $mbegin/$mend/$MBEGIN/$MEND count characters
+  (`set_match_params` takes the start's character index);
+  `PatternMatch` stays in bytes.
+- **Case flags on non-ASCII.** Under MULTIBYTE a literal is one code point
+  compared with zsh's CHARMATCH (towlower/towupper); brackets are never
+  folded, for (#i), (#l) and NO_CASE_GLOB alike (zsh's filename generation
+  checked: `setopt nocaseglob; print [a]*` lists `abc`, not `ABD`).
+  `GlobPatternMatch.BracketExpressions` pinned the old folding and now pins
+  zsh's.
+- **Repeats** as zsh runs them: one-character x#/x## in a loop (no
+  recursion per character, so (#b)(a#) on 200k gives its group); complex
+  x# with zsh's P_WBRANCH marks (while the outermost x# on a node tries a
+  repeat, a repeat is tried from a position once, so an empty repeat ends
+  it with its groups kept and nested repeats stay polynomial; the marks
+  are dropped before the outermost one tries what follows, kept in a
+  per-node hash set); (#cN,M) with P_COUNT's per-node start, stale values
+  included.  The stale start makes zsh reject matches the set matcher
+  finds (`[[ cba = (?|cb)(#c1,2) ]]` fails), so with a (#cN,M)
+  (`Impl::counted`) the backtracker decides and the set matcher only
+  filters; when the backtracker gives up the set matcher's answer stands.
+  x#'s node takes its operand's case flags.
+- **At most 9 (#b) groups.**  Flags of exclusions, as zsh: at the top
+  level a `~` exclusion and the text after `^` start with the flags their
+  branch ends with (so `(#b)*~(aaa)` has a group), inside a group with the
+  group's flags (`((#i)a~A|b)` matches `a`); both without (#aN).  A `~`
+  right after leading flags excludes (`(#i)~a` matches the empty string).
+- **Bad patterns**: unknown flags, (#a) without a number or over 254,
+  (#s)/(#e) not alone, (#c) not right after a piece, `#` with nothing to
+  repeat, `*#`, `x###`, an unclosed `(#`.  `CompiledPattern::bad()`;
+  [[ ]] fails with status 2, `case` with 0, ${…} (and `:s` with
+  HIST_SUBST_PATTERN) with 1, globbing with 1 (or the word as is under
+  NO_BAD_PATTERN), each ending the command line.
+- **`|` in operands**: written outside parentheses in ${x#…}, ${x/…} or a
+  HIST_SUBST_PATTERN `:s` it is text; one from $~var alternates.
+- **Bytes**: a pattern byte that starts no character matches only such a
+  byte; zsh's anchored `*`/x# before final literal text compares that text
+  with the last bytes of the subject (`(|\xc3)?#\xa9` matches é,
+  `(|\xc3)\xa9` does not), copied as `TailLiteral`.
+- Filename generation compiles each segment once, not once per
+  directory.  `SubstReview.DeepNestingFailsCleanly` no longer pins the
+  depth where the stack runs out.
+- (#cN,M) reads its numbers as zstrtol: blanks (and newlines) and a sign
+  may come first, a lone sign is 0, a negative M is no limit and a
+  negative N is 0.
+- Tests: `Pattern13c.*` (18) in `tests/subst_test.cpp`,
+  `GlobPattern13c.*` (10) in `tests/glob_test.cpp`, expected values from
+  zsh 5.9; `ExclusionsFollowSetSemantics` pins the policy divergence.
+- Random differential tests against zsh (lines that differ, before 13c.1
+  → after): review gen.py 3 seeds × 3000 per mode, plain 116 → 48, (#b)
+  2929 → 97, (#b) without `^`/`~` 1049 → 0, genb 616 → 43; review2
+  gen3.py without `^`/`~`, 11 seeds × 3000: 30532 → 0; gen5.py ((#c)),
+  seeds 1-5 × 4000: 1840 → 0.  gen3.py with `^`/`~` still differs (with
+  $match reset per case, 75-104 lines per seed), and every such case has
+  `^` or `~`.  zsh tests an exclusion only after the rest of the pattern
+  has matched, and keeps per-invocation sync marks that attempts rejected
+  later (by that exclusion or an inner one, `^` being zsh's `*~`) leave
+  behind: `[[ ba = (b|ba)~b ]]` and `((^)#~b)` on anything fail in zsh;
+  `${x##(#b)(^ac)(#c1,2)}` on `ac` takes one repeat in zsh, two in jfsh
+  (not reduced further).  The policy keeps set semantics.
+
+Left after 13c.1:
+- zsh drops MULTIBYTE in top-level alternatives after the first
+  (`[[ é = a|? ]]` fails in zsh); not copied.
+- An unclosed `(` or `[` in [[ ]] or ${x#…} is text in jfsh, "bad pattern"
+  in zsh (`x='a(b'; ${x%%(*}`).
+- Unrelated, seen in the differential test: zsh's ${(qq)a} of an empty
+  array is `''`, jfsh's is nothing.
+- Flags leaking past (#cN,M) are copied (`Node::leaks`): when a further
+  repeat of a one-branch group fails, the case flags zsh last set while
+  trying it stay on for the literals that follow with no flag change of
+  their own (`[[ aB = ((#i)A)(#c1,2)b ]]` matches), through enclosing
+  groups that change no flags themselves.  The places that set flags are
+  the changes in the counted group's branch and in one-branch groups
+  inside it, and the ends of those that changed flags, which put them
+  back; the backtracker notes the last one it passes.  The backtracker
+  decides such patterns (`Impl::leaky`) where the VM does not follow
+  (13c.2, `Impl::vm_leaks`).  A group with a `~` puts its flags back, as
+  zsh's exclusion does.  An approximation: zsh's leaked flags also reach
+  earlier literals that an enclosing repeat or alternative runs again
+  (`[[ AbA = (B|((#i)A)(#c1,2))# ]]` is 0 in zsh, 1 in jfsh); jfsh applies
+  the leak only to literals after the count.  Missed leaks: a flag group
+  under `##` or an inner (#c) in the counted branch
+  (`[[ aB = (((#i)A)##)(#c1,2)b ]]` and `(((#i)A)(#c1))(#c1,2)b` are 0 in
+  zsh, 1 in jfsh), and with (#aN) (`((#a1)(#i)A)(#c1,2)b` was zsh 0 /
+  jfsh 1 on aB, zsh 1 / jfsh 0 on aaB; zsh's since 13c.3).  gen6 (review3,
+  3 seeds × 3000) differs now in the mid-literal (#I) below, in s3 #2735 (the
+  enclosing-repeat case) and in $match left over from it (#2736, #2737).
+- Not copied: zsh drops the text after a mid-literal `(#I)` when no case
+  flag is on, so `[[ Ba = B(#I)a ]]` fails and `[[ B = B(#I)a ]]` matches.
+- HIST_SUBST_PATTERN: `x=ab; print ${x:s/\*/Z/}` gives `Z` in zsh and `ab`
+  in jfsh.
+- An error inside `eval` (a bad pattern, `[[ -n ]]`) ends the whole command
+  line in jfsh; zsh ends only the eval (`eval '[[ a = (#X) ]]'; echo
+  after=$?` prints after=2).  Not a local fix: jfsh's `aborting` covers
+  both such errors and those that must still end the shell (`${x?}`).
+- A leading `(#i)` in a glob does not reach later path segments
+  (`print -l (#i)*/*.txt`, `(#i)**/*.txt`): each segment is its own
+  pattern.
+
+**13c.2 — done** (branch `jfsh-pattern-vm`): one priority-ordered Pike VM
+for every pattern without (#aN); `SetMatcher`, `confirm()` and the
+set-matcher fallbacks are gone.
+- `VmProgram` (`src/glob/glob.cpp`): the Node tree compiled to `Char`
+  (a Lit, Any or Class through `Subject::one`), `AnyChar`, `Digit` (a
+  `<lo-hi>` as an automaton over digits, saturating as zsh, longest
+  first), `Split`, `Loop` (x#, `*`, the body of `^`: as zsh's P_WBRANCH
+  marks, a thread arriving again at a position goes on with what follows),
+  `Jmp`, `Boundary`, `Save`, `AtStart`/`AtEnd` (of the whole string, for
+  windows), `CountInit`/`CountTest`/`CountInc` (P_COUNT: a counter, and
+  where the repeat being tried began, so an empty repeat ends the count),
+  `CtxStart`/`NegExit`/`ExclCheck`, `Tail` (TailLiteral, whole matches)
+  and `Match`.  x## compiles its operand twice (up to a size), so a repeat
+  from where the first one ended is tried before the first one's other
+  ways, as zsh does.  Two entries: whole match (with the TailLiteral
+  forms) and prefix.
+- `Vm`: threads in zsh's backtracking order; a thread at the same
+  instruction with the same state registers as an earlier one at that
+  position is dropped.  The state registers are counters (past N, one
+  that can no longer reach M before the end, an empty repeat counting
+  too, is clamped to N, so `*(a)(#c1,100000)c` keeps one thread per
+  instruction), where a repeat began (only whether it began here: a
+  repeat that may match nothing keeps its states apart from those of one
+  that began before, as zsh's frames are), context starts (as a class
+  representative, see Contexts), and leaked flags.  One pass decides the
+  match, the groups (2 registers per group, at most 9) and the end zsh's
+  search reaches first (`First`: the last match recorded, lower threads
+  cut); `Shortest` stops at the first end and takes its groups from a
+  whole match of that window, `Ends` lists every end.  zsh tries each
+  length of a shortest match on the text cut there, whose end counts as
+  a place a character may start; that differs from the VM's run only
+  before a byte that continues no character (`*`, or an exclusion's, may
+  end there).  Without `^`/`~` the run decides those places itself: the
+  threads a `Boundary` stopped there are followed again with it open,
+  reading nothing (`Vm::cut_match()`); with them, a match of the cut text
+  at each such place up to where the run stopped (`cut_ends()`).
+  `x=$'\xa9A'; ${(M)x#*}` is empty, as zsh.  Registers live in a slab
+  with a free list, visited sets use generation stamps, the buffers are
+  thread_local and reused: a step allocates nothing once grown.  No
+  recursion with the subject.
+- Cached steps: a run with no state registers and no TailLiteral depends
+  on its threads' instructions alone, but for the group registers, which
+  only take the position.  After 8 steps its thread lists become the
+  states of a DFA built as it goes (at most 256), each step on an ASCII
+  byte cached where the position does not matter (not at lim, a
+  character starting after it), with where each thread came from and the
+  group registers it set; without the groups only the states are
+  followed.  `b*`, `*/`, `.*`, `a##`, `(*)(*)c` on 200k run at the speed
+  of HEAD's set matcher or better.
+- Contexts: `^x`'s x and a branch's exclusions run as set programs beside
+  the threads, each state carrying the starts it was reached from as
+  ranges, so the starts that pile up after a `*` share one run.  Starts
+  in the same states of a context, and matching here alike, go on alike:
+  a thread's start register becomes the first of its class (`Vm::rep()`,
+  from the ranges between the states' starts' ends, while a context has
+  at most 16 states and 64 ranges), so `*(^*b)c` keeps one thread in the
+  `^` rather than one per start, and `*(^*(^*(^*b)))c` is linear (3.6 ms
+  at 2000 characters; HEAD did not finish in 120 s).  Set semantics, as
+  the policy says.
+- Flags leaking past (#cN,M) are followed by the VM where the count's
+  operand matches in one way and holds no repeat, the count is in no
+  repeat and there is no `^`/`~`: the further repeats are then one chain,
+  walked once ahead with the backtracker to find the change of flags zsh's
+  failed repeat passed last (memoized per repeat), kept in a Leak register
+  for the literals that follow.  `x=${(l:20000::a:)}b;
+  [[ $x = ((#i)A)(#c1,200000)B ]]` is now 0, as zsh.
+- Routed to the backtracker, which decides (the VM only filters: these
+  quirks only reject matches; where the backtracker gives up, the VM's
+  answer):
+  - `Impl::stale`: a (#cN,M) whose operand may match more than one way
+    from a place (`calls_once()`: alternatives must start with literals no
+    character matches both of; an exact (#cN) of such an operand is
+    allowed; no `*`, x#, `<->`, `^`).  zsh's stale
+    start depends on attempts that failed later, which a VM cannot know.
+    `(a|b)(#c1,300000)` is not stale and runs on the counter.
+  - `Impl::marks`: a repeat of a group inside another repeat
+    (`nested_repeats()`).  zsh keeps the inner repeat's marks across the
+    outer one's repeats, so a repeat is not tried again from a place an
+    attempt that failed tried it from, even where what follows differs:
+    `p='(#b)(((|?)#)|()a)#'; [[ ba = $~p ]]` sets the last group
+    ($mbegin[4] $mend[4] are 2 1), which the VM alone leaves unset.
+    Following it needs each mark's window as thread state.
+  - Leaks outside the class above (no filter there: leaked flags allow
+    more).
+- The backtracker's step budget and give-up now matter only for those;
+  `PrefixSearch::gave_up`, set when it runs out of steps (not of stack),
+  in the longest search or the shortest, makes the rest of the search
+  take the VM's answer.  Where it gives up, the answer the VM found when
+  it filtered is taken, not run again.  A give-up inside an exclusion's
+  test no longer reports a match (`backtrack()` checks `deep` first).
+  (#aN) patterns are not compiled for the VM.
+- A required-literal filter: ASCII literals without case flags every match
+  has (`VmProgram::needs`); when one is missing from the rest of the
+  subject nothing runs (`${x//(#b)(*)(*)c/x}` on 30 KB: 25 s without it,
+  0.01 s).
+- `PatternEngine` (glob.h) and `CompiledPattern::engine()` for tests:
+  `Backtrack` routes every pattern to the backtracker (the oracle), `Vm`
+  none.
+- Tests: `GlobPattern13c2.*` (12) in `tests/glob_test.cpp` (the VM
+  against the backtracker on 5 × 4000 random patterns × 6 subjects: with
+  `^`/`~` whose contents have no repeats, counts, case flags, and the VM
+  alone on patterns without group repeats; 250 patterns on 24-character
+  subjects without groups, for the cached steps; the routed quirks; time
+  bounds on 200k subjects, a 300000 count, a 20000-repeat leak, nested
+  `^`, a count, `^` and `~` after `*`, the DFA shapes, 20000 stray
+  continuation bytes, 30 KB prefix searches); `Pattern13c2.*` (6) in
+  `tests/subst_test.cpp` with zsh's values; `Pattern13c.SearchStateIsPerCall`
+  pins zsh's 300.
+- Differential tests against zsh (lines that differ, unchanged from
+  13c.1, outputs byte-identical): gen5 seeds 1-5 × 4000: 0; gen3 `x` 11
+  seeds × 3000: 0; gen6 seeds 1-3: 1/1/7; gen.py (#b) without `^`/`~`: 0,
+  plain 48, (#b) 97, genb 43; gen3 `excl` seeds 21/31: 222/215 (HEAD
+  224/215, both changed lines now zsh's); the review's seeds 61-63 equal
+  HEAD's but for gen6 62 (7, HEAD 8).  The VM against the backtracker in
+  fuzzers (`(#b)`, `^`/`~`, counts, case flags, MULTIBYTE with é and
+  stray bytes, 30-character subjects without groups): 0.
+- Timings (HEAD → 13c.2, release, inside the shell; z is 200k a's, x
+  `b` then 200k of `ab/c.d`, e 8000 a's): `[[ $x = b* ]]` 1.6 → 1.7 ms,
+  `${x%%.*}` 0.5 → 0.6 ms, `${x##*/}` 1.0 → 0.8 ms, `${z%%a*}` 0.6 →
+  0.5 ms, `${z%%a##}` 0.9 → 0.5 ms, `[[ ${z}c = (*)(*)c ]]` 2.5 → 1.7 ms,
+  with (#b) 2.7 → 6.3 ms; `[[ ${e}bc = *(a)(#c1,100000)c ]]` 0.26 s →
+  2.4 ms (zsh 1.23 s); `[[ ${e}c = *(^*b)c ]]` 0.28 s → 3.3 ms (zsh
+  0.60 s), `(#b)*(^*b)c` 0.28 s → 3.5 ms, `(#b)(*)(*~*b)c` 0.31 s →
+  3.8 ms; `x=${(pl:20000::\xa9:)}A; ${x#*[[:upper:]]}` 0.2 → 1.6 ms;
+  `${z//a/b}` 17 → 17 ms; `${z##(a|b)#}` 24 → 0.9 ms; `${x#*((#i)A)(#c1,2)b}`
+  at 20k 39.7 s → 19 ms (zsh 18.5 s); `${(S)x#*((#i)A)(#c1,2)c}` at 10k
+  10.0 s → 10 ms (zsh 4.6 s), `${(S)x#((#i)A)(#c1,2)*c}` 0.30 s → 4 ms;
+  `(a|b)(#c1,300000)` on 200k 38 s → 40 ms; `*^b` on 200k 103 s → 48 ms;
+  `*(^*(^*(^*b)))c` at 2000 > 120 s → 3.6 ms.
+
+Left after 13c.2:
+- Inside `^` and `~` contents the VM keeps set semantics where the
+  backtracker shares its repeats' marks with the rest of the match (as
+  zsh, partly), and exclusions keep the policy's set semantics with the
+  routed classes too: `p='(((^)#)~??)#'; x=ab; ${(M)x##$~p}` is empty in
+  zsh, `a` in jfsh.
+- x## whose operand, compiled twice, would make the program longer than
+  32768 instructions loops back to its one copy, so its first repeat's
+  other ways come before a repeat from where it ended (not zsh's order;
+  only the groups can differ).
+- The routed classes above.
+- A (#cN,M) whose M is below the length of what follows it keeps its
+  counts apart, so after a `*` it is quadratic (one thread per count:
+  `*(a)(#c1,5000)c` on 8000 a's).
+- (13c.4: the context fallback, the cut texts and the grouped steps are
+  in 13c.4's notes.)
+
+**13c.3 — done** (branch `jfsh-pattern-vm`): `(#aN)` as zsh 5.9's
+pattern.c runs it (read from its source: patmatch's approximation code,
+P_EXACTLY, P_END, and igetmatch), on the backtracker.
+- **Literal strings.** A literal is in one of zsh's strings (P_EXACTLY,
+  `Node::run`): a run of literals in a branch, ended by anything else,
+  globbing flags included; the literal a `#` or (#cN,M) repeats is one of
+  its own.  `Matcher::exact()` matches a string; only where it first fails,
+  with errors left, does it try, each as one error, an extra input
+  character, two characters the wrong way round inside the string, a
+  wrong one and a missing one, then goes on with the rest of the string.
+  A string that matched is not tried with errors when what follows fails.
+  Characters are characters under MULTIBYTE.
+- **Other nodes.** `?`, `[…]`, <lo-hi>, (#s) and (#e) never take a wrong
+  character or go missing; when one fails, an extra character before it
+  is an error and it is tried again (zsh's last gasp, `skip()`), and the
+  error counts even at the end of the input.  So extra characters before
+  (#e) are errors (`x=abcd; ${x#(#a2)ab(#e)}` is empty).
+- **The end.** In a whole match extra characters after the pattern cost
+  one error each (P_END), with the (#aN) in force there at run time;
+  zsh compares a plain string as a string (PAT_PURES, `Impl::pure`, so
+  `[[ x = (#a1) ]]` fails) and drops flags at the very end of a pattern
+  (`[[ abx = (#a1)ab(#a0) ]]` matches).  `match_prefix` runs the search
+  with the end left open (PAT_NOANCH, `Matcher::open()`): the longest is
+  the end it reaches first (`x=cab; ${x##(#a1)ca}` is `b`), the shortest
+  each length below that on the text cut there, as igetmatch;
+  `PrefixSearch::below` passes the first search's end so the shortest one
+  does not run it again with (#e) off.  The longest is one run per call,
+  the shortest one more per cut length below its end, as zsh's
+  (`${x#(#a1)*zz}` on 20k characters: 14.0 s, zsh 8.7 s); the lengths end
+  on characters.  Existence checks ((S)%'s starts, (r) subscripts) take
+  the one run (`x=z${(l:4000::ab:)}z; ${(S)x%(#a1)z*zz}`: 1.31 → 0.78 s,
+  zsh 0.40 s).
+- **zsh's exactend.** After an error zsh goes on with the rest of the
+  string up to the end of the string that failed last; when the tries
+  before failed in another string, that is another string's end
+  (`Matcher::exact_end`): one before this string leaves nothing to
+  compare, one after it the compiled pattern's bytes, which fail and use
+  up the errors left.  So a missing character at the end of a string in a
+  group, before more literals, costs that string twice over (`[[ ac =
+  (#a1)a(b)c ]]` fails, `(#a3)(ab)c` matches), and a `?` or `[…]` between
+  them changes it (`[[ a1c = (#a1)(ab)[1]c ]]` matches, `(ab)?c` does not).
+  Exclusions, tested at the group's end in jfsh but after the whole
+  pattern in zsh, leave it alone.
+- **Run-time flags and errors.** The (#aN) in force is kept as zsh's flags
+  word is (`cur_approx`): set where a flags node or a group's restore
+  runs (`Node::reset`, `alt_end_reset`, `restores`; header flags at the
+  start, (#a0) for later top-level alternatives), and put back with the
+  error count (`Tally`) where zsh puts them back: after a failed
+  alternative, x# or `^`, before each shorter `*` or one-character
+  repeat (not after the last), and before each try at an error, which
+  also puts back the case flags a (#cN,M) leaks (`passed`).  Not after a
+  (#cN,M) or <lo-hi> whose attempts failed, so what they spent stays spent
+  and the flags they set stay set: `[[ a = (#a2)(a[c])(#c0,1)acb ]]`,
+  `[[ b = (#a2)((#a0)cab*)(#c0,2)cba ]]`, `[[ c11c = (#a1)((#a2)<1-5>)c ]]`
+  fail as in zsh, and the recorded `((#a1)(#i)A)(#c1,2)b` is zsh's (0 on
+  aB, 1 on aaB).  A x# mark takes the errors now even when an attempt with
+  fewer was made there, as zsh's.  Exclusions run with no errors and no
+  (#aN) but their own (`[[ ab = (#a1)ab~(#a1)ac ]]` fails); the branch
+  before a top-level `^` keeps its (#aN) for its end (`[[ ab = (#a1)^ab ]]`
+  matches).
+- Top-level alternatives after the first start without the header's
+  (#aN), the TailLiteral ones too (`[[ Ab = (#a1)c|b*b ]]` fails).
+- Long subjects: no recursion per length any more.  zsh's search with
+  errors is quadratic on a repeated group, so with (#aN) the step budget
+  is quadratic in the subject, up to 2^28 steps (about 4 s):
+  `x=${(l:1500::ab:)}; [[ ${x}d = (#a3)(a|ab|b)#cc ]]` matches (0.13 s,
+  zsh 0.06 s; 3000: 0.52 s, zsh 0.25 s).  A repeat per character deeper
+  than the stack gives up as no match (zsh's recursion crashes:
+  `x=${(l:200000::a:)}; ${x##(#a1)a#}`).  Whenever the backtracker gives
+  up in a ${x#…} ${x%…} ${x/…} search (`PrefixSearch::lost`, also from
+  `matches(…, search)` for the % forms), the whole expansion is no match:
+  the searches after it are skipped (so one budget bounds it:
+  `x=${(l:300::ab:)}; ${x//(#a2)((ab|a|b)(ab|a|b))#cccc/Z}` 24.5 s →
+  0.09 s, zsh > 100 s), and with (#aN) `find_match` calls `hit` (the
+  replacement's expansion) only after a scan that lost nothing.  Timings (release, inside the
+  shell, x 200000 characters of `ab`, HEAD → 13c.3, zsh):
+  `${x//(#a1)abc/Z}` > 120 s → 15 ms (zsh 2.1 s); `${x##(#a2)abc}`
+  230 ms → 1.6 ms (2.4 ms); `${x#(#a1)ab}` 50 ms → 1.6 ms (2.4 ms);
+  `${x##(#a2)*abc}` 1.6 ms (2.0 ms); `${x%%(#a1)abc}` 72 → 26 ms (13 ms);
+  z of 200000 a's, `${z##(#a2)a#}` > 30 s → 3 ms (gives up; zsh crashes).
+- Tests: `Pattern13c3.*` (9) in `tests/subst_test.cpp`, `GlobPattern13c3.*`
+  (4) in `tests/glob_test.cpp`, expected values from zsh 5.9.
+- Differential tests against zsh: a new generator for (#aN), impl3
+  `gen7.py` (literal runs, `?`, `[…]`, <lo-hi>, `*`, groups with `#`,
+  `##`, (#c), nested (#aN)/(#i)/(#I)/(#a0), (#s)/(#e), (#b); modes
+  `plain`, `mb` with é, `excl` with `^`/`~`, `alt` with top-level `|`;
+  each case in its own process with a 5 s limit, ${x##} ${x#} (S)## (S)#
+  // %% % (S)%, [[ ]] with $match and `case`): plain seeds 1-10, mb and
+  alt seeds 1-4 × 3000: 0 cases differ; excl seeds 1-4: 2/3/2/6, all
+  with `^` or `~` (zsh's exclusion sync marks, the policy above); the
+  review's gen9 (top-level `|`): 0.  About 0.4% of the cases crash zsh
+  (status 139; causes not traced, many have nested repeats:
+  `[[ bba = (#a2)((c)#)# ]]`) and are not counted.  The earlier testers
+  are unchanged: gen5 seeds 1-5 × 4000: 0; gen3 `x` 11 seeds: 0; gen6
+  seeds 1-3: 1/1/7; gen.py (#b) without `^`/`~` 0, plain 48, (#b) 97;
+  outputs byte-identical to HEAD's on all of them and on genb; the
+  review5 engine fuzzer: 0.
+
+Left after 13c.3:
+- Exclusions with (#aN) keep the policy's set semantics: zsh tests them
+  after the whole pattern, with sync marks that remember errors.
+- A stale exactend after a later string is taken to fail; zsh compares
+  the compiled pattern's bytes and could, with 16 or more errors left
+  (or input holding those bytes), get through them.
+- Filename generation: leading flags do not reach later segments at all
+  (as on HEAD): with sub/abc and sub/xbc, `print (#a1)sub/abc` gives zsh
+  `sub/abc sub/xbc` and jfsh `sub/abc`, and so `(#i)SU*/ABC`; zsh also
+  counts errors across the segments of a path (PAT_FILE keeps errsfound).
+- A repeat per character deeper than the stack (about 10k repeats; zsh
+  succeeds there and crashes further on) gives up as no match.  On
+  `x=${(l:20000::ab:)}`, p='(#a2)(ab)##c', zsh gives the lengths 1, 1, 0,
+  19999, 0 and 20000 for ${x//p/Z} ${x/p/Z} ${(S)x##p} ${(S)x#p} ${x%%p}
+  ${(MS)x##p}, the jfsh binary 20000, 20000, 20000, 20000, 20000 and 0
+  (no match; in-process tests, with more stack, get zsh's).  ${(S)x%p}
+  and ${x%p} search from the end and agree (19999, 19998).  Searches
+  past the 2^28-step budget give up the same way.
+- Only the (#aN) part of zsh's flags word is kept at run time; case flags
+  keep 13c.1's model (Node::leaks), with the approx tries putting back
+  what a count leaks.
+
+**13c.4 — done** (branch `jfsh-pattern-vm`): performance and cleanup.
+- **The split.** `src/glob/pattern.cpp` holds the parser, the routing
+  (`route()`: Impl::stale/marks/vm_leaks), the dispatch and the
+  CompiledPattern API; `pattern_backtrack.cpp` the backtracker (`Matcher`,
+  `backtrack()`, `backtrack_open()`, `repeat_once()` for the VM's leaked
+  flags); `pattern_vm.cpp` the VM; `pattern_internal.h` (namespace
+  `jfsh::pattern`, private, `#include <glob/pattern_internal.h>`) the Node
+  tree, Impl, Subject and the entry points they share.  `glob.cpp` keeps
+  filename generation; `pattern_syntax.h` gives it `pattern::bracket_end()`
+  for its `[` check, apart from the matchers' internals.
+- **Stray bytes.** `Subject::boundary()` lets a character start at a
+  continuation byte that no character reaches (it scans back at most three
+  bytes, not past where the run began, `Subject::origin`), so
+  `[[ $'\xa9' = *? ]]` and `[[ $'b\xa9' = b*? ]]` are 0 as in zsh.  The
+  VM's cut texts (`Vm::cut_match()`, `cut_ends()`) are gone: with the
+  boundaries right a run agrees with zsh's tries on the cut text.  zsh
+  counts the places of a match from its start with a conversion state a
+  byte that starts no character leaves in error (macOS libc), so each byte
+  after one counts as a character for $mbegin/$mend/$MBEGIN/$MEND
+  (`chars_in(…, stray)`): `[[ $'\xffb\xff\xc3\xa9a' = (#b)(????)? ]]`
+  gives $mend 5; (B)/(E)/(N) count apart and are unchanged.
+- **One run for all starts.** `CompiledPattern::find_start()`: the first
+  (or last) character start with a whole or prefix match, and a whole
+  match's groups.  Starts after the last of a character every match has
+  (`VmProgram::needs`) are not tried.  The VM tries the nearest starts one
+  at a time (walking back by `boundary()` for the last) while that has read
+  no more than one run reads, then runs once with a start at every
+  character
+  (`Vm::Starts`: threads in the order of their starts; a match cuts the
+  threads after it, and with ascending starts stops new ones; a thread of
+  a later start at the same state as an earlier one goes, as it has a
+  match where that one has).  Cached steps add the new start (`NEW_START`).
+  Where the backtracker decides, one call per start as before.
+  `scan_match` uses it for `%`, `%%`, (S)% and (S)%% (also with (I:n:))
+  and, after eight starts in a row without a match, for the next start of
+  the (S)#, ${x/…} and ${x//…} scans.
+- **(S) shortest searches**: once (#e) is off for the search and without
+  groups, where the VM decides (`ordered_ends()`), the shortest search
+  answers alone (it ends no later than the first-found one and exists
+  where it does).  `${(S)x//a/Z}` on 20k: 3.9 → 1.6 ms (base 1.6).
+- **VM.** A cached step's copies and ending threads are worked out when
+  it is cached (`record()`, `COPY`, `dfa_dead`; not for runs that follow
+  the states alone); `canon()` works on each
+  register in place (`Inst::live_bits`); a context with many start ranges
+  finds its classes by the states of each start asked for
+  (`Ctx::by_items`), so `*(^(ab)#c)z` keeps one thread per class.
+- Backtracker continuations are `FnRef` (non-owning) instead of
+  std::function; one `Subject::range_ends()` for <lo-hi>'s saturating
+  digit scan; `parse_flags` takes and returns its flags; blank lines
+  between the case blocks of the parser's switch and the routing ones.
+- Tests: `Pattern13c4.*` (4) in `tests/subst_test.cpp` (zsh's values:
+  stray bytes, places after one, searches, benchmarks with time bounds:
+  30 KB `${x//a/b}`, `(#b)(*)x(*)(*)(*)y(*)` at 200, nested `^` after `*`,
+  `(#a1)` on 8 KB, the 200k shapes, the //, %, %% and (S) runs on 20k, the
+  context of every other place); `GlobPattern13c4.*` (3) in
+  `tests/glob_test.cpp` (find_start() against one call per start on 400
+  random patterns, and on 80 under MULTIBYTE with stray bytes and
+  subjects of 30 bytes or more; stray bytes and starts inside a character;
+  time bounds).
+- Differential tests (zsh vs jfsh, lines/cases): gen5 seeds 1-5: 0; gen3
+  `x` 11 seeds: 0; gen6: 1/1/7; gen.py plain 48, (#b) 97, (#b) without
+  `^`/`~` 0; genb 280/293/288; gen7 plain, mb, alt 0, excl 2/3/2/6; gen9 0;
+  outputs byte-identical to 13c.3's on all of them; review6 gen8 (`(#a)`
+  with stray bytes) seeds 21-23: 8/2/1 → 0, its other modes 0.  The
+  review5 engine fuzzer (Auto modes): 0; a find_start() fuzzer (9 modes ×
+  3 seeds × 2000): 0.
+- Timings (release, best of 3 inside the shell, 13c.3 → 13c.4; z 20k a's
+  unless said): `${z//a*[b]/Z}`, `${z%%a*[b]}`, `${z%a*[b]}`,
+  `${(S)z#a*[b]}`, `${(S)z%a*[b]}`, `${(S)z//a*[b]/Z}` 0.36 s → 0.3-0.7 ms
+  each, `${z//(#b)(a)*[b]/Z}` 2.0 s → 1.9 ms, `${z%%(#b)(a)*[b]}` 2.0 s →
+  0.7 ms; z 20k of ab: `${(S)z//a*b/Z}` 0.28 s → 1.8 ms,
+  `${(S)z//(#b)(a*b)/Z}` 1.75 → 1.36 s, `${(S)z%%a*c}` 4.7 → 0.0 ms,
+  `${(SI:5000:)z%%a}` 0.7 → 0.7 ms, `${(SI:500:)z%a*b}` 1.1 → 0.2 ms;
+  `z=${(l:16000::ab:)}; [[ ${z}z = *(^(ab)#c)z ]]` 10.8 → 0.79 s; 200k
+  `(#b)(*)(*)c` 5.1 → 4.4 ms, `(a|b)(#c1,300000)` 41 → 31 ms, `*^b` 73 →
+  49 ms; `${(S)z//a/Z}` 2.9 → 1.6 ms.  On f=/usr/local/lib/foo.tar.gz, 100000
+  times: `%.*` 0.136 → 0.137 s, `%%.*` 0.237 → 0.205, `%/*` 0.169 →
+  0.160, `%u*` 0.207 → 0.187, `%q*` 0.155 → 0.138, `(S)%/` 0.158 →
+  0.146, `(S)%l*b` 0.313 → 0.254, `%[/]*` 0.215 → 0.200, `//\//:` 0.235
+  → 0.221, `##*/` 0.221 → 0.220, `#*/` 0.259 → 0.255, `%%/*` 0.183 →
+  0.181, `%(#b)(.*)` 0.179 → 0.182.  Dense ${x//…}: 30k of ab `//a/b`
+  2.1 → 1.8 ms, `//c/Z` 10.4 → 0.0 ms, `(S)//a/b` 3.2 → 1.8 ms,
+  `//(#b)(a)/b` 5.7 → 5.3 ms; 200k a's `//a/b` 15.2 → 13.7 ms; 20k a's
+  `//a/Z` 1.6 → 1.4 ms.  A VM call no longer allocates (the all-clear
+  state registers and the match's group registers live in the scratch):
+  a short call is 49 ns, 60 on 13c.3.  The other 200k shapes (`b*`,
+  `%%.*`, `##*/`, `%%a*`, `%%a##`, `(*)(*)c`, `##(a|b)#`) are 0.5-1.6 ms
+  on both.
+
+Left after 13c.4 (the phase's open items):
+- From 13c.1: MULTIBYTE dropped in later top-level alternatives, unclosed
+  `(`/`[` as text, `${(qq)a}` of an empty array, leaks reaching earlier
+  literals, mid-literal `(#I)`, HIST_SUBST_PATTERN `\*`, errors inside
+  `eval`, leading flags in later glob segments (above, 13c.1).
+- From 13c.2: set semantics inside `^`/`~`; x## over 32768 instructions;
+  the routed classes (stale counts, marks of nested repeats, some leaks);
+  a (#cN,M) whose M is below what follows keeps its counts apart.
+- From 13c.3: the (#aN) items above.
+- A context of many start ranges is still quadratic in them (its sets of
+  starts are copied per step): `*(^(ab)#c)z` at 16000 is 0.79 s, zsh
+  0.0001 s.
+- (S) shortest searches with groups still run the first-found search at
+  each start (its groups are the answer when the two ends agree).
+- The VM's grouped steps still copy registers per thread (200k
+  `(#b)(*)(*)c` 3.2 ms in the library, the pre-VM build's 2.7).
+- The $mend count after a stray byte copies macOS libc's state after an
+  invalid sequence; on glibc zsh may count characters.
+- Chars and length counting (as on HEAD): zsh counts an incomplete UTF-8
+  sequence as one character for ${#x} and (B)/(E)/(N), jfsh each byte:
+  `x=$'\xe2\x82'; print ${#x}` is 1 in zsh, 2 in jfsh;
+  `x=$'\xe2\x82b'; ${(SBE)x#b}` `2 4` / `3 4`; `x=$'a\xf0\x9f\x98';
+  ${#x} ${(SBE)x%?}` `2 3 3` / `4 4 5`.
+- `%`/`%%` with (#b): find_start() takes the groups from the run of the
+  start it tried alone; one it found in the run for all starts is matched
+  again for its groups.
+
 ### M14. Compound short forms, PCRE `=~`, `BASH_REMATCH` [parser/short], [builtins/cond]
 
 **Done** (branch `jfsh-m14-short-forms`):
