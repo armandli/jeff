@@ -26,6 +26,7 @@
 #include <jfsh/builtins/cond.h>
 #include <jfsh/builtins/math.h>
 #include <jfsh/core/aliases.h>
+#include <jfsh/core/stack.h>
 #include <jfsh/editor/completion.h>
 #include <jfsh/editor/zle.h>
 #include <jfsh/exec/subst.h>
@@ -82,6 +83,7 @@ int Executor::exec_string(strv src, bool by_line) {
   if (mCtx.opts.get(OPT_ALIASES)) parser.set_aliases(&mCtx.aliases);
   auto parse_failed = [&](const ShellError& e) {
     s::fprintf(stderr, "jfsh:%d: %s\n", e.code, e.message.c_str());
+    mParseFailed = true;
     mCtx.last_exit = 1;
     return 1;
   };
@@ -115,6 +117,23 @@ int Executor::exec_string(strv src, bool by_line) {
   }
   return rc;
 }
+
+// Around a trap: an error in it ends the trap, not the code it interrupted,
+// as in zsh; an interrupt (`interrupt`) goes on unwinding.
+struct TrapErrorScope {
+  explicit TrapErrorScope(ExecContext& c) : ctx(c), was_aborting(c.aborting) {
+    if (not was_aborting) ctx.interrupt = false;
+  }
+  ~TrapErrorScope() {
+    if (not was_aborting and ctx.aborting and not ctx.interrupt)
+      ctx.aborting = ctx.abort_line = false;
+  }
+  TrapErrorScope(const TrapErrorScope&) = delete;
+  TrapErrorScope& operator=(const TrapErrorScope&) = delete;
+
+  ExecContext& ctx;
+  bool         was_aborting;
+};
 
 // Copies the words of prog[begin, end) into a program of their own, with
 // the strings they use renumbered.  A function body outlives the program
@@ -161,6 +180,8 @@ static Redirection fetch_redir(ExecState& es) {
     auto [name, target] = split_redir_varid(r.target);
     r.varid  = str(name);
     r.target = str(target);
+  } else if (r.type == REDIR_HEREDOC or r.type == REDIR_HEREDOCD) {
+    r.target = str(split_heredoc(r.target).second);
   }
   return r;
 }
@@ -344,7 +365,9 @@ int Executor::exec_simple(vec<str> args,
         args.insert(at, a.name);
         typeset_arrays.push_back(s::move(a));
       } else {
-        args.insert(at, a.name + (a.append ? "+=" : "=") + a.value);
+        // An element keeps its (expanded) subscript: typeset decides.
+        str name = a.subscript ? a.name + "[" + *a.subscript + "]" : a.name;
+        args.insert(at, name + (a.append ? "+=" : "=") + a.value);
       }
     }
     return true;
@@ -768,6 +791,7 @@ void Executor::on_command_error(int rc) {
   if (mCtx.exiting) return;
   if (not exempt and mCtx.opts.errexit()) {
     mCtx.exiting  = true;
+    mCtx.exit_now = true;
     mCtx.exit_val = rc;
   } else if (mCtx.opts.get(OPT_ERRRETURN) and mCtx.noerrreturn == 0) {
     mCtx.returning  = true;
@@ -788,11 +812,15 @@ int Executor::exec_sublist(ExecState& es, ExecFlags flags) {
       // off ZERR and ERR_EXIT; everything the others run is exempt.
       bool exempt = type != WC_SUBLIST_END or (f & WC_SUBLIST_NOT);
       bool counts = failure_counts(*es.prog, es.pc);
+      auto runs   = mCtx.code_runs;
       mCtx.err_reported = false;
       if (exempt) { ++mCtx.noerrexit; ++mCtx.noerrreturn; }
       rc = exec_pline(es, flags);
       if (exempt) { --mCtx.noerrexit; --mCtx.noerrreturn; }
       if (f & WC_SUBLIST_NOT) rc = (rc == 0) ? 1 : 0;
+      // zsh 5.9 forgets the `!` of `! f` once the function (or eval, or
+      // sourced file) has run commands of its own.
+      if (type == WC_SUBLIST_END and mCtx.code_runs != runs) exempt = false;
       mCtx.last_exit = rc;
       if (rc != 0 and not exempt and counts and not interrupted())
         on_command_error(rc);
@@ -936,10 +964,13 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
 
   // The forked stages make a job, so their statuses are recorded however
   // they are reaped.
+  // As in zsh, a stage before `|&` shows as `cmd 2>&1`.
   auto texts = pipeline_stage_texts(*es.prog, pipe_pc);
   str text;
   for (s::size_t i = 0; i < texts.size(); ++i) {
-    if (i) text += wc_pipe_stderr(w, static_cast<s::uint32_t>(i - 1)) ? " |& " : " | ";
+    if (i + 1 < texts.size() and wc_pipe_stderr(w, static_cast<s::uint32_t>(i)))
+      texts[i] += " 2>&1";
+    if (i) text += " | ";
     text += texts[i];
   }
   auto add_process = [&](int jid, s::size_t i, pid_t pid) {
@@ -1217,6 +1248,7 @@ bool Executor::loop_values(ExecState& es, WordCode head,
   auto expanded = ex.words(raw);
   if (not expanded) {
     s::fprintf(stderr, "jfsh: %s\n", expanded.error().message.c_str());
+    mCtx.aborting = mCtx.abort_line = true;
     return false;
   }
   values = s::move(*expanded);
@@ -1237,13 +1269,8 @@ int Executor::exec_for(ExecState& es, WordCode head) {
   ++mCtx.loop_depth;
   for (s::size_t i = 0; i < values.size(); i += names.size()) {
     bool ok = true;
-    for (s::size_t k = 0; k < names.size() and ok; ++k) {
-      str v = i + k < values.size() ? values[i + k] : str{};
-      if (auto r = mCtx.params.set_scalar(names[k], s::move(v)); not r) {
-        s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
-        ok = false;
-      }
-    }
+    for (s::size_t k = 0; k < names.size() and ok; ++k)
+      ok = assign_var(names[k], i + k < values.size() ? values[i + k] : str{});
     if (not ok) {
       rc = 1;
       break;
@@ -1275,7 +1302,9 @@ int Executor::exec_for_cond(ExecState& es, WordCode head) {
     if (is_blank(expr)) return true;
     auto v = ex.math(expr);
     if (not v) {
+      // As in zsh, an arithmetic error ends the command line.
       s::fprintf(stderr, "jfsh: %s\n", v.error().message.c_str());
+      mCtx.aborting = mCtx.abort_line = true;
       return false;
     }
     value = v->truthy();
@@ -1315,6 +1344,7 @@ int Executor::exec_case(ExecState& es, WordCode head) {
   Expander ex{*this, mCtx};
   auto fail = [&](const ShellError& e) {
     s::fprintf(stderr, "jfsh: %s\n", e.message.c_str());
+    mCtx.aborting = mCtx.abort_line = true;
     es.pc = end;
     return 1;
   };
@@ -1330,8 +1360,16 @@ int Executor::exec_case(ExecState& es, WordCode head) {
       if (match) break;
       auto pat = ex.pattern(word);
       if (not pat) return fail(pat.error());
-      auto cp = CompiledPattern::compile(*pat, false, mCtx.opts.extended_glob(),
-                                         mCtx.opts.multibyte());
+      // Compiled once per text and options: a loop runs the same case.
+      bool ext = mCtx.opts.extended_glob(), mb = mCtx.opts.multibyte();
+      str  key = str{ext ? 'e' : '-', mb ? 'm' : '-'} + *pat;
+      auto found = mCasePatterns.find(key);
+      if (found == mCasePatterns.end()) {
+        if (mCasePatterns.size() >= 4096) mCasePatterns.clear();
+        found = mCasePatterns.emplace(s::move(key),
+                                      CompiledPattern::compile(*pat, false, ext, mb)).first;
+      }
+      const CompiledPattern& cp = found->second;
       if (cp.bad()) {
         // As in zsh: the command line ends, with status 0.
         s::fprintf(stderr, "jfsh: bad pattern: %s\n", glob_unescape(*pat).c_str());
@@ -1350,8 +1388,8 @@ int Executor::exec_case(ExecState& es, WordCode head) {
       continue;
     }
     rc = exec_list(es, EF_NONE);
-    if (interrupted() or wc_cmd_type(arm) == WC_CASE_BREAK) break;
-    fall  = wc_cmd_type(arm) == WC_CASE_FALL;
+    if (interrupted() or wc_case_end(arm) == WC_CASE_BREAK) break;
+    fall  = wc_case_end(arm) == WC_CASE_FALL;
     es.pc = next;
   }
   es.pc = end;
@@ -1422,13 +1460,12 @@ int Executor::exec_select(ExecState& es, WordCode head) {
     menu = line->empty();
     if (menu) continue;
     (void)mCtx.params.set_scalar("REPLY", *line);
-    char* rest = nullptr;
-    long n = s::strtol(line->c_str(), &rest, 10);
-    str choice = (*rest == '\0' and n >= 1
+    // The number at the start, as atoi reads it (`1x` is 1).
+    long n = s::strtol(line->c_str(), nullptr, 10);
+    str choice = (n >= 1
                   and static_cast<s::size_t>(n) <= values.size())
                        ? values[static_cast<s::size_t>(n) - 1] : str{};
-    if (auto r = mCtx.params.set_scalar(names[0], choice); not r) {
-      s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+    if (not assign_var(names[0], s::move(choice))) {
       rc = 1;
       break;
     }
@@ -1449,6 +1486,7 @@ int Executor::exec_repeat(ExecState& es, WordCode head) {
   auto count = ex.arith(es.fetch_str());
   if (not count) {
     s::fprintf(stderr, "jfsh: %s\n", count.error().message.c_str());
+    mCtx.aborting = mCtx.abort_line = true;
     es.pc = end;
     return 1;
   }
@@ -1512,10 +1550,20 @@ int Executor::exec_funcdef(ExecState& es, WordCode head) {
     args->insert(args->begin(), "(anon)");
     return call_function(body, *args);
   }
-  auto names = fetch_words(es);
+  // The names are expanded as words, as zsh's execfuncdef does: `'if'()`
+  // defines `if`, `$n()` the value of $n.
+  auto raw = fetch_words(es);
+  Expander ex{*this, mCtx};
+  auto names = ex.words(raw);
+  if (not names) {
+    s::fprintf(stderr, "jfsh: %s\n", names.error().message.c_str());
+    mCtx.aborting = mCtx.abort_line = true;
+    es.pc = end;
+    return 1;
+  }
   ProgRef body = extract_body(*es.prog, es.pc, end);
   body->line_base = def_line;
-  for (auto& name : names) {
+  for (auto& name : *names) {
     // TRAPINT() { … } is the trap for SIGINT, and so on.
     if (name.starts_with("TRAP"))
       if (auto sig = SignalTable::name_to_sig(strv(name).substr(4));
@@ -1568,7 +1616,46 @@ static bool looks_like_cond_op(strv w) noexcept {
   });
 }
 
+// `!`, `&&` and `||` go down their right side in a loop, so a long chain
+// (laid out to the right by the parser) needs no recursion; a left
+// operand that is a chain of its own, from parentheses, recurses.
 int Executor::exec_cond_node(ExecState& es, WordCode head) {
+  s::size_t end  = es.pc + wc_cmd_skip(head);
+  bool      flip = false;   // under an odd number of `!`
+  int       rc   = 0;
+  auto note = [&](strv s) { if (mCondTrace) *mCondTrace += s; };
+  for (;;) {
+    WordCode type = wc_cmd_type(head);
+    if (type == WC_COND_NOT) {
+      note("! ");
+      flip = not flip;
+      head = es.fetch();
+      continue;
+    }
+    if (type != WC_COND_AND and type != WC_COND_OR) {
+      rc = exec_cond_leaf(es, head);
+      break;
+    }
+    if (stack_low()) {
+      s::fprintf(stderr, "jfsh: condition nested too deeply\n");
+      mCtx.aborting = mCtx.abort_line = true;
+      rc = 2;
+      break;
+    }
+    bool is_and = type == WC_COND_AND;
+    rc = exec_cond(es, es.fetch());
+    // `&&` and `||` stop at an error.
+    if (rc != (is_and ? 0 : 1) or interrupted()) break;
+    note(is_and ? " && " : " || ");
+    head = es.fetch();
+  }
+  es.pc = end;
+  return flip and rc < 2 ? 1 - rc : rc;
+}
+
+// A primary of `[[ ]]`: a string, a unary or binary test, or a module's
+// condition.
+int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
   s::size_t end = es.pc + wc_cmd_skip(head);
   Expander ex{*this, mCtx};
   auto finish = [&](int rc) {
@@ -1583,20 +1670,6 @@ int Executor::exec_cond_node(ExecState& es, WordCode head) {
   };
   auto note = [&](strv s) { if (mCondTrace) *mCondTrace += s; };
   switch (wc_cmd_type(head)) {
-    case WC_COND_NOT: {
-      note("! ");
-      int rc = exec_cond(es, es.fetch());
-      return finish(rc < 2 ? 1 - rc : rc);
-    }
-    case WC_COND_AND: case WC_COND_OR: {
-      bool is_and = wc_cmd_type(head) == WC_COND_AND;
-      int rc = exec_cond(es, es.fetch());
-      if (rc == (is_and ? 0 : 1)) {
-        note(is_and ? " && " : " || ");
-        rc = exec_cond(es, es.fetch());
-      }
-      return finish(rc);
-    }
     case WC_COND_STR: {
       strv raw = es.fetch_str();
       if (looks_like_cond_op(raw)) {
@@ -1778,26 +1851,45 @@ int Executor::exec_arith(ExecState& es, WordCode) {
 }
 
 // try := WC_TRY(0, skip) body body(always).  The always block runs however
-// the first one ended; a break, continue, return or exit pending from the
-// first block is held while it runs and then goes on, unless the always
-// block started one of its own.  The status is the first block's.
+// the first one ended, as zsh's exectry: a break, continue, return or exit
+// pending from the first block is held while it runs and then goes on,
+// unless the always block started one of its own.  An error that ended the
+// first block is held too, as $TRY_BLOCK_ERROR: the always block may clear
+// it to go on.  The status is the first block's, also for a `return` in the
+// always block.  An exit that leaves at once (exit_now) skips the block.
 int Executor::exec_always(ExecState& es, WordCode head) {
   s::size_t end    = es.pc + wc_cmd_skip(head);
   s::size_t always = body_end(*es.prog, es.pc);
+  mCtx.interrupt = false;
   int rc = exec_list(es, EF_NONE);
+  es.pc = end;
+  if (mCtx.exiting and mCtx.exit_now) return rc;
+  if (mCtx.aborting and rc == 0) rc = 1;
   auto held = s::tuple{mCtx.break_level, mCtx.continuing, mCtx.returning,
                        mCtx.return_val, mCtx.exiting, mCtx.exit_val};
+  auto saved_try  = s::pair{mCtx.try_error, mCtx.try_interrupt};
+  bool abort_line = mCtx.abort_line, interrupt = mCtx.aborting and mCtx.interrupt;
+  mCtx.try_error     = mCtx.aborting and not interrupt ? 1 : 0;
+  mCtx.try_interrupt = interrupt ? 1 : 0;
+  mCtx.aborting    = mCtx.abort_line = false;
   mCtx.break_level = 0;
   mCtx.continuing  = false;
   mCtx.returning   = false;
   mCtx.exiting     = false;
   es.pc = always;
   exec_list(es, EF_NONE);
-  if (not interrupted()) {
+  es.pc = end;
+  // As in zsh, an error in the always block itself is dropped unless the
+  // first block's still stands; so is an interrupt.
+  mCtx.aborting   = mCtx.try_error != 0 or mCtx.try_interrupt != 0;
+  mCtx.abort_line = mCtx.aborting and abort_line;
+  mCtx.interrupt  = mCtx.try_interrupt != 0;
+  s::tie(mCtx.try_error, mCtx.try_interrupt) = saved_try;
+  if (mCtx.break_level == 0 and not mCtx.returning and not mCtx.exiting) {
     s::tie(mCtx.break_level, mCtx.continuing, mCtx.returning,
            mCtx.return_val, mCtx.exiting, mCtx.exit_val) = held;
   }
-  es.pc = end;
+  if (mCtx.returning) mCtx.return_val = rc;
   return rc;
 }
 
@@ -2431,6 +2523,9 @@ bool Executor::expand_command(vec<str>& args,
   auto fail = [&](const ShellError& e) {
     s::fprintf(stderr, "jfsh: %s\n", e.message.c_str());
     subst_status = ex.subst_status();
+    // In a here-document or here-string even ${x?} fails just the command
+    // (zsh 5.9), so the shell doesn't exit for it.
+    if (not fatal and mCtx.exit_now) mCtx.exiting = mCtx.exit_now = false;
     return false;
   };
   // The arguments are expanded first, then the redirection targets; the
@@ -2682,6 +2777,7 @@ static Result<void> prefix_param(ParamTable& params, const str& name, bool expor
     int level = o.scope;
     p = &params.assign(name, o.value,
                        o.flags & ~(PM_READONLY | PM_SPECIAL | PM_PRIVATE | PM_TIED));
+    p->base = o.base;
     // It stands for the original, so `typeset -p` in a function says -g
     // just when it would for that one.
     p->scope = level;
@@ -2694,6 +2790,32 @@ static Result<void> prefix_param(ParamTable& params, const str& name, bool expor
 }
 
 Result<void> Executor::assign_expanded(const Assignment& a) { return assign_one(mCtx, a); }
+
+bool Executor::assign_var(str name, str value) {
+  auto digit = [](char c) { return s::isdigit(static_cast<unsigned char>(c)) != 0; };
+  // As zsh's isident: a positional parameter's number, or an identifier
+  // whose letters may be multibyte.
+  bool ok = not name.empty()
+        and (s::all_of(name.begin(), name.end(), digit)
+             or (not digit(name[0]) and s::all_of(name.begin(), name.end(), [](char c) {
+                   return s::isalnum(static_cast<unsigned char>(c)) or c == '_'
+                       or static_cast<unsigned char>(c) >= 0x80;
+                 })));
+  if (not ok) {
+    s::fprintf(stderr, "jfsh: not an identifier: %s\n", name.c_str());
+    mCtx.aborting = true;
+    return false;
+  }
+  Assignment a;
+  a.name  = s::move(name);
+  a.value = s::move(value);
+  if (auto r = assign_one(mCtx, a); not r) {
+    s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+    mCtx.aborting = true;
+    return false;
+  }
+  return true;
+}
 
 int Executor::apply_assigns(vec<Assignment>& assigns, AssignTo to,
                             opt<int>& subst_status) {
@@ -2831,18 +2953,23 @@ static constexpr long DEFAULT_FUNC_NEST = 700;
 
 int Executor::call_function(const ProgRef& body,
                             vec<str>& args) {
-  long limit = DEFAULT_FUNC_NEST;
+  // $FUNCNEST is an integer parameter in zsh: its text is evaluated
+  // (`FUNCNEST=abc` is 0).
+  s::int64_t limit = DEFAULT_FUNC_NEST;
   if (auto p = mCtx.params.lookup("FUNCNEST"); p and p->get().is_set()) {
-    str text = p->get().is_integer() ? s::to_string(p->get().integer())
-                                     : p->get().scalar();
-    char* rest = nullptr;
-    long n = s::strtol(text.c_str(), &rest, 10);
-    if (not text.empty() and *rest == '\0') limit = n;
+    if (p->get().is_integer()) {
+      limit = p->get().integer();
+    } else if (auto n = arith_eval(p->get().scalar(), mCtx.params, math_options(mCtx.opts),
+                                   &mCtx.modules.math_funcs())) {
+      limit = *n;
+    }
   }
+  // As zsh's zerr, this ends the command line.
   if (limit >= 0 and mCtx.func_depth >= limit) {
     s::fprintf(stderr,
                "jfsh: %s: maximum nested function level reached; increase FUNCNEST?\n",
                args[0].c_str());
+    mCtx.aborting = mCtx.abort_line = true;
     return 1;
   }
 
@@ -2862,6 +2989,8 @@ int Executor::call_function(const ProgRef& body,
   mCtx.params.push_scope();
   for (const auto& [_, hook] : mCtx.hooks.function) hook(args[0], true);
 
+  // An empty body runs no commands.
+  if (not body->empty() and wc_code(body->prog[0]) != WC_END) ++mCtx.code_runs;
   int rc = exec(*body);
   if (mCtx.returning) {
     mCtx.returning = false;
@@ -2874,14 +3003,28 @@ int Executor::call_function(const ProgRef& body,
   // in the function stay in the function, matching POSIX.
   auto exit_trap = mCtx.signals.pop_trap_frame(
       mCtx.opts.get(OPT_LOCALTRAPS) or mCtx.opts.get(OPT_POSIXTRAPS));
-  if (exit_trap and exit_trap->action == TrapAction::Command and not mCtx.exiting) {
-    int saved = mCtx.last_exit;
-    exec_string(exit_trap->command);
-    if (not mCtx.exiting) mCtx.last_exit = saved;
+  // It runs on an `exit` in the function too, which then goes on; there,
+  // as in zsh, the trap sees $? 0.
+  if (exit_trap and exit_trap->action == TrapAction::Command) {
+    int  saved = mCtx.last_exit;
+    auto exit = s::tuple{mCtx.exiting, mCtx.exit_val, mCtx.exit_now};
+    if (mCtx.exiting) mCtx.last_exit = 0;
+    mCtx.exiting = mCtx.exit_now = false;
+    {
+      TrapErrorScope scope{mCtx};
+      exec_string(exit_trap->command);
+    }
+    if (not mCtx.exiting) {
+      s::tie(mCtx.exiting, mCtx.exit_val, mCtx.exit_now) = exit;
+      if (not mCtx.exiting) mCtx.last_exit = saved;
+    }
   }
   for (const auto& [_, hook] : mCtx.hooks.function) hook(args[0], false);
   mCtx.params.pop_scope();
   --mCtx.func_depth;
+  // An `exit` that has unwound the functions leaves at once from here, as
+  // zsh's does: always blocks outside them don't run.
+  if (mCtx.exiting and mCtx.func_depth == 0) mCtx.exit_now = true;
   mCtx.noerrreturn = saved_noerrreturn;
   if (own_optind) {
     mCtx.optind  = saved_optind;
@@ -3111,6 +3254,7 @@ int Executor::exec_replace(const vec<str>& args, vec<Assignment> assigns,
     // A shell that can't exec goes on only when interactive.
     if (not mCtx.opts.interactive()) {
       mCtx.exiting  = true;
+      mCtx.exit_now = true;
       mCtx.exit_val = rc;
     }
     return rc;
@@ -3175,13 +3319,29 @@ int Executor::source_file(const str& path, const vec<str>& args, const str& name
   str saved_arg0   = mCtx.arg0;
   str saved_source = s::exchange(mCtx.source_name, path);
   if (mCtx.opts.get(OPT_FUNCTIONARGZERO)) mCtx.arg0 = name;
+  // The file is not inside the caller's loops, as zsh's source sets
+  // `loops` to 0: a `break` in it is an error.
+  int saved_loops = s::exchange(mCtx.loop_depth, 0);
+  mCtx.interrupt = false;
+  mParseFailed   = false;
   ++mCtx.source_depth;
+  ++mCtx.code_runs;
   int rc = exec_string(*text, /*by_line=*/true);
   --mCtx.source_depth;
+  // A parse error in the file gives the caller 126, as in zsh.
+  if (s::exchange(mParseFailed, false)) rc = mCtx.last_exit = 126;
+  mCtx.loop_depth = saved_loops;
   // `return` in the file ends the file.
   if (mCtx.returning) {
     mCtx.returning = false;
     rc = mCtx.return_val;
+  }
+  // An error ends the file but not the caller, which sees status 126, as
+  // in zsh.  An interrupt goes on unwinding, and under ERR_EXIT so does
+  // the error (the shell exits with its status, 1).
+  if (mCtx.aborting and not mCtx.interrupt and not mCtx.opts.errexit()) {
+    mCtx.aborting = mCtx.abort_line = false;
+    rc = mCtx.last_exit = 126;
   }
   mCtx.source_name = s::move(saved_source);
   mCtx.arg0        = s::move(saved_arg0);
@@ -3384,10 +3544,11 @@ void Executor::handle_signals() {
     if (mCtx.signals.traps().trapped(sig)) {
       run_trap(sig);
     } else if (sig == SIGINT and mCtx.signals.job_control()) {
-      mCtx.aborting = true;
+      mCtx.aborting = mCtx.interrupt = true;
     } else if (sig == SIGHUP and mCtx.signals.job_control()) {
       mCtx.hangup   = true;
       mCtx.exiting  = true;
+      mCtx.exit_now = false;
       mCtx.exit_val = 128 + SIGHUP;
     }
   }
@@ -3426,6 +3587,8 @@ void Executor::run_trap(int sig) {
   ++mTrapDepth;
   int  saved_status = mCtx.last_exit;
   bool saved_err    = mCtx.err_reported;
+  opt<TrapErrorScope> scope;
+  scope.emplace(mCtx);
   if (trap.action == TrapAction::Function) {
     str name = str("TRAP") + SignalTable::sig_to_name(sig);
     auto fn = mCtx.functions.find(name);
@@ -3435,13 +3598,16 @@ void Executor::run_trap(int sig) {
       if (is_real_signal(sig))  args.push_back(s::to_string(sig));
       else if (sig == SIGEXIT)  args.push_back("0");
       int rc = call_function(body, args);
-      // A signal trap function that fails acts as if the signal had
-      // interrupted the shell.
-      if (rc != 0 and is_real_signal(sig) and not mCtx.exiting) mCtx.aborting = true;
+      // A signal trap function that fails (not by an error) acts as if the
+      // signal had interrupted the shell.
+      bool error = mCtx.aborting and not mCtx.interrupt;
+      if (rc != 0 and not error and is_real_signal(sig) and not mCtx.exiting)
+        mCtx.aborting = mCtx.interrupt = true;
     }
   } else {
     exec_string(trap.command);
   }
+  scope.reset();
   if (not mCtx.exiting) mCtx.last_exit = saved_status;
   mCtx.err_reported = saved_err;
   --mTrapDepth;
@@ -3455,7 +3621,7 @@ int Executor::run_exit_trap(int status) {
   mCtx.signals.set_trap(SIGEXIT, TrapAction::Default);
   bool was_exiting = mCtx.exiting;
   int  was_val     = mCtx.exit_val;
-  mCtx.exiting = mCtx.returning = mCtx.aborting = false;
+  mCtx.exiting = mCtx.returning = mCtx.aborting = mCtx.exit_now = false;
   mCtx.break_level = 0;
   mCtx.last_exit   = status;
   ++mTrapDepth;

@@ -706,7 +706,7 @@ TEST(Functions, PrintsDefinitionsAsZshDoes) {
       "f() { echo hi; ls | wc -l && echo a || echo b; x=1 y=(a b) cmd >out 2>&1 <in; "
       "if true; then echo t; elif false; then :; else echo e; fi; for i in 1 2; do echo $i; done; "
       "for ((i=0;i<3;i++)) { echo $i }; while true; do break; done; "
-      "case $x in (a|b) echo ab ;; c) echo c ;& *) ;; esac; (cd /; ls); { echo g; }; "
+      "case $x in a|b) echo ab ;; c) echo c ;& *) ;; esac; (cd /; ls); { echo g; }; "
       "repeat 3 echo r; [[ -n $x && $y == a* ]]; (( x++ )); sleep 1 & ; g() { echo inner; }; "
       "select s in a b; do break; done; { a } always { b }; local z=3; ! true; echo \"q $x\" 's' }");
   EXPECT_EQ(out(sh, "functions f"),
@@ -718,7 +718,7 @@ TEST(Functions, PrintsDefinitionsAsZshDoes) {
             "\tfor i in 1 2\n\tdo\n\t\techo $i\n\tdone\n"
             "\tfor ((i=0; i<3; i++)) do\n\t\techo $i\n\tdone\n"
             "\twhile true\n\tdo\n\t\tbreak\n\tdone\n"
-            "\tcase $x in\n\t\t(a|b) echo ab ;;\n\t\t(c) echo c ;&\n\t\t(*)  ;;\n\tesac\n"
+            "\tcase $x in\n\t\t(a | b) echo ab ;;\n\t\t(c) echo c ;&\n\t\t(*)  ;;\n\tesac\n"
             "\t(\n\t\tcd /\n\t\tls\n\t)\n"
             "\t{\n\t\techo g\n\t}\n"
             "\trepeat 3\n\tdo\n\t\techo r\n\tdone\n"

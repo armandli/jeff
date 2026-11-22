@@ -12,10 +12,24 @@ namespace jfsh {
 
 str Param::scalar() const noexcept {
   if (auto* s = s::get_if<str>(&value)) return *s;
-  if (auto* i = s::get_if<s::int64_t>(&value)) return s::to_string(*i);
+  if (auto* i = s::get_if<s::int64_t>(&value)) {
+    if (base == 0 or base == 10) return s::to_string(*i);
+    // As zsh's convbase: `16#FF`, `-2#101`.
+    constexpr strv kDigits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    auto b = static_cast<s::uint64_t>(base);
+    auto n = *i < 0 ? 0 - static_cast<s::uint64_t>(*i) : static_cast<s::uint64_t>(*i);
+    str digits;
+    do {
+      digits.insert(digits.begin(), kDigits[n % b]);
+      n /= b;
+    } while (n > 0);
+    return (*i < 0 ? "-" : "") + s::to_string(base) + "#" + digits;
+  }
   if (auto* f = s::get_if<double>(&value)) {
-    char buf[64];
-    s::snprintf(buf, sizeof buf, (flags & PM_EFLOAT) ? "%.9e" : "%.10f", *f);
+    int digits = base > 0 ? base : 10;
+    char buf[400];
+    if (flags & PM_EFLOAT) s::snprintf(buf, sizeof buf, "%.*e", digits - 1, *f);
+    else                   s::snprintf(buf, sizeof buf, "%.*f", digits, *f);
     return buf;
   }
   return {};
@@ -359,7 +373,7 @@ vec<str> ParamTable::make_envp() const {
   for_each([&](const Param& p) {
     if (not p.is_exported() or not p.is_set()) return;
     if (p.is_scalar())       env.push_back(p.name + "=" + p.scalar());
-    else if (p.is_integer()) env.push_back(p.name + "=" + s::to_string(p.integer()));
+    else if (p.is_integer()) env.push_back(p.name + "=" + p.scalar());   // in its base
     else if (p.is_float())   env.push_back(p.name + "=" + p.scalar());
   });
   return env;

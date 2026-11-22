@@ -103,7 +103,8 @@ enum WCOpcode : WordCode {
 //                 bit 10:     has_fd flag (user wrote a prefix `2>`, `3<`)
 //                 bit 11:     literal flag: a here-doc whose delimiter was
 //                             quoted, so its body is not expanded
-//                 target_or_body is the here-doc body for REDIR_HEREDOC{,D},
+//                 target_or_body is the here-doc delimiter as written, a
+//                 NUL and the body for REDIR_HEREDOC{,D} (split_heredoc),
 //                 empty for REDIR_CLOSE, the subcommand source for
 //                 REDIR_PROC_{IN,OUT,EQ}, otherwise the target word
 //
@@ -239,6 +240,10 @@ constexpr s::pair<strv, strv> split_redir_varid(strv target) noexcept {
   if (nul == strv::npos) return {strv{}, target};
   return {target.substr(0, nul), target.substr(nul + 1)};
 }
+// A here-document's string: the delimiter as written, a NUL, the body.
+constexpr s::pair<strv, strv> split_heredoc(strv target) noexcept {
+  return split_redir_varid(target);
+}
 constexpr int wc_redir_fd(WordCode w) noexcept {
   return static_cast<int>((wc_data(w) >> WC_REDIR_TYPE_BITS) & 0x1fu);
 }
@@ -271,6 +276,9 @@ inline constexpr WordCode WC_CASE_HEAD     = 0u;
 inline constexpr WordCode WC_CASE_BREAK    = 1u;   // ;;
 inline constexpr WordCode WC_CASE_FALL     = 2u;   // ;&
 inline constexpr WordCode WC_CASE_TESTNEXT = 3u;   // ;|
+// Added to an arm's type when its patterns were written as one group,
+// `(a|b) cmd`, which zsh prints as written; `a|b) cmd` prints `(a | b)`.
+inline constexpr WordCode WC_CASE_GROUPED  = 4u;
 
 inline constexpr WordCode WC_COND_NOT    = 0u;
 inline constexpr WordCode WC_COND_AND    = 1u;
@@ -290,6 +298,10 @@ constexpr WordCode make_wc_cmd(WordCode op, WordCode type, WordCode skip) noexce
 }
 constexpr WordCode wc_cmd_type(WordCode w) noexcept {
   return wc_data(w) & ((1u << WC_CMD_TYPE_BITS) - 1u);
+}
+// An arm's `;;`, `;&` or `;|`, without WC_CASE_GROUPED.
+constexpr WordCode wc_case_end(WordCode arm) noexcept {
+  return wc_cmd_type(arm) & ~WC_CASE_GROUPED;
 }
 constexpr WordCode wc_cmd_skip(WordCode w) noexcept {
   return wc_data(w) >> WC_CMD_TYPE_BITS;

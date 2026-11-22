@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <cctype>
 #include <initializer_list>
 #include <iterator>
 #include <string>
@@ -46,7 +48,8 @@ static const char* cmd_type_name(WordCode op, WordCode type) noexcept {
     case WC_FOR: case WC_SELECT:
       return type == WC_FOR_ARGS ? "args" : "in";
     case WC_CASE: {
-      static const char* const kArms[] = {"head", ";;", ";&", ";|"};
+      static const char* const kArms[] = {"head", ";;", ";&", ";|",
+                                          "?", ";; grouped", ";& grouped", ";| grouped"};
       return type < s::size(kArms) ? kArms[type] : "?";
     }
     case WC_FUNCDEF:
@@ -106,8 +109,14 @@ str disassemble(const CompiledProgram& prog) {
       }
       break; case WC_STRING: {
         WordCode idx = wc_data(w);
-        out += idx < prog.strs.size() ? " \"" + prog.strs[idx] + '"'
-                                      : " <bad index " + s::to_string(idx) + '>';
+        if (idx < prog.strs.size()) {
+          // The NUL in a here-document's or `{name}>`'s string shows as \0.
+          out += " \"";
+          for (char c : prog.strs[idx]) out += c == '\0' ? str("\\0") : str(1, c);
+          out += '"';
+        } else {
+          out += " <bad index " + s::to_string(idx) + '>';
+        }
       }
       break; case WC_IF: case WC_WHILE: case WC_FOR: case WC_CASE:
       case WC_SELECT: case WC_REPEAT: case WC_SUBSH: case WC_CURSH:
@@ -156,7 +165,23 @@ str close_text(const str& fd, const str& target) {
   return fd + (in ? "<&-" : ">&-");
 }
 
-struct Decompiler {
+// A here-document waiting for the end of the line: its body and the line
+// that ends it.
+struct HereDoc {
+  str body, end;
+};
+
+// `text` in single quotes, as zsh's quotedzputs gives a here-document in a
+// job's one-line text.
+str single_quote(strv text) {
+  str out = "'";
+  for (char c : text) out += c == '\'' ? str("'\\''") : str(1, c);
+  return out + "'";
+}
+
+// Reads the bytecode for both texts, and gives the parts they write the
+// same way: words, redirections, case patterns and conditions.
+struct Reader {
   const CompiledProgram& p;
   s::size_t              pc;
 
@@ -169,15 +194,142 @@ struct Decompiler {
     return i < p.strs.size() ? p.strs[i] : str{};
   }
 
-  str words() {
+  str words(strv sep = " ") {
     WordCode n = wc_data(fetch());  // WC_WORDS
     str out;
     for (WordCode i = 0; i < n; ++i) {
-      if (i) out += ' ';
+      if (i) out += sep;
       out += next_str();
     }
     return out;
   }
+
+  // A case arm's patterns, as zsh prints them: `a | b`, or `a|b` when they
+  // were written as one group.
+  str patterns(WordCode arm) {
+    return words(wc_cmd_type(arm) & WC_CASE_GROUPED ? "|" : " | ");
+  }
+
+  // The connector before stage `i + 1` of pipeline `w`; zsh writes `|&` as
+  // `2>&1 |`.
+  static strv pipe_text(WordCode w, WordCode i) {
+    return wc_pipe_stderr(w, i) ? " 2>&1 | " : " | ";
+  }
+
+  // A redirection.  A here-document is `<<DELIM` with its body and end
+  // line added to `docs`, or, with no `docs` (one-line text), its body as
+  // a here-string, as in zsh's job text.
+  str redir(vec<HereDoc>* docs) {
+    WordCode  w      = fetch();
+    str       target = next_str();
+    RedirType t      = wc_redir_type(w);
+    str       fd     = fd_text(w);
+    if (wc_redir_varid(w)) {
+      auto [name, rest] = split_redir_varid(target);
+      fd = "{" + str(name) + "}";
+      target = str(rest);
+    }
+    switch (t) {
+      case REDIR_READ:       return fd + "< " + target;
+      case REDIR_WRITE:      return fd + "> " + target;
+      case REDIR_APPEND:     return fd + ">> " + target;
+      case REDIR_HEREDOC:
+      case REDIR_HEREDOCD: {
+        auto [delim, body] = split_heredoc(target);
+        if (not docs) {
+          strv text = body.ends_with('\n') ? body.substr(0, body.size() - 1) : body;
+          return fd + "<<<" + single_quote(text);
+        }
+        bool quoted = false;
+        docs->push_back({str(body), heredoc_delimiter(delim, quoted)});
+        return fd + "<<" + str(delim);
+      }
+      case REDIR_HERESTR:    return fd + "<<< " + target;
+      case REDIR_READWRITE:  return fd + "<> " + target;
+      case REDIR_CLOBBER:    return fd + ">| " + target;
+      case REDIR_MERGE:      return fd + ">&" + target;
+      case REDIR_MERGEOUT:   return "&> " + target;
+      case REDIR_PROC_IN:    return fd + "< <(" + target + ")";
+      case REDIR_PROC_OUT:   return fd + "> >(" + target + ")";
+      case REDIR_CLOSE:      return close_text(fd, target);
+      case REDIR_IN_DUP:     return fd + "<&" + target;
+      case REDIR_APPEND_ERR: return "&>> " + target;
+      case REDIR_APPEND_CLOBBER:     return fd + ">>| " + target;
+      case REDIR_MERGEOUT_CLOBBER:   return "&>| " + target;
+      case REDIR_APPEND_ERR_CLOBBER: return "&>>| " + target;
+      default:               return target;
+    }
+  }
+
+  str assign() {
+    WordCode f     = wc_data(fetch());
+    str      name  = next_str();
+    str      value = next_str();
+    str      op    = (f & WC_ASSIGN_APPEND) ? "+=" : "=";
+    if (f & WC_ASSIGN_ARRAY) return name + op + "(" + value + ")";
+    return name + op + value;
+  }
+
+  // The condition of `[[ … ]]`, with parentheses where zsh's text.c puts
+  // them: around a `&&` under `||` (and the other way round) and around a
+  // `!`, `&&` or `||` under `!`, so the text reads back the same.  A lone
+  // word is `-n word` with `n_word`.  The right side of a chain is
+  // followed in a loop, as the executor does.
+  str cond(bool n_word) {
+    str out;
+    int closing = 0;
+    auto open = [&](WordCode parent) {
+      WordCode t = wc_cmd_type(peek());
+      bool binary = t == WC_COND_AND or t == WC_COND_OR;
+      if (parent == WC_COND_NOT ? binary or t == WC_COND_NOT : binary and t != parent) {
+        out += "( ";
+        return true;
+      }
+      return false;
+    };
+    for (;;) {
+      WordCode w    = fetch();
+      WordCode type = wc_cmd_type(w);
+      if (type == WC_COND_NOT) {
+        out += "! ";
+        if (open(type)) ++closing;
+        continue;
+      }
+      if (type == WC_COND_AND or type == WC_COND_OR) {
+        bool paren = open(type);
+        out += cond(n_word);
+        if (paren) out += " )";
+        out += type == WC_COND_AND ? " && " : " || ";
+        if (open(type)) ++closing;
+        continue;
+      }
+      switch (type) {
+        case WC_COND_UNARY: {
+          auto o = next_str();
+          out += o + " " + next_str();
+        }
+
+        break; case WC_COND_MOD: {
+          out += next_str();
+          for (WordCode k = 1; k < wc_cmd_skip(w); ++k) out += " " + next_str();
+        }
+
+        break; case WC_COND_BINARY: {
+          auto o = next_str();
+          auto l = next_str();
+          auto r = next_str();
+          out += l + " " + o + " " + r;
+        }
+
+        break; default: out += (n_word ? "-n " : "") + next_str();
+      }
+      for (; closing > 0; --closing) out += " )";
+      return out;
+    }
+  }
+};
+
+struct Decompiler : Reader {
 
   // list* WC_END
   str body() {
@@ -224,57 +376,15 @@ struct Decompiler {
     auto parts = stages();
     str out;
     for (s::size_t i = 0; i < parts.size(); ++i) {
-      if (i) out += wc_pipe_stderr(w, static_cast<s::uint32_t>(i - 1)) ? " |& " : " | ";
+      if (i) out += pipe_text(w, static_cast<WordCode>(i - 1));
       out += parts[i];
     }
     return out;
   }
 
-  str redir() {
-    WordCode    w      = fetch();
-    str target = next_str();
-    RedirType t      = wc_redir_type(w);
-    str       fd     = fd_text(w);
-    if (wc_redir_varid(w)) {
-      auto [name, rest] = split_redir_varid(target);
-      fd = "{" + str(name) + "}";
-      target = str(rest);
-    }
-    switch (t) {
-      case REDIR_READ:       return fd + "< " + target;
-      case REDIR_WRITE:      return fd + "> " + target;
-      case REDIR_APPEND:     return fd + ">> " + target;
-      case REDIR_HEREDOC:    return fd + "<<EOF";
-      case REDIR_HEREDOCD:   return fd + "<<-EOF";
-      case REDIR_HERESTR:    return fd + "<<< " + target;
-      case REDIR_READWRITE:  return fd + "<> " + target;
-      case REDIR_CLOBBER:    return fd + ">| " + target;
-      case REDIR_MERGE:      return fd + ">&" + target;
-      case REDIR_MERGEOUT:   return "&> " + target;
-      case REDIR_PROC_IN:    return fd + "< <(" + target + ")";
-      case REDIR_PROC_OUT:   return fd + "> >(" + target + ")";
-      case REDIR_CLOSE:      return close_text(fd, target);
-      case REDIR_IN_DUP:     return fd + "<&" + target;
-      case REDIR_APPEND_ERR: return "&>> " + target;
-      case REDIR_APPEND_CLOBBER:     return fd + ">>| " + target;
-      case REDIR_MERGEOUT_CLOBBER:   return "&>| " + target;
-      case REDIR_APPEND_ERR_CLOBBER: return "&>>| " + target;
-      default:               return target;
-    }
-  }
-
-  str assign() {
-    WordCode    f     = wc_data(fetch());
-    str name  = next_str();
-    str value = next_str();
-    str op    = (f & WC_ASSIGN_APPEND) ? "+=" : "=";
-    if (f & WC_ASSIGN_ARRAY) return name + op + "(" + value + ")";
-    return name + op + value;
-  }
-
   str command() {
     vec<str> redirs;
-    while (wc_code(peek()) == WC_REDIR) redirs.push_back(redir());
+    while (wc_code(peek()) == WC_REDIR) redirs.push_back(redir(nullptr));
     WordCode op = wc_code(peek());
     vec<str> parts;
     if (op == WC_ASSIGN or op == WC_SIMPLE or op == WC_TYPESET) {
@@ -282,7 +392,7 @@ struct Decompiler {
       for (;;) {
         op = wc_code(peek());
         if      (op == WC_ASSIGN) assigns.push_back(assign());
-        else if (op == WC_REDIR)  redirs.push_back(redir());
+        else if (op == WC_REDIR)  redirs.push_back(redir(nullptr));
         else break;
       }
       parts = s::move(assigns);
@@ -300,26 +410,6 @@ struct Decompiler {
       out += s;
     }
     return out;
-  }
-
-  str cond() {
-    WordCode w = fetch();
-    switch (wc_cmd_type(w)) {
-      case WC_COND_NOT: return "! " + cond();
-      case WC_COND_AND: { auto a = cond(); return a + " && " + cond(); }
-      case WC_COND_OR:  { auto a = cond(); return a + " || " + cond(); }
-      case WC_COND_UNARY: { auto o = next_str(); return o + " " + next_str(); }
-      case WC_COND_MOD: {
-        str words = next_str();
-        for (WordCode k = 1; k < wc_cmd_skip(w); ++k) words += " " + next_str();
-        return words;
-      }
-      case WC_COND_BINARY: {
-        auto o = next_str(); auto l = next_str(); auto r = next_str();
-        return l + " " + o + " " + r;
-      }
-      default: return next_str();
-    }
   }
 
   str compound() {
@@ -369,10 +459,8 @@ struct Decompiler {
         while (pc < end) {
           WordCode  a    = fetch();
           s::size_t aend = pc + wc_cmd_skip(a);
-          str       pats = words();
-          for (char& c : pats) if (c == ' ') c = '|';
-          out += " (" + pats + ") " + body();
-          WordCode t = wc_cmd_type(a);
+          out += " (" + patterns(a) + ") " + body();
+          WordCode t = wc_case_end(a);
           out += t == WC_CASE_FALL ? " ;&" : t == WC_CASE_TESTNEXT ? " ;|" : " ;;";
           pc = aend;
         }
@@ -400,7 +488,7 @@ struct Decompiler {
         auto l = e.find_last_not_of(" \t\n");
         out = "(( " + (b == str::npos ? str{} : e.substr(b, l - b + 1)) + " ))";
       }
-      break; case WC_COND:  { --pc; out = "[[ " + cond() + " ]]"; }
+      break; case WC_COND:  { --pc; out = "[[ " + cond(false) + " ]]"; }
       break; default: ;
     }
     pc = end;
@@ -414,31 +502,12 @@ struct Decompiler {
 // Function definitions as `functions` and `whence -f` print them: one
 // command per line, bodies indented by a tab per level, as zsh's text.c.
 
-struct Pretty {
-  const CompiledProgram& p;
-  s::size_t              pc;
-  str                    out;
-  vec<str>               docs;   // here-document bodies waiting for a newline
+struct Pretty : Reader {
+  str          out{};
+  vec<HereDoc> docs{};   // here-documents waiting for a newline
 
-  bool     at_end() const noexcept { return pc >= p.prog.size(); }
-  WordCode peek()   const noexcept { return at_end() ? WC_END : p.prog[pc]; }
-  WordCode fetch()        noexcept { return at_end() ? WC_END : p.prog[pc++]; }
-  str next_str() {
-    WordCode w = fetch();
-    WordCode i = wc_data(w);
-    return i < p.strs.size() ? p.strs[i] : str{};
-  }
-  str words() {
-    WordCode n = wc_data(fetch());
-    str o;
-    for (WordCode i = 0; i < n; ++i) {
-      if (i) o += ' ';
-      o += next_str();
-    }
-    return o;
-  }
   void flush_docs() {
-    for (auto& d : docs) out += "\n" + d + "EOF";
+    for (auto& d : docs) out += "\n" + d.body + d.end;
     docs.clear();
   }
   void nl(int ind) {
@@ -481,63 +550,21 @@ struct Pretty {
     WordCode w = fetch();
     WordCode n = wc_pipe_count(w);
     for (WordCode i = 0; i < n and not at_end(); ++i) {
-      if (i) out += wc_pipe_stderr(w, i - 1) ? " |& " : " | ";
+      if (i) out += pipe_text(w, i - 1);
       command(ind);
     }
   }
 
-  str redir() {
-    WordCode  w      = fetch();
-    str       target = next_str();
-    RedirType t      = wc_redir_type(w);
-    str       fd     = fd_text(w);
-    if (wc_redir_varid(w)) {
-      auto [name, rest] = split_redir_varid(target);
-      fd = "{" + str(name) + "}";
-      target = str(rest);
-    }
-    switch (t) {
-      case REDIR_READ:       return fd + "< " + target;
-      case REDIR_WRITE:      return fd + "> " + target;
-      case REDIR_APPEND:     return fd + ">> " + target;
-      case REDIR_HEREDOC:
-      case REDIR_HEREDOCD:   docs.push_back(target); return fd + "<<EOF";
-      case REDIR_HERESTR:    return fd + "<<< " + target;
-      case REDIR_READWRITE:  return fd + "<> " + target;
-      case REDIR_CLOBBER:    return fd + ">| " + target;
-      case REDIR_MERGE:      return fd + ">&" + target;
-      case REDIR_MERGEOUT:   return "&> " + target;
-      case REDIR_PROC_IN:    return fd + "< <(" + target + ")";
-      case REDIR_PROC_OUT:   return fd + "> >(" + target + ")";
-      case REDIR_CLOSE:      return close_text(fd, target);
-      case REDIR_IN_DUP:     return fd + "<&" + target;
-      case REDIR_APPEND_ERR: return "&>> " + target;
-      case REDIR_APPEND_CLOBBER:     return fd + ">>| " + target;
-      case REDIR_MERGEOUT_CLOBBER:   return "&>| " + target;
-      case REDIR_APPEND_ERR_CLOBBER: return "&>>| " + target;
-      default:               return target;
-    }
-  }
-
-  str assign() {
-    WordCode f     = wc_data(fetch());
-    str      name  = next_str();
-    str      value = next_str();
-    str      op    = (f & WC_ASSIGN_APPEND) ? "+=" : "=";
-    if (f & WC_ASSIGN_ARRAY) return name + op + "(" + value + ")";
-    return name + op + value;
-  }
-
   void command(int ind) {
     vec<str> redirs;
-    while (wc_code(peek()) == WC_REDIR) redirs.push_back(redir());
+    while (wc_code(peek()) == WC_REDIR) redirs.push_back(redir(&docs));
     WordCode op = wc_code(peek());
     if (op == WC_ASSIGN or op == WC_SIMPLE or op == WC_TYPESET) {
       str line;
       for (;;) {
         op = wc_code(peek());
         if      (op == WC_ASSIGN) line += assign() + " ";
-        else if (op == WC_REDIR)  redirs.push_back(redir());
+        else if (op == WC_REDIR)  redirs.push_back(redir(&docs));
         else break;
       }
       WordCode head = fetch();
@@ -559,26 +586,6 @@ struct Pretty {
       compound(ind);
     }
     for (auto& r : redirs) out += " " + r;
-  }
-
-  str cond() {
-    WordCode w = fetch();
-    switch (wc_cmd_type(w)) {
-      case WC_COND_NOT: return "! " + cond();
-      case WC_COND_AND: { auto a = cond(); return a + " && " + cond(); }
-      case WC_COND_OR:  { auto a = cond(); return a + " || " + cond(); }
-      case WC_COND_UNARY: { auto o = next_str(); return o + " " + next_str(); }
-      case WC_COND_MOD: {
-        str words = next_str();
-        for (WordCode k = 1; k < wc_cmd_skip(w); ++k) words += " " + next_str();
-        return words;
-      }
-      case WC_COND_BINARY: {
-        auto o = next_str(); auto l = next_str(); auto r = next_str();
-        return l + " " + o + " " + r;
-      }
-      default: return "-n " + next_str();
-    }
   }
 
   // `do` on a line of its own, then the body, then `done`.
@@ -649,12 +656,10 @@ struct Pretty {
         while (pc < end) {
           WordCode  a    = fetch();
           s::size_t aend = pc + wc_cmd_skip(a);
-          str       pats = words();
-          for (char& ch : pats) if (ch == ' ') ch = '|';
           nl(ind + 1);
-          out += "(" + pats + ") ";
+          out += "(" + patterns(a) + ") ";
           body(ind + 2);
-          WordCode t = wc_cmd_type(a);
+          WordCode t = wc_case_end(a);
           out += t == WC_CASE_FALL ? " ;&" : t == WC_CASE_TESTNEXT ? " ;|" : " ;;";
           pc = aend;
         }
@@ -701,7 +706,7 @@ struct Pretty {
         auto l = e.find_last_not_of(" \t\n");
         out += "(( " + (b == str::npos ? str{} : e.substr(b, l - b + 1)) + " ))";
       }
-      break; case WC_COND: --pc; out += "[[ " + cond() + " ]]";
+      break; case WC_COND: --pc; out += "[[ " + cond(true) + " ]]";
       break; default: ;
     }
     pc = end;
@@ -711,16 +716,16 @@ struct Pretty {
 }  // namespace
 
 str pipeline_text(const CompiledProgram& prog, s::size_t pc) {
-  return Decompiler{prog, pc}.pipeline();
+  return Decompiler{{prog, pc}}.pipeline();
 }
 
 vec<str> pipeline_stage_texts(const CompiledProgram& prog,
                               s::size_t pc) {
-  return Decompiler{prog, pc}.stages();
+  return Decompiler{{prog, pc}}.stages();
 }
 
 str sublist_text(const CompiledProgram& prog, s::size_t pc) {
-  return Decompiler{prog, pc}.sublist();
+  return Decompiler{{prog, pc}}.sublist();
 }
 
 }  // namespace jfsh
@@ -742,16 +747,27 @@ static bool redirected_body(const CompiledProgram& body) {
   return pc > 3 and pc < p.size() and wc_code(p[pc]) == WC_CURSH;
 }
 
+// A function's name as zsh prints it: in single quotes when it has
+// characters a word would not keep (`'a b' () {`).
+static str name_text(strv name) {
+  bool plain = not name.empty() and s::all_of(name.begin(), name.end(), [](char c) {
+    return s::isalnum(static_cast<unsigned char>(c)) or strv("_-./+:@%,").find(c) != strv::npos
+        or static_cast<unsigned char>(c) >= 0x80;
+  });
+  return plain ? str(name) : single_quote(name);
+}
+
 str function_text(strv names, const CompiledProgram& body) {
+  str head = name_text(names);
   if (redirected_body(body)) {
-    Pretty pr{body, 0, {}, {}};
-    pr.out = str(names) + " () ";
+    Pretty pr{{body, 0}};
+    pr.out = head + " () ";
     pr.body(0);
     pr.flush_docs();
     return pr.out;
   }
-  Pretty pr{body, 0, {}, {}};
-  pr.out = str(names) + " () {\n\t";
+  Pretty pr{{body, 0}};
+  pr.out = head + " () {\n\t";
   pr.body(1);
   pr.flush_docs();
   pr.out += "\n}";

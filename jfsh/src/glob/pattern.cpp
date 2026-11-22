@@ -97,7 +97,7 @@ struct PatternParser {
   }
 
   // `[…]` starting at p[i] == '['.  Returns false (and leaves i) when the
-  // bracket is never closed, so the caller treats `[` as a literal.
+  // bracket is never closed.
   bool parse_class(Node& n) {
     s::size_t j = i + 1;
     n.kind = Kind::Class;
@@ -443,7 +443,13 @@ struct PatternParser {
       } else if (c == '?') {
         n.kind = Kind::Any;
         ++i;
-      } else if (c == '[' and parse_class(n)) {
+      } else if (c == '[') {
+        // An unclosed `[` is a bad pattern, as zsh's patcompile has it.
+        // (Globbing lets a lone `[` stand for itself before it gets here.)
+        if (not parse_class(n)) {
+          bad = true;
+          break;
+        }
       } else if (c == '(' and parse_group(n, fl)) {
       } else if (c == '<' and parse_range(n)) {
       } else {

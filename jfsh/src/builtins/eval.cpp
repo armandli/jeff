@@ -85,6 +85,7 @@ int builtin_eval(vec<str>& args, ExecContext& ctx) {
   }
   if (text.find_first_not_of(" \t\n") == str::npos) return 0;
   FuncFrame frame{ctx, "(eval)"};
+  ++ctx.code_runs;
   return ctx.executor->exec_string(text);
 }
 
@@ -105,6 +106,8 @@ int builtin_exit(vec<str>& args, ExecContext& ctx) {
   if (not n) return 1;
   ctx.exiting  = true;
   ctx.exit_val = *n & 0xff;
+  // Outside a function zsh exits at once; in one, the exit unwinds it.
+  ctx.exit_now = ctx.func_depth == 0;
   return ctx.exit_val;
 }
 

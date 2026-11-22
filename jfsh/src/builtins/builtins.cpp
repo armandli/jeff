@@ -126,27 +126,32 @@ int builtin_false(vec<str>&, ExecContext&) { return 1; }
 // hist.cpp.
 
 // `break [N]` / `continue [N]`: leave, or start the next pass of, the Nth
-// enclosing loop.  N past the outermost loop means the outermost.
+// enclosing loop.  N past the outermost loop means the outermost.  A bad N
+// or no loop is an error that ends the command line, as zsh's zerr.
 static int loop_control(vec<str>& args, ExecContext& ctx,
                         bool cont) {
   const char* name = args[0].c_str();
+  auto fail = [&] {
+    ctx.aborting = ctx.abort_line = true;
+    return 1;
+  };
   s::int64_t n = 1;
   if (args.size() > 1) {
     auto v = arith_eval(args[1], ctx.params, math_options(ctx.opts),
                         &ctx.modules.math_funcs());
     if (not v) {
       s::fprintf(stderr, "jfsh: %s: %s\n", name, v.error().message.c_str());
-      return 1;
+      return fail();
     }
     if (*v < 1) {
       s::fprintf(stderr, "jfsh: %s: argument is not positive: %" PRId64 "\n", name, *v);
-      return 1;
+      return fail();
     }
     n = s::min<s::int64_t>(*v, ctx.loop_depth);
   }
   if (ctx.loop_depth == 0) {
     s::fprintf(stderr, "jfsh: %s: not in while, until, select, or repeat loop\n", name);
-    return 1;
+    return fail();
   }
   ctx.break_level = static_cast<int>(s::min<s::int64_t>(n, ctx.loop_depth));
   ctx.continuing  = cont;

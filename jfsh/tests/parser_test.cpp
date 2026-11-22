@@ -122,20 +122,22 @@ TEST(Parser, RedirectionsAttachToSimpleCommands) {
 }
 
 TEST(Parser, HeredocBodyLandsInStringTable) {
-  // Unquoted <<EOF: body in disassembly is the content between the opening
-  // line and the EOF marker.  The disassembler emits raw newlines inside the
-  // STRING literal rather than escaped ones.
+  // The string is the delimiter as written, a NUL (shown as \0) and the
+  // body: the content between the opening line and the end line.  The
+  // disassembler emits raw newlines inside the STRING literal rather than
+  // escaped ones.
   auto out = listing("cat <<EOF\nhello\nEOF\n");
-  EXPECT_NE(out.find("REDIR <<\nSTRING \"hello\n\""), str::npos);
+  EXPECT_NE(out.find("REDIR <<\nSTRING \"EOF\\0hello\n\""), str::npos);
   // <<-EOF strips one leading tab per line.
   auto out2 = listing("cat <<-END\n\tx\n\ty\n\tEND\n");
-  EXPECT_NE(out2.find("STRING \"x\ny\n\""), str::npos);
+  EXPECT_NE(out2.find("STRING \"END\\0x\ny\n\""), str::npos);
 }
 
 TEST(Parser, QuotedHeredocDelimiterMarksTheBodyLiteral) {
-  EXPECT_NE(listing("cat <<'EOF'\n$x\nEOF\n").find("REDIR << literal\nSTRING \"$x\n\""),
+  EXPECT_NE(listing("cat <<'EOF'\n$x\nEOF\n")
+                .find("REDIR << literal\nSTRING \"'EOF'\\0$x\n\""),
             str::npos);
-  EXPECT_NE(listing("cat <<EOF\n$x\nEOF\n").find("REDIR <<\nSTRING \"$x\n\""),
+  EXPECT_NE(listing("cat <<EOF\n$x\nEOF\n").find("REDIR <<\nSTRING \"EOF\\0$x\n\""),
             str::npos);
 }
 
@@ -144,7 +146,7 @@ TEST(Parser, QuotedHeredocDelimiterMarksTheBodyLiteral) {
 TEST(Parser, HeredocLeavesTheRestOfTheLineAndTheNextCommand) {
   auto out = listing("cat <<A | tr a b\nbody\nA\necho next\n");
   EXPECT_NE(out.find("PIPE 2"), str::npos) << out;
-  EXPECT_NE(out.find("STRING \"body\n\""), str::npos) << out;
+  EXPECT_NE(out.find("STRING \"A\\0body\n\""), str::npos) << out;
   EXPECT_NE(out.find("STRING \"next\""), str::npos) << out;
 }
 
@@ -174,7 +176,8 @@ TEST(Parser, RejectsLeftoverAndMisplacedTokens) {
   EXPECT_EQ(listing("fi"),      "error: parse error near `fi'");
   // `a ; ;` is an empty command after the first, as in zsh; `;;` is not.
   EXPECT_EQ(listing("a ;;"),    "error: parse error near `;;'");
-  EXPECT_EQ(listing("a &&"),    "error: parse error: unexpected end of input");
+  // At the end of the input zsh names the last token.
+  EXPECT_EQ(listing("a &&"),    "error: parse error near `&&'");
 }
 
 TEST(Parser, UnimplementedConstructsFailClearly) {
@@ -236,7 +239,7 @@ TEST(Parser, CaseArmsCarryTheirTerminator) {
             program(30,
                     "CASE head skip=29\nSTRING \"$x\"\n"
                     "CASE ;; skip=9\nWORDS 2\nSTRING \"a\"\nSTRING \"b\"\n" + body("c") +
-                    "CASE ;& skip=8\nWORDS 1\nSTRING \"d\"\n" + body("e") +
+                    "CASE ;& grouped skip=8\nWORDS 1\nSTRING \"d\"\n" + body("e") +
                     "CASE ;| skip=8\nWORDS 1\nSTRING \"f\"\n" + body("g")));
   // The last arm may leave out `;;`.
   EXPECT_EQ(listing("case x in\n  a) b\nesac"),
@@ -350,9 +353,9 @@ TEST(Parser, TypesetArgumentsAreAssignments) {
 }
 
 TEST(Parser, CompoundCommandErrors) {
-  EXPECT_EQ(listing("if a; then b"), "error: parse error: unexpected end of input");
+  EXPECT_EQ(listing("if a; then b"), "error: parse error near `b'");
   EXPECT_EQ(listing("if a; then b; done"), "error: parse error near `done'");
-  EXPECT_EQ(listing("for in a; do b; done"), "error: parse error near `in'");
+  EXPECT_EQ(listing("for 1a in a; do b; done"), "error: parse error near `1a'");
   EXPECT_EQ(listing("case x in a b) c;; esac"), "error: parse error near `b'");
   EXPECT_EQ(listing("for ((a;b)); do c; done"), "error: parse error near `((a;b))'");
   EXPECT_EQ(listing("{ a } <(b)"), "error: parse error near `<(b)'");
@@ -371,6 +374,50 @@ TEST(Parser, IncompleteInputAsksForMore) {
   EXPECT_FALSE(is_incomplete("cat <<E\nbody\nE\n"));
   EXPECT_FALSE(is_incomplete("echo )"));      // an error, not unfinished
   EXPECT_FALSE(is_incomplete("echo # if"));
+  // A backslash-newline the input ends in, and an unclosed `name=(`.
+  EXPECT_TRUE(is_incomplete("echo a \\\n"));
+  EXPECT_TRUE(is_incomplete("echo ab\\\n"));
+  EXPECT_TRUE(is_incomplete("x=(\n"));
+  EXPECT_TRUE(is_incomplete("x=(a\nb"));
+  EXPECT_FALSE(is_incomplete("echo a \\\nb\n"));
+  EXPECT_FALSE(is_incomplete("x=(\na b\n)\n"));
+}
+
+// At the end of the input zsh's parse error names the last token read.
+TEST(Parser, ErrorAtTheEndNamesTheLastToken) {
+  EXPECT_EQ(listing("if true; then"), "error: parse error near `then'");
+  EXPECT_EQ(listing("for i in a; do"), "error: parse error near `do'");
+  EXPECT_EQ(listing("{ echo"),       "error: parse error near `echo'");
+  EXPECT_EQ(listing("f() {"),        "error: parse error near `{'");
+  EXPECT_EQ(listing("case x in"),    "error: parse error near `in'");
+  EXPECT_EQ(listing("if true; then\n"), "error: parse error near `\\n'");
+}
+
+// [[ ]] chains group to the right, as in zsh, so the executor walks their
+// right side in a loop; parentheses only group.
+TEST(Parser, CondChainsGroupToTheRight) {
+  EXPECT_EQ(listing("[[ a || b || c ]]"),
+            program(8, "COND or skip=7\nCOND str skip=1\nSTRING \"a\"\n"
+                       "COND or skip=4\nCOND str skip=1\nSTRING \"b\"\n"
+                       "COND str skip=1\nSTRING \"c\"\n"));
+  EXPECT_EQ(listing("[[ ( a || b ) && ! c ]]"),
+            program(9, "COND and skip=8\nCOND or skip=4\nCOND str skip=1\nSTRING \"a\"\n"
+                        "COND str skip=1\nSTRING \"b\"\nCOND not skip=2\n"
+                        "COND str skip=1\nSTRING \"c\"\n"));
+  EXPECT_EQ(listing("[[ ( ( a ) ) ]]"), listing("[[ a ]]"));
+  EXPECT_EQ(listing("[[ ( a ]]"), "error: parse error near `]]'");
+  EXPECT_EQ(listing("[[ a ) ]]"), "error: parse error near `)'");
+}
+
+// Names of for/select/foreach, as zsh's isident; select takes one.
+TEST(Parser, LoopNamesAreIdentifiers) {
+  EXPECT_EQ(listing("for 1x in a; do b; done"), "error: parse error near `1x'");
+  EXPECT_EQ(listing("foreach a-b (x) c; end"),  "error: parse error near `a-b'");
+  EXPECT_EQ(listing("select x y in a; do b; done"), "error: parse error near `do'");
+  EXPECT_NE(listing("for 1 2 in a; do b; done").find("WORDS 2\nSTRING \"1\"\nSTRING \"2\""),
+            str::npos);
+  EXPECT_NE(listing("for in in a; do b; done").find("WORDS 1\nSTRING \"in\"\nWORDS 1\n"),
+            str::npos);
 }
 
 TEST(Parser, ErrorCarriesTheLineNumber) {

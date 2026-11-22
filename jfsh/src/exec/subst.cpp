@@ -2848,6 +2848,12 @@ struct Scan {
               // zsh 5.9 prints the word as written: no expansion, no
               // quote removal (`${x:?'boom'}` says `x: 'boom'`).
               str msg = word.empty() ? str("parameter not set") : nice_text(word);
+              // A shell that isn't interactive exits at once, as zsh's
+              // does: `always` blocks don't run.
+              if (not opts().interactive()) {
+                ctx().exiting  = ctx().exit_now = true;
+                ctx().exit_val = 1;
+              }
               return s::unexpected(subst_error(label + ": " + msg));
             }
         }

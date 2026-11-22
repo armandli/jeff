@@ -605,8 +605,6 @@ tests in `tests/subst_test.cpp`, `GlobPatternMatch.LongSubjectsAndPatterns`,
 - An unmatched `"` inside `${…}` gives "bad substitution" where zsh says `unmatched "`.
 - `(q+)`/`(q-)` follow zsh for the cases tested (control characters, quotes, `~`, `=`
   at the start), not every corner of zsh's quotestring.
-- `[[ … == [a ]]` and `case` patterns with an unclosed `[` match literally instead of
-  failing with "bad pattern".
 - `(t)` decorates only parameters that exist in jfsh (jfsh has no `$IFS`, `$path`,
   `$fpath`, … parameters until M17).
 - Brace expansion still materializes every word of a large sequence as a `Field`
@@ -652,9 +650,8 @@ and `tests/compound_test.cpp` (behaviour, with zsh's output as the expected valu
 - `typeset`, `local`, `declare`, `integer`, `float`, `export` and `readonly` are parsed
   as zsh's reserved-word typeset (`WC_TYPESET`), so `local x=$(cmd)` isn't split and
   `local a=(1 2)` makes an array. The builtins handle `-a -A -i -F/-E -g -l -u -r -x` and
-  `+` to turn attributes off. A new local is set but empty. Known difference: it keeps
-  the export attribute of the parameter it hides, so `export y=1; g() { local y=5;
-  printenv y; }` prints 5, where zsh's local is not exported. A builtin with no prefix assignments no longer gets its
+  `+` to turn attributes off. A new local is set but empty, and not exported (unless
+  `-x`), whatever it hides. A builtin with no prefix assignments no longer gets its
   own parameter scope, so `local` lands in the function's scope.
 - `read [-rA] [name…]` (needed by `while read` loops): IFS splitting, with the rest of the
   line in the last name, `$REPLY` with no name, backslash handling without `-r`, and
@@ -668,14 +665,91 @@ and `tests/compound_test.cpp` (behaviour, with zsh's output as the expected valu
   reads more lines after `PS2` (`Editor::read_line(true)`). The editor now switches raw
   mode with `TCSADRAIN`, so pasted multi-line input isn't discarded.
 
+**Review fixes** (branch jfsh-m4-review): `always` follows zsh's exectry: an error in
+the `{ … }` (`$((1/0))`, a fatal builtin error) is held in the new specials
+`$TRY_BLOCK_ERROR` / `$TRY_BLOCK_INTERRUPT` (integers, -1 outside an always block)
+while the always block runs, with the error flag cleared, and comes back unless the
+block set `TRY_BLOCK_ERROR=0`; an error in the always block itself is dropped; the
+status is the first block's even for a `return` in the always block; `exit` outside a
+function, ERR_EXIT and `${x?}` in a shell that isn't interactive leave at once
+(`ExecContext::exit_now`) without running it. Errors zsh calls with zerr end the
+command line (`aborting`): `break`/`continue` outside a loop or with a bad count, the
+FUNCNEST limit (now evaluated arithmetically, `FUNCNEST=abc` is 0), arithmetic errors in
+`for ((…))` and `repeat`, expansion errors in `for … in`, `select` and `case`, typeset
+names (`not an identifier: 1`, `not valid in this context`, `a[1]: can't create local
+array elements`, after the other names are done) and failed assignments in for, select
+and read. Those three assign through `Executor::assign_var` (as `name=value`: `typeset
+-i n; for n in 1+1` gives 2, `for 1 in a b` sets `$1`); `typeset a[1]=x` sets the
+element. `typeset -i N`/`-F N`/`-E N` take a base or a number of digits, attached or
+the next word (`Param::base`; `16#FF`, `typeset -i16`, `1.50`, `1.23e+03`; "invalid
+base"). `.`/`source` run with no enclosing loops, and an error ends just the file
+(status 126). Locals are not exported. `readonly` in a function is local (`typeset -r`,
+`-gr` under POSIX_BUILTINS). Function names are expanded as words (`'if'() …`,
+`$n() …`, `f*()` → no matches). `! f` with f a function, eval or sourced file that ran
+commands is not exempt from ERR_EXIT and ZERR (zsh 5.9's behaviour). for/select/foreach
+names must be identifiers or numbers (parse error otherwise), `for in in a b` works,
+select takes one name and reads its reply as atoi does. `( )` is an empty subshell and
+`()` an anonymous function (`LexToken::inout`), `{}` in command position an empty group,
+and separators may come before a function body (`f(); echo hi`). A parse error at the
+end of the input names the last token, as zsh's (`near `then'`, `near `\n'` in a
+script). `[[ ]]` allows newlines around an operator and before a pattern. stdin mode
+joins a backslash-newline and an unclosed `name=(` with the next line
+(`is_incomplete`); `<<-` handles an end line without a newline. The condition parser is
+an operator-precedence loop with no recursion and lays chains out to the right; the
+executor walks the right side in a loop, and a left-nested chain too deep for the stack
+fails with "condition nested too deeply" (40000 `||`s: crash → 0.04 s; 30000 nested
+`( … )` and 20000 `!`s: crash → 0.01 s). Trailing redirections are moved in front of
+their command in one pass at the end of parsing (6000 nested `{ … } 2>&1`: 0.30 s →
+0.04 s), and `case` keeps its compiled patterns by text and options (50000 passes of a
+10-arm case: 0.20 s → 0.08 s). An unclosed `[` is a bad pattern in `case`, `[[ ]]` and
+`${x#…}` (globbing still lets a lone `[` be a word). `functions`/`whence -f` text reads
+back the same: `[[ ]]` parenthesised as zsh's text.c does, here-documents with their
+own delimiter as written (the string is `delimiter NUL body`, `split_heredoc`), `|&` as
+`2>&1 |` (also in job text), case alternatives as `a | b` or, written as a group,
+`(a|b)` (`WC_CASE_GROUPED`); the one-line and multi-line texts share `Reader` for words,
+redirections, patterns and conditions, and a job's here-document shows as `<<<'body'`.
+Tests: `CompoundM4Review.*` in `tests/compound_test.cpp`, and
+`Parser.ErrorAtTheEndNamesTheLastToken`, `CondChainsGroupToTheRight`,
+`LoopNamesAreIdentifiers` and new `IncompleteInputAsksForMore` cases in
+`tests/parser_test.cpp`. Round 2: an error in a trap (a command trap, a TRAPxxx
+function, a function's EXIT trap) ends just the trap again, as zsh's (a regression of
+round 1's fatal errors; a trap function failing other than by an error still counts as
+an interrupt); a function's EXIT trap also runs on an `exit` in it; an `exit` that has
+unwound the functions to the top level skips the `always` blocks there (`exit_now`); a
+sourced file's runtime error under ERR_EXIT exits with 1, and its parse error gives the
+caller 126; `functions` quotes a name that needs it (`'a b' () {`); an exported integer
+is passed on in its base (`16#FF`); `typeset -F 1.5` / `-i 1x` say "bad precision
+value" / "bad base value" without ending the line; a local of a special integer
+(`local TRY_BLOCK_ERROR=3`) sets it through its setter; `exec_case` uses the cached
+pattern by reference. Tests: `CompoundM4Review2.*`. Round 3: a function's EXIT trap
+run by `exit` sees `$?` 0; the "an error ends just the trap" logic of `run_trap` and of
+that EXIT-trap path is one RAII helper (`TrapErrorScope`); `$LINENO` and `$HISTCMD`
+are read-only, also as locals (zsh's other read-only specials may be made local); a
+`local -i` of a special integer (`$OPTIND`) is set through its setter. Tests:
+`CompoundM4Review3.LocalSpecials`.
+
 **Left**
-- Deeply nested `[[ ( ( … ) ) ]]` crashes the condition parser (about 30000 levels on
-  an 8 MB stack; found in the M3 review).
-- zsh's other short forms: `if [[ x ]] { … }`, `while cond { … }`, `foreach … end`,
-  `for x in a b; cmd` [parser/short].
-- Redirections written after a function definition (`f() { … } > log`) should become part
-  of the function; they are a parse error.
-- `EF_NOFORK` for a subshell that is already a forked pipeline stage [exec/subsh].
+- Fixed in the review: deeply nested `[[ ( ( … ) ) ]]` crashed the condition parser
+  (found in the M3 review); the parser no longer recurses. The short forms, function
+  redirections and `EF_NOFORK` items that were here were done in M14.
+- zsh's job and process text for a multi-process job lists each process on its own line
+  (`sleep 1 2>&1 |` / `cat`); jfsh prints the pipeline on one line.
+- `$TRY_BLOCK_INTERRUPT` is set for Ctrl-C and failed signal traps only (`interrupt`);
+  `typeset -p TRY_BLOCK_ERROR` says `-i`, zsh `-i10`.
+- `x=$(case a in a) echo c;; esac)`: the lexer's `$(…)` scan ends at the pattern's `)`
+  (a parse error); zsh parses the command substitution.
+- `$é` and other multibyte parameter names don't expand (for-loop names accept them).
+- `-c 'x=(a⏎'` (an array assignment the input ends in) is accepted silently with status
+  0; zsh reports a parse error. jfsh's parse doesn't fail on input the lexer marks
+  incomplete (as for an unclosed `"`, see M3's Left list); doing so is a wider change.
+- `$functions[f]` (zsh/parameter) holds the whole `f () { … }` text; zsh's holds only
+  the body.
+- Job texts lack zsh's `; }` and `do;` details as well as its per-process lines.
+- MULTIOS with a function defined with a redirection, in a pipeline (`f() { … } >
+  /dev/stdout; f | cat`), prints once; zsh prints twice.
+- An error inside `eval` ends the caller too (recorded under M13's Left list).
+- `typeset -F2 -i8` and `-iF 3` combinations, and `-Z`/`-L`/`-R` padding, are not
+  zsh's yet [builtin/typeset].
 - The function call depth is bounded by the C++ stack: a Debug build reaches the default
   `FUNCNEST=700` with about 2× headroom but crashes somewhere between 1500 and 3000; under
   ASan, 700 already overflows.
@@ -824,7 +898,9 @@ output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
   implemented; neither are `suspend`, `time` (JOB_TIMED) or `$ZSH_SUBSHELL`.
 - A non-interactive shell keeps finished background jobs in its table until `jobs` or
   `wait` reports them.
-- Job text shows a here-document as `<<EOF` whatever its delimiter.
+- Trap return statuses: `TRAPINT() { return 1 }` should make the shell exit with 1
+  (zsh), and a `return 4` in a trap string run inside a function should leave the
+  caller's `$?` at 0.
 - The editor doesn't re-layout on SIGWINCH yet: `$COLUMNS`/`$LINES` are updated, but
   the editor doesn't use them (B26, B27).
 
@@ -2774,6 +2850,8 @@ superseded: compsys is zsh's shell-function library, run as is.
   numbers and `(eval)` where it uses them (M7 left item).
 
 **Specials**
+- `$IFS` as a parameter with zsh's default ` \t\n\0` (`echo "[$IFS]"`); jfsh splits
+  with the default but has no `$IFS` until it is set.
 - `$TTYIDLE` (seconds since last keystroke).
 - `$UID`, `$EUID`, `$GID`, `$EGID`, `$USERNAME`: assignable through
   setuid/setgid (readable since M15c).

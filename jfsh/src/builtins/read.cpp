@@ -261,13 +261,12 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
     str name = names.empty() ? "REPLY" : names[0];
     if (query) {
       bool yes = got == "y" or got == "Y";
-      if (auto r = ctx.params.set_scalar(name, yes ? "y" : "n"); not r)
-        return builtin_error(cmd, r.error().message);
+      if (not ctx.executor->assign_var(name, yes ? "y" : "n")) return 1;
       return eof ? 2 : yes ? 0 : 1;
     }
     if (echo_only or echo_too) s::printf("%s\n", got.c_str());
     if (echo_only) return eof ? 1 : 0;
-    if (auto r = ctx.params.set_scalar(name, got); not r) return builtin_error(cmd, r.error().message);
+    if (not ctx.executor->assign_var(name, got)) return 1;
     return eof ? 1 : 0;
   }
 
@@ -327,18 +326,14 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
     }
   }
 
-  auto set = [&](const str& name, str value) {
-    if (auto r = ctx.params.set_scalar(name, s::move(value)); not r) {
-      s::fprintf(stderr, "jfsh: read: %s\n", r.error().message.c_str());
-      return false;
-    }
-    return true;
-  };
+  // The names are assigned as `name=value` would be (an integer one
+  // evaluates the text); a failure ends the command line, as in zsh.
   if (array) {
     str name = names.empty() ? "reply" : names[0];
     if (nothing) fields.emplace_back();   // zsh's array then holds one empty element
     if (auto r = ctx.params.set_array(name, fields); not r) {
-      s::fprintf(stderr, "jfsh: read: %s\n", r.error().message.c_str());
+      s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+      ctx.aborting = true;
       return 1;
     }
     return eof ? 1 : 0;
@@ -354,7 +349,7 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
     } else if (n < fields.size()) {
       value = fields[n];
     }
-    if (not set(names[n], s::move(value))) return 1;
+    if (not ctx.executor->assign_var(names[n], s::move(value))) return 1;
   }
   return eof ? 1 : 0;
 }

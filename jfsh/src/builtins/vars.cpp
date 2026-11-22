@@ -26,6 +26,7 @@ struct TypesetAttrs {
   bool        pattern = false;  // -m
   bool        functions = false;   // -f
   bool        tie    = false;   // -T
+  opt<int>    base{};   // -i N (output base), -F N / -E N (digits)
   s::uint32_t on     = 0;   // PM_EXPORTED, PM_READONLY, PM_UPPER, PM_LOWER, …
   s::uint32_t off    = 0;
 };
@@ -52,10 +53,30 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
   bool append    = has_value and eq > 0 and arg[eq - 1] == '+';
   str  name(arg.substr(0, has_value ? eq - (append ? 1 : 0) : arg.size()));
   str  value = has_value ? str(arg.substr(eq + 1)) : str{};
+  // `name[sub]=value` sets an element of a parameter that exists in the
+  // scope typeset declares in, as an assignment would.
+  if (auto lb = name.find('['); lb != str::npos and lb > 0 and name.back() == ']'
+                                and is_identifier(strv(name).substr(0, lb))) {
+    str base = name.substr(0, lb);
+    if (not attrs.global and ctx.params.local_scope() > 0 and not ctx.params.lookup_local(base))
+      return builtin_error(cmd, name + ": can't create local array elements");
+    if (attrs.type or not has_value)
+      return builtin_error(cmd, name + ": inconsistent array element or slice assignment");
+    Assignment a;
+    a.name      = s::move(base);
+    a.subscript = name.substr(lb + 1, name.size() - lb - 2);
+    a.value     = s::move(value);
+    a.append    = append;
+    if (auto r = ctx.executor->assign_expanded(a); not r) {
+      s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+      return 1;
+    }
+    return 0;
+  }
   if (not is_identifier(name)) {
-    s::fprintf(stderr, "jfsh: %.*s: not valid in this context: %s\n",
-               static_cast<int>(cmd.size()), cmd.data(), name.c_str());
-    return 1;
+    bool digit = not name.empty() and s::isdigit(static_cast<unsigned char>(name[0]));
+    return builtin_error(cmd, (digit ? "not an identifier: " : "not valid in this context: ")
+                                  + name);
   }
   auto existing = attrs.global ? ctx.params.lookup(name) : ctx.params.lookup_local(name);
   if (existing and existing->get().is_readonly()
@@ -65,9 +86,9 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
   }
   Param* p = existing ? &existing->get() : nullptr;
   if (not p) {
-    // A new local keeps the export attribute of the parameter it hides.
+    // A new local is not exported (unless -x), even when the parameter it
+    // hides is, as in zsh: children see the local's absence.
     auto outer = ctx.params.lookup(name);
-    bool exported = outer and outer->get().is_exported();
     if (attrs.global) {
       (void)ctx.params.set_scalar(name, "");
       p = &ctx.params.lookup(name)->get();
@@ -78,6 +99,12 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
       Param* special = outer and (outer->get().flags & PM_SPECIAL) and outer->get().handlers
                            and not (attrs.on & PM_HIDE)
                        ? &outer->get() : nullptr;
+      // zsh refuses a local $LINENO or $HISTCMD (its other read-only
+      // specials, $status, $PPID, …, may be made local).
+      if (special and special->is_readonly() and (name == "LINENO" or name == "HISTCMD")) {
+        s::fprintf(stderr, "jfsh: read-only variable: %s\n", name.c_str());
+        return 1;
+      }
       bool settable = special and (special->handlers->set_scalar or special->handlers->set_array);
       ParamValue saved = special ? special->value : ParamValue{};
       s::uint32_t kind = special ? special->flags & (PM_SCALAR | PM_INTEGER | PM_FLOAT | PM_ARRAY
@@ -98,7 +125,6 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
         p->set(str{});
       }
     }
-    if (exported) p->flags |= PM_EXPORTED;
     if (attrs.type == 'i' and not has_value) p->set(s::int64_t{0});
     if (attrs.type == 'F' and not has_value) p->set(0.0);
   } else if (not p->is_set() and not has_value) {
@@ -118,6 +144,7 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
     }
     return *v;
   };
+  bool was_integer = p->is_integer(), was_float = p->is_float();
   switch (attrs.type) {
     case 'a':
       if (has_value) p->set(vec<str>{value});
@@ -134,6 +161,9 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
         if (not v) return 1;
         if (attrs.type == 'i') p->set(v->as_int());
         else                   p->set(v->as_float());
+        // A special one ($OPTIND) takes it through its setter too.
+        if (has_value and p->handlers and p->handlers->set_scalar)
+          p->handlers->set_scalar(p->scalar());
       }
       break;
     default:
@@ -141,6 +171,10 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
         if (p->is_integer() or p->is_float()) {
           auto v = math(value);
           if (not v) return 1;
+          // A special one (a local $TRY_BLOCK_ERROR) takes it through its
+          // setter, which its getter reads back.
+          if (p->handlers and p->handlers->set_scalar)
+            p->handlers->set_scalar(p->is_integer() ? s::to_string(v->as_int()) : p->scalar());
           if (p->is_integer()) p->set(v->as_int());
           else                 p->set(v->as_float());
         } else if (p->is_array() or p->is_hash()) {
@@ -156,6 +190,11 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
       }
   }
   p->flags = (p->flags | attrs.on) & ~attrs.off;
+  // The base or digits given stay until another is; a parameter that
+  // becomes an integer or a float starts from the default.
+  if (attrs.base) p->base = *attrs.base;
+  else if ((attrs.type == 'i' and not was_integer) or (attrs.type == 'F' and not was_float))
+    p->base = 0;
   if ((p->flags & PM_UNIQUE) and p->is_array()) p->set(unique(p->array()));
   if (has_value) ctx.params.note_assigned(name);
   return 0;
@@ -177,7 +216,7 @@ str type_words(const Param& p) {
   auto add = [&](strv w) { out += w; out += ' '; };
   if (p.is_array())   add("array");
   if (p.is_hash())    add("association");
-  if (p.is_integer()) add("integer");
+  if (p.is_integer()) add(p.base > 0 ? "integer " + s::to_string(p.base) : str("integer"));
   if (p.is_float())   add("float");
   if (p.flags & PM_LOCAL) add("local");
   if (p.is_exported()) add("exported");
@@ -306,8 +345,31 @@ int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
                    static_cast<int>(cmd.size()), cmd.data(), a[0], a[k]);
         return 1;
       }
+      // -i, -F and -E take a number, attached (`-F2`) or as the next word.
+      if (a[0] != '-' or (a[k] != 'i' and a[k] != 'F' and a[k] != 'E')) continue;
+      auto number = [](strv t) {
+        return not t.empty() and s::all_of(t.begin(), t.end(), [](char c) {
+          return s::isdigit(static_cast<unsigned char>(c));
+        });
+      };
+      str digits = a.substr(k + 1);
+      if (not number(digits)) {
+        // A next word that starts as a number must be one, as in zsh.
+        bool next = k + 1 == a.size() and i + 1 < args.size();
+        if (next and not number(args[i + 1]) and not args[i + 1].empty()
+            and s::isdigit(static_cast<unsigned char>(args[i + 1][0])))
+          return builtin_error(cmd, str(a[k] == 'i' ? "bad base value: " : "bad precision value: ")
+                                        + args[i + 1]);
+        if (not next or not number(args[i + 1])) continue;
+        digits = args[++i];
+      }
+      attrs.base = static_cast<int>(s::min(s::strtol(digits.c_str(), nullptr, 10), 9999L));
+      break;
     }
   }
+  if (attrs.type == 'i' and attrs.base and (*attrs.base < 2 or *attrs.base > 36))
+    return builtin_error(cmd, "invalid base (must be 2 to 36 inclusive): "
+                                  + s::to_string(*attrs.base));
   if (cmd == "local") attrs.global = false;
   vec<str> names(args.begin() + static_cast<s::ptrdiff_t>(i), args.end());
 
@@ -350,6 +412,9 @@ int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
   }
   for (const auto& name : names)
     if (typeset_one(cmd, name, attrs, ctx) != 0) rc = 1;
+  // As in zsh, a name that can't be declared or assigned ends the command
+  // line once the rest are done.
+  if (rc != 0) ctx.aborting = true;
   return rc;
 }
 
@@ -367,9 +432,10 @@ int builtin_export(vec<str>& args, ExecContext& ctx) {
   return typeset_common(args, ctx, "gx");
 }
 
-// `readonly` is `typeset -gr`.
+// `readonly` is `typeset -r` (so local in a function), and `typeset -gr`
+// under POSIX_BUILTINS, as in zsh.
 int builtin_readonly(vec<str>& args, ExecContext& ctx) {
-  return typeset_common(args, ctx, "gr");
+  return typeset_common(args, ctx, ctx.opts.get(OPT_POSIXBUILTINS) ? "gr" : "r");
 }
 
 // unfunction [-m] name …: unset -f.
