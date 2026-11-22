@@ -1791,7 +1791,7 @@ struct Scan {
       // As zsh's getarg: each tail is a string of its own, so (#s) is
       // where it starts.
       strv rest = strv(v.scalar).substr(cs.pos(static_cast<s::size_t>(k - 1)));
-      return exact ? rest.starts_with(text) : pat.match_prefix(rest, false) != strv::npos;
+      return exact ? rest.starts_with(text) : pat.match_prefix(rest, true) != strv::npos;
     };
     bool backward = kind == 'R' or kind == 'I' or kind == 'K';
     s::int64_t from = backward ? n : 1;
@@ -2053,13 +2053,42 @@ struct Scan {
   // character index of another start.
   static Result<bool> find_match(const str& s, const CompiledPattern& pat, MatchHow how,
                                  s::int64_t nth, bool mb, const HitFn& hit) {
+    if (not pat.approximate()) {
+      PrefixSearch search;
+      return scan_match(s, pat, how, nth, mb, hit, search);
+    }
+    // With (#aN) a backtracker that gave up anywhere leaves the answer
+    // unknown: no match, the calls after it skipped, and `hit` called only
+    // once the scan is done.
+    struct Hit {
+      s::size_t    b, e, k;
+      PatternMatch pm;
+    };
+    vec<Hit> hits;
+    PrefixSearch search;
+    auto r = scan_match(s, pat, how, nth, mb,
+                        [&](s::size_t b, s::size_t e, s::size_t k,
+                            const PatternMatch& pm) -> Result<void> {
+                          hits.push_back({b, e, k, pm});
+                          return {};
+                        },
+                        search);
+    if (search.lost) return false;
+    if (not r) return r;
+    for (const auto& h : hits)
+      if (auto x = hit(h.b, h.e, h.k, h.pm); not x) return s::unexpected(x.error());
+    return r;
+  }
+
+  // find_match()'s search; `search` is shared by its calls: (#e) off after
+  // a shortest search, and whether the backtracker gave up.
+  static Result<bool> scan_match(const str& s, const CompiledPattern& pat, MatchHow how,
+                                 s::int64_t nth, bool mb, const HitFn& hit,
+                                 PrefixSearch& search) {
     Chars cs{s, mb};
     s::size_t size = s.size(), chars = cs.size();
     s::int64_t n = s::max<s::int64_t>(nth, 1);
     PatternMatch pm;
-    // Shared by the searches: (#e) off after a shortest search, and
-    // whether the backtracker gave up.
-    PrefixSearch search;
     // Whether the last from() found a shorter match than the first one.
     bool shorter = false;
     // The length of the match from character k: the end zsh's search
@@ -2075,9 +2104,11 @@ struct Scan {
       PrefixSearch cut = search;
       cut.notstart = notstart;
       cut.notend = true;
+      cut.below  = b + len;
       s::size_t min = pat.match_prefix(s, b, false, &shortest, &cut);
       search.notend  = true;
       search.gave_up = cut.gave_up;
+      search.lost    = cut.lost;
       if (min == str::npos or min >= len) return len;
       pm = s::move(shortest);
       shorter = true;
@@ -2085,15 +2116,19 @@ struct Scan {
     };
     auto exists = [&](s::size_t k) {
       search.notstart = false;
-      return pat.match_prefix(s, cs.pos(k), false, nullptr, &search) != str::npos;
+      return pat.match_prefix(s, cs.pos(k), true, nullptr, &search) != str::npos;
     };
     auto empty_at_end = [&] {
       search.notstart = false;
       return pat.match_prefix(s, size, true, &pm, &search) == 0;
     };
     auto found = [&](s::size_t b, s::size_t e, s::size_t k) -> Result<bool> {
+      if (search.lost) return false;
       if (auto r = hit(b, e, k, pm); not r) return s::unexpected(r.error());
       return true;
+    };
+    auto whole = [&](s::size_t b, PatternMatch* info) {
+      return pat.matches(s, b, size, info, search);
     };
     if (not how.end and not how.substr) {
       s::size_t len = from(0);
@@ -2105,18 +2140,19 @@ struct Scan {
       // matches, the longest from the first.
       if (not how.longest) {
         // zsh gives its tries at the end the byte length as the index.
-        if (pat.matches(s, size, size, &pm) and --n == 0) return found(size, size, size);
-        for (s::size_t k = chars; k-- > 0;)
-          if (pat.matches(s, cs.pos(k), size, &pm)) return found(cs.pos(k), size, k);
+        if (whole(size, &pm) and --n == 0) return found(size, size, size);
+        for (s::size_t k = chars; k-- > 0 and not search.lost;)
+          if (whole(cs.pos(k), &pm)) return found(cs.pos(k), size, k);
         // zsh tries the empty match at the end again with the (#s) of the
         // last start, so on one character (#s) matches there.
         bool at_start = chars <= 1;
-        if (at_start ? pat.matches(strv(s).substr(size), &pm) : pat.matches(s, size, size, &pm))
+        if (search.lost) return false;
+        if (at_start ? pat.matches(strv(s).substr(size), &pm) : whole(size, &pm))
           return found(size, size, chars);
         return false;
       }
-      for (s::size_t k = 0; k <= chars; ++k)
-        if (pat.matches(s, cs.pos(k), size, &pm)) return found(cs.pos(k), size, k);
+      for (s::size_t k = 0; k <= chars and not search.lost; ++k)
+        if (whole(cs.pos(k), &pm)) return found(cs.pos(k), size, k);
       return false;
     }
     if (how.end) {
@@ -2125,7 +2161,7 @@ struct Scan {
       if (empty_at_end() and --n == 0) return found(size, size, size);
       opt<s::size_t> last, nth_last;
       s::int64_t count = 0;
-      for (s::size_t k = chars; k-- > 0;) {
+      for (s::size_t k = chars; k-- > 0 and not search.lost;) {
         if (not exists(k)) continue;
         if (not last) last = k;
         if (++count == n) {
@@ -2151,7 +2187,7 @@ struct Scan {
     s::size_t k = 0;
     do {
       matched = false;
-      for (; k <= chars;) {
+      for (; k <= chars and not search.lost;) {
         s::size_t len = from(k);
         if (len != str::npos) {
           s::size_t b = cs.pos(k), mpos = b + len;
@@ -2176,7 +2212,8 @@ struct Scan {
         if (k == chars) break;
         ++k;
       }
-    } while (matched and k < chars);
+    } while (matched and k < chars and not search.lost);
+    if (search.lost) return false;
     if (how.longest and not how.global and empty_at_end() and --n == 0) return found(0, 0, 0);
     return any;
   }

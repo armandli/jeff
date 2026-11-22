@@ -60,6 +60,14 @@ struct CompiledPattern::Node {
   vec<vec<PatternSeq>> alt_excludes;
   bool negate  = false;   // ^x: anything but its one alternative
   int  capture = -1;      // (#b): its backreference
+  // For (#aN), which the backtracker keeps as zsh's flags at run time:
+  // per alternative, the (#aN) globbing flags at its end set (-1: none);
+  // whether the group's end puts the flags back, its branches having
+  // changed them; whether it is the whole pattern's, whose alternatives
+  // after the first start without (#aN).
+  vec<int> alt_end_reset;
+  bool     restores = false;
+  bool     top      = false;
 
   bool       has_lo = false, has_hi = false;              // Range <lo-hi>
   s::int64_t lo = 0, hi = 0;
@@ -81,6 +89,15 @@ struct CompiledPattern::Node {
   bool nocase = false;
   bool lower  = false;
   int  approx = 0;
+  // zsh sets the flags to this node's right before it (P_GFLAGS): globbing
+  // flags that change something come before it, or a group that put them
+  // back.
+  bool reset  = false;
+  // Lit: which of zsh's literal strings (P_EXACTLY) it is in, numbered in
+  // the order of the pattern.  A string is a run of literals in a branch,
+  // ended by anything else, globbing flags included; the literal a `#` or
+  // (#cN,M) repeats is one of its own.
+  int  run    = -1;
   // Which stretch of the pattern with the same case flags this is in:
   // zsh changes its flags at run time only at a flag change in the
   // pattern and at the end of a group that changed them.
@@ -107,7 +124,9 @@ struct CompiledPattern::Impl {
   int  captures   = 0;       // groups under (#b), at most 9
   bool set_match  = false;   // (#m) seen
   bool approx     = false;   // (#aN) with N > 0 seen
-  int  end_approx = 0;       // (#aN) in force at the end
+  int  head_approx = 0;      // (#aN) right at the start, in zsh's header
+  int  runs       = 0;       // literal strings, see Node::run
+  bool pure       = false;   // see PatternParser::Branch::pure
   bool multibyte  = false;   // ? [...] and literals take a UTF-8 character
   bool bad        = false;   // zsh's "bad pattern": it matches nothing
   // A (#cN,M) whose operand can match in more than one way from a place.
@@ -160,6 +179,7 @@ struct PatFlags {
   bool lower   = false;
   int  approx  = 0;
   bool backref = false;
+  bool matchref = false;   // (#m)
 };
 
 bool single_char(const Node& n) {
@@ -175,6 +195,12 @@ struct PatternParser {
   struct Branch {
     Seq      seq;
     PatFlags flags;
+    // zsh would compare it as a plain string (its P_PURESTR): literals
+    // only, read with no case flags or (#aN), and flags that change
+    // nothing it matches.
+    bool     pure = true;
+    // The (#aN) that globbing flags at its end set (-1: none).
+    int      end_reset = -1;
   };
   // The character at p[j].
   Decoded take(s::size_t j) const {
@@ -195,6 +221,12 @@ struct PatternParser {
   }
 
   bool failed() const { return too_deep or bad; }
+
+  // Whether zsh's flags words would be the same.
+  static bool same_flags(const PatFlags& a, const PatFlags& b) {
+    return a.nocase == b.nocase and a.lower == b.lower and a.approx == b.approx
+       and a.backref == b.backref and a.matchref == b.matchref;
+  }
 
   // `[…]` starting at p[i] == '['.  Returns false (and leaves i) when the
   // bracket is never closed, so the caller treats `[` as a literal.
@@ -271,7 +303,9 @@ struct PatternParser {
       // group, with those the branch ends with at the top level.
       auto alt = parse_seq(in_group, fl);
       n.alts.push_back(s::move(alt.seq));
-      int end_approx = impl.end_approx;
+      n.alt_end_reset.push_back(alt.end_reset);
+      if (not same_flags(alt.flags, fl)) n.restores = in_group;
+      bool pure = alt.pure;
       n.alt_excludes.emplace_back();
       while (ext and i < p.size() and p[i] == '~' and not failed()) {
         ++i;
@@ -280,7 +314,10 @@ struct PatternParser {
         alt = parse_seq(in_group, excl);
         n.alt_excludes.back().push_back(s::move(alt.seq));
       }
-      impl.end_approx = end_approx;
+      if (not in_group) {
+        n.top = true;
+        impl.pure = pure and n.alts.size() == 1 and n.alt_excludes[0].empty();
+      }
       if (failed()) return false;
       if (i >= p.size()) return not in_group;
       ++i;   // `|`, or the `)` closing the group
@@ -335,16 +372,18 @@ struct PatternParser {
         break; case 'I': nf.nocase = nf.lower = false;
         break; case 'b': nf.backref = true;
         break; case 'B': nf.backref = false;
-        break; case 'm': impl.set_match = true;
-        break; case 'M': case 'u': case 'U':
+        break; case 'm': impl.set_match = nf.matchref = true;
+        break; case 'M': nf.matchref = false;
+        break; case 'u': case 'U':
         // `q` starts glob qualifiers, which the pattern ignores.
         break; case 'q': k = f.size();
         break; case 's': case 'e': {
           // An anchor stands alone.
           if (f.size() != 1) { bad = true; return; }
           Node n;
-          n.kind  = f[k] == 's' ? Kind::AtStart : Kind::AtEnd;
-          n.epoch = epoch;
+          n.kind   = f[k] == 's' ? Kind::AtStart : Kind::AtEnd;
+          n.epoch  = epoch;
+          n.approx = fl.approx;
           seq.push_back(s::move(n));
         }
         break; case 'a': {
@@ -400,7 +439,11 @@ struct PatternParser {
     rep.min     = s::max(lo, 0);
     rep.max     = hi;
     rep.epoch   = seq.back().epoch;
+    rep.approx  = seq.back().approx;
+    rep.reset   = s::exchange(seq.back().reset, false);
     rep.sub     = s::make_shared<Node>(s::move(seq.back()));
+    // zsh repeats only the last literal of a string.
+    if (rep.sub->kind == Kind::Lit) rep.sub->run = impl.runs++;
     // The branches are where they stay now, so the points can name them.
     flag_points(*rep.sub, rep.leaks);
     rep.leak_epoch = epoch;
@@ -438,6 +481,13 @@ struct PatternParser {
     Seq seq;
     bool can_count = false;   // the last thing read is a piece (#c) may repeat
     bool any = false;         // a piece or globbing flags were read
+    bool in_run = false;      // the last thing read is a literal of a string
+    bool pure = true;         // see Branch::pure
+    bool pure_last = false;   // the last piece read is a plain string
+    bool reset = false;       // the next node gets Node::reset
+    // Flags right at the end of the pattern are left for nothing, as zsh
+    // does: they do not reach its end (`end_flags`).
+    PatFlags end_flags = fl;
     while (i < p.size() and not failed()) {
       char c = p[i];
       if (c == '|' or (in_group and c == ')')) break;
@@ -449,8 +499,26 @@ struct PatternParser {
         break;
       any = true;
       if (ext and c == '(' and i + 1 < p.size() and p[i + 1] == '#') {
+        bool first = i == 0;
+        PatFlags before = fl;
+        s::size_t anchors = seq.size();
         parse_flags(fl, seq, can_count);
+        bool last = i == p.size() and not first;
+        end_flags = last ? before : fl;
+        if (first) impl.head_approx = fl.approx;
+        // zsh keeps flags at the very start in the pattern's header and
+        // drops those at the very end; others that change something are
+        // a node, which leaves a plain string only after one.
+        bool node = not first and not last and not same_flags(before, fl);
+        if (seq.size() != anchors) {
+          pure = pure_last = false;
+          seq.back().reset = s::exchange(reset, false);
+        } else if (node) {
+          if (not pure_last) pure = false;
+          reset = true;
+        }
         can_count = false;
+        in_run = false;
         continue;
       }
       if (ext and c == '^') {
@@ -462,17 +530,26 @@ struct PatternParser {
         n.kind   = Kind::Group;
         n.negate = true;
         n.epoch  = epoch;
-        PatFlags rest_fl = fl;
-        if (in_group) {
-          rest_fl = entry;
-          rest_fl.approx = 0;
-        }
+        n.approx = fl.approx;
+        // Exclusions are tested without (#aN), but the branch goes on
+        // with it: zsh's P_END is reached before the test.
+        PatFlags rest_fl = in_group ? entry : fl;
+        rest_fl.approx = 0;
         auto rest = parse_seq(in_group, rest_fl, true);
         n.alts.push_back(s::move(rest.seq));
         n.alt_excludes.emplace_back();
-        if (not in_group) fl = rest.flags;
+        n.alt_end_reset.push_back(-1);
+        if (not in_group) {
+          int approx = fl.approx;
+          fl = rest.flags;
+          fl.approx = approx;
+        }
+        end_flags = fl;
+        n.reset = s::exchange(reset, false);
         seq.push_back(s::move(n));
         can_count = false;
+        in_run = false;
+        pure = pure_last = false;
         continue;
       }
       // A `#` repeats the piece before it; with none, it is bad.
@@ -498,6 +575,7 @@ struct PatternParser {
       n.lower  = fl.lower;
       n.approx = fl.approx;
       n.epoch  = at;
+      bool lit = n.kind == Kind::Lit;
       can_count = n.kind != Kind::Star;
       if (ext and i < p.size() and p[i] == '#') {
         // `*#` and `x###` are bad patterns in zsh.
@@ -510,16 +588,26 @@ struct PatternParser {
         if (i < p.size() and p[i] == '#') { bad = true; break; }
         rep.nocase = n.nocase;
         rep.lower  = n.lower;
+        rep.approx = n.approx;
         rep.epoch  = n.epoch;
+        if (lit) n.run = impl.runs++;
         rep.sub = s::make_shared<Node>(s::move(n));
         n = s::move(rep);
         can_count = false;
+        lit = false;
+      } else if (lit) {
+        if (not in_run) ++impl.runs;
+        n.run = impl.runs - 1;
       }
+      in_run = lit;
+      pure_last = lit and fl.approx == 0 and not fl.nocase and not fl.lower;
+      if (not pure_last) pure = false;
+      end_flags = fl;
+      n.reset = s::exchange(reset, false);
       seq.push_back(s::move(n));
       ++impl.nodes;
     }
-    if (not in_group) impl.end_approx = fl.approx;
-    return {s::move(seq), fl};
+    return {s::move(seq), fl, pure, reset ? end_flags.approx : -1};
   }
 
   strv      p;
@@ -592,7 +680,8 @@ opt<TailLiteral> tail_literal(const Seq& alt, bool mb) {
   const Node& x = alt[r - 1];
   bool simple = x.kind == Kind::Repeat and not x.counted and x.max < 0
             and single_char(*x.sub) and x.sub->approx == 0;
-  if ((x.kind != Kind::Star and not simple) or not same_flags(x)) return s::nullopt;
+  if ((x.kind != Kind::Star and not simple) or not same_flags(x) or x.approx > 0)
+    return s::nullopt;
   TailLiteral t;
   t.head.assign(alt.begin(), alt.begin() + static_cast<s::ptrdiff_t>(r - 1));
   t.rep = x;
@@ -695,11 +784,13 @@ using Cont = func<bool(s::size_t)>;
 // <lo-hi> longest first.  It runs (#aN), and decides the patterns whose
 // zsh quirks the VM does not follow (see backtracked()); tests compare the
 // VM with it.  It gives the (#b) groups of a match and the end zsh's
-// search reaches first.  `errs` counts the (#aN)
-// errors made so far; `caps` the (#b) groups' extents, put back as
-// alternatives fail.  It recurses per node matched, so on a subject too
-// long for the stack, or after so many steps that the search is
-// exponential, it gives up (`deep`) and fails.
+// search reaches first.  `errs` counts the (#aN) errors made so far,
+// put back where zsh's does (alternatives, x#, `*`, the tries at one
+// error) and not elsewhere: errors an attempt that failed made stay
+// counted after a (#cN,M) or <lo-hi>; `caps` the (#b) groups' extents,
+// put back as alternatives fail.  It recurses per node matched, so on a
+// subject too long for the stack, or after so many steps that the search
+// is exponential, it gives up (`deep`) and fails.
 struct Matcher : Subject {
   // Per x# node: the positions a repeat was tried from, with the errors
   // + 1 then, and whether its outermost x# is trying a repeat.
@@ -707,12 +798,29 @@ struct Matcher : Subject {
     umap<s::size_t, int> tried;
     bool                 active = false;
   };
+  // The errors made and the (#aN) in force (`errs`, `cur_approx`).
+  struct Tally {
+    int errs, approx;
+  };
 
   // Ready to match the pattern in `impl` against `subject`.
   Matcher(Subject subject, const CompiledPattern::Impl& impl)
       : Subject{subject},
         caps(static_cast<s::size_t>(impl.captures), {strv::npos, strv::npos}),
-        budget{(s::size_t{1} << 22) + 16 * (lim + 1) * static_cast<s::size_t>(impl.nodes)} {}
+        cur_approx{impl.head_approx},
+        budget{steps_for(impl, lim)} {}
+
+  // The steps before the search counts as exponential: linear in the
+  // subject, but with (#aN), whose repeats zsh's search tries with each
+  // error count from each place, quadratic up to 2^28.
+  static s::size_t steps_for(const CompiledPattern::Impl& impl, s::size_t lim) {
+    auto nodes = static_cast<s::size_t>(impl.nodes);
+    s::size_t linear = (s::size_t{1} << 22) + 16 * (lim + 1) * nodes;
+    if (not impl.approx) return linear;
+    s::size_t cap = s::size_t{1} << 28, n = lim + 1;
+    s::size_t square = n > cap / n ? cap : s::min(cap, n * n * s::max<s::size_t>(nodes, 1));
+    return s::max(linear, square);
+  }
 
   // Whether to give up: the search has taken so many steps that it is
   // likely exponential (`spent`), or the stack is nearly used up.
@@ -725,41 +833,150 @@ struct Matcher : Subject {
     return tick();
   }
 
-  // A one-character node, with (#aN) the errors it may absorb: a wrong
-  // character, a missing one, an extra one.
+  // zsh's error count and (#aN) at run time, which it puts back after
+  // an attempt that failed in some places only (see `errs`).
+  Tally tally() const { return {errs, cur_approx}; }
+  void put(Tally t) const {
+    errs       = t.errs;
+    cur_approx = t.approx;
+  }
+  // The (#aN) in force once n is reached, and reaching it.
+  int approx(const Node& n) const { return n.reset ? n.approx : cur_approx; }
+  void enter(const Node& n) const {
+    if (n.reset) cur_approx = n.approx;
+  }
+
+  // With (#aN), a node other than a literal string that fails at pos
+  // (zsh's last gasp): the input character there is an error, and the
+  // node is tried again after it.  As in zsh, the error counts even at
+  // the end, where there is no character to take.
+  bool skip(const Node& n, s::size_t pos, const Cont& k) const {
+    if (cur_approx <= errs) return false;
+    ++errs;
+    if (pos >= lim) return false;
+    s::size_t next = 0;
+    at(pos, next);
+    return reached(n, next, k);
+  }
+
+  // A `?` or `[…]`: with (#aN) it never matches a wrong character, but
+  // extra ones before it are errors.
   bool single(const Node& n, s::size_t pos, const Cont& k) const {
+    s::size_t next = 0;
+    if (one(n, pos, next)) return k(next);
+    return skip(n, pos, k);
+  }
+
+  // zsh's P_EXACTLY: the literal string lits[0, len) (one Node::run) from
+  // its character j at pos.  When it matches, what follows decides, with
+  // no errors tried here; at the first character that fails, with errors
+  // left, zsh tries in turn an extra input character, two characters the
+  // wrong way round, a wrong one and a missing one, each as one error,
+  // and goes on with the rest of the string.
+  bool exact(const Node* lits, s::size_t len, s::size_t j, s::size_t pos, const Cont& k) const {
     if (low()) return false;
     s::size_t next = 0;
-    if (one(n, pos, next) and k(next)) return true;
-    if (n.approx <= errs) return false;
-    if (pos < lim) at(pos, next);
+    while (j < len and one(lits[j], pos, next)) {
+      ++j;
+      pos = next;
+    }
+    if (j == len) return k(pos);
+    // The string failed: zsh's exactend is its end now.
+    exact_end = lits[0].run;
+    if (cur_approx <= errs) return false;
     ++errs;
-    bool ok = (pos < lim and k(next)) or k(pos)
-           or (pos < lim and single(n, next, k));
-    --errs;
-    return ok;
+    // zsh puts its flags back before each try, the case flags a (#cN,M)
+    // leaks too.
+    Tally one_more = tally();
+    const Node::FlagPoint* last = passed;
+    auto again = [&] {
+      put(one_more);
+      passed = last;
+    };
+    if (pos < lim) {
+      s::size_t in1 = 0;
+      at(pos, in1);
+      if (resume(lits, len, j, in1, k)) return true;
+      again();
+      // zsh compares with the end of the string that failed last, which
+      // the tries before may have made another one: one before this
+      // string leaves nothing to compare, one after it pattern bytes.
+      s::size_t n1 = 0, n2 = 0;
+      if (exact_end >= lits[0].run and j + 1 < len and in1 < lim
+          and one(lits[j + 1], pos, n1) and one(lits[j], in1, n2)) {
+        if (resume(lits, len, j + 2, n2, k)) return true;
+        again();
+      }
+      if (resume(lits, len, j + 1, in1, k)) return true;
+      again();
+    }
+    return resume(lits, len, j + 1, pos, k);
+  }
+
+  // The string resumed at its character j after an error, up to the end
+  // of the string that failed last (see exact()).  When that is a later
+  // string, zsh compares the compiled pattern's bytes up to its end with
+  // the input and fails, as the 16 or more such bytes cannot be errors,
+  // its tries at them using up the errors left.
+  bool resume(const Node* lits, s::size_t len, s::size_t j, s::size_t pos, const Cont& k) const {
+    if (exact_end > lits[0].run) {
+      errs = s::max(errs, cur_approx);
+      return false;
+    }
+    if (exact_end < lits[0].run) return k(pos);
+    return exact(lits, len, j, pos, k);
   }
 
   bool node(const Node& n, s::size_t pos, const Cont& k) const {
+    enter(n);
+    return reached(n, pos, k);
+  }
+
+  // Node n from pos, once reached (its Node::reset done).
+  bool reached(const Node& n, s::size_t pos, const Cont& k) const {
     if (low()) return false;
     switch (n.kind) {
-      case Kind::Lit: case Kind::Any: case Kind::Class:
+      case Kind::Lit:
+        return exact(&n, 1, 0, pos, k);
+
+      case Kind::Any: case Kind::Class:
         return single(n, pos, k);
-      case Kind::Star:
+
+      case Kind::Star: {
         // Greedy, as zsh's: the longest run first, so (#b)(*)X(*) on
-        // aXbXc gives aXb and c.
-        for (s::size_t e = lim + 1; e-- > pos and not tick();)
-          if (boundary(e) and k(e)) return true;
+        // aXbXc gives aXb and c.  The errors are put back before each
+        // shorter try, not after the last.
+        Tally saved = tally();
+        for (s::size_t e = lim + 1; e-- > pos and not tick();) {
+          if (not boundary(e)) continue;
+          put(saved);
+          if (k(e)) return true;
+        }
         return false;
+      }
+
       case Kind::AtStart:
-        return pos == 0 and not notstart and k(pos);
+        if (pos == 0 and not notstart) return k(pos);
+        return skip(n, pos, k);
+
       case Kind::AtEnd:
-        // (#e): the end of the whole string.
-        return pos == s.size() and not notend and k(pos);
-      case Kind::Group:
-        for (s::size_t a = 0; a < n.alts.size(); ++a)
+        // (#e): the end of the whole string; with (#aN) the characters
+        // before it are errors.
+        if (pos == s.size() and not notend) return k(pos);
+        return skip(n, pos, k);
+
+      case Kind::Group: {
+        // zsh puts the errors back after each alternative that failed, but
+        // runs a group of one branch with no `~` as part of what is around.
+        bool choice = n.alts.size() > 1 or n.negate or not n.alt_excludes[0].empty();
+        Tally saved = tally();
+        for (s::size_t a = 0; a < n.alts.size(); ++a) {
           if (alt(n, a, pos, k)) return true;
+          if (choice) put(saved);
+        }
         return false;
+      }
+
       case Kind::Range: {
         // The values of each run of digits from pos, saturating; the
         // longest is tried first.
@@ -777,10 +994,12 @@ struct Matcher : Subject {
           if ((not n.has_lo or x >= n.lo) and (not n.has_hi or x <= n.hi) and k(pos + len))
             return true;
         }
-        return false;
+        return skip(n, pos, k);
       }
+
       case Kind::Repeat:
         return repeat(n, pos, k);
+
       default:
         assert(false);  // should never get here
     }
@@ -789,7 +1008,11 @@ struct Matcher : Subject {
 
   // Alternative `a` of group `g` from pos, then k.
   bool alt(const Node& g, s::size_t a, s::size_t pos, const Cont& k) const {
+    if (g.top and a > 0) cur_approx = 0;
     auto finish = [&](s::size_t e) {
+      // The flags its end sets, then those the group puts back.
+      if (g.alt_end_reset[a] >= 0) cur_approx = g.alt_end_reset[a];
+      if (g.restores) cur_approx = g.approx;
       for (const auto& ex : g.alt_excludes[a])
         if (spans(ex, pos, e)) return false;
       if (g.capture < 0) return k(e);
@@ -801,7 +1024,8 @@ struct Matcher : Subject {
       return false;
     };
     if (g.negate) {
-      for (s::size_t e = lim + 1; e-- > pos and not tick();)
+      Tally saved = tally();
+      for (s::size_t e = lim + 1; e-- > pos and not tick(); put(saved))
         if (boundary(e) and not spans(g.alts[a], pos, e) and finish(e)) return true;
       return false;
     }
@@ -813,7 +1037,15 @@ struct Matcher : Subject {
   // their marks are too.)
   bool spans(const Seq& q, s::size_t b, s::size_t e) const {
     auto saved = caps;
+    // zsh tests an exclusion with no errors made yet and no (#aN), and
+    // only once the whole pattern matched, so not before what the string
+    // that failed last means here.
+    Tally outer = tally();
+    int   end   = exact_end;
+    put({0, 0});
     bool ok = seq(q, 0, b, [&](s::size_t x) { return x == e; });
+    put(outer);
+    exact_end = end;
     caps = s::move(saved);
     return ok;
   }
@@ -829,8 +1061,11 @@ struct Matcher : Subject {
       for (s::size_t q = pos, next = 0;
            (n.max < 0 or ends.size() <= static_cast<s::size_t>(n.max)) and one(sub, q, next);)
         ends.push_back(q = next);
-      for (s::size_t c = ends.size(); c-- > static_cast<s::size_t>(n.min) and not tick();)
+      Tally saved = tally();
+      for (s::size_t c = ends.size(); c-- > static_cast<s::size_t>(n.min) and not tick();) {
+        put(saved);
         if (k(ends[c])) return true;
+      }
       return false;
     }
     if (n.counted) {
@@ -864,14 +1099,20 @@ struct Matcher : Subject {
         m.tried.clear();
       m.active = true;
     }
+    // zsh marks the place with the errors now even when an attempt with
+    // fewer was made there.
     bool ok = false;
+    Tally saved = tally();
     auto [it, fresh] = m.tried.try_emplace(pos, errs + 1);
-    if (fresh or errs + 1 < it->second) {
-      it->second = errs + 1;
-      ok = node(*n.sub, pos, [&](s::size_t e) { return loop(n, e, k); });
-    }
+    bool again = fresh or errs + 1 < it->second;
+    it->second = errs + 1;
+    if (again) ok = node(*n.sub, pos, [&](s::size_t e) { return loop(n, e, k); });
     if (owner) m.active = false;
-    return ok or k(pos);
+    if (ok) return true;
+    put(saved);
+    if (k(pos)) return true;
+    put(saved);
+    return false;
   }
 
   // (#cN,M) after `cur` repeats (zsh's P_COUNT): a repeat that matched
@@ -928,7 +1169,7 @@ struct Matcher : Subject {
   }
 
   bool plain(const Seq& q, s::size_t j) const {
-    return j < q.size() and q[j].approx == 0 and single_char(q[j]);
+    return j < q.size() and approx(q[j]) == 0 and single_char(q[j]);
   }
 
   bool seq(const Seq& q, s::size_t i, s::size_t pos, const Cont& k) const {
@@ -938,49 +1179,77 @@ struct Matcher : Subject {
     // loop, without a continuation each: they have one way to match.
     for (s::size_t next = 0; plain(q, i); ++i, pos = next) {
       if (notes) note(q, i);
-      if (not one(q[i], pos, next)) return false;
+      enter(q[i]);
+      if (not one(q[i], pos, next)) {
+        if (q[i].kind == Kind::Lit) exact_end = q[i].run;
+        return false;
+      }
     }
     if (notes) note(q, i);
     if (i == q.size()) return k(pos);
-    // `*` then a plain character: only where that character is.
-    if (q[i].kind == Kind::Star and plain(q, i + 1)) {
+    enter(q[i]);
+    // A literal string with (#aN), as one.
+    if (q[i].kind == Kind::Lit) {
+      s::size_t r = i + 1;
+      while (r < q.size() and q[r].kind == Kind::Lit and q[r].run == q[i].run) ++r;
+      return exact(&q[i], r - i, 0, pos, [&](s::size_t e) { return seq(q, r, e, k); });
+    }
+    // `*` then a plain character: only where that character is (zsh looks
+    // ahead so only without (#aN)).
+    if (q[i].kind == Kind::Star and cur_approx == 0 and plain(q, i + 1)) {
       for (s::size_t e = lim; e-- > pos and not tick();) {
         s::size_t next = 0;
         if (boundary(e) and one(q[i + 1], e, next) and seq(q, i + 1, e, k)) return true;
       }
       return false;
     }
-    if (node(q[i], pos, [&](s::size_t e) { return seq(q, i + 1, e, k); })) return true;
-    // (#aN): two characters the wrong way round are one error.
-    const Node& a = q[i];
-    s::size_t n1 = 0, n2 = 0;
-    if (a.approx > errs and a.kind == Kind::Lit and i + 1 < q.size()
-        and q[i + 1].kind == Kind::Lit and pos + 1 < lim
-        and one(q[i + 1], pos, n1) and one(a, pos + 1, n2)) {
-      ++errs;
-      bool ok = seq(q, i + 2, pos + 2, k);
-      --errs;
-      return ok;
-    }
-    return false;
+    return node(q[i], pos, [&](s::size_t e) { return seq(q, i + 1, e, k); });
   }
 
-  // All of s[b, lim); with (#aN) still in force at the end, extra
-  // characters there are errors too.  With `tails`, the alternatives that
-  // have a TailLiteral form match as zsh's do in a whole match.
+  // Whether the characters in s[e, lim) are at most `room`.
+  bool within(s::size_t e, int room) const {
+    for (s::size_t next = 0; e < lim; e = next, --room) {
+      if (room <= 0) return false;
+      at(e, next);
+    }
+    return true;
+  }
+
+  // All of s[b, lim); with (#aN) still in force at the end of the
+  // alternative, extra characters there are errors too.  With `tails`,
+  // the alternatives that have a TailLiteral form match as zsh's do in a
+  // whole match.
   bool whole(const CompiledPattern::Impl& impl, s::size_t b, bool tails) const {
     const Node& top = impl.main.front();
-    auto end = [&](s::size_t e) {
-      return e == lim or lim - e <= static_cast<s::size_t>(s::max(0, impl.end_approx - errs));
-    };
     for (s::size_t a = 0; a < top.alts.size(); ++a) {
+      // Alternatives after the first start without (#aN), as in alt().
+      put({0, a > 0 ? 0 : impl.head_approx});
       if (const auto& t = impl.tails[a]; tails and t) {
         if (seq(t->head, 0, b, [&](s::size_t x) { return tail_matches(*t, x); })) return true;
         continue;
       }
+      // zsh's P_END takes the extra characters one error at a time; it
+      // compares a plain string (PAT_PURES) as a string.
+      auto end = [&](s::size_t e) {
+        int approx = impl.pure ? 0 : cur_approx;
+        if (within(e, approx - errs)) return true;
+        errs = s::max(errs, approx);
+        return false;
+      };
       if (alt(top, a, b, end)) return true;
     }
     return false;
+  }
+
+  // The end zsh's search reaches first with the end left open (its
+  // PAT_NOANCH): npos when there is none.
+  s::size_t open(const CompiledPattern::Impl& impl, s::size_t b) const {
+    s::size_t found = strv::npos;
+    node(impl.main.front(), b, [&](s::size_t e) {
+      found = e;
+      return true;
+    });
+    return found;
   }
 
   // The groups of the match found, counting from b.
@@ -995,6 +1264,13 @@ struct Matcher : Subject {
 
   mutable vec<s::pair<s::size_t, s::size_t>> caps;
   mutable int errs = 0;
+  // The (#aN) at run time: zsh sets its flags where Node::reset says and
+  // at the ends of branches and groups (Node::alt_end_reset, restores),
+  // and puts them back with the errors.
+  mutable int cur_approx = 0;
+  // The Node::run of the literal string that failed last (zsh's
+  // exactend), which a string resumed after an error compares up to.
+  mutable int exact_end = -1;
   mutable umap<const Node*, Marks> marks;
   // The (#cN,M) whose repeat is being tried, and the last change of the
   // flags that repeat passed, for flags it leaks.
@@ -2823,6 +3099,8 @@ CompiledPattern CompiledPattern::compile(strv pattern, bool case_insensitive,
       n.nocase = case_insensitive;
       all.alts[0].push_back(s::move(n));
     }
+    all.alt_end_reset.push_back(-1);
+    all.top = true;
     lit->main.push_back(s::move(all));
     lit->tails.resize(1);
     compile_vm(*lit);
@@ -2871,17 +3149,14 @@ Verdict backtrack(const CompiledPattern::Impl& impl, strv text, s::size_t b, s::
   return Verdict::Yes;
 }
 
-// The backtracking matcher with the end left open: the end zsh's search
-// reaches first, npos when there is none, and nothing when it gave up
-// (`spent` when on steps).
+// The backtracking matcher with the end left open, on the text cut at
+// `lim`: the end zsh's search reaches first, npos when there is none, and
+// nothing when it gave up (`spent` when on steps).
 opt<s::size_t> backtrack_open(const CompiledPattern::Impl& impl, strv text, s::size_t b,
-                              PatternMatch* info, const PrefixSearch& how, bool& spent) {
-  Matcher m{{text, text.size(), impl.multibyte, how.notstart, how.notend}, impl};
-  s::size_t found = strv::npos;
-  m.node(impl.main.front(), b, [&](s::size_t e) {
-    found = e;
-    return true;
-  });
+                              PatternMatch* info, const PrefixSearch& how, bool& spent,
+                              s::size_t lim = strv::npos) {
+  Matcher m{{text, s::min(lim, text.size()), impl.multibyte, how.notstart, how.notend}, impl};
+  s::size_t found = m.open(impl, b);
   spent = m.spent;
   if (m.deep) return s::nullopt;
   if (found != strv::npos and info) {
@@ -2889,6 +3164,36 @@ opt<s::size_t> backtrack_open(const CompiledPattern::Impl& impl, strv text, s::s
     if (impl.captures > 0) m.report(b, *info);
   }
   return found;
+}
+
+// match_prefix() with (#aN), which only the backtracker runs, as zsh's
+// igetmatch: the end its search with the end left open reaches first;
+// for the shortest, then each shorter length of the text cut there.  A
+// search that gives up finds nothing.
+s::size_t approx_prefix(const CompiledPattern::Impl& impl, strv text, s::size_t b,
+                        bool longest, PatternMatch* info, PrefixSearch& how) {
+  // Once it gave up in this search, the rest of it is not run.
+  if (how.lost) return strv::npos;
+  bool spent = false;
+  opt<s::size_t> end = how.below;
+  if (longest or how.below == strv::npos) {
+    end = backtrack_open(impl, text, b, info, how, spent);
+    if (not end) how.lost = true;
+    if (not end or *end == strv::npos) return strv::npos;
+    if (longest) return *end - b;
+  }
+  // The cut text: (#e) fails before the end of the string.
+  Subject subject{text, text.size(), impl.multibyte};
+  for (s::size_t t = b, next = 0; t < *end; t = next) {
+    auto e = backtrack_open(impl, text, b, info, how, spent, t);
+    if (not e) {
+      how.lost = true;
+      return strv::npos;
+    }
+    if (*e != strv::npos) return *e - b;
+    subject.at(t, next);
+  }
+  return *end - b;
 }
 
 void no_groups(const CompiledPattern::Impl& impl, PatternMatch* info) {
@@ -3121,6 +3426,16 @@ bool CompiledPattern::matches(strv text, s::size_t b, s::size_t e, PatternMatch*
   return vm_matches(impl, text, b, e, info);
 }
 
+bool CompiledPattern::matches(strv text, s::size_t b, s::size_t e, PatternMatch* info,
+                              PrefixSearch& search) const {
+  const Impl& impl = *mImpl;
+  if (not impl.approx or impl.bad) return matches(text, b, e, info);
+  if (search.lost) return false;
+  Verdict v = backtrack(impl, text, b, e, info);
+  if (v == Verdict::GaveUp) search.lost = true;
+  return v == Verdict::Yes;
+}
+
 s::size_t CompiledPattern::match_prefix(strv text, bool longest, PatternMatch* info) const {
   return match_prefix(text, 0, longest, info);
 }
@@ -3131,15 +3446,7 @@ s::size_t CompiledPattern::match_prefix(strv text, s::size_t b, bool longest,
   if (impl.bad) return strv::npos;
   PrefixSearch none;
   PrefixSearch& how = search ? *search : none;
-  if (impl.approx) {
-    s::size_t room = text.size() - b;
-    for (s::size_t n = 0; n <= room; ++n) {
-      s::size_t len = longest ? room - n : n;
-      if (backtrack(impl, text, b, b + len, info, false, how.notstart, how.notend) == Verdict::Yes)
-        return len;
-    }
-    return strv::npos;
-  }
+  if (impl.approx) return approx_prefix(impl, text, b, longest, info, how);
   if (mEngine == PatternEngine::Backtrack)
     return backtracked_prefix(impl, text, b, longest, info, how, true);
   if (mEngine == PatternEngine::Auto and backtracked(impl))
@@ -3148,6 +3455,8 @@ s::size_t CompiledPattern::match_prefix(strv text, s::size_t b, bool longest,
 }
 
 bool CompiledPattern::backrefs() const noexcept { return mImpl->captures > 0; }
+
+bool CompiledPattern::approximate() const noexcept { return mImpl->approx; }
 
 bool CompiledPattern::bad() const noexcept { return mImpl->bad; }
 

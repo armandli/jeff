@@ -652,5 +652,97 @@ TEST(GlobPattern13c2, PrefixSearchesStayFast) {
             5.0);
 }
 
+// M13 Phase 13c.3: (#aN) as zsh 5.9 runs it, on the backtracker; the
+// expected values are zsh's.
+
+TEST(GlobPattern13c3, PrefixesEndWhereTheSearchFirstEnds) {
+  // ${x##(#a1)ca} on cab is b: the end is not an error there.
+  EXPECT_EQ(ext("(#a1)ca").match_prefix("cab", true), 2u);
+  EXPECT_EQ(ext("(#a1)ca").match_prefix("cab", false), 1u);
+  EXPECT_TRUE(ext("(#a1)ca").matches("cab"));
+  EXPECT_FALSE(ext("(#a1)ca").matches("cabd"));
+  // Before (#e) extra characters are errors.
+  EXPECT_EQ(ext("(#a2)ab(#e)").match_prefix("abcd", true), 4u);
+  EXPECT_EQ(ext("(#a1)ab(#e)").match_prefix("abcd", true), str::npos);
+  PatternMatch pm;
+  ASSERT_TRUE(ext("(#b)(#a1)(ab)(cd)(ef)").matches("abcXdef", &pm));
+  EXPECT_EQ(pm.groups, (vec<Span>{{0, 2}, {2, 5}, {5, 7}}));
+  ASSERT_NE(ext("(#b)(#a1)(b)?").match_prefix("abcdef", true, &pm), str::npos);
+  EXPECT_EQ(pm.groups, (vec<Span>{{0, 2}}));
+}
+
+TEST(GlobPattern13c3, ErrorsOnLiteralStringsOnly) {
+  EXPECT_FALSE(ext("(#a1)[a]").matches("b"));
+  EXPECT_TRUE(ext("(#a1)[a]").matches("xa"));
+  EXPECT_FALSE(ext("(#a1)??").matches("a"));
+  EXPECT_TRUE(ext("(#a1)<1-20>").matches("x12"));
+  EXPECT_TRUE(ext("(#a1)ba").matches("ab"));
+  EXPECT_FALSE(ext("(#a1)b(a)").matches("ab"));
+  // The string that failed last (see Pattern13c3.TheStringThatFailedLast).
+  EXPECT_FALSE(ext("(#a1)a(b)c").matches("ac"));
+  EXPECT_FALSE(ext("(#a2)(ab)c").matches("ac"));
+  EXPECT_TRUE(ext("(#a3)(ab)c").matches("ac"));
+}
+
+TEST(GlobPattern13c3, PrefixesEndOnCharacters) {
+  Utf8Ctype loc;
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  EXPECT_EQ(ext("(#a1)aé", true).match_prefix("éa", true), 3u);
+  EXPECT_EQ(ext("(#a1)é", true).match_prefix("ééx", true), 2u);
+  // From each character, every length ends on one (a stray byte is one).
+  for (strv p : {"(#a1)é", "(#a2)éb", "(#a1)?é", "(#a1)(é|a)#", "(#a2)*é", "(#a1)é(#e)"})
+    for (strv x : {"ééx", "éa\xa9", "xé", "aéé", "\xc3\xa9\xc3"}) {
+      auto pat = ext(p, true);
+      vec<s::size_t> starts;
+      for (s::size_t i = 0; i <= x.size();) {
+        starts.push_back(i);
+        bool whole = i + 1 < x.size() and x[i] == '\xc3' and (x[i + 1] & 0xc0) == 0x80;
+        i += whole ? 2 : 1;
+      }
+      for (bool longest : {true, false})
+        for (s::size_t b : starts) {
+          s::size_t len = pat.match_prefix(x, b, longest);
+          if (len != str::npos)
+            EXPECT_TRUE(s::find(starts.begin(), starts.end(), b + len) != starts.end())
+                << p << " " << x << " " << b;
+        }
+    }
+}
+
+TEST(GlobPattern13c3, LongSubjects) {
+  str x;
+  while (x.size() < 200000) x += "ab";
+  str z(200000, 'a');
+  EXPECT_LT(seconds([&] {
+              // ${x//(#a1)abc/Z}: each start is short; aba matches, with an
+              // error, and then a b does not.
+              auto pat = ext("(#a1)abc");
+              s::size_t found = 0;
+              for (s::size_t b = 0; b < x.size();) {
+                s::size_t len = pat.match_prefix(x, b, true);
+                if (len == str::npos or len == 0) {
+                  ++b;
+                  continue;
+                }
+                ++found;
+                b += len;
+              }
+              EXPECT_EQ(found, x.size() / 4);
+              EXPECT_EQ(ext("(#a2)*abc").match_prefix(x, true), x.size());
+              EXPECT_EQ(ext("(#a2)abc").match_prefix(x, true), 4u);
+              EXPECT_EQ(ext("(#a1)ab").match_prefix(x, false), 1u);
+            }),
+            5.0);
+  // A repeat per character may be too deep for the stack: then the
+  // backtracker gives up, as no match (zsh's recursion crashes).
+  EXPECT_LT(seconds([&] {
+              s::size_t len = ext("(#a1)a#").match_prefix(z, true);
+              EXPECT_TRUE(len == z.size() or len == str::npos);
+              EXPECT_EQ(ext("(#a1)a#").matches(z), len == z.size());
+              (void)ext("(#a2)(ab)#").matches(x);
+            }),
+            5.0);
+}
+
 }  // namespace
 }  // namespace jfsh

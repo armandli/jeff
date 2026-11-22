@@ -5,6 +5,7 @@
 #include <pwd.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <clocale>
 
 #include <string>
@@ -1772,6 +1773,162 @@ TEST(Pattern13c2, MarksOfInnerRepeats) {
   EXPECT_EQ(out(sh, "for x in ab aab bb; do [[ $x = ((a|)#b)# ]] && print -n y; "
                     "[[ $x = ((a|)#)# ]] || print -n n; done; print"),
             "ynynyn\n");
+}
+
+// M13 Phase 13c.3: (#aN) as zsh 5.9's pattern.c runs it; expected values
+// are zsh's.
+
+// Errors are made on literal strings: `?`, `[…]` and <lo-hi> never take a
+// wrong character or go missing, but an extra character before one is an
+// error.  Two characters the wrong way round in a string are one error, a
+// non-ASCII character one character.
+TEST(Pattern13c3, ErrorsOnLiteralStrings) {
+  Utf8Locale loc{LC_CTYPE};
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "for x in b xa a x12 12x; do [[ $x = (#a1)[a] ]]; print -n $?; "
+                    "[[ $x = (#a1)?? ]]; print -n $?; [[ $x = (#a1)<1-20> ]]; print -n $?; "
+                    "done; print"),
+            "111001011100100\n");
+  EXPECT_EQ(out(sh, "for x in ab ba bxa éa aé; do [[ $x = (#a1)ba ]]; print -n $?; "
+                    "[[ $x = (#a1)b(a) ]]; print -n $?; [[ $x = (#a1)aé ]]; print -n $?; "
+                    "done; print"),
+            "010001001000110\n");
+}
+
+// Extra characters after the pattern are errors in a whole match, not in
+// ${x#…} and ${x##…}, which end where zsh's search first reaches the end
+// of the pattern; before (#e) they are errors.  zsh compares a plain
+// string as a string, and drops flags at the very end of a pattern.
+TEST(Pattern13c3, TheEndOfThePattern) {
+  Utf8Locale loc{LC_CTYPE};
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "x=cab; print -r -- ${x##(#a1)ca} ${x#(#a1)ca} ${x%%(#a1)ab} "
+                    "${x%(#a1)ab}; x=abcd; print -r -- ${x##(#a1)abc} \"<${x#(#a2)ab(#e)}>\" "
+                    "\"<${x#(#a1)ab(#e)}>\"; x=ééx; print -r -- ${x##(#a1)é} ${x#(#a1)é}"),
+            "b ab ca\nd <> <abcd>\néx ééx\n");
+  EXPECT_EQ(out(sh, "for p in '(#a1)ab(#a0)' '(#a1)' 'ab(#a1)' '(#b)(#a1)(#I)' "
+                    "'(#a1)(#i)(#a0)' 'a(#a1)b'; do [[ abx = $~p ]]; print -n $?; "
+                    "[[ x = $~p ]]; print -n $?; done; print"),
+            "011111101001\n");
+  EXPECT_EQ(out(sh, "x=e; print -r -- \"<${(M)x#(#a3)eb((#e)a|(#s)a)}>\""), "<>\n");
+}
+
+// After an error zsh goes on with the rest of the string up to the end of
+// the string that failed last (its exactend).  When the tries before
+// failed in a later string, that is the compiled pattern's bytes, which
+// do not match: a missing character at the end of a string inside a
+// group, before more literals, costs that string's characters twice.
+TEST(Pattern13c3, TheStringThatFailedLast) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "for p in '(#a1)a(b)c' '(#a3)(ab)c' '(#a2)(ab)c' '(#a1)a(x)b' "
+                    "'(#a1)a(x)[b]' '(#a1)(ab|x)c' '(#a1)ax(#i)b'; do [[ ac = $~p ]]; "
+                    "print -n $?; [[ ab = $~p ]]; print -n $?; done; print"),
+            "10001011100011\n");
+  EXPECT_EQ(out(sh, "[[ a1c = (#a1)(ab)[1]c ]]; print -n $?; [[ a1c = (#a1)(ab)?c ]]; "
+                    "print -n $?; [[ a1c = (#a3)(ab)?c ]]; print $?"),
+            "010\n");
+}
+
+// zsh puts its error count and flags back after an alternative, a `*` or
+// x# that failed, and before each try at an error, but not after a
+// (#cN,M) or <lo-hi> whose attempts failed: what they spent stays spent,
+// and the flags they set stay set (the case flags too: the aB and aX
+// cases match).
+TEST(Pattern13c3, WhatFailedAttemptsLeave) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "[[ a = (#a2)(a[c])(#c0,1)acb ]]; print -n $?; x=cb; "
+                    "print -n \" ${x#(#a1)(x)(#c0,1)c} \"; [[ b = (#a2)((#a0)cab*)(#c0,2)cba ]]; "
+                    "print -n $?; [[ c11c = (#a1)((#a2)<1-5>)c ]]; print -n $?; "
+                    "[[ '' = (#a1)(*a(a|(#I)aacba))(#c0,1)a ]]; print -n $?; "
+                    "[[ b = (#a2)(cb)(#c0,1)bc ]]; print $?"),
+            "1 b 1111\n");
+  EXPECT_EQ(out(sh, "for x in aB aaB ab aX; do [[ $x = ((#a1)(#i)A)(#c1,2)b ]]; print -n $?; "
+                    "[[ $x = ((#a1)(#i)A)(#c1,2)x ]]; print -n $?; done; print"),
+            "01110110\n");
+}
+
+TEST(Pattern13c3, ScopesGroupsAndExclusions) {
+  Utf8Locale loc{LC_CTYPE};
+  if (not loc.ok) GTEST_SKIP() << "no UTF-8 locale";
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "for x in xyz xqz xyq qyz xyzq; do [[ $x = (#a1)x((#a0)y)z ]]; "
+                    "print -n $?; done; print"),
+            "01000\n");
+  EXPECT_EQ(out(sh, "for x in abcXdef abdcef; do [[ $x = (#b)(#a1)(ab)(cd)(ef) ]] && "
+                    "print -r -- $match / $mbegin / $mend; done; x=éxbc; "
+                    "[[ $x = (#b)(#a1)(éa)(bc) ]] && print -r -- $match / $mbegin / $mend"),
+            "ab cXd ef / 1 3 6 / 2 5 7\nab dc ef / 1 3 5 / 2 4 6\néx bc / 1 3 / 2 4\n");
+  // An exclusion is tested without (#aN) but for its own, and the branch
+  // before it may end with errors: (#a1)^ab matches ab as a and an error.
+  EXPECT_EQ(out(sh, "[[ c = (#a1)(b~x)[c] ]]; print -n $?; [[ c = (#a1)(b~x)? ]]; "
+                    "print -n $?; [[ ab = (#a1)^ab ]]; print -n $?; "
+                    "[[ ab = (#a1)ab~(#a1)ac ]]; print -n $?; [[ ab = (#a1)ab~ac ]]; print $?; "
+                    "x=cc1cb; print -r -- ${x#(#a1)(b~ac)[c]} ${(M)x#(#a1)(b~ac)[c]}"),
+            "00010\nc1cb c\n");
+}
+
+// Top-level alternatives after the first start without the header's
+// (#aN), the ones with a `*` before final text too.
+TEST(Pattern13c3, LaterAlternatives) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "for t in 'abx (#a1)x|b*x' 'Ab (#a1)c|b*b' 'bx (#a1)q|ab(#a0)*x' "
+                    "'abb (#a2)c|ba*b' 'ab (#a1)c|b' 'b (#a1)c|bb'; do x=${t%% *} p=${t#* }; "
+                    "[[ $x = $~p ]]; print -n $?; done; print; p='(#a2)cabcc|ba*b|bcc'; x=Ab; "
+                    "print -r -- \"<${x%%$~p}>\"; case Ab in ($~p) print yes;; (*) print no;; esac"),
+            "111110\n<Ab>\nno\n");
+}
+
+// zsh's search with errors is quadratic on a repeated group; the
+// backtracker's budget lets it finish.
+TEST(Pattern13c3, QuadraticSearches) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "x=${(l:1500::ab:)}; [[ ${x}d = (#a3)(a|ab|b)#cc ]]; print $?"), "0\n");
+}
+
+// When the backtracker gives up (here on its step budget: the search is
+// exponential, and zsh does not finish in 100 s), every form reports no
+// match, the replacement is never expanded, and the rest of the search is
+// not run, so it stays within about one budget.
+TEST(Pattern13c3, GivingUpIsNoMatch) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  auto t = s::chrono::steady_clock::now();
+  EXPECT_EQ(out(sh, "x=${(l:300::ab:)}; p='(#a2)((ab|a|b)(ab|a|b))#cccc'; "
+                    "print ${#${x//$~p/Z}} ${#${x/$~p/Z}} ${#${(S)x##$~p}} ${#${(S)x#$~p}} "
+                    "${#${x%%$~p}} ${#${(MS)x##$~p}} ${#${(S)x%$~p}} ${#${x%$~p}}; n=0; "
+                    "a=${x//(#m)$~p/$((++n))}; print $n ${#a}"),
+            "300 300 300 300 300 0 300 300\n0 300\n");
+  // The starts in the ab… give up on the budget, and a later one would
+  // match (at the y, with two errors, as it does after 20 characters):
+  // still no match, for the first match as for all of them.  zsh does not
+  // finish in 100 s.
+  EXPECT_EQ(out(sh, "p='(#a2)((ab|a|b)(ab|a|b))#cccc'; for n in 20 300; do "
+                    "x=${(l:$n::ab:)}xyzcccc; print ${#${x/$~p/Z}} ${#${(S)x##$~p}} "
+                    "${#${x//$~p/Z}}; done"),
+            "22 21 22\n307 307 307\n");
+  EXPECT_LT(s::chrono::duration<double>(s::chrono::steady_clock::now() - t).count(), 20.0);
+}
+
+// (#aN) stays on the backtracker: on 200000 characters ${x//…} tries each
+// start once.
+TEST(Pattern13c3, LongSubjects) {
+  Shell sh;
+  sh.opts.set(OPT_EXTENDEDGLOB);
+  EXPECT_EQ(out(sh, "x=${(l:200000::ab:)}; print ${#${x//(#a1)abc/Z}} ${#${x##(#a2)abc}} "
+                    "${#${x##(#a2)*abc}} ${#${x#(#a1)ab}}"),
+            "100000 199996 0 199999\n");
+  EXPECT_EQ(out(sh, "x=${(l:5000::ab:)}; print ${#${x##(#a2)(ab)#}} ${#${x##(#a1)a#}}; "
+                    "x=${(l:5000::a:)}; print ${#${x##(#a1)a#}} ${#${x#(#a1)a#b}}"),
+            "0 4997\n0 5000\n");
 }
 
 }  // namespace

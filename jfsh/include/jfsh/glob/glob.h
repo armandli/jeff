@@ -81,6 +81,13 @@ struct PrefixSearch {
   // some leaked flags), ran out of steps in this search, longest or
   // shortest; the calls after it take the VM's answer instead of trying.
   bool gave_up  = false;
+  // A shortest search after the search for the end zsh's reaches first,
+  // which found `below`: only matches ending before it are looked for
+  // (with (#aN), which tries each length of the text cut there).
+  s::size_t below = strv::npos;
+  // With (#aN), which has no VM to fall back on, the backtracker gave up
+  // in this search: what it found is not the answer.
+  bool lost = false;
 };
 
 // Which matcher decides: normally (Auto) the VM, and the backtracker where
@@ -107,6 +114,10 @@ struct CompiledPattern {
   // end of the whole `text` (${x/a(#e)/…} tries each part of x); the
   // backreferences in `info` count from b.
   bool matches(strv text, s::size_t b, s::size_t e, PatternMatch* info = nullptr) const;
+  // The same, setting search.lost when (#aN)'s backtracker gave up (the
+  // answer, false, is then not known).
+  bool matches(strv text, s::size_t b, s::size_t e, PatternMatch* info,
+               PrefixSearch& search) const;
   // Length of the shortest prefix of `text` that matches, or with
   // `longest` the one zsh's `##` takes: where its greedy search, with the
   // end left open, first gets to the end of the pattern (${x##(a|aa)} on
@@ -118,6 +129,8 @@ struct CompiledPattern {
                          PrefixSearch* search = nullptr) const;
   // (#b) groups, and (#m), which set $match … and $MATCH … after a match.
   bool backrefs() const noexcept;
+  // Whether (#aN) allows errors somewhere: only the backtracker runs it.
+  bool approximate() const noexcept;
   bool sets_match() const noexcept;
   // Whether the pattern was bad, so callers report "bad pattern".
   bool bad() const noexcept;
