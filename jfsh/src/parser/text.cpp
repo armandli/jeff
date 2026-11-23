@@ -388,6 +388,8 @@ struct Decompiler : Reader {
       s::size_t end = pc + wc_sublist_skip(w);
       if (f & WC_SUBLIST_NOT) out += "! ";
       out += pipeline();
+      // `! nocorrect` (an empty command negated) shows as `!`, as in zsh.
+      if (out.ends_with("! ")) out.pop_back();
       pc = end;
       WordCode type = f & WC_SUBLIST_TYPE;
       if (type == WC_SUBLIST_END or at_end()) return out;
@@ -573,6 +575,8 @@ struct Pretty : Reader {
       s::size_t end = pc + wc_sublist_skip(w);
       if (f & WC_SUBLIST_NOT) out += "! ";
       pipeline(ind);
+      // `! nocorrect` (an empty command negated) shows as `!`, as in zsh.
+      if (out.ends_with("! ")) out.pop_back();
       pc = end;
       WordCode type = f & WC_SUBLIST_TYPE;
       if (type == WC_SUBLIST_END or at_end()) return;
@@ -826,6 +830,9 @@ str function_text(strv names, const CompiledProgram& body) {
   pr.out = head + " () {\n\t";
   pr.body(1);
   pr.flush_docs();
+  // A ksh-style autoload body ends by calling what it defined, as zsh
+  // shows it.
+  if (body.run_after) pr.out += "\n\t" + head + " \"$@\"";
   pr.out += "\n}";
   return pr.out;
 }

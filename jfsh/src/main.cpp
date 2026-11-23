@@ -157,6 +157,8 @@ int main(int argc, char* argv[]) {
   opts.assign(jfsh::OPT_RCS,           inv.rcs);
   opts.assign(jfsh::OPT_GLOBALRCS,     inv.global_rcs);
   opts.assign(jfsh::OPT_SINGLECOMMAND, false);
+  // HASH_DIRS defaults to INTERACTIVE, as zsh's init sets it.
+  opts.assign(jfsh::OPT_HASHDIRS,      interactive);
   for (auto [idx, on] : inv.options) opts.assign(idx, on);
 
   for (char** ep = environ; ep and *ep; ++ep) {
@@ -511,18 +513,46 @@ int main(int argc, char* argv[]) {
         s::fprintf(stderr, "jfsh: warning: %d jobs SIGHUPed\n", n);
   } else {
     // Lines are gathered until they make a whole command, so constructs
-    // spanning lines work, and so do lines longer than the buffer.
+    // spanning lines work.  As zsh's shingetline, fd 0 is read without
+    // buffering, so what the script runs (`read`, `cat`, `exec <f`) gets
+    // the lines after the current one: a file a block at a time, the rest
+    // given back with lseek, a pipe a byte at a time.
     str pending;
-    char buf[4096];
+    int  line_no = 1;   // the first line of `pending`, for $LINENO
+    bool seekable = ::lseek(STDIN_FILENO, 0, SEEK_CUR) >= 0;
+    auto get_line = [&](str& line) {
+      line.clear();
+      char b[4096];
+      for (;;) {
+        ssize_t n = ::read(STDIN_FILENO, b, seekable ? sizeof b : 1);
+        if (n < 0 and errno == EINTR) continue;
+        if (n <= 0) return not line.empty();
+        auto len = static_cast<s::size_t>(n);
+        if (const void* nl = s::memchr(b, '\n', len)) {
+          s::size_t k = static_cast<s::size_t>(static_cast<const char*>(nl) - b) + 1;
+          line.append(b, k);
+          if (k < len) ::lseek(STDIN_FILENO, -static_cast<off_t>(len - k), SEEK_CUR);
+          return true;
+        }
+        line.append(b, len);
+      }
+    };
     auto run = [&] {
       bool blank = pending.find_first_not_of(" \t\n") == str::npos;
-      if (not blank) ctx.last_exit = executor.exec_string(pending);
+      // Read as a script is (by_line), with its rules: an alias defined on
+      // one line applies on the next, and a fatal error that leaves
+      // status 0 exits with 1.
+      (void)executor.take_top_return();   // not one a startup file left
+      if (not blank) ctx.last_exit = executor.exec_string(pending, true, line_no);
+      line_no += static_cast<int>(s::count(pending.begin(), pending.end(), '\n'));
       pending.clear();
-      return not ctx.exiting;
+      // A `return` at the top ends the script, as it ends a file.
+      return not ctx.exiting and not executor.take_top_return();
     };
     bool more = true;
-    while (more and s::fgets(buf, sizeof buf, stdin)) {
-      pending += buf;
+    str line;
+    while (more and get_line(line)) {
+      pending += line;
       if (pending.back() != '\n' or jfsh::is_incomplete(pending)) continue;
       more = run();
     }

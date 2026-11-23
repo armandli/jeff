@@ -23,6 +23,10 @@ int builtin_error(strv cmd, strv msg);
 // A shell identifier: [A-Za-z_][A-Za-z0-9_]*.
 bool is_identifier(strv s) noexcept;
 
+// Whether a character shows as itself: zsh's ZISPRINT for ASCII, and
+// iswprint for the rest in a multibyte locale.
+bool printable_char(char32_t c) noexcept;
+
 // Quotes `s` for output that can be read back, as zsh's listings do: as
 // is when it needs no quoting, otherwise in single quotes ('' empty), or
 // as $'…' when it holds control characters.
@@ -53,13 +57,9 @@ struct OptParse {
 bool parse_options(const vec<str>& args, strv letters, strv with_arg,
                    OptParse& out, bool plus = false, bool numbers = false);
 
-// The value of `p` as typeset -p and set print it: `'a b'`, `( a b )`,
-// `( [k]=v )`.
+// The value of `p` as typeset -p and set print it: `'a b'`, `( a b )`
+// (`(  )` when empty), `( [k]=v )`.
 str param_value_text(const Param& p);
-
-// The typeset options that recreate `p`'s attributes: "-a", "-i", "-rx" …
-// (empty for a plain scalar).
-str param_type_flags(const Param& p);
 
 // Parameters, sorted by name, that `pred` accepts (every scope's innermost).
 vec<const Param*> sorted_params(const ParamTable& params,

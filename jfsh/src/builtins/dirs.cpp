@@ -16,6 +16,7 @@
 #include <jfsh/builtins/util.h>
 #include <jfsh/core/aliases.h>
 #include <jfsh/exec/executor.h>
+#include <jfsh/exec/loop.h>
 
 namespace jfsh {
 
@@ -91,17 +92,25 @@ bool change_dir(strv cmd, const str& target, const CdOptions& o, ExecContext& ct
   if (now.empty()) now = physical_cwd();
   (void)ctx.params.set_scalar("OLDPWD", old);
   (void)ctx.params.set_scalar("PWD", now);
-  if (print and ctx.opts.interactive() and not o.silent and not ctx.opts.get(OPT_PUSHDSILENT))
+  // As zsh's cd_new_pwd: printed when interactive or under POSIX_CD.
+  if (print and (ctx.opts.interactive() or ctx.opts.get(OPT_POSIXCD)) and not o.silent
+      and not ctx.opts.get(OPT_CDSILENT))
     s::printf("%s\n", tilde_abbrev(ctx.params, now).c_str());
-  // The chpwd hook, as zsh runs it after a change of directory.
-  if (old != now and not o.silent) {
-    if (auto fn = ctx.functions.find("chpwd"); fn != ctx.functions.end()) {
-      vec<str> fargs{"chpwd"};
-      ProgRef body = fn->second;
-      ctx.executor->call_function(body, fargs);
+  return true;
+}
+
+// After a change of directory (even to the same one), unless -q: the
+// chpwd hook and DIRSTACKSIZE, as at the end of zsh's cd_new_pwd.
+void after_change(ExecContext& ctx, const CdOptions& o) {
+  s::fflush(nullptr);
+  if (not o.silent) run_hook(*ctx.executor, "chpwd");
+  if (auto p = ctx.params.lookup("DIRSTACKSIZE"); p and p->get().is_set()) {
+    long size = s::strtol(p->get().scalar().c_str(), nullptr, 10);
+    if (size > 0) {
+      s::size_t keep = static_cast<s::size_t>(s::max(size, 2L)) - 1;
+      if (ctx.dirstack.size() > keep) ctx.dirstack.resize(keep);
     }
   }
-  return true;
 }
 
 // The stack with $PWD on top.
@@ -133,10 +142,14 @@ void print_stack(const ExecContext& ctx, bool full_paths, bool one_per_line, boo
   if (not numbered and not one_per_line) s::printf("\n");
 }
 
+// Pushes the directory left; under PUSHD_IGNORE_DUPS the new current
+// directory leaves the stack (its first copy), as zsh's cd_new_pwd.
 void push_dir(ExecContext& ctx, str dir) {
-  if (ctx.opts.get(OPT_PUSHDIGNOREDUPS))
-    s::erase(ctx.dirstack, dir);
   ctx.dirstack.insert(ctx.dirstack.begin(), s::move(dir));
+  if (ctx.opts.get(OPT_PUSHDIGNOREDUPS))
+    if (auto it = s::find(ctx.dirstack.begin(), ctx.dirstack.end(), current_dir(ctx.params));
+        it != ctx.dirstack.end())
+      ctx.dirstack.erase(it);
 }
 
 void print_stack_if_interactive(ExecContext& ctx) {
@@ -155,25 +168,24 @@ opt<str> substitute_pwd(strv cmd, const ExecContext& ctx, const str& from, const
   return pwd.substr(0, at) + to + pwd.substr(at + from.size());
 }
 
-// Options of cd/pushd: -q -s -L -P.  Stops at a `-N`/`+N` stack index.
-bool cd_options(vec<str>& args, s::size_t& i, CdOptions& o) {
-  for (i = 1; i < args.size(); ++i) {
+// Options of cd/pushd/popd: -q -s -L -P; returns the index of the first
+// argument.  Stops at a `-N`/`+N` stack index, and at a word with another
+// letter, which is a directory (zsh's BINF_SKIPINVALID).
+s::size_t cd_options(const vec<str>& args, CdOptions& o) {
+  s::size_t i = 1;
+  for (; i < args.size(); ++i) {
     const str& a = args[i];
     if (a == "--") { ++i; break; }
-    if (a.size() < 2 or a[0] != '-' or s::isdigit(static_cast<unsigned char>(a[1]))) break;
+    if (a.size() < 2 or a[0] != '-' or s::isdigit(static_cast<unsigned char>(a[1]))
+        or a.find_first_not_of("qsLP", 1) != str::npos)
+      break;
     for (char c : strv(a).substr(1)) {
-      switch (c) {
-        case 'q': o.silent = true; break;
-        case 's': break;
-        case 'L': o.physical = false; break;
-        case 'P': o.physical = true; break;
-        default:
-          s::fprintf(stderr, "jfsh: %s: bad option: -%c\n", args[0].c_str(), c);
-          return false;
-      }
+      if      (c == 'q') o.silent = true;
+      else if (c == 'L') o.physical = false;
+      else if (c == 'P') o.physical = true;
     }
   }
-  return true;
+  return i;
 }
 
 // Resolves a cd argument: CDPATH for a relative name (reports whether a
@@ -226,8 +238,7 @@ str resolve_with_cdpath(const str& dir, ExecContext& ctx, bool& via_cdpath) {
 int cd_common(vec<str>& args, ExecContext& ctx, bool pushd) {
   strv cmd = args[0];
   CdOptions o;
-  s::size_t i = 1;
-  if (not cd_options(args, i, o)) return 1;
+  s::size_t i = cd_options(args, o);
   vec<str> rest(args.begin() + static_cast<s::ptrdiff_t>(i), args.end());
   if (rest.size() > 2) return builtin_error(cmd, "too many arguments");
   bool print = false;
@@ -240,14 +251,14 @@ int cd_common(vec<str>& args, ExecContext& ctx, bool pushd) {
     print  = true;
   } else if (rest.empty() or rest[0].empty()) {
     if (not rest.empty()) return 0;   // `cd ""` stays put
-    if (pushd and not ctx.opts.get(OPT_PUSHDTOHOME)) {
-      // pushd alone swaps the top two entries.
-      if (ctx.dirstack.empty()) return builtin_error(cmd, "no other directory");
+    if (pushd and not ctx.opts.get(OPT_PUSHDTOHOME) and not ctx.dirstack.empty()) {
+      // pushd alone swaps the top two entries (with none, goes home).
       str top = ctx.dirstack.front();
       str here = current_dir(ctx.params);
       if (not change_dir(cmd, top, o, ctx)) return 1;
       ctx.dirstack.front() = here;
       print_stack_if_interactive(ctx);
+      after_change(ctx, o);
       return 0;
     }
     target = param_value(ctx.params, "HOME");
@@ -265,6 +276,7 @@ int cd_common(vec<str>& args, ExecContext& ctx, bool pushd) {
       if (not change_dir(cmd, all.front(), o, ctx)) return 1;
       ctx.dirstack.assign(all.begin() + 1, all.end());
       print_stack_if_interactive(ctx);
+      after_change(ctx, o);
       return 0;
     }
     target = all[*idx];
@@ -272,6 +284,7 @@ int cd_common(vec<str>& args, ExecContext& ctx, bool pushd) {
     str here = current_dir(ctx.params);
     if (not change_dir(cmd, target, o, ctx, true)) return 1;
     if (ctx.opts.get(OPT_AUTOPUSHD)) push_dir(ctx, here);
+    after_change(ctx, o);
     return 0;
   } else {
     bool via = false;
@@ -284,6 +297,7 @@ int cd_common(vec<str>& args, ExecContext& ctx, bool pushd) {
     push_dir(ctx, here);
     if (pushd) print_stack_if_interactive(ctx);
   }
+  after_change(ctx, o);
   return 0;
 }
 
@@ -297,8 +311,7 @@ int builtin_pushd(vec<str>& args, ExecContext& ctx) { return cd_common(args, ctx
 int builtin_popd(vec<str>& args, ExecContext& ctx) {
   strv cmd = args[0];
   CdOptions o;
-  s::size_t i = 1;
-  if (not cd_options(args, i, o)) return 1;
+  s::size_t i = cd_options(args, o);
   if (ctx.dirstack.empty()) return builtin_error(cmd, "directory stack empty");
   s::size_t idx = 0;
   if (i < args.size()) {
@@ -315,6 +328,7 @@ int builtin_popd(vec<str>& args, ExecContext& ctx) {
     ctx.dirstack.erase(ctx.dirstack.begin() + static_cast<s::ptrdiff_t>(idx - 1));
   }
   if (not o.silent) print_stack_if_interactive(ctx);
+  after_change(ctx, o);
   return 0;
 }
 
@@ -339,6 +353,7 @@ int builtin_dirs(vec<str>& args, ExecContext& ctx) {
 int builtin_pwd(vec<str>& args, ExecContext& ctx) {
   OptParse o;
   if (not parse_options(args, "rLP", "", o)) return 1;
+  if (o.next < args.size()) return builtin_error(args[0], "too many arguments");
   bool physical = o.has('P') or o.has('r') or ctx.opts.get(OPT_CHASELINKS);
   if (o.has('L')) physical = false;
   str dir = physical ? physical_cwd() : current_dir(ctx.params);

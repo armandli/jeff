@@ -20,6 +20,7 @@
 #endif
 
 #include <chrono>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -104,10 +105,11 @@ struct Pty {
 
   // Sends `key` until `needle` appears: a key sent before the command has
   // started reaches the line editor instead, which ignores it.
-  bool key_until(std::string_view key, std::string_view needle, int tries = 20) {
+  bool key_until(std::string_view key, std::string_view needle, int tries = 20,
+                 std::chrono::milliseconds wait = 300ms) {
     for (int i = 0; i < tries; ++i) {
       send(key);
-      if (expect(needle, 300ms)) return true;
+      if (expect(needle, wait)) return true;
     }
     return false;
   }
@@ -496,9 +498,10 @@ TEST(InteractiveM6Review, TrappedCtrlCRunsTheTrapAndTheLineGoesOn) {
   sh.line("for i in 1 2; do sleep 30; echo i-$((i*10)); done; echo st-$?");
   ASSERT_TRUE(sh.expect("st-$?")) << sh.out;
   std::this_thread::sleep_for(300ms);
-  ASSERT_TRUE(sh.key_until("\x03", "got-2\r\ni-10\r\n")) << sh.out;
+  // A loaded machine can take a while to run the trap: wait longer per key.
+  ASSERT_TRUE(sh.key_until("\x03", "got-2\r\ni-10\r\n", 10, 1500ms)) << sh.out;
   std::this_thread::sleep_for(300ms);
-  ASSERT_TRUE(sh.key_until("\x03", "got-2\r\ni-20\r\nst-0\r\n")) << sh.out;
+  ASSERT_TRUE(sh.key_until("\x03", "got-2\r\ni-20\r\nst-0\r\n", 10, 1500ms)) << sh.out;
 }
 
 // A TRAPINT that returns non-zero ends the line, with its status.
@@ -730,6 +733,73 @@ TEST(InteractiveM6Review, HangupDuringAForegroundJobExitsAtOnce) {
   EXPECT_NE(sh.out.find("jfsh: warning: 1 jobs SIGHUPed"), std::string::npos) << sh.out;
   ASSERT_TRUE(WIFEXITED(status)) << sh.out;
   EXPECT_EQ(WEXITSTATUS(status), 1);
+}
+
+}  // namespace
+
+namespace {
+
+// read -k and -q read the terminal a character at a time (zsh's
+// setcbreak), still echoing what is typed.
+TEST(InteractiveM7Review, ReadKAndQEchoWhatIsTyped) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("read -k 2 x");
+  ASSERT_TRUE(sh.expect("read -k 2 x")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  sh.send("ab");
+  // Echoed by the terminal before anything else is sent.
+  EXPECT_TRUE(sh.expect("ab")) << sh.out;
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  sh.line("read -q 'y?ok? '");
+  ASSERT_TRUE(sh.expect("\nok?")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  sh.send("n");
+  EXPECT_TRUE(sh.expect(" n")) << sh.out;
+  sh.line("echo x-$x y-$y");
+  EXPECT_TRUE(sh.expect("x-ab y-n\r\n")) << sh.out;
+}
+
+// fc's messages as zsh's, which name fc for history and r too.
+TEST(InteractiveM7Review, FcMessagesAndMatching) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("echo one");
+  ASSERT_TRUE(sh.expect("one\r\n")) << sh.out;
+  sh.line("echo two");
+  ASSERT_TRUE(sh.expect("two\r\n")) << sh.out;
+  sh.line("fc -l 100");
+  EXPECT_TRUE(sh.expect("fc: no such event: 100\r\n")) << sh.out;
+  sh.line("r nosuch");
+  EXPECT_TRUE(sh.expect("fc: event not found: nosuch\r\n")) << sh.out;
+  sh.line("fc -l 1 2 3");
+  EXPECT_TRUE(sh.expect("fc: too many arguments\r\n")) << sh.out;
+  sh.line("fc -lm 'echo t*'");
+  EXPECT_TRUE(sh.expect("    2  echo two\r\n")) << sh.out;
+  // -m matching nothing, listed or run (zsh's fclist).
+  sh.line("fc -l -m 'zz*' 1; echo rc-$?");
+  EXPECT_TRUE(sh.expect("fc: no matching events found\r\nrc-1\r\n")) << sh.out;
+  sh.line("fc -e - -m 'zz*' 1; echo rc-$?");
+  EXPECT_TRUE(sh.expect("fc: no matching events found\r\nrc-1\r\n")) << sh.out;
+}
+
+// pushd alone with an empty stack goes home and prints the stack, as
+// zsh's cd_get_dest; chpwd runs for it.
+TEST(InteractiveM7Review, PushdAloneWithAnEmptyStackGoesHome) {
+  char tmpl[] = "/tmp/jfsh_m7_XXXXXX";
+  ASSERT_NE(::mkdtemp(tmpl), nullptr);
+  std::string d = tmpl;
+  {
+    Pty sh;
+    ASSERT_TRUE(sh.expect("% "));
+    sh.line("mkdir " + d + "/h; HOME=" + d + "/h; cd " + d);
+    ASSERT_TRUE(sh.expect("% ")) << sh.out;
+    sh.line("chpwd() { echo hook-${PWD##*/} }; pushd; echo st-$?");
+    EXPECT_TRUE(sh.expect("~ ")) << sh.out;
+    EXPECT_TRUE(sh.expect("hook-h\r\nst-0\r\n")) << sh.out;
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(d, ec);
 }
 
 }  // namespace

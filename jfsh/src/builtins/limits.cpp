@@ -1,5 +1,35 @@
 // Resource builtins: ulimit, umask and times.
 
+// ulimit and umask are derived from zsh 5.9's bin_ulimit
+// (Src/Builtins/rlimits.c) and bin_umask (Src/builtin.c).  zsh's copyright
+// and licence:
+//
+// The Z Shell is copyright (c) 1992-2017 Paul Falstad, Richard Coleman,
+// Zoltán Hidvégi, Andrew Main, Peter Stephenson, Sven Wischnowsky, and
+// others.  All rights reserved.  Individual authors, whether or not
+// specifically named, retain copyright in all changes; in what follows, they
+// are referred to as `the Zsh Development Group'.  This is for convenience
+// only and this body has no legal status.  The Z shell is distributed under
+// the following licence; any provisions made in individual files take
+// precedence.
+//
+// Permission is hereby granted, without written agreement and without
+// licence or royalty fees, to use, copy, modify, and distribute this
+// software and to distribute modified versions of this software for any
+// purpose, provided that the above copyright notice and the following
+// two paragraphs appear in all copies of this software.
+//
+// In no event shall the Zsh Development Group be liable to any party for
+// direct, indirect, special, incidental, or consequential damages arising out
+// of the use of this software and its documentation, even if the Zsh
+// Development Group have been advised of the possibility of such damage.
+//
+// The Zsh Development Group specifically disclaim any warranties, including,
+// but not limited to, the implied warranties of merchantability and fitness
+// for a particular purpose.  The software provided hereunder is on an "as is"
+// basis, and the Zsh Development Group have no obligation to provide
+// maintenance, support, updates, enhancements, or modifications.
+
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
@@ -8,6 +38,8 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+
+#include <algorithm>
 
 #include <jfsh/builtins/builtins.h>
 #include <jfsh/builtins/util.h>
@@ -63,9 +95,31 @@ const Limit LIMITS[] = {
 #endif
 };
 
+// The limits this system has, by resource number as zsh's `ulimit -a`
+// lists them; one that is another's alias (RLIMIT_RSS is RLIMIT_AS on
+// macOS) is left out, as zsh's RLIMIT_RSS_IS_AS.
+vec<const Limit*> system_limits() {
+  vec<const Limit*> out;
+  for (const auto& l : LIMITS) {
+#if defined(RLIMIT_RSS)
+    if (l.letter == 'm' and RLIMIT_RSS == RLIMIT_AS) continue;
+#endif
+    out.push_back(&l);
+  }
+  s::stable_sort(out.begin(), out.end(),
+                 [](const Limit* a, const Limit* b) { return a->resource < b->resource; });
+  return out;
+}
+
 const Limit* find_limit(char c) {
-  for (const auto& l : LIMITS)
-    if (l.letter == c) return &l;
+  for (const Limit* l : system_limits())
+    if (l->letter == c) return l;
+  return nullptr;
+}
+
+const Limit* find_resource(int res) {
+  for (const Limit* l : system_limits())
+    if (l->resource == res) return l;
   return nullptr;
 }
 
@@ -76,8 +130,9 @@ str limit_text(rlim_t v, s::uint64_t unit) {
 
 }  // namespace
 
-// ulimit [-HSa] [-tfdscmunlvxiqerN [limit]] …: shows or sets resource
-// limits, soft ones unless -H (-HS: both).  With no resource, -f.
+// ulimit [-HSa] [-tfdscmunlvxiqer [limit]] [-N n [limit]] …: shows or sets
+// resource limits, soft ones unless -H (-HS: both).  With no resource,
+// -f.  As zsh's bin_ulimit.
 int builtin_ulimit(vec<str>& args, ExecContext& ctx) {
   (void)ctx;
   strv cmd = args[0];
@@ -89,55 +144,76 @@ int builtin_ulimit(vec<str>& args, ExecContext& ctx) {
   vec<Request> reqs;
   for (s::size_t i = 1; i < args.size(); ++i) {
     const str& a = args[i];
+    if (a == "-") return builtin_error(cmd, "missing option letter");
     if (a.size() > 1 and a[0] == '-') {
       for (s::size_t k = 1; k < a.size(); ++k) {
         char c = a[k];
         if (c == 'H') { hard = true; continue; }
         if (c == 'S') { soft = true; continue; }
-        if (c == 'a') { all = true; continue; }
-        const Limit* l = find_limit(c);
-        if (c == 'N') {
-          // -N takes the resource number; only RLIMIT_RTTIME (15) is named.
-          if (i + 1 < args.size()) ++i;
+        if (c == 'a') {
+          if (not reqs.empty()) return builtin_error(cmd, "no limits allowed with -a");
+          all = true;
+          continue;
         }
-        if (not l) {
+        const Limit* l = nullptr;
+        if (c == 'N') {
+          // -N takes the resource's number, attached or in the next word.
+          str number = a.substr(k + 1);
+          if (number.empty()) {
+            if (i + 1 >= args.size()) return builtin_error(cmd, "number required after -N");
+            number = args[++i];
+          }
+          char* end = nullptr;
+          long n = s::strtol(number.c_str(), &end, 10);
+          if (number.empty() or *end != '\0')
+            return builtin_error(cmd, "invalid number: " + number);
+          l = find_resource(static_cast<int>(n));
+          if (not l) return builtin_error(cmd, "bad option: -N " + number);
+          k = a.size();
+        } else if (not (l = find_limit(c))) {
           s::fprintf(stderr, "jfsh: ulimit: bad option: -%c\n", c);
           return 1;
         }
+        if (all) return builtin_error(cmd, "no limits allowed with -a");
         reqs.push_back({l, s::nullopt});
       }
       continue;
     }
-    if (reqs.empty()) reqs.push_back({find_limit('f'), s::nullopt});
+    if (all) return builtin_error(cmd, "no arguments allowed after -a");
+    if (reqs.empty() or reqs.back().value) reqs.push_back({find_limit('f'), s::nullopt});
     reqs.back().value = a;
   }
   if (all) {
-    for (const auto& l : LIMITS) {
+    for (const Limit* l : system_limits()) {
       struct rlimit rl{};
-      if (::getrlimit(l.resource, &rl) != 0) continue;
-      s::printf("%-36s%s\n", l.label, limit_text(hard ? rl.rlim_max : rl.rlim_cur, l.unit).c_str());
+      if (::getrlimit(l->resource, &rl) != 0) continue;
+      s::printf("%-36s%s\n", l->label,
+                limit_text(hard ? rl.rlim_max : rl.rlim_cur, l->unit).c_str());
     }
     return 0;
   }
   if (reqs.empty()) reqs.push_back({find_limit('f'), s::nullopt});
-  bool labelled = reqs.size() > 1;
+  // The ones to show are shown once each, after the ones set, in
+  // resource order (zsh's resmask); with a label when more were named.
+  bool labelled = s::count_if(reqs.begin(), reqs.end(), [](const Request& r) {
+                    return not r.value;
+                  }) > 1;
+  vec<const Limit*> shown;
+  int rc = 0;
   for (const auto& r : reqs) {
     struct rlimit rl{};
     if (::getrlimit(r.limit->resource, &rl) != 0)
       return builtin_error(cmd, s::strerror(errno));
     if (not r.value) {
-      str v = limit_text(hard ? rl.rlim_max : rl.rlim_cur, r.limit->unit);
-      if (labelled) s::printf("%-36s%s\n", r.limit->label, v.c_str());
-      else          s::printf("%s\n", v.c_str());
+      if (s::find(shown.begin(), shown.end(), r.limit) == shown.end()) shown.push_back(r.limit);
       continue;
     }
+    // "unlimited", "hard" (the hard limit) or a number; zsh has no "soft".
     rlim_t v;
     if (*r.value == "unlimited") {
       v = RLIM_INFINITY;
     } else if (*r.value == "hard") {
       v = rl.rlim_max;
-    } else if (*r.value == "soft") {
-      v = rl.rlim_cur;
     } else {
       char* end = nullptr;
       errno = 0;
@@ -149,8 +225,11 @@ int builtin_ulimit(vec<str>& args, ExecContext& ctx) {
     bool set_hard = hard;
     bool set_soft = soft or not hard;
     if (set_soft and not set_hard and rl.rlim_max != RLIM_INFINITY
-        and (v == RLIM_INFINITY or v > rl.rlim_max))
-      return builtin_error(cmd, "value exceeds hard limit");
+        and (v == RLIM_INFINITY or v > rl.rlim_max)) {
+      builtin_error(cmd, "value exceeds hard limit");
+      rc = 1;
+      continue;
+    }
     if (set_hard) rl.rlim_max = v;
     if (set_soft) rl.rlim_cur = v;
     // A hard limit below the soft one takes the soft one down with it.
@@ -158,98 +237,87 @@ int builtin_ulimit(vec<str>& args, ExecContext& ctx) {
         and (rl.rlim_cur == RLIM_INFINITY or rl.rlim_cur > v))
       rl.rlim_cur = v;
     if (::setrlimit(r.limit->resource, &rl) != 0) {
-      if (errno == EPERM) return builtin_error(cmd, "can't raise hard limits");
-      return builtin_error(cmd, s::strerror(errno));
+      builtin_error(cmd, errno == EPERM ? str("can't raise hard limits") : str(s::strerror(errno)));
+      rc = 1;
     }
   }
-  return 0;
-}
-
-namespace {
-
-str symbolic_mask(mode_t mask) {
-  mode_t allowed = ~mask & 0777;
-  str out;
-  const char who[] = {'u', 'g', 'o'};
-  for (int w = 0; w < 3; ++w) {
-    int shift = 6 - 3 * w;
-    if (w) out += ',';
-    out += who[w];
-    out += '=';
-    if (allowed & (4u << shift)) out += 'r';
-    if (allowed & (2u << shift)) out += 'w';
-    if (allowed & (1u << shift)) out += 'x';
+  s::sort(shown.begin(), shown.end(),
+          [](const Limit* a, const Limit* b) { return a->resource < b->resource; });
+  for (const Limit* l : shown) {
+    struct rlimit rl{};
+    if (::getrlimit(l->resource, &rl) != 0) return builtin_error(cmd, s::strerror(errno));
+    str v = limit_text(hard ? rl.rlim_max : rl.rlim_cur, l->unit);
+    if (labelled) s::printf("%-36s%s\n", l->label, v.c_str());
+    else          s::printf("%s\n", v.c_str());
   }
-  return out;
+  return rc;
 }
-
-// `u=rwx,g+w,o-x`: applied to the permissions the mask leaves.
-opt<mode_t> parse_symbolic(strv spec, mode_t mask) {
-  mode_t allowed = ~mask & 0777;
-  s::size_t i = 0;
-  while (i <= spec.size()) {
-    s::size_t end = spec.find(',', i);
-    if (end == strv::npos) end = spec.size();
-    strv clause = spec.substr(i, end - i);
-    i = end + 1;
-    if (clause.empty()) return s::nullopt;
-    mode_t who = 0;
-    s::size_t k = 0;
-    for (; k < clause.size() and strv("ugoa").find(clause[k]) != strv::npos; ++k) {
-      switch (clause[k]) {
-        case 'u': who |= 0700; break;
-        case 'g': who |= 0070; break;
-        case 'o': who |= 0007; break;
-        default:  who |= 0777;
-      }
-    }
-    if (who == 0) who = 0777;
-    if (k >= clause.size()) return s::nullopt;
-    while (k < clause.size()) {
-      char op = clause[k++];
-      if (op != '+' and op != '-' and op != '=') return s::nullopt;
-      mode_t perms = 0;
-      for (; k < clause.size() and strv("rwx").find(clause[k]) != strv::npos; ++k)
-        perms |= clause[k] == 'r' ? 0444u : clause[k] == 'w' ? 0222u : 0111u;
-      perms &= who;
-      if (op == '+') allowed |= perms;
-      else if (op == '-') allowed &= ~perms;
-      else allowed = (allowed & ~who) | perms;
-    }
-    if (end == spec.size()) break;
-  }
-  return static_cast<mode_t>(~allowed & 0777);
-}
-
-}  // namespace
 
 // umask [-S] [mask]: an octal mask or a symbolic one; -S shows it
-// symbolically.
+// symbolically.  As zsh's bin_umask.
 int builtin_umask(vec<str>& args, ExecContext& ctx) {
   (void)ctx;
   strv cmd = args[0];
-  bool symbolic = false;
-  s::size_t i = 1;
-  if (i < args.size() and args[i] == "-S") { symbolic = true; ++i; }
-  mode_t mask = ::umask(0);
-  ::umask(mask);
-  if (i >= args.size()) {
-    if (symbolic) s::printf("%s\n", symbolic_mask(mask).c_str());
-    else          s::printf("%03o\n", static_cast<unsigned>(mask));
+  OptParse o;
+  if (not parse_options(args, "S", "", o)) return 1;
+  if (args.size() > o.next + 1) return builtin_error(cmd, "too many arguments");
+  mode_t um = ::umask(0777);
+  ::umask(um);
+  if (o.next >= args.size()) {
+    if (o.has('S')) {
+      str out;
+      for (const char* who = "ugo"; *who; ++who) {
+        out += *who;
+        out += '=';
+        for (const char* what = "rwx"; *what; ++what) {
+          if (not (um & 0400)) out += *what;
+          um = static_cast<mode_t>(um << 1);
+        }
+        out += who[1] ? ',' : '\n';
+      }
+      s::fputs(out.c_str(), stdout);
+    } else {
+      s::printf("%s%03o\n", (um & 0700) ? "0" : "", static_cast<unsigned>(um));
+    }
     return 0;
   }
-  const str& spec = args[i];
-  opt<mode_t> next;
+  const str& spec = args[o.next];
   if (not spec.empty() and s::isdigit(static_cast<unsigned char>(spec[0]))) {
-    if (spec.find_first_not_of("01234567") == str::npos and spec.size() <= 4) {
-      unsigned long v = s::strtoul(spec.c_str(), nullptr, 8);
-      if (v <= 0777) next = static_cast<mode_t>(v);
-    }
+    // An octal number (zstrtol: as many octal digits as there are).
+    char* end = nullptr;
+    unsigned long v = s::strtoul(spec.c_str(), &end, 8);
+    if (*end) return builtin_error(cmd, "bad umask");
+    um = static_cast<mode_t>(v);
   } else {
-    next = parse_symbolic(spec, mask);
+    // u, g, o or a (all by default), an operator, and rwx; clauses
+    // separated by commas.
+    s::size_t i = 0;
+    for (;;) {
+      mode_t who = 0;
+      for (; i < spec.size() and strv("ugoa").find(spec[i]) != strv::npos; ++i)
+        who |= spec[i] == 'u' ? 0700 : spec[i] == 'g' ? 0070 : spec[i] == 'o' ? 0007 : 0777;
+      if (not who) who = 0777;
+      char op = i < spec.size() ? spec[i] : '\0';
+      if (op != '+' and op != '-' and op != '=') {
+        if (op) return builtin_error(cmd, str("bad symbolic mode operator: ") + op);
+        return builtin_error(cmd, "bad umask");
+      }
+      mode_t mask = 0;
+      for (++i; i < spec.size() and spec[i] != ','; ++i) {
+        char c = spec[i];
+        if      (c == 'r') mask |= 0444 & who;
+        else if (c == 'w') mask |= 0222 & who;
+        else if (c == 'x') mask |= 0111 & who;
+        else return builtin_error(cmd, str("bad symbolic mode permission: ") + c);
+      }
+      if      (op == '+') um &= static_cast<mode_t>(~mask);
+      else if (op == '-') um |= mask;
+      else                um = static_cast<mode_t>((um | who) & ~mask);
+      if (i < spec.size() and spec[i] == ',') ++i;
+      else break;
+    }
   }
-  if (not next) return builtin_error(cmd, "bad umask");
-  ::umask(*next);
+  ::umask(um);
   return 0;
 }
 
@@ -267,8 +335,8 @@ str minutes_seconds(const struct timeval& tv) {
 
 // times: the user and system time of the shell, then of its children.
 int builtin_times(vec<str>& args, ExecContext& ctx) {
-  (void)args;
   (void)ctx;
+  if (args.size() > 1) return builtin_error(args[0], "too many arguments");
   struct rusage self{}, children{};
   ::getrusage(RUSAGE_SELF, &self);
   ::getrusage(RUSAGE_CHILDREN, &children);

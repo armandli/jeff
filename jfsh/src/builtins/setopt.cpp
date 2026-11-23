@@ -55,7 +55,8 @@ void print_restorable(const OptionState& opts) {
 bool set_option(strv cmd, const OptionInfo& info, bool on, OptionState& opts,
                 strv shown) {
   if (opts.get(info.index) == on) return true;
-  if (not can_change(info, opts)) {
+  // An interactive shell can't be made NO_EXEC (zsh's dosetopt).
+  if (not can_change(info, opts) or (info.index == OPT_EXEC and not on and opts.interactive())) {
     s::fprintf(stderr, "jfsh: %.*s: can't change option: %.*s\n",
                static_cast<int>(cmd.size()), cmd.data(),
                static_cast<int>(shown.size()), shown.data());
@@ -161,7 +162,8 @@ int builtin_set(vec<str>& args, ExecContext& ctx) {
       s::printf("%s=%s\n", shell_quote(p->name).c_str(), param_value_text(*p).c_str());
     return 0;
   }
-  bool sort = false, reverse = false, positional_given = false;
+  bool sort = false, reverse = false, positional_given = false, failed = false;
+  bool plus_seen = false;   // zsh's hadplus
   opt<str> array_name;
   bool array_merge = false;
   s::size_t i = 1;
@@ -181,29 +183,38 @@ int builtin_set(vec<str>& args, ExecContext& ctx) {
     }
     if (a.size() < 2 or (a[0] != '-' and a[0] != '+')) break;
     bool on = a[0] == '-';
+    plus_seen = plus_seen or not on;
     for (s::size_t k = 1; k < a.size(); ++k) {
       char c = a[k];
       if (c == 'o') {
         str name = a.substr(k + 1);
         if (name.empty()) {
           if (i + 1 >= args.size()) {
-            if (on) print_ksh_style(ctx.opts);
-            else    print_restorable(ctx.opts);
+            // As printoptionstates(hadplus): a `+` anywhere asks for
+            // the restorable form.  An earlier error still ends the line,
+            // with status 0.
+            if (plus_seen) print_restorable(ctx.opts);
+            else           print_ksh_style(ctx.opts);
+            if (failed) ctx.aborting = true;
             return 0;
           }
           name = args[++i];
         }
-        if (not set_named(cmd, name, on, ctx.opts)) return 1;
+        if (not set_named(cmd, name, on, ctx.opts)) failed = true;
         break;
       }
       if (c == 'A') {
         str name = a.substr(k + 1);
         if (name.empty()) {
           if (i + 1 >= args.size()) {
-            // `set -A`: list the arrays.
+            // `set -A`: list the arrays (`set +A` their names).
             for (const Param* p : sorted_params(ctx.params,
-                                                [](const Param& p) { return p.is_array(); }))
-              s::printf("%s=%s\n", shell_quote(p->name).c_str(), param_value_text(*p).c_str());
+                                                [](const Param& p) { return p.is_array(); })) {
+              if (plus_seen) s::printf("%s\n", shell_quote(p->name).c_str());
+              else           s::printf("%s=%s\n", shell_quote(p->name).c_str(),
+                                       param_value_text(*p).c_str());
+            }
+            if (failed) ctx.aborting = true;
             return 0;
           }
           name = args[++i];
@@ -213,8 +224,14 @@ int builtin_set(vec<str>& args, ExecContext& ctx) {
         break;
       }
       if (c == 's') { sort = true; reverse = not on; continue; }
-      if (not set_letter(cmd, c, on, ctx.opts)) return 1;
+      if (not set_letter(cmd, c, on, ctx.opts)) failed = true;
     }
+  }
+  // As zsh's bin_set, whose errors are zerrnam's: the command line ends
+  // (once every option was tried).
+  if (failed) {
+    ctx.aborting = true;
+    return 1;
   }
   vec<str> rest(args.begin() + static_cast<s::ptrdiff_t>(i), args.end());
   if (rest.empty() and not positional_given and not array_name) return 0;
@@ -439,6 +456,7 @@ int builtin_shift(vec<str>& args, ExecContext& ctx) {
   bool from_end = false;
   s::size_t i = 1;
   if (i < args.size() and args[i] == "-p") { from_end = true; ++i; }
+  if (i < args.size() and args[i] == "--") ++i;
   s::int64_t n = 1;
   // The count, unless the word names an array (`shift arr`).
   auto names_array = [&](const str& w) {

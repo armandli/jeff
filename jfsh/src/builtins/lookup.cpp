@@ -20,10 +20,12 @@ namespace jfsh {
 
 namespace {
 
+// zsh's reswdtab (hashtable.c): `in` and `always` aren't in it, the
+// typeset family is.
 constexpr strv RESERVED[] = {
-  "!", "[[", "{", "}", "always", "case", "coproc", "do", "done", "elif", "else",
-  "esac", "fi", "for", "foreach", "function", "if", "in", "nocorrect", "repeat",
-  "select", "then", "time", "until", "while",
+  "!", "[[", "{", "}", "case", "coproc", "declare", "do", "done", "elif", "else", "end",
+  "esac", "export", "fi", "float", "for", "foreach", "function", "if", "integer", "local",
+  "nocorrect", "readonly", "repeat", "select", "then", "time", "typeset", "until", "while",
 };
 
 bool is_reserved(strv name) {
@@ -45,16 +47,64 @@ vec<str> all_in_path(const ExecContext& ctx, const str& name) {
   }
   for (const auto& dir : path_dirs(ctx.params)) {
     // An empty component is the current directory, named as zsh does.
+    // A directory listed twice is searched twice, as in zsh.
     str candidate = dir.empty() ? name : dir + "/" + name;
-    if (is_executable(candidate) and s::find(out.begin(), out.end(), candidate) == out.end())
-      out.push_back(candidate);
+    if (is_executable(candidate)) out.push_back(candidate);
   }
   return out;
 }
 
-str resolve_links(const str& path) {
-  char buf[PATH_MAX];
-  return ::realpath(path.c_str(), buf) ? str(buf) : path;
+// One step of zsh's xsymlinks: the path with its first symbolic link
+// replaced by what it points to (`.` and `..` taken as written before
+// it), or nothing when no component is a link.
+opt<str> expand_one_link(const str& path) {
+  vec<str> parts;
+  for (s::size_t i = 0; i <= path.size();) {
+    s::size_t j = path.find('/', i);
+    if (j == str::npos) j = path.size();
+    if (j > i) parts.push_back(path.substr(i, j - i));
+    i = j + 1;
+  }
+  str done;
+  for (s::size_t k = 0; k < parts.size(); ++k) {
+    if (parts[k] == ".") continue;
+    if (parts[k] == "..") {
+      if (auto slash = done.rfind('/'); slash != str::npos) done.resize(slash);
+      continue;
+    }
+    str next = done + "/" + parts[k];
+    char buf[PATH_MAX];
+    ssize_t n = ::readlink(next.c_str(), buf, sizeof buf);
+    if (n < 0) {
+      done = s::move(next);
+      continue;
+    }
+    str target(buf, static_cast<s::size_t>(n));
+    str out = target[0] == '/' ? target : done + "/" + target;
+    for (++k; k < parts.size(); ++k) out += "/" + parts[k];
+    return out;
+  }
+  return s::nullopt;
+}
+
+// What whence -s / -S add to an absolute path, as zsh's print_if_link:
+// -s the real path, -S each step through the links.
+str link_suffix(const str& path, bool steps) {
+  if (path.empty() or path[0] != '/') return {};
+  if (not steps) {
+    char buf[PATH_MAX];
+    return ::realpath(path.c_str(), buf) ? " -> " + str(buf) : str{};
+  }
+  str out;
+  str at = path;
+  // Bounded, as a loop of links would go round for ever.
+  for (int n = 0; n < 64; ++n) {
+    auto next = expand_one_link(at);
+    if (not next) break;
+    out += " -> " + (next->empty() ? str("/") : *next);
+    at = s::move(*next);
+  }
+  return out;
 }
 
 enum class Style {
@@ -64,12 +114,20 @@ enum class Style {
   Word,     // -w: `x: alias`
 };
 
+// What whence_one looks at: everything, or (for -m, a table at a time)
+// one kind.
+enum Kinds : unsigned {
+  K_ALIAS = 1, K_RESERVED = 2, K_FUNCTION = 4, K_BUILTIN = 8, K_COMMAND = 16, K_ALL = 31,
+};
+
 struct WhenceOpts {
   Style style = Style::Plain;
+  unsigned kinds = K_ALL;
   bool  all = false;          // -a
   bool  path_only = false;    // -p
   bool  func_body = false;    // -f, or -c/-v for functions in csh style
   bool  symlinks = false;     // -s / -S
+  bool  link_steps = false;   // -S
 };
 
 // Describes `name`; false when it is nothing at all.
@@ -85,7 +143,8 @@ bool whence_one(const str& name, const WhenceOpts& w, ExecContext& ctx) {
     }
   };
   if (not w.path_only) {
-    if (auto a = ctx.aliases.regular.find(name); a != ctx.aliases.regular.end()) {
+    if (auto a = ctx.aliases.regular.find(name);
+        (w.kinds & K_ALIAS) and a != ctx.aliases.regular.end()) {
       const str& text = a->second.text;
       say(text,
           name + " is " + (a->second.global ? "a global alias" : "an alias") + " for " + text,
@@ -93,40 +152,39 @@ bool whence_one(const str& name, const WhenceOpts& w, ExecContext& ctx) {
           "alias");
       if (not w.all) return true;
     }
-    if (is_reserved(name)) {
+    if ((w.kinds & K_RESERVED) and is_reserved(name)) {
       say(name, name + " is a reserved word", name + ": shell reserved word", "reserved");
       if (not w.all) return true;
     }
     auto fn = ctx.functions.find(name);
-    if (fn != ctx.functions.end() or ctx.autoloads.contains(name)) {
+    if ((w.kinds & K_FUNCTION) and (fn != ctx.functions.end() or ctx.autoloads.contains(name))) {
       str file;
       if (auto f = ctx.function_files.find(name); f != ctx.function_files.end()) file = f->second;
       str def = fn != ctx.functions.end() ? function_text(name, *fn->second)
-                                          : name + " () {\n\t# undefined\n\tbuiltin autoload -XU\n}";
+                                          : name + " () {\n\t# undefined\n\t"
+                                                + autoload_stub_body(ctx, name) + "\n}";
       str verbose = fn != ctx.functions.end()
                   ? name + " is a shell function" + (file.empty() ? str{} : " from " + file)
                   : name + " is an autoload shell function";
-      if (w.func_body and w.style == Style::Verbose) verbose += "\n" + def;
+      // -f shows the definition alone, -v or not (zsh's printshfuncexpand).
+      if (w.func_body and w.style == Style::Verbose) verbose = def;
       say(w.func_body ? def : name, verbose, def, "function");
       if (not w.all) return true;
     }
-    if (ctx.executor->is_builtin(name)) {
+    if ((w.kinds & K_BUILTIN) and ctx.executor->is_builtin(name)) {
       say(name, name + " is a shell builtin", name + ": shell built-in command", "builtin");
       if (not w.all) return true;
     }
   }
   vec<str> paths;
-  if (w.all) {
-    paths = all_in_path(ctx, name);
-  } else if (auto p = ctx.executor->find_command(name); p and is_executable(*p)) {
-    paths.push_back(*p);
+  if (w.kinds & K_COMMAND) {
+    if (w.all) paths = all_in_path(ctx, name);
+    else if (auto p = ctx.executor->find_command(name); p and is_executable(*p))
+      paths.push_back(*p);
   }
   for (const auto& p : paths) {
     str shown = p;
-    if (w.symlinks) {
-      str real = resolve_links(p);
-      if (real != p) shown = p + " -> " + real;
-    }
+    if (w.symlinks) shown = p + link_suffix(p, w.link_steps);
     say(shown, name + " is " + shown, shown, "command");
   }
   if (not found) {
@@ -146,22 +204,38 @@ int whence_common(vec<str>& args, ExecContext& ctx, WhenceOpts w) {
   if (o.has('p')) w.path_only = true;
   if (o.has('f')) w.func_body = true;
   if (o.has('s') or o.has('S')) w.symlinks = true;
+  w.link_steps = o.has('S');
+  if (o.next >= args.size()) return 1;
   int rc = 0;
   for (s::size_t i = o.next; i < args.size(); ++i) {
     if (o.has('m')) {
-      // -m: patterns over aliases, functions, builtins and $PATH commands.
+      // -m: patterns over each table in turn, as zsh's bin_whence:
+      // aliases, reserved words, functions, builtins, then the commands.
       auto pat = CompiledPattern::compile(args[i]);
-      vec<str> names;
-      for (const auto& [n, _] : ctx.aliases.regular) names.push_back(n);
-      for (const auto& [n, _] : ctx.functions) names.push_back(n);
-      for (const auto& n : ctx.executor->builtin_names()) names.push_back(n);
-      ctx.executor->fill_command_hash();
-      for (const auto& [n, _] : ctx.executor->command_hash()) names.push_back(n);
-      s::sort(names.begin(), names.end());
-      names.erase(s::unique(names.begin(), names.end()), names.end());
       bool any = false;
-      for (const auto& n : names)
-        if (pat.matches(n)) any = whence_one(n, w, ctx) or any;
+      auto scan = [&](unsigned kind, vec<str> names) {
+        s::sort(names.begin(), names.end());
+        WhenceOpts one = w;
+        one.kinds = kind;
+        one.all = false;
+        for (const auto& n : names)
+          if (pat.matches(n)) any = whence_one(n, one, ctx) or any;
+      };
+      if (not w.path_only) {
+        vec<str> names;
+        for (const auto& [n, _] : ctx.aliases.regular) names.push_back(n);
+        scan(K_ALIAS, s::move(names));
+        scan(K_RESERVED, vec<str>(s::begin(RESERVED), s::end(RESERVED)));
+        names.clear();
+        for (const auto& [n, _] : ctx.functions) names.push_back(n);
+        for (const auto& [n, _] : ctx.autoloads) names.push_back(n);
+        scan(K_FUNCTION, s::move(names));
+        scan(K_BUILTIN, ctx.executor->builtin_names());
+      }
+      ctx.executor->fill_command_hash();
+      vec<str> names;
+      for (const auto& [n, _] : ctx.executor->command_hash()) names.push_back(n);
+      scan(K_COMMAND, s::move(names));
       if (not any) rc = 1;
       continue;
     }
@@ -202,7 +276,7 @@ int builtin_command(vec<str>& args, ExecContext& ctx) {
   OptParse o;
   if (not parse_options(args, "pvV", "", o)) return 1;
   vec<str> rest(args.begin() + static_cast<s::ptrdiff_t>(o.next), args.end());
-  if (rest.empty()) return 0;
+  if (rest.empty()) return o.has('v') or o.has('V') ? 1 : 0;
   if (o.has('v') or o.has('V')) {
     WhenceOpts w;
     if (o.has('V')) w.style = Style::Verbose;
@@ -288,63 +362,77 @@ int builtin_rehash(vec<str>& args, ExecContext& ctx) {
 }
 
 // alias [-gLmrs] [name[=value] …]: defines aliases (-g global, -s suffix)
-// or lists them.
+// or lists them, as zsh's bin_alias: -L lists them as commands (and with
+// `name=value` just looks name up), -r/-g/-s pick one kind.
 int builtin_alias(vec<str>& args, ExecContext& ctx) {
+  strv cmd = args[0];
   OptParse o;
   if (not parse_options(args, "gLmrs", "", o, true)) return 1;
   bool global = o.has('g'), suffix = o.has('s'), regular_only = o.has('r');
+  if (static_cast<int>(global) + static_cast<int>(suffix) + static_cast<int>(regular_only) > 1)
+    return builtin_error(cmd, "illegal combination of options");
   bool as_command = o.has('L');
   auto& regular = ctx.aliases.regular;
   auto& suffixes = ctx.aliases.suffix;
   auto list = [&](const func<bool(const str&)>& want) {
-    if (not suffix) {
-      vec<str> names;
-      for (const auto& [n, a] : regular) {
-        if (global and not a.global) continue;
-        if (regular_only and a.global) continue;
-        if (want(n)) names.push_back(n);
-      }
-      s::sort(names.begin(), names.end());
-      for (const auto& n : names)
-        print_alias(n, regular[n].text, regular[n].global ? 'g' : 0, as_command);
-    }
-    if (suffix or (not global and not regular_only and as_command)) {
+    if (suffix) {
       vec<str> names;
       for (const auto& [n, _] : suffixes)
         if (want(n)) names.push_back(n);
       s::sort(names.begin(), names.end());
       for (const auto& n : names) print_alias(n, suffixes[n], 's', as_command);
+      return;
     }
+    vec<str> names;
+    for (const auto& [n, a] : regular) {
+      if (global and not a.global) continue;
+      if (regular_only and a.global) continue;
+      if (want(n)) names.push_back(n);
+    }
+    s::sort(names.begin(), names.end());
+    for (const auto& n : names)
+      print_alias(n, regular[n].text, regular[n].global ? 'g' : 0, as_command);
   };
   if (o.next >= args.size()) {
     list([](const str&) { return true; });
     return 0;
   }
+  if (o.has('m')) {
+    for (s::size_t i = o.next; i < args.size(); ++i) {
+      auto pat = CompiledPattern::compile(args[i]);
+      list([&](const str& n) { return pat.matches(n); });
+    }
+    return 0;
+  }
   int rc = 0;
   for (s::size_t i = o.next; i < args.size(); ++i) {
     const str& a = args[i];
-    if (o.has('m')) {
-      auto pat = CompiledPattern::compile(a);
-      list([&](const str& n) { return pat.matches(n); });
-      continue;
-    }
     auto eq = a.find('=');
-    if (eq == str::npos or eq == 0) {
-      // `alias name`: show it.
-      if (suffix) {
-        if (auto it = suffixes.find(a); it != suffixes.end()) print_alias(a, it->second, 's', as_command);
-        else rc = 1;
-      } else if (auto it = regular.find(a); it != regular.end()) {
-        print_alias(a, it->second.text, it->second.global ? 'g' : 0, as_command);
-      } else {
-        rc = 1;
-      }
-      continue;
+    // `=x`: zsh's getasg has no name to give (a zerr: the line ends).
+    if (eq == 0) {
+      s::fprintf(stderr, "jfsh: bad assignment\n");
+      ctx.aborting = true;
+      return rc;
     }
     str name = a.substr(0, eq);
-    str text = a.substr(eq + 1);
-    if (suffix) suffixes[name] = s::move(text);
-    else        regular[name] = AliasDef{s::move(text), global};
+    if (eq != str::npos and not as_command) {
+      str text = a.substr(eq + 1);
+      if (suffix) suffixes[name] = s::move(text);
+      else        regular[name] = AliasDef{s::move(text), global};
+      continue;
+    }
+    // `alias name`: show it, if it is of the kind asked for.
+    if (suffix) {
+      if (auto it = suffixes.find(name); it != suffixes.end())
+        print_alias(name, it->second, 's', as_command);
+      else rc = 1;
+    } else if (auto it = regular.find(name); it != regular.end()) {
+      if ((not global and not regular_only) or (global and it->second.global)
+          or (regular_only and not it->second.global))
+        print_alias(name, it->second.text, it->second.global ? 'g' : 0, as_command);
+    } else {
+      rc = 1;
+    }
   }
   return rc;
 }

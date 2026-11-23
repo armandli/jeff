@@ -56,6 +56,11 @@ protected:
   s::size_t emit(WordCode w);
   s::size_t emit_str(str s);
   void        patch(s::size_t addr, WordCode w) { mProg->prog[addr] = w; }
+  // Drops the code emitted from `addr` on (zsh's `ecused--`).
+  void        truncate(s::size_t addr) {
+    mProg->prog.resize(addr);
+    mProg->line_map.resize(addr);
+  }
 
   bool par_list();
   bool par_list1();
@@ -161,6 +166,10 @@ private:
   CompiledProgram* mProg = nullptr;
   const AliasTable* mAliases = nullptr;
   bool             mLineMode = false;   // parse_line: stop at a newline
+  // The command just parsed was null: a `nocorrect` with no command after
+  // it, which zsh's par_simple returns as nothing (no code, no error), for
+  // the pipeline, sublist and list around it to decide.
+  bool             mNull = false;
   vec<s::size_t> mPendingHeredocs;   // strs indices awaiting bodies
   // Redirections at [mid, end) that go in front of the command at start.
   struct RedirMove {

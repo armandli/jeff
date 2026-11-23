@@ -177,8 +177,9 @@ struct ExecContext {
   // Where each function was defined: the script or sourced file, or the
   // shell's name ($0) for one typed in (`whence -v`).
   HashTable<str>     function_files{};
-  // `autoload name`: loaded from $fpath when first called.
-  uset<str>          autoloads{};
+  // `autoload name`: loaded from $fpath when first called; name → the
+  // flags it was marked with (zsh's "UtTkzc" letters, in that order).
+  HashTable<str>     autoloads{};
   // `disable name`, `disable -f name`: skipped when commands are looked up.
   uset<str>          disabled_builtins{};
   uset<str>          disabled_functions{};
@@ -222,6 +223,24 @@ struct ExecContext {
   bool        hist_current = false;
   LoopState   loop{};
 };
+
+// The body `functions` and `whence` show for an autoload function not yet
+// loaded, as zsh's: `builtin autoload -X` and the flags it was marked
+// with and the directory it was named in (just U and t for $functions,
+// `full` false).
+inline str autoload_stub_body(const ExecContext& ctx, const str& name, bool full = true) {
+  str flags;
+  if (auto f = ctx.autoloads.find(name); f != ctx.autoloads.end()) flags = f->second;
+  if (not full) {
+    s::erase_if(flags, [](char c) { return c != 'U' and c != 't'; });
+    return "builtin autoload -X" + flags;
+  }
+  // The directory it was named in (`autoload /dir/name`, zsh's PM_LOADDIR).
+  str dir;
+  if (auto p = ctx.function_files.find(name); p != ctx.function_files.end())
+    dir = " " + p->second.substr(0, p->second.rfind('/'));
+  return "builtin autoload -X" + flags + dir;
+}
 
 // Pushes a $funcstack frame for `name` while it lives.
 struct FuncFrame {
@@ -311,8 +330,12 @@ struct Executor {
   // Parses and runs `src`.  By default the whole text is parsed first, as
   // for `-c` and `eval`; `by_line` parses and runs one line at a time, as
   // for scripts and sourced files, so an alias defined on one line is
-  // used on the next.
-  int exec_string(strv src, bool by_line = false);
+  // used on the next; `first_line` numbers its first line ($LINENO).
+  int exec_string(strv src, bool by_line = false, int first_line = 1);
+  // A `return` ended the outermost string (a script's top level); cleared
+  // when read.  Lets a script read from standard input a chunk at a time
+  // stop there.
+  bool take_top_return() noexcept { return s::exchange(mTopReturn, false); }
   // Parses `src` as exec_string would, without running it.
   Result<ProgRef> parse_string(strv src);
   void            report_parse_error(const ShellError& e);
@@ -329,7 +352,9 @@ struct Executor {
   // and $0 call it.
   int source_file(const str& path, const vec<str>& args, const str& name);
   // Defines autoloaded function `name` from the first file of that name
-  // in $fpath.  Prints why and returns false when it can't.
+  // in $fpath.  Prints why and returns false when it can't.  A ksh-style
+  // file becomes a body that, once run, calls what it defined
+  // (CompiledProgram::run_after, zsh's EF_RUN).
   bool load_autoload(const str& name);
   // Runs `args` as an external command, bypassing functions and builtins
   // (`command`), in the shell's current fds.
@@ -643,6 +668,7 @@ private:
   bool           mReturnAfterCommand = false;   // see exec_simple
   bool           mSelfSignal  = false;   // handle_signals after `kill` to the shell
   bool           mParseFailed = false;   // exec_string hit a parse error (source)
+  bool           mTopReturn   = false;   // see take_top_return
   // In a forked foreground pipeline stage, until its command starts: a
   // `( … )` there is reset as a subshell (exec_subsh).
   bool           mStageChild = false;

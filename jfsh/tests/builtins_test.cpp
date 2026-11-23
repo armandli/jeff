@@ -605,7 +605,8 @@ TEST(Alias, ListingAndUnalias) {
   sh.run("alias q=\"it's\" r='a b'; alias -g G=x; alias -s txt=cat");
   EXPECT_EQ(out(sh, "alias"), "G=x\nq='it'\\''s'\nr='a b'\n");
   EXPECT_EQ(out(sh, "alias -g; alias -s"), "G=x\ntxt=cat\n");
-  EXPECT_EQ(out(sh, "alias -L"), "alias -g G=x\nalias q='it'\\''s'\nalias r='a b'\nalias -s txt=cat\n");
+  // zsh's alias -L lists the regular and global aliases, not the suffix ones.
+  EXPECT_EQ(out(sh, "alias -L"), "alias -g G=x\nalias q='it'\\''s'\nalias r='a b'\n");
   EXPECT_EQ(out(sh, "alias q; alias -m 'r*'"), "q='it'\\''s'\nr='a b'\n");
   EXPECT_EQ(sh.run("alias nosuch").rc, 1);
   // Quoted: a global alias expands anywhere, in unalias's arguments too.
@@ -684,7 +685,7 @@ TEST(Umask, OctalAndSymbolic) {
   EXPECT_EQ(out(sh, "umask; umask -S"), "022\nu=rwx,g=rx,o=rx\n");
   EXPECT_EQ(out(sh, "umask 027; umask; umask -S"), "027\nu=rwx,g=rx,o=\n");
   EXPECT_EQ(out(sh, "umask u=rwx,g=rx,o=; umask; umask g+w; umask; umask a-x; umask"),
-            "027\n007\n117\n");
+            "027\n007\n0117\n");
   auto r = sh.run("umask 99");
   EXPECT_EQ(r.err, "jfsh: umask: bad umask\n");
   EXPECT_EQ(r.rc, 1);
@@ -754,7 +755,7 @@ TEST(Autoload, LoadsFromFpath) {
   t.file("af", "echo body-of-af \"$@\"\n", RW);
   t.file("kf", "kf() { echo ksh-style $1; }\n", RW);
   EXPECT_EQ(out(sh, "fpath=(" + d + "); autoload af kf; functions af"),
-            "af () {\n\t# undefined\n\tbuiltin autoload -XU\n}\n");
+            "af () {\n\t# undefined\n\tbuiltin autoload -X\n}\n");
   EXPECT_EQ(out(sh, "af 1 2; kf 3; kf 4"), "body-of-af 1 2\nksh-style 3\nksh-style 4\n");
   EXPECT_EQ(out(sh, "whence -v af"), "af is a shell function from " + d + "/af\n");
   EXPECT_EQ(out(sh, "functions af"), "af () {\n\techo body-of-af \"$@\"\n}\n");
@@ -790,9 +791,10 @@ TEST(History, ListsAndReruns) {
   EXPECT_EQ(out(sh, "fc -s a=Z 1"), "echo Z\nZ\n");
   EXPECT_EQ(out(sh, "r b=B echo"), "echo Z\nZ\n");   // the latest `echo …` is now `echo Z`
   EXPECT_EQ(out(sh, "fc -e - 2"), "echo b\nb\n");
-  EXPECT_EQ(sh.run("fc -l 99").err, "jfsh: fc: event not found: 99\n");
+  EXPECT_EQ(sh.run("fc -l 99").err, "jfsh: fc: no such event: 99\n");
   sh.ctx.history = nullptr;
-  EXPECT_EQ(sh.run("history").err, "jfsh: history: no history\n");
+  // As zsh -c, whose history is empty.
+  EXPECT_EQ(sh.run("history").err, "jfsh: fc: no such event: 1\n");
 }
 
 // ---- builtins that need later milestones ---------------------------------------
@@ -903,6 +905,641 @@ TEST(Builtins15c, ArgvIsThePositionalParameters) {
   Shell sh;
   EXPECT_EQ(out(sh, "argv=(--x a b); argv[(r)--x]=(); echo $argv $#"),
             "a b 2\n");
+}
+
+// ---- M7 review ---------------------------------------------------------------
+
+TEST(BuiltinsM7Review, BuiltinsAsZshC) {
+  // Expected stdout and stderr from zsh 5.9 -f -c (stable over three runs),
+  // its "zsh:cmd:1: msg" as "jfsh: cmd: msg".  Each runs in a fresh shell;
+  // the directory ones in a subshell of a scratch directory.
+  struct Case {
+    const char* script;
+    const char* out;
+    const char* err;
+  };
+  const Case cases[] = {
+    {"typeset -a x; typeset -p x; typeset -A h; typeset -p h",
+     "typeset -a x=(  )\ntypeset -A h=( )\n",
+     ""},
+    {"x=1; typeset x; typeset -a y=(1 2); typeset y",
+     "x=1\ny=( 1 2 )\n",
+     ""},
+    {"f() { typeset -g g=1; local l=2; typeset -p g l; }; f",
+     "typeset -g g=1\ntypeset l=2\n",
+     ""},
+    {"typeset -xr x=5; typeset -p x; typeset -ir i=5; typeset -p i",
+     "export -r x=5\ntypeset -ir i=5\n",
+     ""},
+    {"typeset -i 16 n=255; typeset -p n; typeset -lu c=Ab; typeset"
+     " -p c",
+     "typeset -i16 n=255\ntypeset c=Ab\n",
+     ""},
+    {"typeset -a a=(1 '' 'x y'); typeset -p1 a",
+     "typeset -a a=(\n  1\n  ''\n  'x y'\n)\n",
+     ""},
+    {"typeset x=$'\\e[0m'; typeset -p x; typeset y=$'a\\x80b'; types"
+     "et -p y",
+     "typeset x=$'\\C-[[0m'\ntypeset y=$'a\\M-\\C-@b'\n",
+     ""},
+    {"typeset x=1; typeset -a x; typeset -p x; typeset -a y=(1); t"
+     "ypeset +a y; typeset -p y",
+     "typeset -a x=(  )\ntypeset y=''\n",
+     ""},
+    {"readonly r=1; typeset +r r; r=2; echo $r",
+     "2\n",
+     ""},
+    {"typeset x+=a; echo after",
+     "",
+     "jfsh: typeset: not valid in this context: x+\n"},
+    {"typeset -a arr; typeset arr+=(1); echo after",
+     "",
+     "jfsh: typeset: not valid in this context: arr+\n"},
+    {"typeset -A h=(a); echo after",
+     "",
+     "jfsh: bad set of key/value pairs for associative array\n"},
+    {"f() { local x=1; unset x; typeset -p x; echo st $?; }; f",
+     "st 0\n",
+     ""},
+    {"typeset -p HISTCMD; echo st $?",
+     "st 0\n",
+     ""},
+    {"typeset -z; echo st $?",
+     "st 0\n",
+     ""},
+    {"export -n x; echo st $?",
+     "st 1\n",
+     "jfsh: export: bad option: -n\n"},
+    {"abc=1 abd=2; typeset -m 'ab*'",
+     "abc=1\nabd=2\n",
+     ""},
+    {"unset; echo st $?",
+     "st 1\n",
+     "jfsh: unset: not enough arguments\n"},
+    {"unset 1x; echo after",
+     "",
+     "jfsh: unset: 1x: invalid parameter name\n"},
+    {"readonly r=1; unset r; echo after",
+     "",
+     "jfsh: read-only variable: r\n"},
+    {"set -o nosuch; echo after",
+     "",
+     "jfsh: set: no such option: nosuch\n"},
+    {"set -Q; echo after",
+     "after\n",
+     ""},
+    {"set -n; echo not run",
+     "",
+     ""},
+    {"unsetopt exec; echo not run",
+     "",
+     ""},
+    {"echo -e -E 'a\\tb'; echo -E -e 'a\\tb'; echo - - a",
+     "a\tb\na\tb\n- a\n",
+     ""},
+    {"echo '\\E|\\q|\\101|\\0101|\\x41'",
+     "\\E|\\q|\\101|A|A\n",
+     ""},
+    {"print '\\E|\\q|\\101|\\0101|\\M-a|\\C-a|\\C-?|\\x41|\\08' | od -An -c",
+     "         033   |   q   |   A   |  \\b   1   | 341   | 001   |"
+     " 177   |   A\n           |  \\0   8  \\n                       "
+     "                         \n\n",
+     ""},
+    {"print 'a\\c' b; echo",
+     "a\n",
+     ""},
+    {"print -n -l a 'b\\c' c; echo",
+     "a\nb\n",
+     ""},
+    {"print -v 1x a; echo after",
+     "",
+     "jfsh: not an identifier: 1x\n"},
+    {"print -lv x a b; echo \"[$x]\"",
+     "[a\nb\n]\n",
+     ""},
+    {"print -u 9 x; echo st $?",
+     "st 1\n",
+     "jfsh: print: bad file number: 9\n"},
+    {"print -p x; echo st $?",
+     "st 1\n",
+     "jfsh: print: -p: no coprocess\n"},
+    {"print -C 0 a; echo st $?; print -C x a; echo st $?",
+     "st 1\nst 1\n",
+     "jfsh: print: invalid number of columns: 0\njfsh: print: numbe"
+     "r expected after -C: x\n"},
+    {"print -C 2 -a a b c | sed 's/$/|/'",
+     "a  b|\nc  |\n",
+     ""},
+    {"print -c a b c",
+     "a\nb\nc\n",
+     ""},
+    {"print -x 0 a; echo st $?",
+     "st 1\n",
+     "jfsh: print: positive integer expected after -x: 0\n"},
+    {"printf '%q\\n' 'a b' \"it's\" '' $'\\n' $'\\t' $'\\e' '*' '$x' '~a"
+     "' 'a~' 'a=b' '=a' '!'",
+     "a\\ b\nit\\'s\n''\n$'\\n'\n$'\\t'\n$'\\033'\n\\*\n\\$x\n\\~a\na~\na=b\n\\=a\n!\n",
+     ""},
+    {"printf '%q\\n' $'\\x80' $'\\x01'",
+     "$'\\200'\n$'\\001'\n",
+     ""},
+    {"printf '%c|%5c|%c|\\n' abc x '' | od -An -c",
+     "           a   |                   x   |  \\0   |  \\n        "
+     "            \n\n",
+     ""},
+    {"printf '%5.2s|%-4s|\\n' éèà ab",
+     "   éè|ab  |\n",
+     ""},
+    {"printf '%2$s\\n' a; echo st $?",
+     "st 1\n",
+     "jfsh: printf: 2: argument specifier out of range\n"},
+    {"printf '%0$s\\n' a; echo st $?",
+     "st 1\n",
+     "jfsh: printf: %0$: invalid directive\n"},
+    {"printf '%ld %lld\\n' 1 2; echo st $?",
+     "1 st 1\n",
+     "jfsh: printf: %ll: invalid directive\n"},
+    {"printf '%5'; echo st $?",
+     "st 1\n",
+     "jfsh: printf: %5: invalid directive\n"},
+    {"printf '%a\\n' 1; echo st $?",
+     "st 1\n",
+     "jfsh: printf: %a: invalid directive\n"},
+    {"printf '%d\\n' 12abc; echo st $?",
+     "0\nst 1\n",
+     "jfsh: bad math expression: operator expected at `abc'\n"},
+    {"printf '%b|\\n' '\\101|\\0101|\\q|\\E'",
+     "\\101|A|\\q|\\E|\n",
+     ""},
+    {"echo 'a,b,,' | IFS=, read -A arr; typeset -p arr",
+     "typeset -a arr=( a b '' '' )\n",
+     ""},
+    {"echo '' | read -A arr; typeset -p arr",
+     "typeset -a arr=( '' )\n",
+     ""},
+    {"echo ' a  b ' | read -A arr; typeset -p arr",
+     "typeset -a arr=( a b '' )\n",
+     ""},
+    {"printf 'a \\\\ \\n' | read x y; echo \"[$x][$y]\"",
+     "[a][]\n",
+     ""},
+    {"echo 'a::b' | IFS=: read x y; echo \"[$x][$y]\"",
+     "[a][:b]\n",
+     ""},
+    {"echo 'a b' | read -A x y; echo st $?",
+     "st 1\n",
+     "jfsh: read: only one array argument allowed\n"},
+    {"read -k x </dev/null; echo st $?",
+     "st 1\n",
+     "not interactive and can't open terminal\n"},
+    {"( mkdir -p d/a; cd d; cd -x; echo st $?; mkdir -- -x; cd -x;"
+     " echo ${PWD##*/} )",
+     "st 1\n-x\n",
+     "jfsh: cd: no such file or directory: -x\n"},
+    {"( mkdir -p d/a; cd d; chpwd() { echo hook ${PWD##*/}; }; cd "
+     "a; cd .; cd -q ..; echo ${PWD##*/} )",
+     "hook a\nhook a\nd\n",
+     ""},
+    {"( mkdir -p d/a; cd d; chpwd_functions=(f); f() { echo f; }; "
+     "cd a )",
+     "f\n",
+     ""},
+    {"( mkdir -p d/a d/b; cd d; dirstack=($PWD/a $PWD/b); dirs -lv"
+     " | sed 's#/.*/##'; popd >/dev/null; echo ${PWD##*/} )",
+     "0\td\n1\ta\n2\tb\na\n",
+     ""},
+    {"( mkdir -p d; cd d; pushd; echo st $? )",
+     "st 0\n",
+     ""},
+    {"( mkdir -p d/a; cd d; setopt autopushd pushdignoredups; cd a"
+     "; cd ..; cd a; cd ..; print -l $dirstack | sed 's#.*/##' )",
+     "a\n",
+     ""},
+    {"( mkdir -p d/a d/b d/c; cd d; DIRSTACKSIZE=2; pushd a >/dev/"
+     "null; pushd ../b >/dev/null; pushd ../c >/dev/null; print -l"
+     " $dirstack | sed 's#.*/##' )",
+     "b\n",
+     ""},
+    {"( mkdir -p d/x/sub; cd d; setopt posixcd; cdpath=($PWD/x); c"
+     "d sub | sed 's#.*/##' )",
+     "sub\n",
+     ""},
+    {"pwd a; echo st $?",
+     "st 1\n",
+     "jfsh: pwd: too many arguments\n"},
+    {"eval -- echo x",
+     "x\n",
+     ""},
+    {"eval 'return 5'; echo after",
+     "",
+     ""},
+    {"f() { eval 'return 5'; echo no; }; f; echo $?",
+     "5\n",
+     ""},
+    {". /dev/null; echo st $?",
+     "st 0\n",
+     ""},
+    {"autoload foo; autoload -Uz bar; functions foo bar",
+     "foo () {\n\t# undefined\n\tbuiltin autoload -X\n}\nbar () {\n\t# und"
+     "efined\n\tbuiltin autoload -XUz\n}\n",
+     ""},
+    {"autoload -X; echo after",
+     "",
+     "jfsh: autoload: bad autoload\n"},
+    {"f() { autoload -X; }; f 2>/dev/null; echo st $?",
+     "st 1\n",
+     ""},
+    {"f() { echo a; }; functions -x 2 f; functions -x0 f",
+     "f () {\n  echo a\n}\nf () {\necho a\n}\n",
+     ""},
+    {"whence -v typeset in; whence -w end always",
+     "typeset is a reserved word\nin not found\nend: reserved\nalways"
+     ": none\n",
+     ""},
+    {"f() { :; }; whence -vf f",
+     "f () {\n\t:\n}\n",
+     ""},
+    {"whence; echo st $?; command -v; echo st $?",
+     "st 1\nst 1\n",
+     ""},
+    {"command -x; echo st $?",
+     "st 127\n",
+     "jfsh: command not found: -x\n"},
+    {"alias -L a=b c; echo st $?; alias a",
+     "st 1\n",
+     ""},
+    {"alias -gs a=b; echo st $?",
+     "st 1\n",
+     "jfsh: alias: illegal combination of options\n"},
+    {"alias -s txt=cat; alias -L a1 txt; alias a1=b '=x=1'; echo a"
+     "fter",
+     "",
+     "jfsh: bad assignment\n"},
+    {"( ulimit -c 0 -n 256; ulimit -c -n; ulimit -c hard; ulimit -"
+     "c soft; echo st $? )",
+     "-c: core file size (blocks)         0\n-n: file descriptors  "
+     "              256\nst 1\n",
+     "jfsh: ulimit: invalid number: soft\n"},
+    {"ulimit -a -c; echo st $?",
+     "st 1\n",
+     "jfsh: ulimit: no limits allowed with -a\n"},
+    {"ulimit -N 4 -N4 | wc -l | tr -d ' '; ulimit -N 0 -t -N 0 | w"
+     "c -l | tr -d ' '",
+     "1\n1\n",
+     ""},
+    {"( umask 022; umask a-w; umask; umask =; umask; umask 0; umas"
+     "k )",
+     "0222\n0777\n000\n",
+     ""},
+    {"( umask u=q; echo st $?; umask abc; echo st $?; umask 1 2; e"
+     "cho st $?; umask -x; echo st $? )",
+     "st 1\nst 1\nst 1\nst 1\n",
+     "jfsh: umask: bad symbolic mode permission: q\njfsh: umask: ba"
+     "d symbolic mode operator: b\njfsh: umask: too many arguments\n"
+     "jfsh: umask: bad option: -x\n"},
+    {"times x; echo st $?",
+     "st 1\n",
+     "jfsh: times: too many arguments\n"},
+    {"history; echo st $?",
+     "st 1\n",
+     "jfsh: fc: no such event: 1\n"},
+    {"fc -W /dev/null; echo st $?",
+     "st 0\n",
+     ""},
+    {"( mkdir b; ln -s /bin/ls b/l; ln -s l b/m; PATH=$PWD/b:$PATH"
+     "; whence -S m | sed \"s#$PWD#P#g\"; whence -s m | sed \"s#$PWD#"
+     "P#g\" )",
+     "P/b/m -> P/b/l -> /bin/ls\nP/b/m -> /bin/ls\n",
+     ""},
+    {"( mkdir b c; ln -s /bin/ls c/l; ln -s ../c/l b/m; PATH=$PWD/"
+     "b:$PATH; whence -S m | sed \"s#$PWD#P#g\" )",
+     "P/b/m -> P/b/../c/l -> /bin/ls\n",
+     ""},
+    {"whence -S ls; whence -s ls",
+     "/bin/ls\n/bin/ls -> /bin/ls\n",
+     ""},
+    {"f() { autoload -X x; echo rc $?; }; f 2>/dev/null; echo next",
+     "rc 1\nnext\n",
+     ""},
+    {"f() { autoload -X a b; echo rc $?; }; f 2>/dev/null; echo ne"
+     "xt",
+     "rc 1\nnext\n",
+     ""},
+    {"( mkdir fd; echo 'echo from dir $1' > fd/f; f() { autoload -"
+     "X $PWD/fd; }; f a; echo next )",
+     "from dir a\nnext\n",
+     ""},
+    {"set -o nosuch -o >/dev/null; echo rc $?; echo next",
+     "",
+     "jfsh: set: no such option: nosuch\n"},
+    {"set +o nosuch -o | head -2",
+     "set +o noaliases\nset +o aliasfuncdef\n",
+     "jfsh: set: no such option: nosuch\n"},
+    {"a=(1); set +A | grep \"^a\"",
+     "a\nargv\n",
+     ""},
+    {"print -cv v a b; echo \"[$v]\"",
+     "[a\nb\n]\n",
+     ""},
+    {"print -C2 -v w a b c; echo \"[$w]\"",
+     "[a  c\nb\n]\n",
+     ""},
+    {"command - echo hi; echo $?",
+     "127\n",
+     "jfsh: command not found: -\n"},
+    {"command nocorrect echo hi; echo $?",
+     "127\n",
+     "jfsh: command not found: nocorrect\n"},
+    {"unset -m \"nosuch*\"; echo $?",
+     "1\n",
+     ""},
+    {"x=1; unset -m \"x*\" \"nosuch*\"; echo $?",
+     "0\n",
+     ""},
+    {"read -E b c <<< \"x y\"; echo \"[$b][$c]\"",
+     "x\ny\n[x][y]\n",
+     ""},
+    {"read -e b c <<< \"x y  z\"; echo \"[$b][$c]\"",
+     "x\ny  z\n[][]\n",
+     ""},
+    {"read -E -A a <<< \"x y\"; echo ${#a}",
+     "x\ny\n2\n",
+     ""},
+    {"r; echo rc $?",
+     "rc 1\n",
+     "jfsh: fc: current history line would recurse endlessly, abor"
+     "ted\n"},
+    {"r foo; history 5; fc -l 3 4",
+     "",
+     "jfsh: fc: event not found: foo\njfsh: fc: no such event: 5\njf"
+     "sh: fc: no events in that range\n"},
+    {"autoload -U g; autoload g; functions g",
+     "g () {\n\t# undefined\n\tbuiltin autoload -XU\n}\n",
+     ""},
+    {"autoload -Uz g; autoload +U g; functions g",
+     "g () {\n\t# undefined\n\tbuiltin autoload -Xz\n}\n",
+     ""},
+    {"autoload -U g; autoload -z g; functions g",
+     "g () {\n\t# undefined\n\tbuiltin autoload -XUz\n}\n",
+     ""},
+    {"autoload -z g; autoload -k g; functions g",
+     "g () {\n\t# undefined\n\tbuiltin autoload -Xk\n}\n",
+     ""},
+    {"fc -l -1; fc -l -3 -2; fc -l 0 0; fc -l 3 3; fc -l -0; fc -l"
+     " 3 4",
+     "",
+     "jfsh: fc: no such event: 0\njfsh: fc: no such event: 0\njfsh: "
+     "fc: no such event: 0\njfsh: fc: no such event: 3\njfsh: fc: ev"
+     "ent not found: -0\njfsh: fc: no events in that range\n"},
+    {"setopt posixbuiltins; command nocorrect echo hi; echo $?",
+     "127\n",
+     "jfsh: command not found: nocorrect\n"},
+    {"noglob nocorrect echo hi; echo $?",
+     "127\n",
+     "jfsh: command not found: nocorrect\n"},
+    {"readonly zzr=1; unset -m \"zz*\"; echo rc $?",
+     "",
+     "jfsh: read-only variable: zzr\n"},
+    {"g() { autoload -X; }; g 2>/dev/null; functions g",
+     "g () {\n\t# undefined\n\tbuiltin autoload -X\n}\n",
+     ""},
+    {"nocorrect nocorrect echo hi; echo $?",
+     "hi\n0\n",
+     ""},
+    {"nocorrect x=1; echo $x",
+     "1\n",
+     ""},
+    {"x=1 nocorrect y=2; echo $x $y",
+     "1 2\n",
+     ""},
+    {"autoload -kz g; echo $?",
+     "1\n",
+     "jfsh: autoload: invalid option(s)\n"},
+    {"( mkdir d; print 'echo outer; g() { echo inner }' > d/g; fpa"
+     "th=($PWD/d); autoload -k g; g; g )",
+     "outer\ninner\ninner\n",
+     ""},
+    {"( mkdir d; print 'echo outer; g() { echo inner }' > d/g; fpa"
+     "th=($PWD/d); setopt kshautoload; autoload -z g; g; g )",
+     "outer\ninner\n",
+     ""},
+    {"( mkdir d; print 'echo outer; g() { echo inner }' > d/g; fpa"
+     "th=($PWD/d); autoload g; g; g )",
+     "outer\ninner\n",
+     ""},
+    {"( mkdir d; print 'foo' > d/g; fpath=($PWD/d); alias foo='ech"
+     "o aliased'; autoload -U g; g 2>/dev/null; echo st $? )",
+     "st 127\n",
+     ""},
+    {"( mkdir d; print 'foo' > d/g; fpath=($PWD/d); alias foo='ech"
+     "o aliased'; autoload g; g )",
+     "aliased\n",
+     ""},
+    {"( mkdir d; print 'echo body' > d/g; fpath=($PWD/d); function"
+     "s -u g; g )",
+     "body\n",
+     ""},
+    {"autoload -U g h; unfunction -m 'g*'; functions",
+     "h () {\n\t# undefined\n\tbuiltin autoload -XU\n}\n",
+     ""},
+    {"autoload -U g h; unset -fm 'g*'; functions",
+     "h () {\n\t# undefined\n\tbuiltin autoload -XU\n}\n",
+     ""},
+    {"unfunction -m 'zz*'; echo $?",
+     "1\n",
+     ""},
+    {"autoload -Uz g; disable -f g; functions g; echo $?",
+     "1\n",
+     ""},
+    {"typeset -fu g; echo $?; functions g",
+     "0\ng () {\n\t# undefined\n\tbuiltin autoload -X\n}\n",
+     ""},
+    {"g(){ echo hi }; typeset -fu g; echo $?",
+     "0\n",
+     ""},
+    {"functions -uz g; echo $?; functions g",
+     "0\ng () {\n\t# undefined\n\tbuiltin autoload -Xz\n}\n",
+     ""},
+    {"autoload -U /abs/d/g; functions g",
+     "g () {\n\t# undefined\n\tbuiltin autoload -XU /abs/d\n}\n",
+     ""},
+    {"nocorrect",
+     "",
+     ""},
+    {"echo a; nocorrect",
+     "a\n",
+     ""},
+    {"false; { nocorrect }; echo $?",
+     "0\n",
+     ""},
+    {"false; ( nocorrect ); echo $?",
+     "0\n",
+     ""},
+    {"case a in a) nocorrect;; esac; echo $?",
+     "0\n",
+     ""},
+    {"false; eval nocorrect; echo $?",
+     "0\n",
+     ""},
+    {"if true; then nocorrect fi; echo $?",
+     "0\n",
+     ""},
+    {"for i in 1; do nocorrect done; echo $?",
+     "0\n",
+     ""},
+    {"( mkdir d; print 'echo outer $1 $#; g() { echo inner $1; }' "
+     "> d/g; fpath=($PWD/d); autoload -k g; g x; g y )",
+     "outer x 1\ninner x\ninner y\n",
+     ""},
+    {"( mkdir d; print 'local v=1; g() { echo inner; }' > d/g; fpa"
+     "th=($PWD/d); autoload -k g; g; echo v=$v )",
+     "inner\nv=\n",
+     ""},
+    {"( mkdir d; print 'echo $0; g() { echo inner; }' > d/g; fpath"
+     "=($PWD/d); autoload -k g; g )",
+     "g\ninner\n",
+     ""},
+    {"( mkdir d; print 'return 3; g() { :; }' > d/g; fpath=($PWD/d"
+     "); autoload -k g; g; echo st $?; echo next )",
+     "st 1\nnext\n",
+     "jfsh: g: function not defined by file\n"},
+    {"( mkdir d; print 'echo body $1' > d/g; fpath=($PWD/d); autol"
+     "oad -k g; g x; echo st $?; g y; echo st $? )",
+     "body x\nst 1\nbody y\nst 1\n",
+     "jfsh: g: function not defined by file\njfsh: g: function not "
+     "defined by file\n"},
+    {"( mkdir d; print 'echo outer $1; g() { echo inner $1; }' > d"
+     "/g; fpath=($PWD/d); g() { autoload -X -k; }; g a b )",
+     "outer a\ninner a\n",
+     ""},
+    {"! nocorrect; echo rc $?",
+     "rc 1\n",
+     ""},
+    {"true; ! nocorrect; echo $?",
+     "1\n",
+     ""},
+    {"eval $'[[ -n x ]] && nocorrect\\necho rc $?'",
+     "rc 0\n",
+     ""},
+    {"while nocorrect; do echo x; break; done",
+     "x\n",
+     ""},
+    {"until nocorrect; do echo x; break; done; echo rc $?",
+     "rc 0\n",
+     ""},
+    {"if nocorrect; then echo y; fi",
+     "y\n",
+     ""},
+    {"false && nocorrect; echo rc $?",
+     "rc 1\n",
+     ""},
+    {"eval $'true || nocorrect\\necho rc $?'",
+     "rc 0\n",
+     ""},
+    {"(setopt errexit; false || nocorrect; echo ok); echo st $?",
+     "st 1\n",
+     ""},
+    {"false; nocorrect",
+     "",
+     ""},
+    {"f() { false; nocorrect }; f; echo rc $?",
+     "rc 1\n",
+     ""},
+    {"f() { echo a; nocorrect }; functions f",
+     "f () {\n\techo a\n}\n",
+     ""},
+    {"f() { ! nocorrect; }; functions f",
+     "f () {\n\t!\n}\n",
+     ""},
+    {"eval 'nocorrect; echo a' 2>/dev/null; echo st $?",
+     "st 1\n",
+     ""},
+    {"eval 'echo a | nocorrect' 2>/dev/null; echo st $?",
+     "st 1\n",
+     ""},
+    {"eval 'false && nocorrect && echo z' 2>/dev/null; echo st $?",
+     "st 1\n",
+     ""},
+    {"eval '{ nocorrect; }' 2>/dev/null; echo st $?",
+     "st 1\n",
+     ""},
+    {"eval 'f() nocorrect' 2>/dev/null; echo st $?",
+     "st 1\n",
+     ""},
+    {"( mkdir d; print -r 'echo out; g() { return 5; }; return 2' "
+     "> d/g; fpath=($PWD/d); autoload -k g; g; echo st $? )",
+     "out\nst 2\n",
+     ""},
+    {"( mkdir d; print -r 'echo out; false; g() { echo in; }' > d/"
+     "g; fpath=($PWD/d); setopt errexit; autoload -k g; g ); echo "
+     "st $?",
+     "out\nst 1\n",
+     ""},
+    {"( mkdir d; print -r 'echo outer; g a; g() { echo inner $1; }"
+     "' > d/g; fpath=($PWD/d); FUNCNEST=5; autoload -k g; g first "
+     "2>/dev/null; echo st $? )",
+     "outer\nouter\nouter\nouter\nouter\n",
+     ""},
+    {"( mkdir d; print -r 'local x=in; g() { echo x=$x; }' > d/g; "
+     "fpath=($PWD/d); autoload -k g; g; echo x=$x )",
+     "x=in\nx=\n",
+     ""},
+    {"( mkdir d; print -r 'trap \"echo exittrap\" EXIT; g() { echo i"
+     "n; }' > d/g; fpath=($PWD/d); autoload -k g; g; echo back )",
+     "in\nexittrap\nback\n",
+     ""},
+    {"( mkdir d; print -r 'echo nodef' > d/g; fpath=($PWD/d); auto"
+     "load -k g; g; echo st $?; functions g )",
+     "nodef\nst 1\ng () {\n\t# undefined\n\tbuiltin autoload -Xk\n}\n",
+     "jfsh: g: function not defined by file\n"},
+    {"( mkdir d; print -r 'return 3; g() { :; }' > d/g; fpath=($PW"
+     "D/d); autoload -k g; g; echo st $? )",
+     "st 1\n",
+     "jfsh: g: function not defined by file\n"},
+    {"( mkdir d; print -r 'echo outer $1; g() { echo inner $1; }' "
+     "> d/g; fpath=($PWD/d); autoload -k g; autoload +X g; functio"
+     "ns g; g q )",
+     "g () {\n\techo outer $1\n\tg () {\n\t\techo inner $1\n\t}\n\tg \"$@\"\n}\no"
+     "uter q\ninner q\n",
+     ""},
+    {"{ echo a } always { nocorrect; }; echo r$?",
+     "a\nr0\n",
+     ""},
+    {"{ echo a } always { echo b; nocorrect; }; echo r$?",
+     "a\nb\nr0\n",
+     ""},
+    {"eval $'{ echo a } always { nocorrect\\n}; echo r$?'",
+     "a\nr0\n",
+     ""},
+    {"eval '{ nocorrect; } always { echo b }' 2>/dev/null; echo r$"
+     "?",
+     "r1\n",
+     ""},
+  };
+  TempDir t;
+  CwdGuard guard;
+  ASSERT_EQ(::chdir(t.path.c_str()), 0);
+  str dir = real(t.path);
+  for (const auto& c : cases) {
+    Shell sh;
+    sh.run("cd " + dir);   // for $PWD
+    auto r = sh.run(c.script);
+    EXPECT_EQ(r.out, c.out) << c.script;
+    EXPECT_EQ(r.err, c.err) << c.script;
+    for (const auto& e : sf::directory_iterator(t.path)) sf::remove_all(e.path());
+  }
+}
+
+TEST(BuiltinsM7Review, AFatalErrorEndsAScriptWithOne) {
+  // zsh's main loop: a script that an error ended with status 0 exits 1;
+  // a -c string keeps 0 (zsh 5.9, `zsh -f file` and `zsh -f -c`).
+  for (const char* src : {"true; print -v 1x hi\n", "false; print -v 1x hi\n",
+                          "printf -v 1x hi\n", "typeset -A h=(a)\n"}) {
+    Shell sh;
+    EXPECT_EQ(sh.run_script(src).rc, 1) << src;
+    Shell sh2;
+    EXPECT_EQ(sh2.run(src).rc, 0) << src;
+  }
 }
 
 }  // namespace

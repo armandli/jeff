@@ -317,6 +317,9 @@ struct CompiledProgram {
   // Subtracted from line_map for $LINENO: a function body counts lines
   // from the line its definition starts on, as in zsh.
   s::uint32_t      line_base = 0;
+  // A ksh-style autoload file loaded as the body of its function (zsh's
+  // EF_RUN): once it has run, the function it defined is called too.
+  bool             run_after = false;
 
   bool empty() const noexcept { return prog.empty(); }
 };

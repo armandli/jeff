@@ -98,13 +98,13 @@ void register_parameter_module(ModuleManager& mm) {
       umap<str, str> h;
       for (const auto& [name, body] : ctxp->functions)
         if (body) h[name] = function_text(name, *body);
-      for (const auto& name : ctxp->autoloads)
-        if (not h.contains(name)) h[name] = "builtin autoload -XU";
+      for (const auto& [name, _] : ctxp->autoloads)
+        if (not h.contains(name)) h[name] = autoload_stub_body(*ctxp, name, false);
       return h;
     }, [ctxp](const str& name) -> opt<str> {
       if (auto it = ctxp->functions.find(name); it != ctxp->functions.end() and it->second)
         return function_text(name, *it->second);
-      if (ctxp->autoloads.contains(name)) return str("builtin autoload -XU");
+      if (ctxp->autoloads.contains(name)) return autoload_stub_body(*ctxp, name, false);
       return s::nullopt;
     });
     hash_special(params, "dis_functions", []() { return umap<str, str>{}; });

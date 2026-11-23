@@ -1410,6 +1410,47 @@ TEST(TrapsM6Review, TrapFailuresQueueingAndExitTrapsAsZshC) {
     {"{ TRAPUSR1() { return 3 }; f() { [[ 2 -gt $(kill -USR1 $$; echo 1) ]]; echo in; }; f"
      "; echo st $?; } 2>/dev/null",
      "", 1},
+    // M7 review: `||` and `&&` go on after a failed TRAPxxx, the words
+    // after it taken as written (zsh's evalcond has no errflag check).
+    {"TRAPUSR1() { return 3 }; [[ 1 -lt $(kill -USR1 $$; echo 5) || 1 ]]; echo st $?",
+     "", 0},
+    {"TRAPUSR1() { return 3 }; [[ $(kill -USR1 $$; echo 1) == 2 || 1 ]]; echo st $?",
+     "", 0},
+    {"TRAPUSR1() { return 3 }; x=lit; [[ -n $(kill -USR1 $$; echo 1) || $x == lit ]]",
+     "", 1},
+    {"TRAPUSR1() { return 3 }; x=lit; [[ -n $(kill -USR1 $$; echo 1) || $x == '$x' ]]",
+     "", 0},
+    {"TRAPUSR1() { return 3 }; [[ $(kill -USR1 $$; echo 1) == '' && '' ]]",
+     "", 0},
+    {"TRAPUSR1() { return 3 }; [[ $(kill -USR1 $$; echo 1) == '' && \"*\" == '\"*\"' ]]",
+     "", 0},
+    {"{ TRAPUSR1() { return 3 }; [[ -n $(kill -USR1 $$) || -n $(echo side >&2; echo y) ]];"
+     " } 2>&1",
+     "", 0},
+    {"TRAPUSR1() { return 3 }; f() { [[ $(kill -USR1 $$; echo 1) == '' && 1 ]]; echo in $?;"
+     " }; f; echo out $?",
+     "", 0},
+    {"TRAPUSR1() { return 3 }; f() { [[ 1 -lt $(kill -USR1 $$; echo 5) || 1 -eq 2 ]]; echo "
+     "in $?; }; f; echo out $?",
+     "", 0},
+    // M7 review round 2: under errflag zsh's patmatch matches no glob operator, so
+    // only a plain string can be equal.
+    {"TRAPUSR1() { return 3 }; [[ $(kill -USR1 $$; echo 1) == 2 || ab == a* ]]",
+     "", 1},
+    {"TRAPUSR1() { return 3 }; [[ $(kill -USR1 $$; echo 1) == 2 || ab == [a]b ]]",
+     "", 1},
+    {"TRAPUSR1() { return 3 }; [[ $(kill -USR1 $$; echo 1) == 2 || a == ? ]]",
+     "", 1},
+    {"TRAPUSR1() { return 3 }; [[ $(kill -USR1 $$; echo 1) == 2 || ab == \"a\"* ]]",
+     "", 1},
+    {"TRAPUSR1() { return 3 }; [[ $(kill -USR1 $$; echo 1) == 2 || ab != a* ]]",
+     "", 0},
+    {"TRAPUSR1() { return 3 }; [[ $(kill -USR1 $$; echo 1) == 2 || ab == ab ]]",
+     "", 0},
+    {"TRAPUSR1() { return 3 }; [[ $(kill -USR1 $$; echo 1) == 2 || ab != ab ]]",
+     "", 1},
+    {"TRAPUSR1() { return 3 }; [[ $(kill -USR1 $$; echo 1) == 2 || ab == a(b|c) ]]",
+     "", 1},
   };
   for (const auto& c : cases) {
     int status = 0;
@@ -1438,4 +1479,46 @@ TEST(TrapsM6Review, AnEvalErrorInTheExitTrapAfterATrapFailure) {
 }
 
 }  // namespace
+// M7 review round 3: a script read from standard input that an error
+// ended with status 0 exits 1, as zsh's main loop (zsh 5.9: `printf
+// 'print -v 1x a\necho next\n' | zsh -f` exits 1 without `next`).
+TEST(BuiltinsM7Review, StdinScriptEndedByAnErrorExitsOne) {
+  str jfsh = JFSH_BINARY;
+  for (const char* body : {"print -v 1x a\\necho next\\n",
+                           "TRAPUSR1() { return 3 }\\nkill -USR1 $$\\necho next\\n"}) {
+    str script = "printf '" + str(body) + "' | " + jfsh + " -f 2>/dev/null; echo st $?";
+    int status = 0;
+    EXPECT_EQ(run_binary(script.c_str(), {}, status), "st 1\n") << body;
+  }
+}
+
+// M7 review round 4: a script read from standard input is read unbuffered,
+// a line at a time (zsh's shingetline), so what it runs reads the lines
+// after; $LINENO counts on; a `return` at the top ends it (zsh 5.9, from a
+// pipe and from a file).
+TEST(BuiltinsM7Review, StdinScriptIsReadALineAtATime) {
+  str jfsh = JFSH_BINARY;
+  struct Case {
+    const char* body;
+    const char* out;        // from a pipe
+    const char* file_out;   // from a file, where `head` reads a block
+  };
+  const Case cases[] = {
+    {"read x\\nhello there\\necho got $x\\n", "got hello there\nst 0\n",
+     "got hello there\nst 0\n"},
+    {"head -1\\nskipped\\necho after\\n", "skipped\nst 0\n", "skipped\nafter\nst 0\n"},
+    {"echo $LINENO\\necho $LINENO\\n", "1\n2\nst 0\n", "1\n2\nst 0\n"},
+    {"return 4\\necho after\\n", "st 4\n", "st 4\n"},
+  };
+  for (const auto& c : cases) {
+    str body = c.body;
+    str pipe = "printf '%b' '" + body + "' | " + jfsh + " -f; echo st $?";
+    str file = "f=$(mktemp); printf '%b' '" + body + "' > $f; " + jfsh
+             + " -f < $f; echo st $?; rm -f $f";
+    int status = 0;
+    EXPECT_EQ(run_binary(pipe.c_str(), {}, status), c.out) << pipe;
+    EXPECT_EQ(run_binary(file.c_str(), {}, status), c.file_out) << file;
+  }
+}
+
 }  // namespace jfsh
