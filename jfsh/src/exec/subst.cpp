@@ -1039,16 +1039,13 @@ struct Scan {
       return s::unexpected(ShellError::from_errno(ErrorKind::ExecError, "fork"));
     }
     if (pid == 0) {
-      ctx().signals.child_reset(ChildKind::Other);
-      ctx().jobs.clear();
+      ex.exec().enter_child(ChildKind::Subshell);
       ::close(pfd[0]);
       if (pfd[1] != 1) {
         ::dup2(pfd[1], 1);
         ::close(pfd[1]);
       }
-      int rc = ex.exec().exec_string(src);
-      s::fflush(nullptr);
-      _exit(rc);
+      ex.exec().exit_child(ex.exec().exec_string(src));
     }
     ::close(pfd[1]);
     str out;
@@ -1064,6 +1061,16 @@ struct Scan {
     while (::waitpid(pid, &status, 0) < 0 and errno == EINTR) {}
     int rc = WIFEXITED(status) ? WEXITSTATUS(status)
            : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
+    // A signal that came meanwhile (`$(kill -USR1 $$)`) is handled now, in
+    // the expansion, as zsh does: a TRAPxxx that fails makes it fail.
+    ex.exec().drop_trap_signals();   // it waited for the child
+    if (ctx().signals.has_pending()) {
+      // A TRAPxxx that fails ends the line, and the substitution expands to
+      // nothing; it keeps its own status (zsh's cmdoutval), which an
+      // assignment replaces (exec_simple).
+      ex.exec().handle_signals();
+      if (ctx().aborting and ctx().trap_status >= 0) out.clear();
+    }
     ctx().last_exit = rc;
     ex.note_subst_status(rc);
     while (not out.empty() and out.back() == '\n') out.pop_back();
@@ -2858,6 +2865,9 @@ struct Scan {
               if (not opts().interactive()) {
                 ctx().exiting  = ctx().exit_now = true;
                 ctx().exit_val = 1;
+                // From a function zsh exits at once (zexit): the shell's
+                // EXIT trap doesn't run.
+                if (ctx().func_depth > 0) ex.exec().drop_exit_trap();
               }
               return s::unexpected(subst_error(label + ": " + msg));
             }

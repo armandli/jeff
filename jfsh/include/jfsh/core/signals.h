@@ -17,8 +17,10 @@
 #include <cstdint>
 #include <termios.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -31,6 +33,22 @@
 namespace jfsh {
 
 struct JobTable;
+struct CompiledProgram;
+
+// What kind of child a fork made, for SignalManager::child_reset.  As
+// zsh's entersubsh:
+enum class ChildKind : s::uint8_t {
+  // `( … )`, `$( … )`, `<( … )`, `>( … )`, `=( … )`, background jobs and
+  // the stages of a background pipeline: signal traps and ignored signals
+  // go back to their defaults (TRAPxxx functions stay), ZERR and DEBUG
+  // stay, EXIT goes.
+  Subshell,
+  // A forked stage of a foreground pipeline: keeps every trap but EXIT.
+  Stage,
+  // External commands and helper processes: every trap goes, ignored
+  // signals stay ignored (an exec keeps them).
+  Other,
+};
 
 // Real signals are 1 … MAX_SIG.  Pseudo-signals live after them in the
 // trap table.
@@ -51,14 +69,22 @@ enum class TrapAction : s::uint8_t {
 };
 
 struct Trap {
-  TrapAction action  = TrapAction::Default;
   str        command;              // only valid when action == Command
+  // Command: the command parsed when the trap was set, so it isn't parsed
+  // again each time it runs; also what `trap` lists.  Function: the
+  // TRAPxxx function's body, so a function's frame can put back the one
+  // it hid.  Null for a trap set without one.
+  sptr<CompiledProgram> prog;
+  TrapAction action  = TrapAction::Default;
+  // Set as ERR rather than ZERR: listed under that name, as zsh does.
+  bool       alias   = false;
 };
 
 // The trap table.  Pure bookkeeping: SignalManager installs the OS
 // dispositions that go with it.
 struct SignalTable {
-  void        set(int sig, TrapAction action, str cmd = {});
+  void        set(int sig, TrapAction action, str cmd = {},
+                  sptr<CompiledProgram> prog = {}, bool alias = false);
   const Trap& get(int sig) const noexcept;
   bool        trapped(int sig) const noexcept {
     auto a = get(sig).action;
@@ -72,21 +98,36 @@ struct SignalTable {
   // function changed gets its old value back; an EXIT trap set inside the
   // function is always function-local: it is handed back in `exit_trap`
   // for the caller to run, and the outer EXIT trap is restored.  Returns
-  // the signals whose trap changed, so their dispositions can be redone.
-  vec<int>  pop_frame(bool restore, opt<Trap>& exit_trap);
+  // each signal whose trap was put back (EXIT always, when the function
+  // changed it) with the action it had in the function, so dispositions
+  // and TRAPxxx functions can be redone.
+  vec<s::pair<int, TrapAction>> pop_frame(bool restore, opt<Trap>& exit_trap);
   s::size_t depth() const noexcept { return mFrames.size(); }
+  // The EXIT trap belongs to the current function (or there is none):
+  // `trap` lists an outer one only outside functions, as zsh.
+  bool exit_trap_here() const noexcept {
+    if (mFrames.empty()) return true;
+    const auto& saved = mFrames.back().saved;
+    return s::any_of(saved.begin(), saved.end(),
+                     [](const auto& e) { return e.first == SIGEXIT; });
+  }
 
-  // In a forked child: drop every trap except ignored signals, which
-  // children inherit.  `keep_pseudo` keeps ZERR and DEBUG (a `( … )`
-  // subshell runs them, a command substitution does not).
-  void reset_for_child(bool keep_pseudo);
+  // In a forked child of `kind` (see ChildKind), as zsh's entersubsh.
+  // `keep_ignored` (POSIX_TRAPS) keeps `trap '' SIG` in a subshell.
+  void reset_for_child(ChildKind kind, bool keep_ignored);
   void clear_all() {
     mTraps.fill(Trap{});
     mFrames.clear();
   }
 
-  // "INT", "SIGINT", "int", "2" → SIGINT; "EXIT" or "0" → SIGEXIT.
-  static opt<int>    name_to_sig(strv name)  noexcept;
+  // "INT", "SIGINT", "2" → SIGINT; "EXIT" or "0" → SIGEXIT.  Names are
+  // upper case, as zsh's getsignum takes them, unless `any_case`.
+  static opt<int>    name_to_sig(strv name, bool any_case = false) noexcept;
+  // A name without the SIG in front: "INT" → SIGINT.
+  static opt<int>    bare_name_to_sig(strv name, bool any_case = false) noexcept;
+  // The number zsh gives a signal (TRAPxxx's $1): real signals their
+  // own, EXIT 0, ZERR and DEBUG the two after the last real signal.
+  static int         zsh_number(int sig_no) noexcept;
   // Real signals and pseudo-signals; "UNKNOWN" for anything else.
   static const char* sig_to_name(int sig_no) noexcept;
   // What a job status line says about a signal: "terminated",
@@ -103,28 +144,26 @@ private:
 
 // Signals that have arrived but not been handled yet.  Set from signal
 // handlers, so every operation is a lock-free atomic.
+// How many times each real signal arrived since it was last taken: zsh
+// queues signals rather than merging them, so two arrivals run a trap
+// twice.
+using SignalCounts = s::array<s::uint16_t, MAX_SIG + 1>;
+
 struct PendingSignals {
   s::atomic<s::uint64_t> lo{0};  // signals 0–63
   s::atomic<s::uint64_t> hi{0};  // signals 64–127
+  s::array<s::atomic<s::uint16_t>, MAX_SIG + 1> count{};
 
   void mark(int sig)  noexcept;
   bool test(int sig)  const noexcept;
   bool any()          const noexcept {
     return (lo.load(s::memory_order_relaxed) | hi.load(s::memory_order_relaxed)) != 0;
   }
-  // Takes every pending bit, leaving the set empty.
-  s::array<s::uint64_t, 2> take() noexcept {
-    return {lo.exchange(0, s::memory_order_relaxed),
-            hi.exchange(0, s::memory_order_relaxed)};
-  }
-  void clear_all()          noexcept { lo = 0; hi = 0; }
-};
-
-// What kind of child a fork made, for SignalManager::child_reset.
-enum class ChildKind : s::uint8_t {
-  Subshell,   // `( … )`: keeps ZERR and DEBUG traps
-  Other,      // pipeline stages, background jobs, external commands,
-              // command and process substitution, here-doc writers
+  // Takes every pending signal with its count (at least 1), leaving the
+  // set empty.
+  SignalCounts take() noexcept;
+  void clear_all()          noexcept;
+  void clear(int sig)       noexcept;
 };
 
 struct SignalManager {
@@ -158,26 +197,61 @@ struct SignalManager {
   // In a freshly forked child: restore the dispositions the shell changed
   // for itself, drop traps (see SignalTable::reset_for_child), give up job
   // control, and open a self-pipe of its own.
-  void child_reset(ChildKind kind) noexcept;
+  // Returns the signals the child keeps blocked (see the definition).
+  sigset_t child_reset(ChildKind kind, bool keep_ignored = false) noexcept;
 
   // Sets a trap and installs the disposition that goes with it.  Fails
   // for an unknown signal number.
-  void set_trap(int sig, TrapAction action, str cmd = {}) {
-    mTraps.set(sig, action, s::move(cmd));
+  // A signal trapped or reset is no longer the one ignored at start, as
+  // zsh's settrap/unsettrap.
+  void set_trap(int sig, TrapAction action, str cmd = {},
+                sptr<CompiledProgram> prog = {}, bool alias = false) {
+    mTraps.set(sig, action, s::move(cmd), s::move(prog), alias);
+    scan_start();
+    if (is_real_signal(sig)) mIgnoredAtStart[static_cast<s::size_t>(sig)] = false;
     install(sig);
+    if (action == TrapAction::Command or action == TrapAction::Function) unblock(sig);
   }
   // Resets every trap to its default.
   void reset_traps();
   // See SignalTable::pop_frame; also redoes the dispositions.
   void push_trap_frame() { mTraps.push_frame(); }
-  opt<Trap> pop_trap_frame(bool restore);
+  // `changed`, when given, gets what pop_frame returned.
+  opt<Trap> pop_trap_frame(bool restore,
+                           vec<s::pair<int, TrapAction>>* changed = nullptr);
+
+  // While the trap for real signal `sig` runs (zsh's ZSIG_IGNORED), its
+  // disposition stays as it is: a `trap - SIG` in the trap takes effect
+  // when end_trap installs it.
+  // `self_sent`: the shell sent itself the signal (`kill -USR1 $$`); zsh
+  // runs such a trap from its signal queue, with the signal still blocked
+  // for the subshells it forks.
+  void begin_trap(int sig, bool self_sent = false) noexcept;
+  void end_trap(int sig) noexcept;
+  bool running_trap(int sig) const noexcept {
+    return is_real_signal(sig) and mRunning[static_cast<s::size_t>(sig)];
+  }
+  // While waiting for a child, the signals a subshell keeps blocked come
+  // through (zsh's sigsuspend waits with none blocked): a default one ends
+  // the subshell, though the children it forked keep the block.
+  void let_kept_through(bool on) const noexcept;
+  // Acts on `sig` as its default disposition would: one that ends the
+  // process does (SIGUSR1, SIGTERM …); one ignored by default does nothing.
+  void raise_default(int sig) noexcept;
+  void clear_pending(int sig) noexcept { mPending.clear(sig); }
+  // Signals the shell acts on itself when untrapped instead of dying:
+  // SIGHUP (it exits through its own path) and, in an interactive shell,
+  // SIGINT.
+  bool shell_handles(int sig) const noexcept {
+    return sig == SIGHUP or (sig == SIGINT and (mJobControl or mInteractive));
+  }
 
   // The handler: marks `sig` pending and wakes the self-pipe.
   void note(int sig) noexcept;
   bool has_pending() const noexcept { return mPending.any(); }
   bool pending(int sig) const noexcept { return mPending.test(sig); }
   // Takes the pending set and drains the self-pipe.
-  s::array<s::uint64_t, 2> take_pending() noexcept;
+  SignalCounts take_pending() noexcept;
   // The first pending signal that has a trap, or 0.
   int  pending_trapped() const noexcept;
 
@@ -203,23 +277,34 @@ struct SignalManager {
 
 protected:
   void install(int sig) noexcept;
+  // Records once which signals were ignored when the shell started.
+  void scan_start() noexcept;
+  // A subshell that traps a signal it inherited blocked (mKeepBlocked)
+  // lets it through again, as zsh's.
+  void unblock(int sig) noexcept;
   void open_self_pipe() noexcept;
 
 private:
   SignalTable    mTraps;
   PendingSignals mPending;
+  struct termios mShellModes{};
   int            mSelfPipe[2]  = {-1, -1};
-  bool           mInteractive  = false;
-  bool           mJobControl   = false;
   int            mTtyFd        = -1;
   Pid            mShellPgid    = -1;
   Pid            mOrigPgid     = -1;   // the group the shell was started in
-  struct termios mShellModes{};
-  bool           mHaveModes    = false;
+  // Blocked in this process and its children: a subshell forked while a
+  // trap for the signal ran (child_reset).
+  sigset_t       mKeepBlocked{};
   // Signals that were ignored when the shell started stay ignored when
   // their trap is reset, as POSIX requires.
   s::array<bool, MAX_SIG + 1> mIgnoredAtStart{};
+  s::array<bool, MAX_SIG + 1> mRunning{};   // begin_trap … end_trap
+  s::array<bool, MAX_SIG + 1> mSelfSent{};  // begin_trap's self_sent
+  bool           mInteractive  = false;
+  bool           mJobControl   = false;
+  bool           mHaveModes    = false;
   bool           mStartChecked = false;
+  bool           mHaveKept     = false;   // mKeepBlocked isn't empty
 };
 
 extern SignalManager Signals;

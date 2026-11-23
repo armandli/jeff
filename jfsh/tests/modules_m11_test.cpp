@@ -595,7 +595,7 @@ TEST(ModulesM11, CloneRunsOnAnotherTerminal) {
   str out = (td.path / "out").string();
   str cmd = str(JFSH_BINARY) + " -f -c 'zmodload zsh/clone; clone " + name +
             "; if [[ $TTY == " + name + " ]]; then print -r -- child:$TTY > " + out +
-            "; else print parent:${!:+set}; fi'";
+            "; else print parent:${!:+set}; fi' </dev/null";
   s::FILE* p = ::popen(cmd.c_str(), "r");
   ASSERT_NE(p, nullptr);
   char buf[128] = {};

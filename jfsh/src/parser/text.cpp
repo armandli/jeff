@@ -1,5 +1,7 @@
-#include <algorithm>
 #include <cctype>
+#include <cstring>
+
+#include <algorithm>
 #include <initializer_list>
 #include <iterator>
 #include <string>
@@ -266,8 +268,38 @@ struct Reader {
     str      name  = next_str();
     str      value = next_str();
     str      op    = (f & WC_ASSIGN_APPEND) ? "+=" : "=";
-    if (f & WC_ASSIGN_ARRAY) return name + op + "(" + value + ")";
+    if (f & WC_ASSIGN_ARRAY) return name + op + "(" + array_words(value) + ")";
     return name + op + value;
+  }
+
+  // An array's elements as zsh writes them: one space between words,
+  // none inside the parentheses (`x=( a  b )` is `x=(a b)`).  Quotes,
+  // backquotes, `$( … )`, `${ … }`, `$[ … ]`, `<( … )`, `>( … )` and
+  // `=( … )` are kept as they are.
+  static str array_words(strv raw) {
+    str  out;
+    char quote = 0;
+    int  depth = 0;
+    bool gap   = false;
+    for (s::size_t i = 0; i < raw.size(); ++i) {
+      char c = raw[i];
+      if (not quote and depth == 0 and (c == ' ' or c == '\t' or c == '\n')) {
+        gap = not out.empty();
+        continue;
+      }
+      if (gap) out += ' ';
+      gap = false;
+      out += c;
+      if (c == '\\' and quote != '\'' and i + 1 < raw.size()) out += raw[++i];
+      else if (quote and c == quote) quote = 0;
+      else if (quote) continue;
+      else if (c == '\'' or c == '"' or c == '`') quote = c;
+      else if ((c == '(' or c == '{' or c == '[')
+               and (depth > 0 or (i > 0 and s::strchr(c == '[' ? "$" : "$<>=", raw[i - 1]))))
+        ++depth;
+      else if (depth > 0 and (c == ')' or c == '}' or c == ']')) --depth;
+    }
+    return out;
   }
 
   // The condition of `[[ … ]]`, with parentheses where zsh's text.c puts
@@ -412,6 +444,9 @@ struct Decompiler : Reader {
     return out;
   }
 
+  // zsh's job text (gettext2 without newlines) ends every list inside a
+  // compound command with "; ", the keywords that open one too:
+  // `( a; )`, `if a; then; b; fi`, `for x; do; b; done`.
   str compound() {
     WordCode  head = fetch();
     s::size_t end  = pc + wc_cmd_skip(head);
@@ -426,9 +461,9 @@ struct Decompiler : Reader {
           if (wc_cmd_type(b) == WC_IF_IF) {
             out += first ? "if " : "; elif ";
             out += body();
-            out += "; then " + body();
+            out += "; then; " + body();
           } else {
-            out += "; else " + body();
+            out += "; else; " + body();
           }
           first = false;
           pc = bend;
@@ -438,21 +473,21 @@ struct Decompiler : Reader {
       break; case WC_WHILE: {
         out = type == WC_WHILE_UNTIL ? "until " : "while ";
         out += body();
-        out += "; do " + body() + "; done";
+        out += "; do; " + body() + "; done";
       }
       break; case WC_FOR: case WC_SELECT: {
         out = wc_code(head) == WC_FOR ? "for " : "select ";
         out += words();
         if (type == WC_FOR_IN) out += " in " + words();
-        out += "; do " + body() + "; done";
+        out += "; do; " + body() + "; done";
       }
       break; case WC_FOR_COND: {
         auto a = next_str(); auto b = next_str(); auto c = next_str();
-        out = "for ((" + a + "; " + b + "; " + c + ")) do " + body() + "; done";
+        out = "for ((" + a + "; " + b + "; " + c + ")) do; " + body() + "; done";
       }
       break; case WC_REPEAT: {
         out = "repeat " + next_str();
-        out += "; do " + body() + "; done";
+        out += "; do; " + body() + "; done";
       }
       break; case WC_CASE: {
         out = "case " + next_str() + " in";
@@ -466,20 +501,19 @@ struct Decompiler : Reader {
         }
         out += " esac";
       }
-      break; case WC_SUBSH: out = "( " + body() + " )";
-      break; case WC_CURSH: out = "{ " + body() + " }";
+      break; case WC_SUBSH: out = "( " + body() + "; )";
+      break; case WC_CURSH: out = "{ " + body() + "; }";
       break; case WC_TRY: {
-        out = "{ " + body();
-        out += " } always { " + body() + " }";
+        out = "{; " + body();
+        out += "; } always {; " + body() + "; }";
       }
       break; case WC_FUNCDEF: {
+        // A definition's body is left out.
         if (type == WC_FUNCDEF_ANON) {
-          out = "() { " + body() + " }";
-          str args = words();
-          if (not args.empty()) out += " " + args;
+          out = "() { ... }";
         } else {
           out = words();
-          out += " () { " + body() + " }";
+          out += " () { ... }";
         }
       }
       break; case WC_ARITH: {
@@ -725,7 +759,15 @@ vec<str> pipeline_stage_texts(const CompiledProgram& prog,
 }
 
 str sublist_text(const CompiledProgram& prog, s::size_t pc) {
-  return Decompiler{{prog, pc}}.sublist();
+  // zsh names a background `a && b` (or `! a`) by its last pipeline.
+  Decompiler d{{prog, pc}};
+  for (;;) {
+    WordCode  w   = d.fetch();  // WC_SUBLIST
+    s::size_t end = d.pc + wc_sublist_skip(w);
+    if ((wc_sublist_flags(w) & WC_SUBLIST_TYPE) == WC_SUBLIST_END or end >= prog.prog.size())
+      return d.pipeline();
+    d.pc = end;
+  }
 }
 
 }  // namespace jfsh
@@ -755,6 +797,20 @@ static str name_text(strv name) {
         or static_cast<unsigned char>(c) >= 0x80;
   });
   return plain ? str(name) : single_quote(name);
+}
+
+str program_text(const CompiledProgram& prog) {
+  Pretty pr{{prog, 0}};
+  pr.body(0);
+  pr.flush_docs();
+  return pr.out;
+}
+
+str list_text(const CompiledProgram& prog, s::size_t pc) {
+  Pretty pr{{prog, pc}};
+  pr.sublist(0);
+  pr.flush_docs();
+  return pr.out;
 }
 
 str function_text(strv names, const CompiledProgram& body) {

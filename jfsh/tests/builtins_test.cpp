@@ -473,7 +473,7 @@ TEST(Exec, RedirectionsAloneArePermanent) {
 // Runs `jfsh -c src` (fds 3 and up are free there, unlike in this test
 // process) and returns its output and status.
 s::pair<str, int> run_binary(strv src) {
-  str cmd = str(JFSH_BINARY) + " --norouter -c '" + str(src) + "' 2>&1";
+  str cmd = str(JFSH_BINARY) + " --norouter -c '" + str(src) + "' 2>&1 </dev/null";
   s::FILE* p = ::popen(cmd.c_str(), "r");
   if (not p) return {"", -1};
   str o;

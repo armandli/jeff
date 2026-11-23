@@ -14,8 +14,11 @@ namespace {
 TEST(SignalNames, NameToSigAcceptsBareAndSigPrefixedAnyCase) {
   EXPECT_EQ(SignalTable::name_to_sig("INT"), SIGINT);
   EXPECT_EQ(SignalTable::name_to_sig("SIGINT"), SIGINT);
-  EXPECT_EQ(SignalTable::name_to_sig("sigterm"), SIGTERM);
-  EXPECT_EQ(SignalTable::name_to_sig("hup"), SIGHUP);
+  EXPECT_EQ(SignalTable::name_to_sig("sigterm", true), SIGTERM);
+  EXPECT_EQ(SignalTable::name_to_sig("hup", true), SIGHUP);
+  // `trap` takes upper case only, as zsh's getsignum.
+  EXPECT_FALSE(SignalTable::name_to_sig("hup").has_value());
+  EXPECT_FALSE(SignalTable::name_to_sig("SIGint").has_value());
 }
 
 TEST(SignalNames, PseudoSignals) {

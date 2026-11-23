@@ -48,4 +48,5 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(jfsh_tests PRIVATE util)   # forkpty
 endif()
 
-gtest_discover_tests(jfsh_tests)
+# No test may hang the suite: each gets two minutes.
+gtest_discover_tests(jfsh_tests PROPERTIES TIMEOUT 120)

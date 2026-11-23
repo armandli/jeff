@@ -325,10 +325,17 @@ TEST(Interactive, ExitWarnsAboutSuspendedJobsThenHangsThemUp) {
   ASSERT_TRUE(sh.key_until("\x1a", "jfsh: suspended  sleep 30")) << sh.out;
   sh.line("exit");
   EXPECT_TRUE(sh.expect("jfsh: you have suspended jobs.")) << sh.out;
+  // zsh 5.9: the `exit` that only warned has status 0, and a stopped job
+  // is left to the kernel's SIGHUP of an orphaned group, without a word.
+  sh.line("echo st $?");
+  EXPECT_TRUE(sh.expect("st 0")) << sh.out;
+  // Another command in between: the next `exit` warns again.
   sh.line("exit");
-  EXPECT_TRUE(sh.expect("jfsh: warning: 1 jobs SIGHUPed")) << sh.out;
-  int status = 0;
+  EXPECT_TRUE(sh.expect("jfsh: you have suspended jobs.")) << sh.out;
+  sh.line("exit");
+  int status = -1;
   EXPECT_TRUE(sh.exits(status)) << sh.out;
+  EXPECT_EQ(sh.out.find("SIGHUPed"), std::string::npos) << sh.out;
 }
 
 TEST(Interactive, ExitAfterJobsGoesAhead) {
@@ -473,3 +480,256 @@ TEST(Interactive, RcBindingsAndWidgets) {
   EXPECT_TRUE(sh.expect("SHOUT\r\n")) << sh.out;
 }
 
+
+// ---- M6 review: zsh 5.9's behaviour through a terminal ----------------------------
+
+namespace {
+
+// A trapped Ctrl-C that kills the foreground job runs the trap, and the
+// command line goes on (zsh's update_job).
+TEST(InteractiveM6Review, TrappedCtrlCRunsTheTrapAndTheLineGoesOn) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("trap 'echo got-$((1+1))' INT");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  // Wait for the line to be read: a Ctrl-C while it is typed ahead drops it.
+  sh.line("for i in 1 2; do sleep 30; echo i-$((i*10)); done; echo st-$?");
+  ASSERT_TRUE(sh.expect("st-$?")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  ASSERT_TRUE(sh.key_until("\x03", "got-2\r\ni-10\r\n")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  ASSERT_TRUE(sh.key_until("\x03", "got-2\r\ni-20\r\nst-0\r\n")) << sh.out;
+}
+
+// A TRAPINT that returns non-zero ends the line, with its status.
+TEST(InteractiveM6Review, TrapIntReturningNonZeroEndsTheLine) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("TRAPINT() { echo got-$((1+1)); return 1 }");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  sh.line("sleep 30; echo not-$((1+1))");
+  ASSERT_TRUE(sh.expect("not-$((1+1))")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  ASSERT_TRUE(sh.key_until("\x03", "got-2\r\n")) << sh.out;
+  sh.line("echo st-$?");
+  EXPECT_TRUE(sh.expect("st-1\r\n")) << sh.out;
+  EXPECT_EQ(sh.out.find("not-2"), std::string::npos) << sh.out;
+}
+
+// A pipeline a signal killed part of is reported a process a line.
+TEST(InteractiveM6Review, KilledPipelineIsReportedPerProcess) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("sh -c 'kill -9 $$' | cat; echo st-$?");
+  EXPECT_TRUE(sh.expect("jfsh: killed     sh -c 'kill -9 $$' | \r\n"
+                        "jfsh: done       cat\r\n"
+                        "st-0\r\n")) << sh.out;
+}
+
+// What a command sets with stty lasts, but echo comes back.
+TEST(InteractiveM6Review, SttySettingsLastButEchoComesBack) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("stty intr ^X -echo");
+  sh.line("stty -a | grep -o 'intr = ^.'; stty -a | grep -c -- ' -echo '");
+  EXPECT_TRUE(sh.expect("intr = ^X\r\n0\r\n")) << sh.out;
+  sh.line("stty sane");
+}
+
+// `fg %-` shows the job's mark before it became current.
+TEST(InteractiveM6Review, FgShowsTheMarkTheJobHad) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("sleep 30 &");
+  sh.line("sleep 31 &");
+  ASSERT_TRUE(sh.expect("[2] ")) << sh.out;
+  sh.line("fg %-");
+  EXPECT_TRUE(sh.expect("[1]  - running    sleep 30\r\n")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  ASSERT_TRUE(sh.key_until("\x1a", "jfsh: suspended  sleep 30")) << sh.out;
+  sh.line("kill -9 %1 %2");
+  EXPECT_TRUE(sh.expect("killed")) << sh.out;
+}
+
+// Signals ignored when an interactive shell starts are not passed on,
+// SIGHUP (nohup) included.
+TEST(InteractiveM6Review, SignalsIgnoredAtStartAreNotPassedOn) {
+  struct sigaction ign{}, old_usr1{}, old_hup{};
+  ign.sa_handler = SIG_IGN;
+  sigemptyset(&ign.sa_mask);
+  ::sigaction(SIGUSR1, &ign, &old_usr1);
+  ::sigaction(SIGHUP, &ign, &old_hup);
+  Pty sh;
+  ::sigaction(SIGUSR1, &old_usr1, nullptr);
+  ::sigaction(SIGHUP, &old_hup, nullptr);
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("sh -c 'kill -USR1 $$; echo alive'; echo st-$?");
+  EXPECT_TRUE(sh.expect("st-" + std::to_string(128 + SIGUSR1) + "\r\n")) << sh.out;
+  sh.line("sh -c 'kill -HUP $$; echo alive'; echo st-$?");
+  EXPECT_TRUE(sh.expect("st-" + std::to_string(128 + SIGHUP) + "\r\n")) << sh.out;
+  sh.line("[[ -o hup ]]; echo hup-$?");
+  EXPECT_TRUE(sh.expect("hup-0\r\n")) << sh.out;
+}
+
+// A SIGCHLD ignored at start keeps the shell's handler: jobs are reported.
+TEST(InteractiveM6Review, SigchldIgnoredAtStartStillReportsJobs) {
+  struct sigaction ign{}, old{};
+  ign.sa_handler = SIG_IGN;
+  sigemptyset(&ign.sa_mask);
+  ::sigaction(SIGCHLD, &ign, &old);
+  Pty sh;
+  ::sigaction(SIGCHLD, &old, nullptr);
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("sleep 0.2 &");
+  ASSERT_TRUE(sh.expect("[1] ")) << sh.out;
+  std::this_thread::sleep_for(500ms);
+  sh.line("echo x-$((1+1))");
+  EXPECT_TRUE(sh.expect("[1]  + done       sleep 0.2")) << sh.out;
+  EXPECT_TRUE(sh.expect("x-2\r\n")) << sh.out;
+}
+
+// Only Ctrl-C owes a newline before the prompt (the terminal echoed ^C
+// without one); Ctrl-\ and a TRAPINT that ends the line don't.
+TEST(InteractiveM6Review, NoBlankLineAfterQuitOrATrapThatEndsTheLine) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("sleep 30; echo next");
+  ASSERT_TRUE(sh.expect("echo next")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  ASSERT_TRUE(sh.key_until("\x1c", "quit       sleep 30\r\n")) << sh.out;
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  EXPECT_EQ(sh.out.find("sleep 30\r\n\r\n"), std::string::npos) << sh.out;
+  sh.line("TRAPINT() { echo t-$((1+1)); return 3 }");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  sh.line("sleep 31");
+  ASSERT_TRUE(sh.expect("sleep 31")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  ASSERT_TRUE(sh.key_until("\x03", "t-2\r\n")) << sh.out;
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  EXPECT_EQ(sh.out.find("t-2\r\n\r\n"), std::string::npos) << sh.out;
+}
+
+}  // namespace
+
+namespace {
+
+// `trap - INT` and `trap - HUP` inside their own trap: SIGINT then ends the
+// trap and the line ($? 1), SIGHUP ends the shell after the trap, with 1.
+// Neither kills the shell outright.
+TEST(InteractiveM6Review, AResetIntOrHupInItsOwnTrapIsTheShellsOwn) {
+  {
+    Pty sh;
+    ASSERT_TRUE(sh.expect("% "));
+    sh.line("trap 'echo t-$((1+1)); trap - INT; kill -INT $$; echo after-$((1+1))' INT");
+    ASSERT_TRUE(sh.expect("% ")) << sh.out;
+    sh.line("kill -INT $$; echo next-$((1+1))");
+    EXPECT_TRUE(sh.expect("t-2\r\n")) << sh.out;
+    sh.line("echo alive-$?");
+    EXPECT_TRUE(sh.expect("alive-1\r\n")) << sh.out;
+    EXPECT_EQ(sh.out.find("after-2"), std::string::npos) << sh.out;
+    EXPECT_EQ(sh.out.find("next-2"), std::string::npos) << sh.out;
+  }
+  {
+    Pty sh;
+    ASSERT_TRUE(sh.expect("% "));
+    sh.line("trap 'echo t-$((1+1)); trap - HUP; kill -HUP $$; echo after-$((1+1))' HUP");
+    ASSERT_TRUE(sh.expect("% ")) << sh.out;
+    sh.line("kill -HUP $$; echo next-$((1+1))");
+    EXPECT_TRUE(sh.expect("after-2\r\n")) << sh.out;
+    int status = -1;
+    ASSERT_TRUE(sh.exits(status)) << sh.out;
+    ASSERT_TRUE(WIFEXITED(status)) << sh.out;
+    EXPECT_EQ(WEXITSTATUS(status), 1);
+  }
+}
+
+// Ctrl-C killing a job inside the INT trap: the trap goes on (zsh's
+// ZSIG_IGNORED), with no extra newline.
+TEST(InteractiveM6Review, CtrlCInsideTheIntTrapLetsItFinish) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("trap 'echo int-$((1+1)); sleep 30; echo done-$((1+1))' INT");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  sh.line("sleep 31");
+  ASSERT_TRUE(sh.expect("sleep 31")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  ASSERT_TRUE(sh.key_until("\x03", "int-2\r\n")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  ASSERT_TRUE(sh.key_until("\x03", "^Cdone-2\r\n")) << sh.out;
+}
+
+}  // namespace
+
+namespace {
+
+// An untrapped `kill -INT $$` ends the line with 130 and no blank line.
+TEST(InteractiveM6Review, KillIntToTheShellGives130) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("kill -INT $$; echo no-$((1+1))");
+  sh.line("echo a-$?");
+  EXPECT_TRUE(sh.expect("a-130\r\n")) << sh.out;
+  EXPECT_EQ(sh.out.find("no-2"), std::string::npos) << sh.out;
+  EXPECT_EQ(sh.out.find("$((1+1))\r\n\r\n"), std::string::npos) << sh.out;
+}
+
+// A trap that fails at the prompt ends its line with a newline of its own,
+// then the prompt comes again (zsh's trashzle and errflag reset).
+TEST(InteractiveM6Review, AFailedTrapAtThePromptEndsItsLine) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("TRAPUSR1() { echo trapped; return 3 }");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  ::kill(sh.pid, SIGUSR1);
+  EXPECT_TRUE(sh.expect("trapped\r\n\r\n")) << sh.out;
+  EXPECT_TRUE(sh.expect("% ")) << sh.out;
+  sh.line("echo st-$?");
+  EXPECT_TRUE(sh.expect("st-")) << sh.out;
+}
+
+// A trap's `return` at the prompt ends there, with a newline of its own:
+// the next line runs, and $? is the trap's status (zsh 5.9).
+TEST(InteractiveM6Review, ATrapReturnAtThePromptEndsThere) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("trap 'echo trapped; return 3' USR1");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  ::kill(sh.pid, SIGUSR1);
+  EXPECT_TRUE(sh.expect("trapped\r\n\r\n")) << sh.out;
+  sh.line("echo one-$?");
+  EXPECT_TRUE(sh.expect("one-3\r\n")) << sh.out;
+  sh.line("echo two-$?");
+  EXPECT_TRUE(sh.expect("two-0\r\n")) << sh.out;
+}
+
+// A trap's `return` in a typed line ends the line with the status of the
+// builtin it ran in (zsh 5.9: `kill`'s 0).
+TEST(InteractiveM6Review, ATrapReturnInALineKeepsTheBuiltinsStatus) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("trap 'echo in; return 4' USR1");
+  sh.line("kill -USR1 $$; echo no-$((1+1))");
+  sh.line("echo st-$?");
+  EXPECT_TRUE(sh.expect("st-0\r\n")) << sh.out;
+  EXPECT_EQ(sh.out.find("no-2"), std::string::npos) << sh.out;
+}
+
+// SIGHUP while a foreground job runs: the shell goes at once, SIGHUPs the
+// job and says so, with status 1.
+TEST(InteractiveM6Review, HangupDuringAForegroundJobExitsAtOnce) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("sleep 31");
+  ASSERT_TRUE(sh.expect("sleep 31")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  ::kill(sh.pid, SIGHUP);
+  int status = -1;
+  ASSERT_TRUE(sh.exits(status, 3000ms)) << sh.out;
+  EXPECT_NE(sh.out.find("jfsh: warning: 1 jobs SIGHUPed"), std::string::npos) << sh.out;
+  ASSERT_TRUE(WIFEXITED(status)) << sh.out;
+  EXPECT_EQ(WEXITSTATUS(status), 1);
+}
+
+}  // namespace

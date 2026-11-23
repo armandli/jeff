@@ -5,6 +5,8 @@
 // test types on the master side and feeds what comes back into a small
 // terminal emulator, so tests can look at the screen as a user would.
 
+#include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -20,6 +22,8 @@
 #include <future>
 #include <string>
 #include <string_view>
+
+#include <gtest/gtest.h>
 
 #include <shell_fixture.h>
 
@@ -199,7 +203,22 @@ struct Rig {
     while (drain(150)) {}
   }
   opt<str> finish() {
-    while (pending.wait_for(s::chrono::milliseconds(5)) != s::future_status::ready) drain(5);
+    // A line that never ends fails the test instead of hanging the suite:
+    // after 10 s the rig types Ctrl-C, after 20 s it gives up.
+    auto start = s::chrono::steady_clock::now();
+    bool interrupted = false;
+    while (pending.wait_for(s::chrono::milliseconds(5)) != s::future_status::ready) {
+      drain(5);
+      auto waited = s::chrono::steady_clock::now() - start;
+      if (not interrupted and waited > s::chrono::seconds(10)) {
+        ADD_FAILURE() << "the editor didn't finish the line; sending Ctrl-C";
+        send("\x03");
+        interrupted = true;
+      } else if (waited > s::chrono::seconds(20)) {
+        s::fprintf(stderr, "editor rig: the line never ended\n");
+        s::abort();
+      }
+    }
     while (drain(20)) {}
     return pending.get();
   }

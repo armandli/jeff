@@ -64,6 +64,11 @@ void Job::continued() noexcept {
 
 // ---- JobTable --------------------------------------------------------------
 
+static str pad9(str s) {
+  if (s.size() < 9) s.append(9 - s.size(), ' ');
+  return s;
+}
+
 int JobTable::find_free_slot() noexcept {
   for (int i = 1; i < static_cast<int>(mTable.size()); ++i)
     if (mTable[static_cast<s::size_t>(i)].job_id == 0) return i;
@@ -184,16 +189,19 @@ bool JobTable::update(Pid pid, int wait_status) noexcept {
 
 int JobTable::notify_changes(s::FILE* out) {
   int printed = 0;
-  for (int id : ids()) {
+  vec<int> all = ids();
+  // Every line first, then the finished jobs go: the marks are the ones
+  // the jobs had when they changed, as zsh reports each job as it is reaped.
+  for (int id : all) {
     auto& j = mTable[static_cast<s::size_t>(id)];
-    if (j.flags & JOB_CHANGED) {
-      j.flags &= ~JOB_CHANGED;
-      str line = format(j);
-      s::fprintf(out, "%s\n", line.c_str());
-      ++printed;
-    }
-    if (j.is_done()) remove(id);
+    if (not (j.flags & JOB_CHANGED)) continue;
+    j.flags &= ~JOB_CHANGED;
+    str line = format(j);
+    s::fprintf(out, "%s\n", line.c_str());
+    ++printed;
   }
+  for (int id : all)
+    if (auto j = get(id); j and j->get().is_done()) remove(id);
   if (printed) s::fflush(out);
   return printed;
 }
@@ -202,6 +210,13 @@ void JobTable::reap() {
   for (int id : ids()) {
     const auto& j = mTable[static_cast<s::size_t>(id)];
     if (j.is_done() or (j.flags & JOB_DISOWNED)) remove(id);
+  }
+}
+
+void JobTable::forget_finished_async() {
+  for (int id : ids()) {
+    const auto& j = mTable[static_cast<s::size_t>(id)];
+    if (j.is_done() and j.is_async()) remove(id);
   }
 }
 
@@ -243,11 +258,6 @@ Result<int> JobTable::find(strv spec) const {
   return fail("job not found: " + str(s));
 }
 
-static str pad9(str s) {
-  if (s.size() < 9) s.append(9 - s.size(), ' ');
-  return s;
-}
-
 str JobTable::format(const Job& j, bool long_format, bool pgid_only) const {
   char mark = j.job_id == mCurrent ? '+' : j.job_id == mPrevious ? '-' : ' ';
   str prefix = "[" + s::to_string(j.job_id) + "]  " + mark + " ";
@@ -267,7 +277,9 @@ str JobTable::format(const Job& j, bool long_format, bool pgid_only) const {
     if (t.size() < width) t.append(width - t.size(), ' ');
     return t;
   };
-  if (not long_format and not pgid_only and not differ)
+  // Without job control zsh lists every process of a pipeline anyway.
+  bool split = differ or (per_proc and not (j.flags & JOB_PGRP));
+  if (not long_format and not pgid_only and not split)
     return prefix + pad9(j.status_text()) + "  " + j.text;
 
   if (not per_proc) {
@@ -283,6 +295,29 @@ str JobTable::format(const Job& j, bool long_format, bool pgid_only) const {
     if (pgid_only)        out += i == 0 ? pgid_field : str(pgid_field.size(), ' ');
     else if (long_format) out += s::to_string(p.pid) + " ";
     out += pad(proc_status_text(p)) + "  " + p.text;
+    if (i + 1 < j.procs.size()) out += " | ";
+  }
+  return out;
+}
+
+str JobTable::format_foreground(const Job& j) const {
+  bool per_proc = j.procs.size() > 1
+               and s::all_of(j.procs.begin(), j.procs.end(),
+                             [](const Process& p) { return not p.text.empty(); });
+  bool differ = per_proc
+            and s::any_of(j.procs.begin(), j.procs.end(), [&](const Process& p) {
+                  return proc_status_text(p) != proc_status_text(j.procs.front());
+                });
+  if (not differ) return "jfsh: " + pad9(j.status_text()) + "  " + j.text;
+  s::size_t width = 9;
+  for (const auto& p : j.procs) width = s::max(width, proc_status_text(p).size());
+  str out;
+  for (s::size_t i = 0; i < j.procs.size(); ++i) {
+    const auto& p = j.procs[i];
+    str st = proc_status_text(p);
+    st.append(width - st.size(), ' ');
+    if (i > 0) out += '\n';
+    out += "jfsh: " + st + "  " + p.text;
     if (i + 1 < j.procs.size()) out += " | ";
   }
   return out;

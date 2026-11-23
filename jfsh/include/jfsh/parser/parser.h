@@ -184,8 +184,9 @@ str heredoc_delimiter(strv raw, bool& quoted);
 str disassemble(const CompiledProgram& prog);
 
 // One-line source text, as job listings show it (src/parser/text.cpp):
-// the pipeline (WC_PIPE) or sublist chain (WC_SUBLIST) at `pc`, words as
-// written and compound commands on one line.
+// the pipeline (WC_PIPE) at `pc`, or for a sublist chain (WC_SUBLIST) its
+// last pipeline, as zsh's getjobtext: words as written, compound commands
+// on one line (`( a; b; )`, `if a; then; b; fi`), function bodies left out.
 str      pipeline_text(const CompiledProgram& prog, s::size_t pc);
 vec<str> pipeline_stage_texts(const CompiledProgram& prog, s::size_t pc);
 str      sublist_text(const CompiledProgram& prog, s::size_t pc);
@@ -193,6 +194,13 @@ str      sublist_text(const CompiledProgram& prog, s::size_t pc);
 // A function definition as `functions` prints it (src/parser/text.cpp):
 // `names () {`, the body one command per line indented by tabs, `}`.
 str function_text(strv names, const CompiledProgram& body);
+// A whole program as zsh's getpermtext gives it (`trap` lists a trap's
+// command so): one command per line, compound commands spread out as in a
+// function body, without indentation at the top.
+str program_text(const CompiledProgram& prog);
+// The sublist chain (WC_SUBLIST) at `pc` in the same form: zsh's
+// $ZSH_DEBUG_CMD.
+str list_text(const CompiledProgram& prog, s::size_t pc);
 
 }  // namespace jfsh
 

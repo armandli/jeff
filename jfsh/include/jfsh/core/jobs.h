@@ -122,6 +122,10 @@ struct JobTable {
   int  notify_changes(s::FILE* out = stderr);
   // Removes finished and disowned jobs without printing.
   void reap();
+  // Removes finished background jobs without printing, as a shell without
+  // job control does: nothing reports them, and `wait $!` still finds
+  // their statuses (remember).
+  void forget_finished_async();
 
   int  current()  const noexcept { return mCurrent; }
   int  previous() const noexcept { return mPrevious; }
@@ -137,6 +141,10 @@ struct JobTable {
   // shows the process group id instead.
   str format(const Job& j, bool long_format = false,
              bool pgid_only = false) const;
+  // What the shell says about a foreground job a signal killed, as zsh's
+  // printjob: "jfsh: killed     cmd", or a line for each process of a
+  // pipeline whose processes ended differently.
+  str format_foreground(const Job& j) const;
   // A short line with `status` in place of the job's own ("continued").
   str format_status(const Job& j, strv status) const;
   // Some job changed state since it was last reported.

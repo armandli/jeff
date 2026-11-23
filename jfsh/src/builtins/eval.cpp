@@ -90,9 +90,19 @@ int builtin_eval(vec<str>& args, ExecContext& ctx) {
   bool hard = s::exchange(ctx.hard_error, false);
   int rc = ctx.executor->exec_string(text);
   // As zsh's eval, an error ends just the evaluated text; an interrupt,
-  // an exit and `${x?}` go on.
-  if (ctx.aborting and not ctx.interrupt and not ctx.exiting and not ctx.hard_error) {
+  // an exit and `${x?}` go on.  A TRAPxxx's failure is an error too, but
+  // its return (zsh's retflag) stays: the function the eval is in returns
+  // 1, and at the top of a script just the line ends.
+  if (ctx.aborting and ctx.trap_failed) {
     ctx.aborting = ctx.abort_line = false;
+    ctx.end_trap_abort();
+    rc = 1;
+    ctx.returning   = true;
+    ctx.return_val  = rc;
+    ctx.return_line = true;
+  } else if (ctx.aborting and not ctx.interrupt and not ctx.exiting and not ctx.hard_error) {
+    ctx.aborting = ctx.abort_line = false;
+    ctx.end_trap_abort();
     if (rc == 0) rc = 1;
   }
   ctx.hard_error = ctx.hard_error or hard;

@@ -68,7 +68,8 @@ Got read_byte(ExecContext& ctx, int fd, double timeout, Clock::time_point deadli
   auto handle = [&] {
     bool trapped = ctx.signals.pending_trapped() != 0;
     if (ctx.executor) ctx.executor->wait_for_input();
-    if (ctx.exiting or ctx.aborting) return Got::Interrupted;
+    // (A trap's `return` ends the read too, as in zsh.)
+    if (ctx.exiting or ctx.aborting or ctx.returning) return Got::Interrupted;
     return trapped and timeout >= 0 ? Got::Timeout : Got::Char;
   };
   for (;;) {
@@ -106,6 +107,9 @@ Got read_byte(ExecContext& ctx, int fd, double timeout, Clock::time_point deadli
 
 // What `read` returns when Ctrl-C or an exiting trap ended it.
 int interrupted_status(const ExecContext& ctx) {
+  // A TRAPxxx that ended the line: 1, or for SIGINT the trap's status.
+  if (ctx.aborting and ctx.trap_failed) return 1;
+  if (ctx.aborting and ctx.interrupt and not ctx.intr_echoed) return ctx.last_exit;
   return ctx.aborting ? 128 + SIGINT : 1;
 }
 

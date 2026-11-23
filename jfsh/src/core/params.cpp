@@ -458,23 +458,26 @@ void ParamTable::pop_scope() {
 // The innermost definition of a name decides whether, and with which value,
 // it is exported; outer definitions it shadows are skipped.
 vec<str> ParamTable::make_envp() const {
+  // Only exported parameters are refreshed: refreshing every special
+  // ($userdirs reads the user database) cost each external command about
+  // 25 ms.
   vec<str> env;
   for_each([&](const Param& p) {
-    if (not p.is_exported() or not p.is_set()) return;
-    if (p.is_scalar())       env.push_back(p.name + "=" + p.scalar());
-    else if (p.is_integer()) env.push_back(p.name + "=" + p.scalar());   // in its base
-    else if (p.is_float())   env.push_back(p.name + "=" + p.scalar());
-  });
+    if (p.is_scalar() or p.is_integer() or p.is_float())   // integers in their base
+      env.push_back(p.name + "=" + p.scalar());
+  }, [](const Param& p) { return p.is_exported() and p.is_set(); });
   return env;
 }
 
-void ParamTable::for_each(func<void(const Param&)> fn) const {
+void ParamTable::for_each(func<void(const Param&)> fn,
+                          func<bool(const Param&)> filter) const {
   HashTable<const Param*> seen;
   for (int i = static_cast<int>(mScopes.size()) - 1; i >= 0; --i) {
     for (auto const& [name, p] : mScopes[static_cast<s::size_t>(i)]) {
       if (hidden_private(p, i, local_scope())) continue;
       if (not seen.count(name)) {
         seen[name] = &p;
+        if (filter and not filter(p)) continue;
         refresh(const_cast<Param&>(p));
         fn(p);
       }
