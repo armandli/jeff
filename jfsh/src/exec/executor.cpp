@@ -87,7 +87,7 @@ void Executor::report_parse_error(const ShellError& e) {
   s::fprintf(stderr, "jfsh:%d: %s\n", e.code, e.message.c_str());
 }
 
-int Executor::exec_string(strv src, bool by_line) {
+int Executor::exec_string(strv src, bool by_line, int first_line) {
   auto parse_failed = [&](const ShellError& e) {
     report_parse_error(e);
     mParseFailed = true;
@@ -100,7 +100,7 @@ int Executor::exec_string(strv src, bool by_line) {
     return exec_parsed(**prog);
   }
   StringDepth depth{*this};
-  StringInputSource in{str(src)};
+  StringInputSource in{str(src), first_line};
   Lexer lex{in};
   set_comments(lex, mCtx.opts);
   Parser parser{lex};
@@ -117,9 +117,11 @@ int Executor::exec_string(strv src, bool by_line) {
     }
     if (parser.at_eof() or interrupted()) break;
   }
-  // A script a trap interrupted with status 0 (`kill` raising a TRAPUSR1
-  // that returned 1) ends with 1; a -c string keeps 0, as in zsh.
-  if (mCtx.aborting and mCtx.trap_failed and mCtx.last_exit == 0 and mStringDepth == 1)
+  // A script that an error or a trap ended with status 0 (`kill` raising
+  // a TRAPUSR1 that returned 1, `print -v 1x`) ends with 1; a -c string
+  // keeps 0, as in zsh (its main loop's "fatal error exits non-zero").
+  if (mCtx.aborting and mCtx.last_exit == 0 and mStringDepth == 1
+      and not mCtx.opts.interactive())
     rc = mCtx.last_exit = 1;
   return end_string(rc);
 }
@@ -137,8 +139,12 @@ int Executor::exec_parsed(const CompiledProgram& prog) {
 }
 
 int Executor::end_string(int rc) {
-  // `return` outside a function ends the script or -c string, as in zsh.
-  if (mCtx.returning and mCtx.func_depth == 0) {
+  // `return` outside a function ends the script or -c string, as in zsh;
+  // one in an `eval` there goes on to end it (or the sourced file).
+  bool in_eval = mStringDepth > 1 and not mCtx.funcstack.empty()
+                 and mCtx.funcstack.back().name == "(eval)";
+  if (mCtx.returning and mCtx.func_depth == 0 and not in_eval) {
+    if (mStringDepth == 1) mTopReturn = true;
     mCtx.returning = mCtx.return_line = false;
     rc = mCtx.last_exit = mCtx.return_val;
   }
@@ -422,7 +428,8 @@ int Executor::exec_simple(vec<str> args,
       auto at = args.begin()
               + static_cast<s::ptrdiff_t>(s::min(a.position + placed++, args.size()));
       if (a.array) {
-        args.insert(at, a.name);
+        // `typeset a+=(…)` is refused by typeset (`a+` is no name), as in zsh.
+        args.insert(at, a.append ? a.name + "+" : a.name);
         typeset_arrays.push_back(s::move(a));
       } else {
         // An element keeps its (expanded) subscript: typeset decides.
@@ -435,7 +442,7 @@ int Executor::exec_simple(vec<str> args,
 
   // Precommand modifiers: `builtin` and `command` pick what the name may
   // be; `exec` replaces the shell (or, alone, makes the redirections
-  // permanent); `-` and `nocorrect` change nothing here.
+  // permanent); `-` changes nothing here (`nocorrect` is the parser's).
   enum class Only { Any, Builtin, External } only = Only::Any;
   bool prefixed = noglob;   // after a precommand modifier other than exec
   bool bare_prefix = false; // `builtin` or `command` with nothing after it
@@ -462,13 +469,11 @@ int Executor::exec_simple(vec<str> args,
       bool default_path = false;
       for (; i < args.size() and args[i].size() > 1 and args[i][0] == '-'; ++i) {
         if (args[i] == "--") { ++i; break; }
+        // A word with another letter is the command, as in zsh.
+        if (args[i].find_first_not_of("pvV", 1) != str::npos) break;
         for (char f : strv(args[i]).substr(1)) {
-          if (f == 'v' or f == 'V') lookup = true;
-          else if (f == 'p') default_path = true;
-          else {
-            s::fprintf(stderr, "jfsh: command: bad option: -%c\n", f);
-            return 1;
-          }
+          if (f == 'p') default_path = true;
+          else          lookup = true;
         }
       }
       // `command -v name`: describe it, as whence does.
@@ -480,7 +485,9 @@ int Executor::exec_simple(vec<str> args,
       only = mCtx.opts.get(OPT_POSIXBUILTINS) ? Only::Any : Only::External;
       continue;
     }
-    if (w == "exec" and not replace) {
+    // After `command` (but under POSIX_BUILTINS), `exec` is a command
+    // name, as in zsh.
+    if (w == "exec" and not replace and only != Only::External) {
       s::size_t i = 1;
       for (; i < args.size() and args[i].size() > 1 and args[i][0] == '-'; ++i) {
         if (args[i] == "--") { ++i; break; }
@@ -511,8 +518,10 @@ int Executor::exec_simple(vec<str> args,
       replace = true;
       continue;
     }
-    if (w == "-" or w == "nocorrect") {
-      if (w == "-") argv0 = "-";
+    // `-` not after `command` either (but under POSIX_BUILTINS).
+    // (`nocorrect` is a reserved word the parser takes.)
+    if (w == "-" and only != Only::External) {
+      argv0 = "-";
       args.erase(args.begin());
       prefixed = true;
       continue;
@@ -775,8 +784,11 @@ int Executor::exec_simple(vec<str> args,
           if (auto q = mCtx.params.lookup(a.name)) q->get().flags |= PM_READONLY;
         }
         if (not r) {
+          // As zsh's zerr in assignaparam: the command line ends, with
+          // typeset's status (0) left as it was.
           s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
-          rc = 1;
+          mCtx.aborting = true;
+          break;
         }
       }
     }
@@ -805,6 +817,12 @@ int Executor::exec_list(ExecState& es, ExecFlags flags) {
       }
     }
     if (interrupted()) return mCtx.exiting ? mCtx.exit_val : rc;
+    // NO_EXEC (`set -n`): the rest is read but not run, as zsh's
+    // execsimple and execcmd skip it.
+    if (not mCtx.opts.get(OPT_EXEC)) {
+      es.pc = end;
+      continue;
+    }
     if (wc_list_flags(w) & WC_LIST_ASYNC) {
       bool        jc   = job_control();
       // `&|` / `&!`: in the background, but not a job of the shell's.
@@ -1846,8 +1864,9 @@ int Executor::exec_cond_node(ExecState& es, WordCode head) {
     }
     bool is_and = type == WC_COND_AND;
     rc = exec_cond(es, es.fetch());
-    // `&&` and `||` stop at an error.
-    if (rc != (is_and ? 0 : 1) or interrupted()) break;
+    // `&&` and `||` stop at an error, but not at a failed TRAPxxx: zsh's
+    // evalcond has no errflag check there (cond.c).
+    if (rc != (is_and ? 0 : 1) or (interrupted() and not mCtx.trap_failed)) break;
     note(is_and ? " && " : " || ");
     head = es.fetch();
   }
@@ -1855,11 +1874,49 @@ int Executor::exec_cond_node(ExecState& es, WordCode head) {
   return flip and rc < 2 ? 1 - rc : rc;
 }
 
+// A `[[ ]]` pattern word as written, quoted characters escaped and the
+// quotes dropped, nothing expanded.
+static str pattern_as_written(strv w) {
+  str  out;
+  char quote = 0;
+  for (s::size_t i = 0; i < w.size(); ++i) {
+    char c = w[i];
+    if (quote) {
+      if (c == quote) quote = 0;
+      else {
+        if (quote == '"' and c == '\\' and i + 1 < w.size()) c = w[++i];
+        out += '\\';
+        out += c;
+      }
+    } else if (c == '\'' or c == '"') {
+      quote = c;
+    } else if (c == '\\' and i + 1 < w.size()) {
+      out += c;
+      out += w[++i];
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
 // A primary of `[[ ]]`: a string, a unary or binary test, or a module's
 // condition.
 int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
   s::size_t end = es.pc + wc_cmd_skip(head);
   Expander ex{*this, mCtx};
+  // After a failed TRAPxxx zsh's prefork expands nothing, so the rest of
+  // the condition sees its words as written (cond.c's singsub under
+  // errflag): a string keeps its quotes, a pattern drops them.
+  auto as_written = [&] { return mCtx.aborting and mCtx.trap_failed; };
+  auto scalar = [&](strv w) -> Result<str> {
+    if (as_written()) return str(w);
+    return ex.scalar(w);
+  };
+  auto pattern = [&](strv w) -> Result<str> {
+    if (as_written()) return pattern_as_written(w);
+    return ex.pattern(w);
+  };
   // Status 2 is an error that ends the command line, as zsh's execcond
   // makes it.
   auto finish = [&](int rc) {
@@ -1883,14 +1940,14 @@ int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
         mCtx.aborting = true;
         return finish(2);
       }
-      auto word = ex.scalar(raw);
+      auto word = scalar(raw);
       if (not word) return fail(word.error());
       note(trace_quote(*word));
       return finish(word->empty() ? 1 : 0);
     }
     case WC_COND_UNARY: {
       str op(es.fetch_str());
-      auto arg = ex.scalar(es.fetch_str());
+      auto arg = scalar(es.fetch_str());
       if (not arg) return fail(arg.error());
       note(op + " " + trace_quote(*arg));
       return finish(cond_unary(op, *arg, mCtx, ""));
@@ -1900,7 +1957,7 @@ int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
       vec<str> args;
       for (WordCode k = 1; k < wc_cmd_skip(head); ++k) {
         // Patterns keep their quoting, as zsh hands them over tokenized.
-        auto arg = ex.pattern(es.fetch_str());
+        auto arg = pattern(es.fetch_str());
         if (not arg) return fail(arg.error());
         args.push_back(s::move(*arg));
       }
@@ -1928,7 +1985,7 @@ int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
     strv words[2] = {lhs_word, rhs_word};
     bool error = false;
     for (int k = 0; k < 2 and not error; ++k) {
-      auto text = ex.scalar(words[k]);
+      auto text = scalar(words[k]);
       if (not text) return fail(text.error());
       auto v = ex.eval_math(*text);
       if (v) {
@@ -1944,12 +2001,19 @@ int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
     if (mCtx.aborting and mCtx.trap_failed) side[0] = side[1] = MathNum{};
     return finish(cond_numeric(op, side[0], side[1]));
   }
-  auto lhs = ex.scalar(lhs_word);
+  auto lhs = scalar(lhs_word);
   if (not lhs) return fail(lhs.error());
   if (op == "=" or op == "==" or op == "!=") {
-    auto pat = ex.pattern(rhs_word);
+    auto pat = pattern(rhs_word);
     if (not pat) return fail(pat.error());
     note(trace_quote(*lhs) + " " + op + " " + trace_pattern(*pat));
+    // After a failed TRAPxxx, zsh's patmatch stops at errflag before any
+    // glob operator matches: only a plain string can be equal.
+    if (as_written()) {
+      bool equal = not has_glob_chars(*pat, mCtx.opts.extended_glob())
+                   and glob_unescape(*pat) == *lhs;
+      return finish(equal == (op != "!=") ? 0 : 1);
+    }
     const CompiledPattern& cp = cached_pattern(*pat);
     if (cp.bad()) {
       s::fprintf(stderr, "jfsh: bad pattern: %s\n", glob_unescape(*pat).c_str());
@@ -1962,7 +2026,7 @@ int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
       set_match_params(mCtx.params, cp, *lhs, 0, lhs->size(), pm, mCtx.opts.get(OPT_KSH_ARRAYS));
     return finish(match == (op != "!=") ? 0 : 1);
   }
-  auto rhs = ex.scalar(rhs_word);
+  auto rhs = scalar(rhs_word);
   if (not rhs) return fail(rhs.error());
   note(trace_quote(*lhs) + " " + op + " " + trace_quote(*rhs));
   if (op == "=~") return finish(cond_rematch(*lhs, *rhs));
@@ -3252,6 +3316,28 @@ int Executor::call_function(const ProgRef& body,
   // An empty body runs no commands.
   if (not body->empty() and wc_code(body->prog[0]) != WC_END) ++mCtx.code_runs;
   int rc = exec(*body);
+  // A ksh-style autoload body, as zsh's execautofn: the file has run in
+  // this frame; the function it defined runs next, in it too, unless the
+  // file returned or the line is ending.  A file that didn't define it
+  // leaves the function to be loaded again, status 1.
+  if (body->run_after) {
+    auto f = mCtx.functions.find(args[0]);
+    if (f != mCtx.functions.end() and f->second != body) {
+      mCtx.autoloads.erase(args[0]);
+      if (not mCtx.returning and not interrupted() and not mCtx.exiting) {
+        ProgRef next = f->second;
+        rc = exec(*next);
+      }
+    } else {
+      if (f != mCtx.functions.end()) mCtx.functions.erase(f);
+      // (zsh's zwarn says nothing once errflag is set, and ERR_EXIT has
+      // left already.)
+      if (not mCtx.aborting and not mCtx.exit_now)
+        s::fprintf(stderr, "jfsh: %s: function not defined by file\n", args[0].c_str());
+      mCtx.returning = false;
+      rc = mCtx.last_exit = 1;
+    }
+  }
   bool did_return = mCtx.returning;
   if (mCtx.returning) {
     mCtx.returning = mCtx.return_line = false;
@@ -3684,20 +3770,25 @@ bool Executor::load_autoload(const str& name) {
     if (stat(path.c_str(), &st) != 0 or not S_ISREG(st.st_mode)) continue;
     auto text = read_file(path);
     if (not text) continue;
+    // The flags autoload gave it (zsh's loadautofn): -U parses without
+    // aliases, -k and -z pick ksh or zsh style over KSH_AUTOLOAD.
+    str flags;
+    if (auto f = mCtx.autoloads.find(name); f != mCtx.autoloads.end()) flags = f->second;
+    auto has = [&](char c) { return flags.find(c) != str::npos; };
     StringInputSource in{*text};
     Lexer lex{in};
     lex.push_state(LEX_SKIPCOMMENTS);
     Parser parser{lex};
+    if (not has('U') and mCtx.opts.get(OPT_ALIASES)) parser.set_aliases(&mCtx.aliases);
     auto prog = parser.parse();
     if (not prog) {
       s::fprintf(stderr, "jfsh: %s: %s\n", name.c_str(), prog.error().message.c_str());
       return false;
     }
-    mCtx.autoloads.erase(name);
-    // A file that is just `name() { … }` (ksh style) defines the function
-    // when run; any other file is the function's body.
+    // A file that is just `name() { … }` defines the function when run, as
+    // does any file in ksh style; any other file is the function's body.
     const auto& code = (*prog)->prog;
-    bool ksh_style = mCtx.opts.get(OPT_KSH_AUTOLOAD);
+    bool ksh_style = has('k') or (mCtx.opts.get(OPT_KSH_AUTOLOAD) and not has('z'));
     if (not ksh_style and code.size() > 4 and wc_code(code[3]) == WC_FUNCDEF
         and wc_cmd_type(code[3]) == WC_FUNCDEF_NAMED) {
       s::size_t after = 4 + wc_cmd_skip(code[3]);
@@ -3706,17 +3797,17 @@ bool Executor::load_autoload(const str& name) {
               and (*prog)->strs[wc_data(code[5])] == name;
       ksh_style = only;
     }
-    str saved_source = s::exchange(mCtx.source_name, path);
+    // Ksh style: the file is the body, run in the call's frame, which then
+    // runs what it defined (call_function); the autoload stays until it
+    // has (zsh's execautofn).
+    mCtx.functions[name] = *prog;
     if (ksh_style) {
-      exec(**prog);
+      (*prog)->run_after = true;
     } else {
-      mCtx.functions[name]      = *prog;
+      mCtx.autoloads.erase(name);
       mCtx.function_files[name] = path;
     }
-    mCtx.source_name = s::move(saved_source);
-    if (mCtx.functions.contains(name)) return true;
-    s::fprintf(stderr, "jfsh: %s: function not defined by file\n", name.c_str());
-    return false;
+    return true;
   }
   s::fprintf(stderr, "jfsh: %s: function definition file not found\n", name.c_str());
   return false;

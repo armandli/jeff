@@ -1,5 +1,34 @@
 // The `read` builtin.
 
+// The splitting of the line into words is derived from zsh 5.9's bin_read
+// (Src/builtin.c).  zsh's copyright and licence:
+//
+// The Z Shell is copyright (c) 1992-2017 Paul Falstad, Richard Coleman,
+// Zoltán Hidvégi, Andrew Main, Peter Stephenson, Sven Wischnowsky, and
+// others.  All rights reserved.  Individual authors, whether or not
+// specifically named, retain copyright in all changes; in what follows, they
+// are referred to as `the Zsh Development Group'.  This is for convenience
+// only and this body has no legal status.  The Z shell is distributed under
+// the following licence; any provisions made in individual files take
+// precedence.
+//
+// Permission is hereby granted, without written agreement and without
+// licence or royalty fees, to use, copy, modify, and distribute this
+// software and to distribute modified versions of this software for any
+// purpose, provided that the above copyright notice and the following
+// two paragraphs appear in all copies of this software.
+//
+// In no event shall the Zsh Development Group be liable to any party for
+// direct, indirect, special, incidental, or consequential damages arising out
+// of the use of this software and its documentation, even if the Zsh
+// Development Group have been advised of the possibility of such damage.
+//
+// The Zsh Development Group specifically disclaim any warranties, including,
+// but not limited to, the implied warranties of merchantability and fitness
+// for a particular purpose.  The software provided hereunder is on an "as is"
+// basis, and the Zsh Development Group have no obligation to provide
+// maintenance, support, updates, enhancements, or modifications.
+
 #include <cerrno>
 #include <cmath>
 #include <csignal>
@@ -36,8 +65,9 @@ struct TtyModes {
     fd = f;
     saved = t;
     if (no_echo) t.c_lflag &= ~static_cast<tcflag_t>(ECHO | ECHONL);
+    // zsh's setcbreak: a character at a time, still echoed.
     if (raw) {
-      t.c_lflag &= ~static_cast<tcflag_t>(ICANON | ECHO);
+      t.c_lflag &= ~static_cast<tcflag_t>(ICANON);
       t.c_cc[VMIN]  = 1;
       t.c_cc[VTIME] = 0;
     }
@@ -205,6 +235,7 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
     }
   }
   vec<str> names(args.begin() + static_cast<s::ptrdiff_t>(i), args.end());
+  if (array and names.size() > 1) return builtin_error(cmd, "only one array argument allowed");
   // -q and -k read the terminal, not stdin, unless -u says (zsh's SHTTY).
   struct CloseFd {
     ~CloseFd() { if (fd >= 0) ::close(fd); }
@@ -216,7 +247,9 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
     } else if ((opened.fd = ::open("/dev/tty", O_RDWR | O_CLOEXEC)) >= 0) {
       fd = opened.fd;
     } else {
-      return builtin_error(cmd, "not interactive and can't open terminal");
+      // zsh prints this one bare.
+      s::fputs("not interactive and can't open terminal\n", stderr);
+      return 1;
     }
   }
   // `name?prompt`: the prompt is shown when the shell is interactive.
@@ -298,43 +331,57 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
     line += c;
     quoted.push_back(false);
   }
-  // At the end of input with nothing read, the names are still set,
-  // empty, as zsh does (status 1).
-  bool nothing = eof and line.empty();
-  if (echo_only or echo_too) s::printf("%s\n", line.c_str());
-  if (echo_only) return eof ? 1 : 0;
+  // -e and -E echo each word as it is taken (bin_read), -e without
+  // assigning it.
+  auto echo = [&](const str& w) {
+    if (echo_only or echo_too) s::printf("%s\n", w.c_str());
+  };
 
   str ifs = " \t\n";
   if (auto p = ctx.params.lookup("IFS"); p and p->get().is_set())
     ifs = p->get().scalar();
-  auto is_sep = [&](s::size_t k) {
-    return not quoted[k] and ifs.find(line[k]) != str::npos;
-  };
-  auto is_white = [&](s::size_t k) {
-    return is_sep(k) and (line[k] == ' ' or line[k] == '\t' or line[k] == '\n');
-  };
-  // Fields, plus where each starts so the last name can take the rest.
-  vec<str> fields;
-  vec<s::size_t> starts;
-  s::size_t k = 0;
-  while (k < line.size() and is_white(k)) ++k;
-  while (k < line.size()) {
-    starts.push_back(k);
-    str field;
-    while (k < line.size() and not is_sep(k)) field += line[k++];
-    fields.push_back(s::move(field));
-    while (k < line.size() and is_white(k)) ++k;
-    if (k < line.size() and is_sep(k)) {
-      ++k;
-      while (k < line.size() and is_white(k)) ++k;
+  // zsh's isep and iwsep: in $IFS, and IFS whitespace.
+  auto isep  = [&](char c) { return ifs.find(c) != str::npos; };
+  auto iwsep = [&](char c) { return isep(c) and (c == ' ' or c == '\t' or c == '\n'); };
+  // The words, as zsh's bin_read takes them from the line.  `first` is
+  // set by a separator that isn't whitespace, after which even an empty
+  // word counts; `gotnl` once the line is used up.
+  s::size_t pos = 0;
+  bool first = true, gotnl = false;
+  auto word = [&](str& buf) {
+    for (;;) {
+      if (pos >= line.size()) {
+        gotnl = true;
+        return;
+      }
+      char c = line[pos];
+      bool sep = not quoted[pos] and isep(c);
+      ++pos;
+      if (sep) {
+        if (not buf.empty() or (not iwsep(c) and first)) {
+          first = first or not iwsep(c);
+          return;
+        }
+        first = first or not iwsep(c);
+        continue;
+      }
+      first = false;
+      buf += c;
     }
-  }
+  };
 
   // The names are assigned as `name=value` would be (an integer one
   // evaluates the text); a failure ends the command line, as in zsh.
   if (array) {
+    vec<str> fields;
+    while (not gotnl) {
+      str buf;
+      word(buf);
+      if (not buf.empty() or first or gotnl) fields.push_back(s::move(buf));
+    }
+    for (const auto& f : fields) echo(f);
+    if (echo_only) return eof ? 1 : 0;
     str name = names.empty() ? "reply" : names[0];
-    if (nothing) fields.emplace_back();   // zsh's array then holds one empty element
     if (auto r = ctx.params.set_array(name, fields); not r) {
       s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
       ctx.aborting = true;
@@ -343,18 +390,30 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
     return eof ? 1 : 0;
   }
   if (names.empty()) names.push_back("REPLY");
-  for (s::size_t n = 0; n < names.size(); ++n) {
-    str value;
-    if (n + 1 == names.size() and n < fields.size()) {
-      // The rest of the line, without trailing IFS whitespace.
-      s::size_t end = line.size();
-      while (end > starts[n] and is_white(end - 1)) --end;
-      value = line.substr(starts[n], end - starts[n]);
-    } else if (n < fields.size()) {
-      value = fields[n];
-    }
-    if (not ctx.executor->assign_var(names[n], s::move(value))) return 1;
+  for (s::size_t n = 0; n + 1 < names.size(); ++n) {
+    str buf;
+    if (not gotnl) word(buf);
+    echo(buf);
+    if (not echo_only and not ctx.executor->assign_var(names[n], s::move(buf))) return 1;
   }
+  // The rest of the line goes to the last name: leading IFS whitespace
+  // (and one other separator, unless one ended the word before) skipped,
+  // trailing IFS whitespace dropped, escaped or not.
+  str rest;
+  for (; pos < line.size(); ++pos) {
+    char c = line[pos];
+    if (rest.empty() and not quoted[pos] and isep(c)) {
+      if (iwsep(c)) continue;
+      if (not first) {
+        first = true;
+        continue;
+      }
+    }
+    rest += c;
+  }
+  while (not rest.empty() and iwsep(rest.back())) rest.pop_back();
+  echo(rest);
+  if (not echo_only and not ctx.executor->assign_var(names.back(), s::move(rest))) return 1;
   return eof ? 1 : 0;
 }
 

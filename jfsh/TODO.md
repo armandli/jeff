@@ -1303,12 +1303,8 @@ zsh's matheval gives 0 for every operand while errflag is set (math.c): `-eq` 0,
   accepted by the lexer; zsh says "unmatched '". Reason: lexer (M3).
 - An exported special keeps updating in the environment (`export SECONDS`); zsh's
   environment copy changes only on assignment. Reason: parameters (M3/M17), as on main.
-- `typeset -p` writes ESC as `$'\e'`; zsh as `$'\C-['`. Reason: shell_quote's control
-  characters, as on main (M7).
 - In an interactive shell zsh prints builtin errors without `zsh:` (`fg: no current
   job`); jfsh always prefixes `jfsh:`. Reason: how all of jfsh's errors are reported.
-- `source /dev/null` is "no such file or directory". Reason: M7's lookup takes regular
-  files only.
 - zsh 5.9's entersubsh loop stops before the last signal (SIGUSR2 on macOS), so a trap
   on it survives into subshells (`trap 'echo x' USR2; (trap)` lists it). Reason:
   deliberate, a zsh bug; jfsh resets it as any other.
@@ -1352,13 +1348,6 @@ zsh's matheval gives 0 for every operand while errflag is set (math.c): `-eq` 0,
   `for ((i=$(kill -USR1 $$; echo 0); …))` also prints "bad math expression" in jfsh,
   nothing in zsh. Reason: those loops check the expansion's error, not errflag; left
   to keep round 8 narrow.
-- After a failed TRAPxxx inside `[[ ]]`, zsh still evaluates the other side of `||`
-  and `&&` (evalcond's COND_OR/COND_AND have no errflag check, cond.c); jfsh stops at
-  the abort, so `TRAPUSR1() { return 3 }; [[ 1 -lt $(kill -USR1 $$; echo 5) || 1 ]]`
-  gives -c status 1, zsh 0 (main 0 by accident, since it compared 1 with the empty
-  substitution's value; script mode now matches zsh). The same holds for string tests
-  (`[[ $(kill -USR1 $$; echo 1) == 2 || 1 ]]`, also on main). Reason: exec_cond breaks
-  on `interrupted()`; left to keep round 8 narrow.
 - `wait` inside a trap with two jobs, where the trap's signal arrives: zsh returns 0
   (a SIGCHLD that comes later replaces its last_signal), jfsh 158. Reason: depends on
   zsh's signal timing.
@@ -1418,40 +1407,249 @@ expected output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
   PUSHD_IGNORE_DUPS, AUTO_PUSHD), `dirs [-clpv]`, `$dirstack`, `~N`/`~+N`/`~-N`, `pwd
   [-rLP]`. Like zsh, they print the stack or new directory only when interactive (B20).
 - **Output:** `echo` interprets escapes unless `-E` or BSD_ECHO; `print` has `-r -R -n
-  -l -N -c -C -a -o -O -i -m -u -v -f -x -X -D -P -s`; `printf` has every conversion
-  (`%b %q %c %s %d %i %o %u %x %X %e %f %g %a`), flags, `*` widths, `%N$`, arithmetic
+  -l -N -c -C -a -o -O -i -m -u -v -f -x -X -D -P -s`; `printf` has zsh's conversions
+  (`%b %q %c %s %d %i %o %u %x %X %e %E %f %g %G`; zsh 5.9 has no `%a`, and `%n` is
+  left), flags, `*` widths, `%N$`, arithmetic
   arguments, `'c` character codes, `\c`, reuse of the format and `-v`.
 - **read:** `-r -A -k N -q -s -d delim -t secs -u fd -e -E` and `name?prompt`; `$REPLY`
   is trimmed like any other name, as in zsh.
 - **Lookup:** `whence [-vcwpafmsS]`, `type`, `which`, `command -v/-V` with zsh's wording,
-  `hash [-dfLmrv] [name[=path]]` and `rehash` on the executor's command hash.
+  `hash [-fLmrv] [name[=path]]` and `rehash` on the executor's command hash.
 - **Functions:** `functions [-mu+]` and `whence -f`/`which` print definitions as zsh does
   (`function_text` in `src/parser/text.cpp`, the multi-line decompiler); `trap` lists
-  TRAPxxx functions; `autoload [-U] name|/path/name` loads zsh-style (the file is the
+  TRAPxxx functions; `autoload [-UXtkz] [+X] name|/path/name` loads zsh-style (the file is the
   body) or ksh-style (the file defines the function) from `$fpath` on first call.
 - **History:** `fc -l [-nrdfiD]`, `fc -s`/`-e -`/`r` with `old=new`, `fc -e editor`,
   `fc -W/-R/-A`; `history` is `fc -l`. Event numbers, `-N` offsets and prefixes.
 - **Limits:** `ulimit [-HSa] -tfdscmunlvxiqerN [value]` with zsh's labels, `umask [-S]`
   octal or symbolic, `times` from `getrusage`.
 - **Control:** `exit`/`return` take arithmetic expressions and reject extra arguments.
-- **Stubs** that need later milestones print `jfsh: NAME: not implemented` and return 1:
-  `bindkey`, `zle`, `vared` (M9), `zpty` (now registered, B21),
-  `compinit`; `zmodload` alone lists nothing.
+- **Stubs** that needed later milestones are gone: `bindkey`, `zle`, `vared` (M9), `zpty`
+  (B21), `zmodload` (M10); `compinit` is a function, as in zsh. The options still
+  missing (see Left) are bad options or say "not implemented" (`read -n`, `fc -p`,
+  `hash -d`).
+
+**Review fixes** (branch jfsh-m7-review), against zsh 5.9 (about 950 probes, `-c` and
+script, plus pty runs): listings quote as zsh's quotedzputs (`shell_quote`): a value
+with an unprintable character is `$'…'` with zsh's `\C-[`, `\M-\C-@`, `\u…` forms, an
+empty array is `(  )`. typeset: `-p` lines are printparamnode's (`export -r x=5`,
+`typeset -g` for a global from a function, attributes in zsh's order, `-x` shown only
+on a local or an array), unset parameters and read-only-by-design specials are left
+out, `-p1` puts elements on lines of their own and `-p N` takes its number, `typeset
+x` on an existing parameter of this scope prints `x=…`, `-m` without `-p` prints
+`name=value` and with attributes sets them, `-u`/`-l` cancel, a type change starts a
+fresh parameter (`typeset -a x` after `x=1` is `(  )`, `+a` makes an empty scalar),
+`+r` takes read-only away, `x+=` is "not valid in this context: x+", `-t`/`-k`/`-z`
+are accepted, a failed `typeset -A h=(a)` ends the line with typeset's 0; `export -n`
+is a bad option. unset: "not enough arguments"; a bad name or a read-only parameter
+ends the line (zsh's zerrnam/zerr). set: a bad option or name ends the line after
+trying the others; NO_EXEC (`set -n`, `unsetopt exec`) skips the rest, and can't be set
+interactively; HASH_DIRS defaults to INTERACTIVE (main.cpp). echo/print/printf
+escapes are zsh's getkeystring for each caller (`ESC_ECHO`, `ESC_PRINT` with `\E`,
+`\M-`, `\C-` and dropped unknown backslashes, `ESC_PRINTF_FMT`, `ESC_PRINTF_ARG` where
+`\101` stays); `-e` beats `-E`/`-r`/BSD_ECHO, `echo -` drops the `-`, print's `\c` drops
+the words after it, `print -p` "no coprocess", `-u` "bad file number", `-C` errors,
+`-v` checks the name (ending the line), `-lv` keeps the last newline, `-x 0` is an
+error, `-aC` pads every column but the last, `-c` without $COLUMNS is one column.
+printf: `%q` is zsh's quotestring (`=`/`~` only first, `$'\n'`, `$'\200'`), `%c` of
+nothing is a NUL, `%s` widths count characters, `%N$` out of range and `%0$`, one
+size modifier (`%lld`, `%a` are invalid), the message names the directive (`%5`),
+an arithmetic error has no `printf:`. read: words are split as bin_read's loops
+(`a,b,,` gives `( a b '' '' )`, an empty line `( '' )`, trailing escaped blanks are
+dropped), `-A` takes one name, `-k`/`-q` keep the terminal's echo (setcbreak), "not
+interactive and can't open terminal" is bare. cd/pushd/popd: a word with letters
+other than `qsLP` is a directory (`cd -x`), `pushd` with an empty stack goes home,
+`$dirstack` can be assigned, chpwd and `chpwd_functions` run after every change but
+`-q` (`run_hook`), DIRSTACKSIZE, POSIX_CD/CDSILENT printing, PUSHD_IGNORE_DUPS as
+cd_new_pwd; `pwd x` "too many arguments". eval drops a first `--`, and its `return`
+at the top ends the script or the sourced file (`end_string`); `.` reads any file but a
+directory found by search (fifos, /dev/null; a path may name a directory). autoload
+keeps its `UtTkz` flags for the `builtin autoload -X…` stub, `-X` in a function loads
+it and runs it with its arguments, `+X` loads now, `-X` elsewhere is "bad autoload";
+`functions -x N`. whence: zsh's reserved words (typeset family, `end`; not `in`,
+`always`), `-m` by table, `-s` always shows `->`, `-vf` the definition alone, `$PATH`
+duplicates kept, no arguments 1; `command -x` runs `-x`, `command exec` runs a command
+named exec (unless POSIX_BUILTINS). alias: `-L a=b` looks up, `=x` "bad assignment",
+"illegal combination of options", suffix aliases only with `-s`. ulimit: resources in
+RLIMIT order with `-m` dropped where it is `-v` (macOS), `-N n`, no `soft`, "no limits
+allowed with -a", each shown once after the ones set. umask is bin_umask (`0222`,
+zsh's messages, one argument). `times x`, `shift --`. fc names `fc` in its messages
+(also for `history` and `r`), "no such event: N" for numbers, "too many arguments",
+`-m pattern`, `-W`/`-A` write nothing without $SAVEHIST, and without history (`-c`)
+"no such event: 1". Carried over from M6: after a failed TRAPxxx in `[[ ]]`, `&&` and
+`||` go on (evalcond has no errflag check) with the words after it taken as written
+(`pattern_as_written`; `[[ … || $x == '$x' ]]` is true). Performance was already on a
+par (typeset -p of 50000 parameters 0.08 s vs zsh 0.04, `print -l {1..1000000}` 0.17
+vs 0.18, a 10000-line read loop 0.09 vs 0.10). Tests: `BuiltinsM7Review.BuiltinsAsZshC`
+(87 rows from `zsh -f -c`), `InteractiveM7Review.ReadKAndQEchoWhatIsTyped`,
+`InteractiveM7Review.FcMessagesAndMatching`,
+`InteractiveM7Review.PushdAloneWithAnEmptyStackGoesHome`, 9 rows under `// M7 review`
+in `TrapsM6Review.TrapFailuresQueueingAndExitTrapsAsZshC`; tests updated to zsh's
+output: `Alias.ListingAndUnalias`, `Umask.OctalAndSymbolic`, `Autoload.LoadsFromFpath`,
+`History.ListsAndReruns`, `HistoryFile.FcWriteAndAppend`. Code close to zsh's
+(getkeystring, quotestring, quotedzputs, bin_read, bin_umask, bin_ulimit) is in
+`print.cpp`, `util.cpp`, `read.cpp` and `limits.cpp`.
+
+Round 2: after a failed TRAPxxx a `[[ ]]` pattern with a glob operator matches
+nothing, as zsh's patmatch stops at errflag (`[[ … || ab == a* ]]` is 1, `!=` 0); only
+a plain string compares equal. `whence -S` follows the links a step at a time as
+zsh's print_if_link / xsymlinks (`P/b/m -> P/b/l -> /bin/ls`; a file that is no link
+gets nothing), `-s` adds the real path. `autoload -X dir` loads the function from
+`dir`, two arguments are "-X: too many arguments" (status 1, the line goes on), and
+the function is the innermost one (not an `eval`). `set -o nosuch -o` and `-A`
+listings end the line too, `set +o … -o` lists the `set +o` form and `set +A` the
+names. `print -cv` keeps the last newline; `command -` and `command nocorrect` are
+command names. `unset -m` with no match is 1. `read -e`/`-E` echo each word taken.
+Without history, fc's messages are zsh -c's ("current history line would recurse
+endlessly, aborted", "event not found: x", "no events in that range"). A script (not a
+-c string) that an error ended with status 0 exits 1, as zsh's main loop
+(`exec_string`). `autoload_flags` entries go with their function. Tests: 20 more rows
+in `BuiltinsM7Review.BuiltinsAsZshC` (107), `BuiltinsM7Review.AFatalErrorEndsAScriptWithOne`,
+8 rows under `// M7 review round 2` in `TrapsM6Review.TrapFailuresQueueingAndExitTrapsAsZshC`.
+
+Round 3: `ExecContext::autoloads` is one table, name → flags (no second table to keep
+in step), and `autoload` merges flags as bin_functions (`(flags | on) & ~off`, `-z`
+and `-k` clearing each other, both together "invalid option(s)"): `autoload -U g;
+autoload g` stays `-XU`. A failed `autoload -X` leaves the function undefined. A script
+read from standard input gets the script rule (main.cpp runs it by line), so a fatal
+error leaving status 0 exits 1 there too. fc resolves events as fcgetcomm (a
+negative number counts from the current line, down to 0; `-0` is text) and reports an
+empty range as fclist: `no such event: N` when both ends are N, else `no events in that
+range`. `nocorrect` is taken only as the first word; `unset -m` on a read-only
+parameter ends the line with status 0. Tests: 9 more rows in
+`BuiltinsM7Review.BuiltinsAsZshC` (116), `BuiltinsM7Review.StdinScriptEndedByAnErrorExitsOne`.
+
+Round 4: `nocorrect` is a reserved word the parser takes before the command word, any
+number of times and among the assignments (zsh's par_simple: `nocorrect nocorrect echo
+hi`, `nocorrect x=1`); the executor no longer looks for it. `fc -m` that matches
+nothing is "no matching events found", listed or run. An autoloaded file is parsed with
+aliases unless `-U`, and in ksh style with `-k` or KSH_AUTOLOAD without `-z`
+(`load_autoload`). `unfunction -m`/`unset -fm` take autoload-only names too and are 1
+when nothing matched; a disabled function isn't listed or found by `functions`;
+`functions -u`/`-U` (and `typeset -fu`/`-fU`) are autoload with `-U`, `-k`, `-z`; an
+autoload named by path shows its directory in the stub (`builtin autoload -XU /d`). A
+script read from standard input is read unbuffered a line at a time, as zsh's
+shingetline (a file a block at a time with the rest given back by lseek, a pipe a byte
+at a time), so `read`, `cat` and `exec <f` in it get the next lines; $LINENO counts on
+across chunks and a top-level `return` ends it (`Executor::take_top_return`). A
+100000-line script: from a file 0.19 s (0.20 before), from a pipe 0.42 s (zsh 0.42; was
+0.14 with stdio's read-ahead). Tests: 18 more rows in `BuiltinsM7Review.BuiltinsAsZshC`
+(134), `BuiltinsM7Review.StdinScriptIsReadALineAtATime`, two `fc -m` checks in
+`InteractiveM7Review.FcMessagesAndMatching`.
+
+Round 5 (reworked in round 6): a `nocorrect` with no command after it was made a null
+command, and a ksh-style autoload file was run in the call; round 6 replaced both.
+
+Round 6: a bare `nocorrect` follows zsh's grammar (parse.c). par_simple returns "null":
+no code and no error (`Parser::mNull`); the pipeline drops it (after `|` it is an
+error); a sublist drops it, but after `!` keeps an empty command negated (`! nocorrect`
+is 1, shown as `!`); `a && <null>` and `a || <null>` are `a`; the list stops there,
+its separator left for the construct around: the if, elif, while and until conditions
+and an `always` block (zsh's par_subsh) skip it (`if nocorrect; then`, `{ … } always {
+nocorrect; }`), a body, the first block of a `{ … } always`, a brace group or the top
+level don't (`{ nocorrect; }`, `nocorrect; echo a` are parse errors), a line of a
+script or of standard input (zsh's par_event) never takes one (interactive lines do,
+see Left), and a short function body must be a command. $? is left as
+it was (`false; nocorrect` is 1). A ksh-style autoload file (`-k`, KSH_AUTOLOAD
+without `-z`, or a file that only defines the function) is loaded as the function's
+body (`CompiledProgram::run_after`, zsh's EF_RUN); `call_function` runs it and then, in
+the same frame (locals, `$0`, traps, `return`), the function it defined, unless the
+file returned or the line is ending; a file that didn't define it prints "NAME:
+function not defined by file" (not after an error, nor once ERR_EXIT has left) and
+leaves the autoload, status 1, as zsh's execautofn. `functions` shows such a body
+with its `name "$@"` line. Neither autoload path touches `$0`'s script name any more
+(xtrace shows `+g:1>`). Tests (with round 7's always block): 30 more rows in
+`BuiltinsM7Review.BuiltinsAsZshC` (178);
+`InteractiveM6Review.TrappedCtrlCRunsTheTrapAndTheLineGoesOn` waits longer for its
+trap.
 
 **Left**
-- `-Z`/`-L`/`-R` padding, `-t`; `emulate -l`; `autoload -X`;
-  `read -z -c -l -n -p`; `print -z` and `-p`; `fc -p/-P`; `hash -d` (named directories,
-  no table yet).
-- `. ./fifo` / `source` of a fifo is refused ("no such file or directory"); zsh reads
-  it.
-- A command that runs in a forked pipeline stage hashes its path in the child, so
-  HASH_CMDS doesn't remember it in the shell.
-- zsh errors in special builtins (`set -o nosuch`, `unset readonly`) exit a
-  non-interactive shell; jfsh's only return 1.
-- Messages name the shell as `jfsh:` and leave out zsh's line numbers and `(eval)`.
-- `f() {}` is parsed as a function whose body runs a command `{}`.
-- `< <(cmd)` (process substitution as a redirection target) is a parse error.
-- zsh's default aliases `run-help` and `which-command` are not defined.
+- Done elsewhere: `f() {}` and `< <(cmd)` (M14); `bindkey`/`zle`/`vared` (M9).
+  Planned elsewhere (M17): `typeset -Z/-L/-R` padding and `-t` (and `functions -t/-T`);
+  `autoload -w`; `read -z -c -l -n -p`; `print -z`; `fc -p/-P`; `hash -d`; zsh's
+  default aliases `run-help` and `which-command`; special-builtin errors under
+  POSIX_BUILTINS; a forked stage's HASH_CMDS; zsh's line numbers and `(eval)` in
+  messages, and no `zsh:` prefix in an interactive shell. `emulate -l` (M12 chose a
+  sourceable listing; zsh lists every option), `emulate nosuch` (zsh: zsh) and its
+  `-c` messages, and sticky emulation (`$0` in a function defined by `emulate sh -c`)
+  are M12's. Coprocesses (`print -p`, `coproc` in a function) are M19's.
+- `typeset -u`/`-l` fold the value when it is assigned; zsh keeps it as given and
+  folds it when read, so only `typeset -p` shows the difference. Reason: needs a
+  raw-value path through `Param` (core/params).
+- Tied parameters list as two (`typeset FOO=a:b`, `typeset -a foo=…`); zsh shows
+  `typeset -T FOO foo=( … )` and `export -T PATH path`. Reason: `Param` keeps no name
+  of its tied peer.
+- zsh's integer specials have base 10 (`typeset -i10 SECONDS`, `integer 10 readonly
+  '#'`); jfsh's have none. Reason: the specials' setup (M17), not typeset.
+- The parameter set differs from `zsh -f`: no `0`, `*`, `@` entries (so `set -A` and
+  `typeset -p 0` list them in zsh), and jfsh has `$aliases`, `$dirstack`, `_` and
+  others loaded; `$pipestatus` starts as `( 0 )`, zsh's empty. Reason: parameter
+  setup (M3/M17).
+- A key like `h[$'k\n']=v` is stored as written by zsh (`['$'\''k\n'\']`); jfsh
+  expands it. Reason: subscript expansion in assignments (M3).
+- `ulimit -H -n 100; ulimit -n 200` succeeds in zsh, which keeps a hard limit it set
+  for the shell's children only; jfsh applies it at once. Reason: deliberate, zsh's
+  deferred limits aren't worth copying.
+- `exec -x` says "bad option: -x"; zsh "exec requires a command to execute".
+  Reason: cosmetic, exec's option parsing in exec_simple.
+- U+2028 and a few other characters zsh's own tables call unprintable are shown as
+  they are. Reason: jfsh asks iswprint.
+- `trap 'echo (' INT`-style lone `(` (`. ./f` with `syntax ( error`) is a parse
+  error; zsh reports a bad pattern at run time. Reason: the parser (M3/M4).
+- `alias for=echo; for x` parses as a `for` loop in jfsh. Reason: the parser.
+- A TRAPINT that returns non-zero inside `[[ -n $(kill -INT $$) ]]` ends the line with
+  1 in zsh, 0 in jfsh (also on main). Reason: an interrupt, not a TRAPxxx failure;
+  zsh's ERRFLAG_INT status path, left with M6's.
+- `whence -m 'ec*'` lists zsh's autoloadable module builtins (`echotc`); jfsh lists
+  loaded builtins only. Reason: module builtins aren't known before loading (M10).
+- At the top of a script file zsh's `autoload -X` is a non-fatal "invalid option(s)"
+  (a -c string: the fatal "bad autoload", which jfsh gives in both). Reason: a quirk
+  of zsh's scriptname test; jfsh doesn't tell a script from -c there.
+- `ulimit -N n` for a number with no resource is "bad option" in jfsh; zsh prints a
+  value read past its table, or "can't read limit". Reason: not worth copying.
+- `unset dirstack` / `unset argv` keep the special in jfsh; zsh drops its special
+  meaning. Reason: the M17 item on unsetting specials.
+- `autoload -t`/`-T` and `functions -t`/`-T` show no `# traced` line (and `functions
+  -t` is a bad option). Reason: tracing is M17's `-t`.
+- `typeset -a x=1` (and `-A h=1`) sets an array in jfsh; zsh reports "x: inconsistent
+  type for assignment" and goes on (also on main). Reason: the parameter zsh leaves
+  behind is unset but declared, which jfsh's typeset doesn't model.
+- `{ eval 'return 8'; … } always { … }` at the top of a -c string ends it with 8 in zsh
+  without running the always block; jfsh runs it first. Reason: zsh's retflag at the
+  top skips the always list (M4's exectry).
+- `[[ $((1/0)) == 2 || 1 ]]` ends a -c string with 0 in zsh, 1 in jfsh (also on main).
+  Reason: an arithmetic error's status in `[[ ]]` (M5).
+- A function `autoload -X` loads runs through an `eval` in zsh, so its `$funcstack`
+  shows `(eval)`; jfsh calls it directly. Reason: cosmetic.
+- `autoload +X g` inside `g` gives zsh status 1; jfsh loads it. Reason: zsh refuses
+  to replace a function being run; an edge case.
+- `whence -S` of a name hashed with `hash m=path` follows the link in jfsh; zsh shows
+  the hashed path alone. Reason: an edge of zsh's hashed-command path.
+- An unterminated quote at the end of a script read from standard input runs; zsh
+  says "unmatched '" with status 1. Reason: the lexer (M3), as for `eval` (M6's Left).
+- zsh keeps both the `fc -s`/`r` line and the command it reruns in the history;
+  jfsh replaces the first by the second. Reason: history recording is M8's.
+- `x=$(nocorrect)` is a parse error in zsh (its par_event in the substitution); jfsh
+  runs nothing there. Reason: jfsh parses the substitution's text as a list.
+- `if true; then nocorrect; fi` is a parse error in both, near `fi` in zsh and near `;`
+  in jfsh. Reason: zsh's lexer has read ahead; cosmetic.
+- Under `-c`, zsh's xtrace names a ksh-style autoload file's lines `+zsh:1>` and the
+  function it defined `+g:0>`; jfsh `+g:1>` for both (as zsh does in a script). After
+  such a load `whence -v` says "from zsh" (the script) in zsh and "from g" in jfsh.
+  Reason: zsh's scriptname and line bookkeeping for EF_RUN.
+- When a zle widget's ksh-style file defines no widget, zsh prints the error under the
+  redrawn line, jfsh before it. Reason: the editor's display (M9).
+- A lone `nocorrect` typed at an interactive prompt is a parse error in zsh (`parse
+  error near '\n'`, $? 1); jfsh runs nothing (also main). Reason: jfsh's interactive
+  lines are parsed as a list, not as zsh's par_event (M9 reads the lines).
+- `time nocorrect` and `coproc nocorrect` are null commands in zsh (status 0, `time`
+  printing its times); jfsh's parser has neither reserved word (also main). Reason:
+  `time` is M17's, `coproc` M19's.
+- `true && nocorrect & echo b` is a parse error near `&` in zsh; jfsh runs it (also
+  main). Reason: zsh's par_sublist marks the reduced sublist complex before the `&`,
+  which jfsh's list doesn't track.
+- `f() ! nocorrect` is a parse error near `!` in zsh; jfsh defines `f () { ! }` (also
+  main). Reason: zsh's short body takes a simple command only, jfsh's a sublist.
 
 ### M8. Startup, REPL loop, invocation [loop/*]
 

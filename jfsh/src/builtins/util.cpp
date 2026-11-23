@@ -1,11 +1,43 @@
+// shell_quote is derived from zsh 5.9's quotedzputs, mb_niceformat and
+// nicechar_sel (Src/utils.c).  zsh's copyright and licence:
+//
+// The Z Shell is copyright (c) 1992-2017 Paul Falstad, Richard Coleman,
+// Zoltán Hidvégi, Andrew Main, Peter Stephenson, Sven Wischnowsky, and
+// others.  All rights reserved.  Individual authors, whether or not
+// specifically named, retain copyright in all changes; in what follows, they
+// are referred to as `the Zsh Development Group'.  This is for convenience
+// only and this body has no legal status.  The Z shell is distributed under
+// the following licence; any provisions made in individual files take
+// precedence.
+//
+// Permission is hereby granted, without written agreement and without
+// licence or royalty fees, to use, copy, modify, and distribute this
+// software and to distribute modified versions of this software for any
+// purpose, provided that the above copyright notice and the following
+// two paragraphs appear in all copies of this software.
+//
+// In no event shall the Zsh Development Group be liable to any party for
+// direct, indirect, special, incidental, or consequential damages arising out
+// of the use of this software and its documentation, even if the Zsh
+// Development Group have been advised of the possibility of such damage.
+//
+// The Zsh Development Group specifically disclaim any warranties, including,
+// but not limited to, the implied warranties of merchantability and fitness
+// for a particular purpose.  The software provided hereunder is on an "as is"
+// basis, and the Zsh Development Group have no obligation to provide
+// maintenance, support, updates, enhancements, or modifications.
+
 #include <jfsh/builtins/util.h>
 
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
+#include <cwctype>
 
 #include <algorithm>
 
 #include <jfsh/core/aliases.h>
+#include <jfsh/core/utf8.h>
 
 namespace jfsh {
 
@@ -22,40 +54,71 @@ bool is_identifier(strv s) noexcept {
   return true;
 }
 
+bool printable_char(char32_t c) noexcept {
+  if (c < 0x80) return c >= 0x20 and c != 0x7f;
+  // iswprint, when the locale has multibyte characters; else at least
+  // the C1 controls aren't.
+  if (MB_CUR_MAX > 1) return ::iswprint(static_cast<wint_t>(c));
+  return c >= 0xa0;
+}
+
+// zsh's nicechar_sel(c, quotable) for a byte that isn't valid UTF-8 (or
+// any control character): \M- for the high bit, \C- for controls, \n and
+// \t as such.
+static void nice_byte(str& out, unsigned char c) {
+  if (c & 0x80) {
+    out += "\\M-";
+    c &= 0x7f;
+  }
+  if (c == 0x7f) out += "\\C-?";
+  else if (c == '\n') out += "\\n";
+  else if (c == '\t') out += "\\t";
+  else if (c < 0x20) {
+    out += "\\C-";
+    out += static_cast<char>(c + 0x40);
+  } else {
+    out += static_cast<char>(c);
+  }
+}
+
 str shell_quote(strv s) {
   if (s.empty()) return "''";
-  bool control = false;
+  // As zsh's quotedzputs: a string with an unprintable character is
+  // written as $'…' (is_mb_niceformat / mb_niceformat).
+  bool nice = false;
   bool special = false;
-  for (char ch : s) {
-    auto c = static_cast<unsigned char>(ch);
-    if (c < 0x20 or c == 0x7f) control = true;
-    else if (strv(" \t'\"\\$`|&;<>()*?[]#~={}^").find(static_cast<char>(c)) != strv::npos)
+  for (s::size_t i = 0; i < s.size() and not nice;) {
+    s::size_t len;
+    char32_t c = utf8_decode(s, i, len);
+    bool invalid = len == 1 and c >= 0x80;
+    if (invalid or not printable_char(c)) nice = true;
+    else if (c < 0x80
+             and strv(" '\"\\$`|&;<>()*?[]#~={}^").find(static_cast<char>(c)) != strv::npos)
       special = true;
+    i += len;
   }
-  if (control) {
+  if (nice) {
     str out = "$'";
-    for (char ch : s) {
-      auto c = static_cast<unsigned char>(ch);
-      switch (c) {
-        case '\n': out += "\\n";  break;
-        case '\t': out += "\\t";  break;
-        case '\r': out += "\\r";  break;
-        case '\a': out += "\\a";  break;
-        case '\b': out += "\\b";  break;
-        case '\f': out += "\\f";  break;
-        case '\v': out += "\\v";  break;
-        case 033:  out += "\\e";  break;
-        case '\'': out += "\\'";  break;
-        case '\\': out += "\\\\"; break;
-        default:
-          if (c < 0x20 or c == 0x7f) {
-            char buf[8];
-            s::snprintf(buf, sizeof buf, "\\%03o", c);
-            out += buf;
-          } else {
-            out += static_cast<char>(c);
-          }
+    for (s::size_t i = 0; i < s.size();) {
+      s::size_t len;
+      char32_t c = utf8_decode(s, i, len);
+      if (len == 1 and c >= 0x80) {
+        nice_byte(out, static_cast<unsigned char>(s[i]));
+      } else if (c == '\'') {
+        out += "\\'";
+      } else if (c == '\\') {
+        out += "\\\\";
+      } else if (c < 0x80 and not printable_char(c)) {
+        nice_byte(out, static_cast<unsigned char>(c));
+      } else if (not printable_char(c)) {
+        char buf[16];
+        s::snprintf(buf, sizeof buf, c >= 0x10000 ? "\\U%.8x" : "\\u%.4x",
+                    static_cast<unsigned>(c));
+        out += buf;
+      } else {
+        out += s.substr(i, len);
       }
+      i += len;
     }
     return out + "'";
   }
@@ -136,9 +199,10 @@ bool parse_options(const vec<str>& args, strv letters, strv with_arg,
 
 str param_value_text(const Param& p) {
   if (p.is_array()) {
+    // zsh's printparamvalue: `( a b )`, and `(  )` when empty.
     str out = "(";
     for (const auto& e : p.array()) out += ' ' + shell_quote(e);
-    return out + " )";
+    return out + (p.array().empty() ? "  )" : " )");
   }
   if (p.is_hash()) {
     auto h = p.hash();
@@ -152,20 +216,6 @@ str param_value_text(const Param& p) {
   if (p.is_integer()) return s::to_string(p.integer());
   if (p.is_float()) return p.scalar();
   return shell_quote(p.scalar());
-}
-
-str param_type_flags(const Param& p) {
-  str f;
-  if (p.is_array()) f += 'a';
-  if (p.is_hash()) f += 'A';
-  if (p.is_integer()) f += 'i' + (p.base > 0 ? s::to_string(p.base) : str{});
-  if (p.is_float()) f += (p.flags & PM_EFLOAT) ? 'E' : 'F';
-  if (p.flags & PM_LOWER) f += 'l';
-  if (p.is_readonly()) f += 'r';
-  if (p.flags & PM_UPPER) f += 'u';
-  if (p.flags & PM_UNIQUE) f += 'U';
-  if (p.is_exported()) f += 'x';
-  return f.empty() ? f : "-" + f;
 }
 
 vec<const Param*> sorted_params(const ParamTable& params,

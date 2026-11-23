@@ -12,35 +12,12 @@
 #include <jfsh/builtins/util.h>
 #include <jfsh/core/aliases.h>
 #include <jfsh/exec/executor.h>
+#include <jfsh/glob/glob.h>
 #include <jfsh/history/history.h>
 
 namespace jfsh {
 
 namespace {
-
-// The index into `entries` an event names: a number (negative counts
-// back from the last), or the latest event that starts with the text.
-opt<s::size_t> find_event(s::span<const HistEntry> entries, strv spec) {
-  if (entries.empty()) return s::nullopt;
-  bool numeric = not spec.empty()
-      and spec.find_first_not_of("0123456789", spec[0] == '-' or spec[0] == '+' ? 1 : 0) == strv::npos
-      and spec != "-" and spec != "+";
-  if (numeric) {
-    long n = s::strtol(str(spec).c_str(), nullptr, 10);
-    if (n < 0) {
-      long idx = static_cast<long>(entries.size()) + n;
-      if (idx < 0) return s::nullopt;
-      return static_cast<s::size_t>(idx);
-    }
-    // The entry numbered n, or the nearest one after it.
-    for (s::size_t i = 0; i < entries.size(); ++i)
-      if (static_cast<long>(entries[i].num) >= n) return i;
-    return s::nullopt;
-  }
-  for (s::size_t i = entries.size(); i-- > 0;)
-    if (strv(entries[i].text).starts_with(spec)) return i;
-  return s::nullopt;
-}
 
 str format_time(s::time_t t, char style) {
   char buf[64];
@@ -76,15 +53,23 @@ int run_again(strv cmd, str text, ExecContext& ctx) {
 }
 
 int fc_common(vec<str>& args, ExecContext& ctx, bool list_mode) {
-  strv cmd = args[0];
+  // zsh names fc in these messages, for history and r too.
+  strv cmd = "fc";
   OptParse o;
   if (not parse_options(args, "lnrdfiDEILmsRWAPap", "e", o, false, true)) return 1;
   if (o.has('p') or o.has('P') or o.has('a'))
     return builtin_error(cmd, "pushing history is not implemented");
-  if (not ctx.history) return builtin_error(cmd, "no history");
-  auto& hist = *ctx.history;
-  // Writing and reading the history file.
-  if (o.has('W') or o.has('R') or o.has('A')) {
+  // Writing and reading the history file.  zsh writes nothing without
+  // $SAVEHIST (or history).
+  if (o.has('W') or o.has('A')) {
+    auto p = ctx.params.lookup("SAVEHIST");
+    if (not ctx.history or not p or not p->get().is_set()
+        or s::strtol(p->get().scalar().c_str(), nullptr, 10) <= 0)
+      return 0;
+  }
+  if (not ctx.history and o.has('R')) return 0;
+  if (ctx.history and (o.has('W') or o.has('R') or o.has('A'))) {
+    auto& hist = *ctx.history;
     str file = o.next < args.size() ? args[o.next] : str{};
     if (file.empty())
       if (auto p = ctx.params.lookup("HISTFILE"); p and p->get().is_set()) file = p->get().scalar();
@@ -94,12 +79,13 @@ int fc_common(vec<str>& args, ExecContext& ctx, bool list_mode) {
     if (not r) return builtin_error(cmd, r.error().message);
     return 0;
   }
-  // The line being run is left out, so -1 is the command before it, as in
-  // zsh.
-  const auto& all = hist.entries();
-  s::span<const HistEntry> entries(all.data(),
-      all.size() - (ctx.hist_current and not all.empty() ? 1 : 0));
   vec<str> rest(args.begin() + static_cast<s::ptrdiff_t>(o.next), args.end());
+  // -m: the first word is a pattern the events must match.
+  opt<CompiledPattern> match;
+  if (o.has('m') and not rest.empty()) {
+    match = CompiledPattern::compile(rest.front());
+    rest.erase(rest.begin());
+  }
   // `old=new` words come before the event range.
   vec<str> subs;
   while (not rest.empty() and rest.front().find('=') != str::npos) {
@@ -110,39 +96,66 @@ int fc_common(vec<str>& args, ExecContext& ctx, bool list_mode) {
   bool reexec = o.has('s') or (editor and *editor == "-");
   bool listing = list_mode or o.has('l');
 
-  if (entries.empty()) return builtin_error(cmd, "no events in that range");
-  s::size_t first, last;
-  if (rest.empty()) {
-    if (listing) {
-      first = entries.size() > 16 ? entries.size() - 16 : 0;
-      last  = entries.size() - 1;
-    } else {
-      first = last = entries.size() - 1;
+  if (rest.size() > 2) return builtin_error(cmd, "too many arguments");
+  // The line being run is left out, so -1 is the command before it, as in
+  // zsh.  A shell without history (zsh -c) has an empty one.
+  static const vec<HistEntry> none;
+  const auto& all = ctx.history ? ctx.history->entries() : none;
+  s::span<const HistEntry> entries(all.data(),
+      all.size() - (ctx.hist_current and not all.empty() ? 1 : 0));
+  // zsh's curhist: the number of the line being run.
+  long curhist = all.empty() ? 1 : static_cast<long>(all.back().num) + (ctx.hist_current ? 0 : 1);
+  // zsh's fcgetcomm: a number (negative ones count back from the current
+  // line, down to 0), else the last event that starts with the text.
+  auto resolve = [&](const str& spec, long& num) {
+    long n = s::atol(spec.c_str());
+    if (n != 0 or spec[0] == '0') {
+      num = n < 0 ? s::max(0L, curhist + n) : n;
+      return true;
     }
-  } else {
-    auto f = find_event(entries, rest[0]);
-    if (not f) return builtin_error(cmd, "event not found: " + rest[0]);
-    first = *f;
-    if (rest.size() > 1) {
-      auto l = find_event(entries, rest[1]);
-      if (not l) return builtin_error(cmd, "event not found: " + rest[1]);
-      last = *l;
-    } else {
-      last = listing ? entries.size() - 1 : first;
-    }
+    for (s::size_t i = entries.size(); i-- > 0;)
+      if (strv(entries[i].text).starts_with(spec)) {
+        num = static_cast<long>(entries[i].num);
+        return true;
+      }
+    builtin_error(cmd, "event not found: " + spec);
+    return false;
+  };
+  long first_num = -1, last_num = -1;
+  if (not rest.empty() and not resolve(rest[0], first_num)) return 1;
+  if (rest.size() > 1 and not resolve(rest[1], last_num)) return 1;
+  if (not listing and entries.empty())
+    return builtin_error(cmd, "current history line would recurse endlessly, aborted");
+  if (last_num < 0) last_num = listing and first_num < curhist ? curhist - 1 : first_num;
+  if (first_num < 0) {
+    first_num = listing ? s::max(1L, curhist - 16) : curhist - 1;
+    if (last_num < first_num) last_num = first_num;
   }
-  bool reverse = o.has('r');
-  if (first > last) {
-    s::swap(first, last);
-    reverse = not reverse;
+  // The events between the two; none is zsh's fclist error.
+  long lo = s::min(first_num, last_num), hi = s::max(first_num, last_num);
+  s::size_t first = entries.size(), last = 0;
+  for (s::size_t i = 0; i < entries.size(); ++i) {
+    long n = static_cast<long>(entries[i].num);
+    if (n < lo or n > hi) continue;
+    if (first == entries.size()) first = i;
+    last = i;
   }
+  if (first == entries.size()) {
+    if (first_num == last_num)
+      return builtin_error(cmd, "no such event: " + s::to_string(first_num));
+    return builtin_error(cmd, "no events in that range");
+  }
+  bool reverse = o.has('r') != (first_num > last_num);
 
   if (listing) {
     vec<s::size_t> order;
     for (s::size_t i = first; i <= last; ++i) order.push_back(i);
     if (reverse) s::reverse(order.begin(), order.end());
+    bool any = false;
     for (s::size_t i : order) {
       const auto& e = entries[i];
+      if (match and not match->matches(e.text)) continue;
+      any = true;
       str line;
       if (not o.has('n')) {
         char num[32];
@@ -161,15 +174,21 @@ int fc_common(vec<str>& args, ExecContext& ctx, bool list_mode) {
       line += substitute(e.text, subs);
       s::printf("%s\n", line.c_str());
     }
+    // zsh's fclist when -m matched nothing in the range.
+    if (not any) return builtin_error(cmd, "no matching events found");
     return 0;
   }
 
   // Re-execute, after an editor if one is asked for.
   str text;
+  bool any = false;
   for (s::size_t i = first; i <= last; ++i) {
-    if (not text.empty()) text += '\n';
+    if (match and not match->matches(entries[i].text)) continue;
+    if (any) text += '\n';
+    any = true;
     text += substitute(entries[i].text, subs);
   }
+  if (not any) return builtin_error(cmd, "no matching events found");
   if (reexec) return run_again(cmd, text, ctx);
 
   str ed = editor ? *editor : str{};

@@ -53,6 +53,7 @@ Result<ProgRef> Parser::parse() {
   mProg  = prog.get();
   mError = {};
   mIncomplete = false;
+  mNull = false;
   mRedirMoves.clear();
   bool ok = par_list();
   if (ok and not at(TokType::TK_EOF)) ok = error_near(mLex.peek());
@@ -77,6 +78,7 @@ Result<ProgRef> Parser::parse_line() {
   mProg  = prog.get();
   mError = {};
   mIncomplete = false;
+  mNull = false;
   mRedirMoves.clear();
   mLineMode = true;
   // A line of only `;` is an empty command, as in zsh.
@@ -245,7 +247,10 @@ bool Parser::par_list() {
   // `then; cmd`, `do; done`: separators may start a list.
   while (eat(TokType::TK_NEWLINE) or eat(TokType::TK_SEMI)) {}
   if (at_list_terminator()) return true;
-  return par_list1();
+  // A list that is only a null command is an empty one.
+  bool ok = par_list1();
+  mNull = false;
+  return ok;
 }
 
 bool Parser::par_body() {
@@ -265,9 +270,26 @@ bool Parser::par_list1() {
   // parse_line stops at a newline outside any construct.
   bool top = mLineMode;
   mLineMode = false;
+  opt<s::size_t> prev;   // the list element before this one
   for (;;) {
     s::size_t head = emit(make_wc_list(0, 0));
     if (not par_sublist()) return false;
+    if (mNull) {
+      // A null sublist ends the list where it is, its separator left for
+      // the construct around to take (zsh's par_list); a script's line
+      // (zsh's par_event) has no room for one.
+      truncate(head);
+      if (top) {
+        mNull = false;
+        return error_near(mLex.peek());
+      }
+      if (prev) {
+        mNull = false;
+        WordCode w = mProg->prog[*prev];
+        patch(*prev, make_wc_list(wc_list_flags(w) | WC_LIST_END, wc_list_skip(w)));
+      }
+      return true;
+    }
     WordCode flags = 0;
     bool     more  = false;
     if (top and at(TokType::TK_NEWLINE)) {
@@ -292,20 +314,42 @@ bool Parser::par_list1() {
     if (not more) flags |= WC_LIST_END;
     patch(head, make_wc_list(flags, words_after(*mProg, head)));
     if (not more) return true;
+    prev = head;
   }
 }
 
 // sublist := WC_SUBLIST(connector | NOT, skip) pipeline, chained by && / ||.
 bool Parser::par_sublist() {
+  opt<s::size_t> prev;   // the element before a `&&` / `||`
   for (;;) {
     s::size_t head = emit(make_wc_sublist(0, 0));
     WordCode flags = eat(TokType::TK_BANG) ? WC_SUBLIST_NOT : 0;
     if (not par_pline()) return false;
+    if (mNull) {
+      if (flags & WC_SUBLIST_NOT) {
+        // `! nocorrect` keeps its sublist, an empty command negated
+        // (status 1), as zsh's par_sublist2.
+        mNull = false;
+        emit(make_wc_pipe(1, 0));
+        emit(make_wc(WC_SIMPLE, 0));
+      } else {
+        // Nothing: `a && <null>` is `a`; alone, no sublist (mNull stays).
+        truncate(head);
+        if (prev) {
+          mNull = false;
+          WordCode w = mProg->prog[*prev];
+          patch(*prev, make_wc_sublist((wc_sublist_flags(w) & ~WC_SUBLIST_TYPE) | WC_SUBLIST_END,
+                                       wc_sublist_skip(w)));
+        }
+        return true;
+      }
+    }
     WordCode skip = words_after(*mProg, head);
     if      (at(TokType::TK_AMPAMP))   flags |= WC_SUBLIST_AND;
     else if (at(TokType::TK_PIPEPIPE)) flags |= WC_SUBLIST_OR;
     patch(head, make_wc_sublist(flags, skip));
     if ((flags & WC_SUBLIST_TYPE) == WC_SUBLIST_END) return true;
+    prev = head;
     mLex.consume();
     skip_newlines();
   }
@@ -318,6 +362,16 @@ bool Parser::par_pline() {
   WordCode stderr_mask = 0;
   for (;;) {
     if (not par_cmd()) return false;
+    // A null command (zsh's par_pline): no pipeline, or after `|` an
+    // error.
+    if (mNull) {
+      if (n > 0) {
+        mNull = false;
+        return error_near(mLex.peek());
+      }
+      truncate(head);
+      return true;
+    }
     ++n;
     if (not (at(TokType::TK_PIPE) or at(TokType::TK_PIPEAMP))) break;
     if (at(TokType::TK_PIPEAMP)) stderr_mask |= (1u << (n - 1));
@@ -495,6 +549,7 @@ bool Parser::par_simple() {
   vec<str>  words;
   vec<Item> items;   // typeset arguments, in order
   bool typeset = false;
+  bool nocorrect = false;   // a `nocorrect` was taken
   int  nassign = 0;
   int  nredir  = 0;
   for (;;) {
@@ -521,6 +576,14 @@ bool Parser::par_simple() {
     // Aliases: the command word (after any assignments), a word after an
     // alias ending in a blank, and global aliases anywhere.
     bool cmdpos = words.empty() or (tok.after_alias_blank and not typeset);
+    // `nocorrect` is a reserved word before the command word, any number
+    // of times and among the assignments, as zsh's par_simple takes it.
+    if (words.empty() and not typeset and tok.type == TokType::TK_WORD
+        and tok.text == "nocorrect") {
+      mLex.consume();
+      nocorrect = true;
+      continue;
+    }
     if (expand_alias(cmdpos)) continue;
     if (tok.type == TokType::TK_WORD) {
       bool append = false;
@@ -562,8 +625,11 @@ bool Parser::par_simple() {
     if (not expect(TokType::TK_RPAREN)) return false;
     return par_funcdef_body(s::move(words));
   }
-  if (words.empty() and nassign == 0 and nredir == 0)
-    return error_near(mLex.peek());
+  if (words.empty() and nassign == 0 and nredir == 0) {
+    if (not nocorrect) return error_near(mLex.peek());
+    mNull = true;
+    return true;
+  }
   if (typeset) {
     emit(make_wc(WC_TYPESET, static_cast<WordCode>(items.size())));
     for (auto& item : items) {
@@ -596,6 +662,8 @@ bool Parser::par_if() {
   for (;;) {
     s::size_t branch = emit(make_wc_cmd(WC_IF, WC_IF_IF, 0));
     if (not par_body()) return false;  // condition
+    // Separators a null command left (zsh's par_if skips them).
+    while (eat(TokType::TK_NEWLINE) or eat(TokType::TK_SEMI)) {}
     bool shortform = true;
     if (eat(TokType::TK_THEN)) {
       shortform = false;
@@ -640,6 +708,11 @@ bool Parser::par_loop_body() {
 bool Parser::par_sublist_body() {
   s::size_t list = emit(make_wc_list(0, 0));
   if (not par_sublist()) return false;
+  if (s::exchange(mNull, false)) {
+    truncate(list);
+    emit(make_wc(WC_END, 0));
+    return true;
+  }
   patch(list, make_wc_list(WC_LIST_END, words_after(*mProg, list)));
   emit(make_wc(WC_END, 0));
   return true;
@@ -651,6 +724,8 @@ bool Parser::par_while() {
   mLex.consume();
   s::size_t head = emit(make_wc_cmd(WC_WHILE, type, 0));
   if (not par_body()) return false;
+  // Separators a null command left (zsh's par_while skips them).
+  while (eat(TokType::TK_NEWLINE) or eat(TokType::TK_SEMI)) {}
   if (not par_loop_body()) return false;
   patch(head, make_wc_cmd(WC_WHILE, type, words_after(*mProg, head)));
   return true;
@@ -958,7 +1033,11 @@ bool Parser::par_cursh(bool opened) {
   if (eat(TokType::TK_ALWAYS)) {
     op = WC_TRY;
     if (not expect(TokType::TK_LBRACE)) return false;
-    if (not par_body() or not expect(TokType::TK_RBRACE)) return false;
+    if (not par_body()) return false;
+    // zsh's par_subsh skips separators after the always block's list (a
+    // null command leaves one), not after the first block's.
+    while (eat(TokType::TK_NEWLINE) or eat(TokType::TK_SEMI)) {}
+    if (not expect(TokType::TK_RBRACE)) return false;
   }
   patch(head, make_wc_cmd(op, 0, words_after(*mProg, head)));
   return true;
@@ -1036,7 +1115,11 @@ bool Parser::par_function_body() {
     s::size_t start = mProg->prog.size();
     return par_body() and expect(TokType::TK_RBRACE) and wrap_body_redirs(start);
   }
-  return par_sublist_body();
+  // A short body must be a command: `f() nocorrect` is an error in zsh.
+  s::size_t start = mProg->prog.size();
+  if (not par_sublist_body()) return false;
+  if (mProg->prog.size() == start + 1) return error_near(mLex.peek());
+  return true;
 }
 
 // `f() { … } > log`: redirections after the body belong to the function

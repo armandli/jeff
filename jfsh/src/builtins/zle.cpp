@@ -196,7 +196,7 @@ void install_zle_hooks(Executor& ex) {
   src.command_names = [&ctx, &ex] {
     vec<str> names = ex.builtin_names();
     for (const auto& [name, body] : ctx.functions) names.push_back(name);
-    for (const auto& name : ctx.autoloads) names.push_back(name);
+    for (const auto& [name, _] : ctx.autoloads) names.push_back(name);
     for (const auto& [name, def] : ctx.aliases.regular) names.push_back(name);
     for (strv r : RESERVED_WORDS) names.emplace_back(r);
     return names;

@@ -20,20 +20,23 @@ namespace jfsh {
 
 namespace {
 
-bool is_regular_file(const str& path) {
+// A file `.` can read: anything that exists but a directory (zsh's
+// stat and !S_ISDIR), so a fifo or /dev/null too.  A path with a slash
+// may even be a directory, which reads as empty.
+bool can_source(const str& path, bool dir_ok) {
   struct stat st{};
-  return ::stat(path.c_str(), &st) == 0 and S_ISREG(st.st_mode);
+  return ::stat(path.c_str(), &st) == 0 and (dir_ok or not S_ISDIR(st.st_mode));
 }
 
 // Where `.` (and `source`, which tries the current directory first) finds
 // `name`: as given when it has a slash, otherwise along $PATH.
 opt<str> find_sourced(const str& name, bool cwd_first, ExecContext& ctx) {
   if (name.find('/') != str::npos)
-    return is_regular_file(name) ? opt<str>{name} : s::nullopt;
-  if (cwd_first and is_regular_file(name)) return name;
+    return can_source(name, true) ? opt<str>{name} : s::nullopt;
+  if (cwd_first and can_source(name, false)) return name;
   for (const auto& dir : path_dirs(ctx.params)) {
     str candidate = dir.empty() ? name : dir + "/" + name;
-    if (is_regular_file(candidate)) return candidate;
+    if (can_source(candidate, false)) return candidate;
   }
   return s::nullopt;
 }
@@ -68,8 +71,8 @@ opt<int> status_arg(vec<str>& args, ExecContext& ctx) {
 }
 
 // What `functions` prints for an autoload function not yet loaded.
-str autoload_stub(const str& name) {
-  return name + " () {\n\t# undefined\n\tbuiltin autoload -XU\n}";
+str autoload_stub(const ExecContext& ctx, const str& name) {
+  return name + " () {\n\t# undefined\n\t" + autoload_stub_body(ctx, name) + "\n}";
 }
 
 }  // namespace
@@ -80,8 +83,10 @@ int builtin_source(vec<str>& args, ExecContext& ctx) { return source_common(args
 // eval arg …: the arguments joined with spaces, run in this shell.
 int builtin_eval(vec<str>& args, ExecContext& ctx) {
   str text;
-  for (s::size_t i = 1; i < args.size(); ++i) {
-    if (i > 1) text += ' ';
+  // A first `--` is dropped, as zsh's BINF_DASHDASHVALID.
+  s::size_t first = args.size() > 1 and args[1] == "--" ? 2 : 1;
+  for (s::size_t i = first; i < args.size(); ++i) {
+    if (i > first) text += ' ';
     text += args[i];
   }
   if (text.find_first_not_of(" \t\n") == str::npos) return 0;
@@ -141,19 +146,69 @@ int builtin_return(vec<str>& args, ExecContext& ctx) {
   return ctx.return_val;
 }
 
-// autoload [-UXkmtz] [name …]: marks functions to be loaded from $fpath
-// when first called.  `autoload /dir/name` loads from that file.  With no
-// names, lists the functions still to be loaded.
+// autoload [-UXkmtz] [+X] [name …]: marks functions to be loaded from
+// $fpath when first called.  `autoload /dir/name` loads from that file.
+// With no names, lists the functions still to be loaded.  +X loads them
+// now; -X, in a function, loads that function and runs it with its
+// arguments, as zsh's eval_autoload.
 int builtin_autoload(vec<str>& args, ExecContext& ctx) {
   OptParse o;
   if (not parse_options(args, "UXdkmrRtTwz", "", o, true)) return 1;
-  if (o.has('X')) return builtin_error(args[0], "-X: not implemented");
+  // zsh's bin_functions refuses -k with -z.
+  if ((o.has('k') or o.has_plus('k')) and (o.has('z') or o.has_plus('z')))
+    return builtin_error(args[0], "invalid option(s)");
+  // As zsh's bin_functions: the flags given are added to (or with `+`
+  // taken from) those a name already has, -z and -k each clearing the
+  // other.
+  str on, off;
+  for (char c : strv("UtTkz")) {
+    if (o.has(c)) on += c;
+    if (o.has_plus(c)) off += c;
+  }
+  if (o.has('z')) off += 'k';
+  if (o.has('k')) off += 'z';
+  // -d (zsh's PM_CUR_FPATH) shows as `c`.
+  if (o.has('d')) on += 'c';
+  if (o.has_plus('d')) off += 'c';
+  if (o.has('X')) {
+    // As zsh's bin_functions: one argument is the directory to load from.
+    if (args.size() > o.next + 1) return builtin_error(args[0], "-X: too many arguments");
+    // The innermost function being run (not an eval or a sourced file).
+    str name;
+    for (auto it = ctx.funcstack.rbegin(); it != ctx.funcstack.rend(); ++it)
+      if (ctx.functions.contains(it->name)) {
+        name = it->name;
+        break;
+      }
+    if (name.empty()) {
+      // zsh's zerrnam: the command line ends.
+      ctx.aborting = true;
+      return builtin_error(args[0], "bad autoload");
+    }
+    // Its file is looked for along $fpath (or in the directory given), not
+    // where it was defined.
+    if (o.next < args.size()) ctx.function_files[name] = args[o.next] + "/" + name;
+    else                      ctx.function_files.erase(name);
+    // The flags are the ones given here (zsh: `shf->node.flags = on`).
+    ctx.autoloads[name] = on;
+    vec<str> fargs{name};
+    fargs.insert(fargs.end(), ctx.positional.begin(), ctx.positional.end());
+    if (not ctx.executor->load_autoload(name)) {
+      // As zsh's: the function is left undefined, to be looked for again.
+      ctx.functions.erase(name);
+      return 1;
+    }
+    ProgRef body = ctx.functions[name];
+    return ctx.executor->call_function(body, fargs);
+  }
   if (o.next >= args.size()) {
-    vec<str> names(ctx.autoloads.begin(), ctx.autoloads.end());
+    vec<str> names;
+    for (const auto& [n, _] : ctx.autoloads) names.push_back(n);
     s::sort(names.begin(), names.end());
-    for (const auto& n : names) s::printf("%s\n", autoload_stub(n).c_str());
+    for (const auto& n : names) s::printf("%s\n", autoload_stub(ctx, n).c_str());
     return 0;
   }
+  int rc = 0;
   for (s::size_t i = o.next; i < args.size(); ++i) {
     str name = args[i];
     str path;
@@ -162,10 +217,16 @@ int builtin_autoload(vec<str>& args, ExecContext& ctx) {
       name = name.substr(slash + 1);
     }
     if (name.empty() or ctx.functions.contains(name)) continue;
-    ctx.autoloads.insert(name);
+    str& flags = ctx.autoloads[name];
+    str merged;
+    for (char c : strv("UtTkzc"))
+      if ((flags.find(c) != str::npos or on.find(c) != str::npos) and off.find(c) == str::npos)
+        merged += c;
+    flags = s::move(merged);
     if (not path.empty()) ctx.function_files[name] = path;
+    if (o.has_plus('X') and not ctx.executor->load_autoload(name)) rc = 1;
   }
-  return 0;
+  return rc;
 }
 
 // functions [-mu+] [name …]: prints function definitions (all, the named
@@ -179,16 +240,47 @@ int builtin_functions(vec<str>& args, ExecContext& ctx) {
     if (a == "+") names_only = true;
     else          a2.push_back(a);
   }
-  if (not parse_options(a2, "mux", "", o, true)) return 1;
-  if (o.has('u')) {
+  if (not parse_options(a2, "mukzU", "x", o, true)) return 1;
+  // -x N: N spaces for each level of indentation (0: none), as zsh's
+  // printshfuncexpand.
+  opt<s::size_t> indent;
+  if (auto* x = o.arg('x')) {
+    char* end = nullptr;
+    long n = s::strtol(x->c_str(), &end, 10);
+    if (x->empty() or *end != '\0' or n < 0)
+      return builtin_error(a2[0], "number expected after -x");
+    indent = static_cast<s::size_t>(n);
+  }
+  auto expand = [&](str text) {
+    if (not indent) return text;
+    str out;
+    bool start = true;
+    for (char c : text) {
+      if (start and c == '\t') {
+        out.append(*indent, ' ');
+        continue;
+      }
+      start = c == '\n';
+      out += c;
+    }
+    return out;
+  };
+  // -u (and -U, zsh's PM_UNALIASED|PM_UNDEFINED) is autoload, with the
+  // flags given.
+  if (o.has('u') or o.has('U')) {
     vec<str> al{"autoload"};
+    for (char c : strv("Ukz"))
+      if (o.has(c)) al.push_back(str("-") + c);
     al.insert(al.end(), a2.begin() + static_cast<s::ptrdiff_t>(o.next), a2.end());
     return builtin_autoload(al, ctx);
   }
   vec<str> requested(a2.begin() + static_cast<s::ptrdiff_t>(o.next), a2.end());
+  // Disabled ones aren't listed, nor found (zsh's DISABLED nodes).
   vec<str> all;
-  for (const auto& [name, body] : ctx.functions) all.push_back(name);
-  for (const auto& name : ctx.autoloads) all.push_back(name);
+  for (const auto& [name, body] : ctx.functions)
+    if (not ctx.disabled_functions.contains(name)) all.push_back(name);
+  for (const auto& [name, _] : ctx.autoloads)
+    if (not ctx.disabled_functions.contains(name)) all.push_back(name);
   s::sort(all.begin(), all.end());
   all.erase(s::unique(all.begin(), all.end()), all.end());
   auto print = [&](const str& name) {
@@ -197,9 +289,9 @@ int builtin_functions(vec<str>& args, ExecContext& ctx) {
       return;
     }
     if (auto fn = ctx.functions.find(name); fn != ctx.functions.end())
-      s::printf("%s\n", function_text(name, *fn->second).c_str());
+      s::printf("%s\n", expand(function_text(name, *fn->second)).c_str());
     else
-      s::printf("%s\n", autoload_stub(name).c_str());
+      s::printf("%s\n", expand(autoload_stub(ctx, name)).c_str());
   };
   if (requested.empty()) {
     for (const auto& n : all) print(n);
@@ -215,7 +307,7 @@ int builtin_functions(vec<str>& args, ExecContext& ctx) {
       if (not any) rc = 1;
       continue;
     }
-    if (ctx.functions.contains(r) or ctx.autoloads.contains(r)) print(r);
+    if (s::binary_search(all.begin(), all.end(), r)) print(r);
     else rc = 1;
   }
   return rc;
@@ -241,7 +333,7 @@ static int enable_common(vec<str>& args, ExecContext& ctx, bool on) {
   vec<str> all;
   if (funcs) {
     for (const auto& [name, body] : ctx.functions) all.push_back(name);
-    for (const auto& name : ctx.autoloads) all.push_back(name);
+    for (const auto& [name, _] : ctx.autoloads) all.push_back(name);
   } else {
     all = ctx.executor->builtin_names();
   }

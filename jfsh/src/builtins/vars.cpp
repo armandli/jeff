@@ -19,16 +19,19 @@ namespace {
 
 // Attributes typeset can give a parameter, from its option letters.
 struct TypesetAttrs {
-  char        type   = 0;   // 'a', 'A', 'i' or 'F'; 0 for scalar
-  bool        global = false;
-  bool        print  = false;   // -p
-  bool        names_only = false;   // a bare `+`
-  bool        pattern = false;  // -m
-  bool        functions = false;   // -f
-  bool        tie    = false;   // -T
   opt<int>    base{};   // -i N (output base), -F N / -E N (digits)
   s::uint32_t on     = 0;   // PM_EXPORTED, PM_READONLY, PM_UPPER, PM_LOWER, …
   s::uint32_t off    = 0;
+  char        type   = 0;   // 'a', 'A', 'i' or 'F'; 0 for scalar
+  bool        global = false;
+  bool        print  = false;      // -p
+  bool        lines  = false;      // -p1: elements on lines of their own
+  bool        no_list = false;     // -t, -k, -z: flags no parameter has here
+  bool        off_array = false;   // +a / +A
+  bool        names_only = false;  // a bare `+`
+  bool        pattern = false;     // -m
+  bool        functions = false;   // -f
+  bool        tie    = false;      // -T
 };
 
 str fold_case(str value, s::uint32_t flags) {
@@ -50,8 +53,9 @@ vec<str> unique(vec<str> words) {
 int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx) {
   s::size_t eq = arg.find('=');
   bool has_value = eq != strv::npos;
-  bool append    = has_value and eq > 0 and arg[eq - 1] == '+';
-  str  name(arg.substr(0, has_value ? eq - (append ? 1 : 0) : arg.size()));
+  // `x+=v` is no assignment to typeset: `x+` is refused as a name below,
+  // as zsh does.
+  str  name(arg.substr(0, has_value ? eq : arg.size()));
   str  value = has_value ? str(arg.substr(eq + 1)) : str{};
   // `name[sub]=value` sets an element of a parameter that exists in the
   // scope typeset declares in, as an assignment would.
@@ -67,7 +71,6 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
     a.subscript = name.substr(lb + 1, name.size() - lb - 2);
     a.subscript_whole = *a.subscript == "@" or *a.subscript == "*";
     a.value     = s::move(value);
-    a.append    = append;
     if (auto r = ctx.executor->assign_expanded(a); not r) {
       s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
       return 1;
@@ -80,8 +83,10 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
                                   + name);
   }
   auto existing = attrs.global ? ctx.params.lookup(name) : ctx.params.lookup_local(name);
+  // `typeset +r` takes the attribute away, except from a special.
   if (existing and existing->get().is_readonly()
-      and (has_value or attrs.type or (attrs.off & PM_READONLY))) {
+      and (has_value or attrs.type
+           or ((attrs.off & PM_READONLY) and (existing->get().flags & PM_SPECIAL)))) {
     s::fprintf(stderr, "jfsh: read-only variable: %s\n", name.c_str());
     return 1;
   }
@@ -132,7 +137,6 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
     // `local x` after `unset x` sets it again, empty.
     p->set(str{});
   }
-  if (append and has_value) value = p->scalar() + value;
   s::uint32_t flags = (p->flags | attrs.on) & ~attrs.off;
   value = fold_case(s::move(value), flags);
   int last_base = -1;
@@ -150,9 +154,10 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
   bool was_integer = p->is_integer(), was_float = p->is_float();
   switch (attrs.type) {
     case 'a':
+      // A parameter that becomes an array starts empty, as zsh makes a
+      // new one for a change of type.
       if (has_value) p->set(vec<str>{value});
-      else if (not p->is_array()) p->set(p->is_set() and not p->scalar().empty()
-                                             ? vec<str>{p->scalar()} : vec<str>{});
+      else if (not p->is_array()) p->set(vec<str>{});
       break;
     case 'A':
       if (not p->is_hash()) p->set(umap<str, str>{});
@@ -170,6 +175,9 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
       }
       break;
     default:
+      // `typeset +a`: an array becomes an empty scalar.
+      if (attrs.off_array and (p->is_array() or p->is_hash()) and not (p->flags & PM_SPECIAL))
+        p->set(str{});
       if (has_value) {
         if (p->is_integer() or p->is_float()) {
           auto v = math(value);
@@ -206,27 +214,80 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
   return 0;
 }
 
-// `typeset -p` form: `typeset -i n=3`, `export X=1`.
-// `global`: shown from a function, a parameter from outside it gets -g.
-str typeset_line(const Param& p, bool global) {
-  str flags = param_type_flags(p);
-  str head  = flags == "-x" ? str("export")
-            : "typeset" + str(global ? " -g" : "") + (flags.empty() ? str{} : " " + flags);
-  if (not p.is_set() or (p.flags & PM_HIDEVAL)) return head + " " + p.name;
-  return head + " " + p.name + "=" + param_value_text(p);
+// zsh's PM_RO_BY_DESIGN: a special that is always read-only can't be
+// restored, so `typeset -p` leaves it out.
+bool ro_by_design(const Param& p) {
+  return (p.flags & (PM_SPECIAL | PM_READONLY)) == (PM_SPECIAL | PM_READONLY);
 }
 
-// The type words `typeset` and `typeset +` print in front of a name.
+// The attributes of `p` in zsh's pmtypes order, each as `letter` (for
+// `typeset -p`) or `word` (for a bare `typeset`).  An export shows only
+// on a local, an array or an association (printparamnode).
+template <typename Fn>
+void for_each_attr(const Param& p, Fn&& fn) {
+  if (p.is_integer()) fn('i', "integer", p.base);
+  if (p.is_float())   fn((p.flags & PM_EFLOAT) ? 'E' : 'F', "float", 0);
+  if (p.is_array())   fn('a', "array", 0);
+  if (p.is_hash())    fn('A', "association", 0);
+  if (p.scope > 0)    fn(0, "local", 0);
+  if (p.flags & PM_LOWER)    fn('l', "lowercase", 0);
+  if (p.flags & PM_UPPER)    fn('u', "uppercase", 0);
+  if (p.is_readonly())       fn('r', "readonly", 0);
+  if (p.is_exported() and (p.scope > 0 or (p.flags & (PM_LOCAL | PM_ARRAY | PM_HASH))))
+    fn('x', "exported", 0);
+  if (p.flags & PM_UNIQUE)   fn('U', "unique", 0);
+}
+
+// `typeset -p` form, as zsh's printparamnode with PRINT_TYPESET:
+// `typeset -i n=3`, `export X=1`, `typeset -g` for a global seen from a
+// function (`locallevel` is the current function scope, 0 outside).
+// `lines` (-p1) puts each element of an array on a line of its own.
+str typeset_line(const Param& p, int locallevel, bool lines = false) {
+  str out = locallevel > 0 and p.scope >= locallevel ? "typeset "
+          : p.is_exported() and not (p.flags & (PM_ARRAY | PM_HASH)) ? "export "
+          : locallevel > 0 ? "typeset -g "
+                           : "typeset ";
+  bool minus = false;
+  for_each_attr(p, [&](char letter, const char*, int base) {
+    if (not letter) return;
+    if (not minus) out += '-';
+    minus = true;
+    out += letter;
+    if (base) {
+      out += s::to_string(base) + ' ';
+      minus = false;
+    }
+  });
+  if (minus) out += ' ';
+  out += shell_quote(p.name);
+  if (p.flags & PM_HIDEVAL) return out;
+  out += '=';
+  if (lines and (p.is_array() or p.is_hash())) {
+    out += '(';
+    if (p.is_array()) {
+      for (const auto& e : p.array()) out += "\n  " + shell_quote(e);
+      if (not p.array().empty()) out += '\n';
+    } else {
+      auto h = p.hash();
+      vec<str> keys;
+      for (const auto& [k, v] : h) keys.push_back(k);
+      s::sort(keys.begin(), keys.end());
+      for (const auto& k : keys) out += "\n  [" + shell_quote(k) + "]=" + shell_quote(h[k]);
+      if (not keys.empty()) out += '\n';
+    }
+    return out + ')';
+  }
+  return out + param_value_text(p);
+}
+
+// The type words a bare `typeset` prints in front of a name.
 str type_words(const Param& p) {
   str out;
-  auto add = [&](strv w) { out += w; out += ' '; };
-  if (p.is_array())   add("array");
-  if (p.is_hash())    add("association");
-  if (p.is_integer()) add(p.base > 0 ? "integer " + s::to_string(p.base) : str("integer"));
-  if (p.is_float())   add("float");
-  if (p.flags & PM_LOCAL) add("local");
-  if (p.is_exported()) add("exported");
-  if (p.is_readonly()) add("readonly");
+  for_each_attr(p, [&](char, const char* word, int base) {
+    out += word;
+    out += ' ';
+    if (base) out += s::to_string(base) + ' ';
+  });
   return out;
 }
 
@@ -247,25 +308,24 @@ int typeset_list(const TypesetAttrs& attrs, const vec<str>& patterns, ExecContex
   vec<CompiledPattern> pats;
   for (const auto& pat : patterns) pats.push_back(CompiledPattern::compile(pat));
   auto params = sorted_params(ctx.params, [&](const Param& p) {
-    if (not p.is_set() and not attrs.print) return false;
+    // As printparamnode: an unset parameter isn't shown, nor with -p a
+    // special that is read-only by design.
+    if (not p.is_set()) return false;
+    if (attrs.print and ro_by_design(p)) return false;
     if (not has_attrs(p, attrs)) return false;
     if (pats.empty()) return true;
     return s::any_of(pats.begin(), pats.end(),
                      [&](const CompiledPattern& c) { return c.matches(p.name); });
   });
+  bool plain = attrs.on or attrs.type or attrs.pattern;
   for (const Param* p : params) {
     if (attrs.print)
-      s::printf("%s\n", typeset_line(*p, p->scope < ctx.params.local_scope()).c_str());
-    else if (attrs.names_only)
+      s::printf("%s\n", typeset_line(*p, ctx.params.local_scope(), attrs.lines).c_str());
+    else if (attrs.names_only or ((p->flags & PM_HIDEVAL) and not attrs.pattern))
       s::printf("%s%s\n", attrs.on or attrs.type ? "" : type_words(*p).c_str(),
                 shell_quote(p->name).c_str());
-    else if (p->flags & PM_HIDEVAL)
-      s::printf("%s%s\n", attrs.on or attrs.type ? "" : type_words(*p).c_str(),
-                shell_quote(p->name).c_str());
-    else if (attrs.on or attrs.type)
-      s::printf("%s=%s\n", shell_quote(p->name).c_str(), param_value_text(*p).c_str());
     else
-      s::printf("%s%s=%s\n", type_words(*p).c_str(), shell_quote(p->name).c_str(),
+      s::printf("%s%s=%s\n", plain ? "" : type_words(*p).c_str(), shell_quote(p->name).c_str(),
                 param_value_text(*p).c_str());
   }
   return 0;
@@ -308,13 +368,16 @@ int typeset_tie(strv cmd, const vec<str>& names, const TypesetAttrs& attrs, Exec
 // A new parameter is set and empty (0 for -i/-F, () for -a/-A).  `implied`
 // holds the options the variant stands for (export is `typeset -gx`).
 // With no names it lists the parameters that have the attributes given.
-// TODO(builtin/typeset): `-Z`/`-L`/`-R` padding, `-t`.
 int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
   strv cmd = args[0];
   TypesetAttrs attrs;
   auto apply = [&](char c, bool on) {
     switch (c) {
-      case 'a': case 'A': case 'i': attrs.type = on ? c : 0; return true;
+      case 'a': case 'A':
+        attrs.type = on ? c : 0;
+        attrs.off_array = not on;
+        return true;
+      case 'i': attrs.type = on ? c : 0; return true;
       case 'F': case 'E':
         attrs.type = on ? 'F' : 0;
         if (on) (c == 'E' ? attrs.on : attrs.off) |= PM_EFLOAT;
@@ -332,7 +395,8 @@ int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
       case 'U': (on ? attrs.on : attrs.off) |= PM_UNIQUE;   return true;
       case 'H': (on ? attrs.on : attrs.off) |= PM_HIDEVAL;  return true;
       case 'h': (on ? attrs.on : attrs.off) |= PM_HIDE;     return true;
-      case 't': return true;   // accepted, no effect yet
+      // Accepted, no effect yet: -t tags, -k and -z are for functions.
+      case 't': case 'k': case 'z': attrs.no_list = on; return true;
       default:  return false;
     }
   };
@@ -350,6 +414,18 @@ int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
         s::fprintf(stderr, "jfsh: %.*s: bad option: %c%c\n",
                    static_cast<int>(cmd.size()), cmd.data(), a[0], a[k]);
         return 1;
+      }
+      // -p takes an optional number, attached or as the next word: 1 puts
+      // array elements on lines of their own (zsh's PRINT_LINE).
+      if (a[0] == '-' and a[k] == 'p') {
+        str n = a.substr(k + 1);
+        if (n.empty() and i + 1 < args.size() and not args[i + 1].empty()
+            and s::isdigit(static_cast<unsigned char>(args[i + 1][0])))
+          n = args[++i];
+        if (n.empty()) continue;
+        if (n != "0" and n != "1") return builtin_error(cmd, "bad argument to -p: " + n);
+        attrs.lines = n == "1";
+        break;
       }
       // -i, -F and -E take a number, attached (`-F2`) or as the next word.
       if (a[0] != '-' or (a[k] != 'i' and a[k] != 'F' and a[k] != 'E')) continue;
@@ -373,6 +449,10 @@ int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
       break;
     }
   }
+  // As zsh's bin_typeset: -u and -l cancel each other.
+  if ((attrs.on & PM_UPPER) and (attrs.on & PM_LOWER)) attrs.on &= ~(PM_UPPER | PM_LOWER);
+  if (attrs.on & PM_UPPER) attrs.off |= PM_LOWER;
+  if (attrs.on & PM_LOWER) attrs.off |= PM_UPPER;
   if (attrs.type == 'i' and attrs.base and (*attrs.base < 2 or *attrs.base > 36))
     return builtin_error(cmd, "invalid base (must be 2 to 36 inclusive): "
                                   + s::to_string(*attrs.base));
@@ -383,9 +463,29 @@ int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
     vec<str> fargs{"functions"};
     if (attrs.names_only) fargs.emplace_back("+");
     if (attrs.pattern) fargs.emplace_back("-m");
+    // typeset -fu / -fU: autoload (-u and -U are their letters here).
+    if (attrs.on & PM_UPPER)  fargs.emplace_back("-u");
+    if (attrs.on & PM_UNIQUE) fargs.emplace_back("-U");
     fargs.insert(fargs.end(), names.begin(), names.end());
     return builtin_functions(fargs, ctx);
   }
+  // `typeset -m -x 'a*'`: the attributes go to every parameter that
+  // matches.
+  if (attrs.pattern and not attrs.print and plus.empty() and not names.empty()
+      and (attrs.on or attrs.off or attrs.type)) {
+    int rc = 0;
+    for (const auto& pat : names) {
+      auto cp = CompiledPattern::compile(pat);
+      vec<str> matched;
+      ctx.params.for_each([&](const Param& p) {
+        if (p.is_set() and cp.matches(p.name)) matched.push_back(p.name);
+      });
+      for (const auto& n : matched)
+        if (typeset_one(cmd, n, attrs, ctx) != 0) rc = 1;
+    }
+    return rc;
+  }
+  if (names.empty() and attrs.no_list) return 0;
   if (names.empty() or attrs.pattern) {
     // `typeset +i`, `typeset +m pat`: the names only, of the parameters
     // with the attributes the `+` options name.
@@ -405,19 +505,38 @@ int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
       // A prefix assignment's copy that was unset is gone, as in zsh.
       if (p and not p->get().is_set() and ctx.params.in_prefix_scope(p->get()))
         p.reset();
+      // The shell's own `$*`, `$?`, … are read-only by design.
+      if (not p and name.size() == 1 and strv("*@#?$!-").find(name[0]) != strv::npos)
+        continue;
       if (not p) {
         s::fprintf(stderr, "jfsh: %.*s: no such variable: %s\n",
                    static_cast<int>(cmd.size()), cmd.data(), name.c_str());
         rc = 1;
         continue;
       }
-      bool global = p->get().scope < ctx.params.local_scope();
-      s::printf("%s\n", typeset_line(p->get(), global).c_str());
+      // As printparamnode: an unset one, or a special read-only by
+      // design, prints nothing.
+      if (not p->get().is_set() or ro_by_design(p->get())) continue;
+      s::printf("%s\n", typeset_line(p->get(), ctx.params.local_scope(), attrs.lines).c_str());
     }
     return rc;
   }
-  for (const auto& name : names)
+  // `typeset x` with no attributes, for a parameter of this scope: zsh's
+  // typeset_single shows it (`x=1`) unless TYPESET_SILENT.
+  bool show = implied.empty() and not attrs.on and not attrs.off and not attrs.type
+              and not attrs.off_array and not attrs.global and plus.empty()
+              and not ctx.opts.get(OPT_TYPESETSILENT);
+  for (const auto& name : names) {
+    if (show and name.find('=') == str::npos) {
+      auto p = ctx.params.lookup_local(name);
+      if (p and p->get().is_set()
+          and (p->get().scope == ctx.params.local_scope() or ctx.params.local_scope() == 0)) {
+        s::printf("%s=%s\n", shell_quote(name).c_str(), param_value_text(p->get()).c_str());
+        continue;
+      }
+    }
     if (typeset_one(cmd, name, attrs, ctx) != 0) rc = 1;
+  }
   // As in zsh, a name that can't be declared or assigned ends the command
   // line once the rest are done.
   if (rc != 0) ctx.aborting = true;
@@ -431,10 +550,8 @@ int builtin_integer(vec<str>& args, ExecContext& ctx) { return typeset_common(ar
 // zsh's `float` is `typeset -E`.
 int builtin_float  (vec<str>& args, ExecContext& ctx) { return typeset_common(args, ctx, "E"); }
 
-// `export` is `typeset -gx`; `-n` takes the export attribute away.
+// `export` is `typeset -gx`.
 int builtin_export(vec<str>& args, ExecContext& ctx) {
-  for (auto& a : args)
-    if (a == "-n") a = "+x";
   return typeset_common(args, ctx, "gx");
 }
 
@@ -457,15 +574,28 @@ int builtin_unset(vec<str>& args, ExecContext& ctx) {
   if (not parse_options(args, "fmv", "", o)) return 1;
   bool funcs   = o.has('f');
   bool pattern = o.has('m');
+  if (o.next >= args.size()) return builtin_error(args[0], "not enough arguments");
   int  rc = 0;
+  bool matched = false;   // -m: by any of the patterns
+  // A name that isn't one, or a read-only parameter, is zsh's zerrnam /
+  // zerr: the command line ends once the rest are done.
+  struct Abort {
+    ~Abort() { if (fatal) ctx.aborting = true; }
+    ExecContext& ctx;
+    bool         fatal = false;
+  } abort{ctx};
   for (s::size_t i = o.next; i < args.size(); ++i) {
     const str& name = args[i];
     if (funcs) {
       vec<str> victims;
       if (pattern) {
+        // Autoload-only names too.
         auto pat = CompiledPattern::compile(name);
         for (const auto& [n, body] : ctx.functions)
           if (pat.matches(n)) victims.push_back(n);
+        for (const auto& [n, _] : ctx.autoloads)
+          if (pat.matches(n) and not ctx.functions.contains(n)) victims.push_back(n);
+        matched = matched or not victims.empty();
       } else if (ctx.functions.contains(name) or ctx.autoloads.contains(name)) {
         victims.push_back(name);
       } else {
@@ -489,13 +619,19 @@ int builtin_unset(vec<str>& args, ExecContext& ctx) {
     if (pattern) {
       auto pat = CompiledPattern::compile(name);
       vec<str> victims;
+      // jfsh's own read-only specials ($aliases, $EPOCHSECONDS, …, which
+      // `zsh -f` doesn't have) are passed over.
       ctx.params.for_each([&](const Param& p) {
-        if (pat.matches(p.name)) victims.push_back(p.name);
+        if (not pat.matches(p.name)) return;
+        matched = true;
+        if (not ro_by_design(p)) victims.push_back(p.name);
       });
+      // A read-only one ends the line, but leaves the status 0: zsh's
+      // returnval is only for a bad pattern or no match.
       for (const auto& v : victims)
         if (auto r = ctx.params.unset(v); not r) {
           s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
-          rc = 1;
+          abort.fatal = true;
         }
       continue;
     }
@@ -516,6 +652,7 @@ int builtin_unset(vec<str>& args, ExecContext& ctx) {
       if (prm.is_readonly()) {
         s::fprintf(stderr, "jfsh: read-only variable: %s\n", base.c_str());
         rc = 1;
+        abort.fatal = true;
         continue;
       }
       if (prm.is_hash()) {
@@ -541,13 +678,18 @@ int builtin_unset(vec<str>& args, ExecContext& ctx) {
     if (not is_identifier(name) and name != "0") {
       s::fprintf(stderr, "jfsh: unset: %s: invalid parameter name\n", name.c_str());
       rc = 1;
+      abort.fatal = true;
       continue;
     }
     if (auto r = ctx.params.unset(name); not r) {
       s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
       rc = 1;
+      abort.fatal = true;
     }
   }
+  // Nothing that a pattern matched (parameters, or functions with -f):
+  // status 1, as zsh's.
+  if (pattern and not matched) rc = 1;
   return rc;
 }
 

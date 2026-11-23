@@ -161,6 +161,13 @@ void install_special_params(ExecContext& ctx) {
     params.assign("signals", s::move(names), PM_ARRAY | PM_READONLY | PM_SPECIAL);
   }
 
+  // $dirstack is the directory stack, without $PWD; assigning it sets the
+  // stack, as zsh's.
+  special(params, "dirstack", vec<str>{}, PM_ARRAY, {
+    .get_array = [&ctx] { return ctx.dirstack; },
+    .set_array = [&ctx](vec<str> v) { ctx.dirstack = s::move(v); },
+  });
+
   // $argv is the positional parameters.
   special(params, "argv", vec<str>{}, PM_ARRAY, {
     .get_array = [&ctx] { return ctx.positional; },

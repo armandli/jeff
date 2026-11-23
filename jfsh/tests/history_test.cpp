@@ -326,6 +326,10 @@ TEST(HistoryFile, FcWriteAndAppend) {
   sh.ctx.history = &h;
   h.add("one");
   h.add("two");
+  // zsh writes nothing without $SAVEHIST.
+  EXPECT_EQ(sh.run("fc -W " + file).rc, 0);
+  EXPECT_FALSE(s::filesystem::exists(file));
+  sh.run("SAVEHIST=100");
   EXPECT_EQ(sh.run("fc -W " + file).rc, 0);
   h.add("three");
   EXPECT_EQ(sh.run("fc -A " + file).rc, 0);
