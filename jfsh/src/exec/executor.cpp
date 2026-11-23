@@ -67,44 +67,79 @@ int Executor::exec(const CompiledProgram& prog) {
   return exec_list(es, EF_NONE);
 }
 
-int Executor::exec_string(strv src, bool by_line) {
-  struct Depth {
-    int& d;
-    explicit Depth(int& x) : d(x) { ++d; }
-    ~Depth() { --d; }
-  } depth{mStringDepth};
+// Comments are always recognized in scripts and -c strings, but
+// interactively only with INTERACTIVE_COMMENTS.
+static void set_comments(Lexer& lex, const OptionState& opts) {
+  if (not opts.interactive() or opts.get(OPT_INTERACTIVECOMMENTS))
+    lex.push_state(LEX_SKIPCOMMENTS);
+}
+
+Result<ProgRef> Executor::parse_string(strv src) {
   StringInputSource in{str(src)};
   Lexer lex{in};
-  // Comments are always recognized in scripts and -c strings, but
-  // interactively only with INTERACTIVE_COMMENTS.
-  if (not mCtx.opts.interactive() or mCtx.opts.get(OPT_INTERACTIVECOMMENTS))
-    lex.push_state(LEX_SKIPCOMMENTS);
+  set_comments(lex, mCtx.opts);
   Parser parser{lex};
   if (mCtx.opts.get(OPT_ALIASES)) parser.set_aliases(&mCtx.aliases);
+  return parser.parse();
+}
+
+void Executor::report_parse_error(const ShellError& e) {
+  s::fprintf(stderr, "jfsh:%d: %s\n", e.code, e.message.c_str());
+}
+
+int Executor::exec_string(strv src, bool by_line) {
   auto parse_failed = [&](const ShellError& e) {
-    s::fprintf(stderr, "jfsh:%d: %s\n", e.code, e.message.c_str());
+    report_parse_error(e);
     mParseFailed = true;
     mCtx.last_exit = 1;
     return 1;
   };
-  int rc = 0;
   if (not by_line) {
-    auto prog = parser.parse();
+    auto prog = parse_string(src);
     if (not prog) return parse_failed(prog.error());
-    rc = exec(**prog);
-  } else {
-    for (;;) {
-      // A line may have turned ALIASES on or off for the next.
-      parser.set_aliases(mCtx.opts.get(OPT_ALIASES) ? &mCtx.aliases : nullptr);
-      auto prog = parser.parse_line();
-      if (not prog) return parse_failed(prog.error());
-      if ((*prog)->prog.size() > 1) rc = exec(**prog);
-      if (parser.at_eof() or interrupted()) break;
-    }
+    return exec_parsed(**prog);
   }
+  StringDepth depth{*this};
+  StringInputSource in{str(src)};
+  Lexer lex{in};
+  set_comments(lex, mCtx.opts);
+  Parser parser{lex};
+  int rc = 0;
+  for (;;) {
+    // A line may have turned ALIASES on or off for the next.
+    parser.set_aliases(mCtx.opts.get(OPT_ALIASES) ? &mCtx.aliases : nullptr);
+    auto prog = parser.parse_line();
+    if (not prog) return parse_failed(prog.error());
+    if ((*prog)->prog.size() > 1) rc = exec(**prog);
+    if (mCtx.returning and mCtx.return_line and mCtx.func_depth == 0 and mStringDepth == 1) {
+      mCtx.returning = mCtx.return_line = false;
+      rc = mCtx.last_exit = mCtx.return_val;
+    }
+    if (parser.at_eof() or interrupted()) break;
+  }
+  // A script a trap interrupted with status 0 (`kill` raising a TRAPUSR1
+  // that returned 1) ends with 1; a -c string keeps 0, as in zsh.
+  if (mCtx.aborting and mCtx.trap_failed and mCtx.last_exit == 0 and mStringDepth == 1)
+    rc = mCtx.last_exit = 1;
+  return end_string(rc);
+}
+
+int Executor::exec_parsed(const CompiledProgram& prog) {
+  StringDepth depth{*this};
+  int rc = exec(prog);
+  // A -c string that an error or an interrupt ended (not `${x?}`) leaves
+  // zsh's errflag set, and dotrapargs then runs no EXIT trap.  (A script's
+  // loop clears it first.)
+  if (mStringDepth == 1 and mCtx.aborting and not mCtx.hard_error
+      and not mCtx.opts.interactive())
+    mExitTrapRan = true;
+  return end_string(rc);
+}
+
+int Executor::end_string(int rc) {
   // `return` outside a function ends the script or -c string, as in zsh.
   if (mCtx.returning and mCtx.func_depth == 0) {
-    mCtx.returning = false;
+    mCtx.returning = mCtx.return_line = false;
     rc = mCtx.last_exit = mCtx.return_val;
   }
   // An aborted command line ends here: a non-interactive shell exits.  (An
@@ -112,8 +147,9 @@ int Executor::exec_string(strv src, bool by_line) {
   if (mCtx.aborting and mStringDepth == 1 and mCtx.func_depth == 0
       and not mCtx.opts.interactive()) {
     mCtx.aborting = false;
+    mCtx.end_trap_abort();
+    if (not mCtx.exiting) mCtx.exit_val = mCtx.last_exit;
     mCtx.exiting  = true;
-    mCtx.exit_val = mCtx.last_exit;
   }
   return rc;
 }
@@ -125,8 +161,10 @@ struct TrapErrorScope {
     if (not was_aborting) ctx.interrupt = false;
   }
   ~TrapErrorScope() {
-    if (not was_aborting and ctx.aborting and not ctx.interrupt)
+    if (not was_aborting and ctx.aborting and not ctx.interrupt) {
       ctx.aborting = ctx.abort_line = false;
+      ctx.end_trap_abort();
+    }
   }
   TrapErrorScope(const TrapErrorScope&) = delete;
   TrapErrorScope& operator=(const TrapErrorScope&) = delete;
@@ -320,6 +358,7 @@ int Executor::exec_simple(vec<str> args,
   // typeset's assignments go back between the words they were among.
   vec<s::size_t> counts;
   bool fatal = true;
+  auto substs_before = mProcSubsts;
   bool expanded = expand_command(args, redirs, subst_status, fatal,
                                  typeset_args.empty() ? nullptr : &counts);
   for (auto& a : typeset_args) {
@@ -334,6 +373,19 @@ int Executor::exec_simple(vec<str> args,
     if (fatal) mCtx.aborting = mCtx.abort_line = true;
     return 1;
   }
+  // A trap's `return` during the expansion (`$(kill -USR1 $$)`): at the
+  // top the command doesn't run; in a function it runs, and the function
+  // returns its status, as zsh's retflag.
+  if (mCtx.returning and s::exchange(mTrapReturned, false)) {
+    if (mCtx.func_depth == 0) return mCtx.last_exit;
+    mReturnAfterCommand = true;
+  }
+  // A trap that ended the line during the expansion (a TRAPxxx that failed
+  // in `$( … )`): the command doesn't run, as zsh's errflag.
+  if (mCtx.aborting) {
+    if (mCtx.trap_status >= 0) mCtx.last_exit = 1;
+    return mCtx.last_exit;
+  }
   // The prefix scope of a builtin or function, popped when the command is
   // done.
   struct ScopeGuard {
@@ -347,6 +399,7 @@ int Executor::exec_simple(vec<str> args,
   // (`x=1 typeset y=$x`): see finish_typeset below.
   vec<Assignment> typeset_arrays;
   str typeset_traced;   // xtrace shows them as assignments
+  int typeset_failed = 1;   // the status when they fail
   auto expand_typeset_args = [&] {
     Expander ex{*this, mCtx};
     s::size_t placed = 0;
@@ -355,6 +408,12 @@ int Executor::exec_simple(vec<str> args,
         s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
         // As any expansion error, this ends the command line.
         mCtx.aborting = true;
+        return false;
+      }
+      // A TRAPxxx that failed in a `$( … )`: typeset doesn't run, with
+      // status 0, as zsh's.
+      if (mCtx.aborting and mCtx.trap_status >= 0) {
+        typeset_failed = mCtx.last_exit = 0;
         return false;
       }
       typeset_traced += ' ' + trace_assigns({a});
@@ -539,6 +598,10 @@ int Executor::exec_simple(vec<str> args,
                            assign_status);
     if (temporary) mCtx.params.pop_scope();
     if (assign_status) subst_status = assign_status;
+    // A TRAPxxx that failed in `x=$( … )`: 1, or 2 for SIGINT and SIGQUIT,
+    // as zsh's `lastval = errflag ? errflag : cmdoutval`.
+    if (mCtx.aborting and mCtx.trap_status >= 0)
+      subst_status = mCtx.last_exit = mCtx.trap_failed ? 1 : 2;
     if (tracing and not assigns.empty())
       write_trace(ps4 + trace_assigns(assigns), trace_fd(saved));
     if (replace) saved.commit();
@@ -554,14 +617,14 @@ int Executor::exec_simple(vec<str> args,
     s::fflush(nullptr);
     SavedFds saved;
     if (not redirs.empty() and not apply_redirects(redirs, saved, flags)) return 1;
-    if (not finish_typeset(trace_fd(saved))) return 1;
+    if (not finish_typeset(trace_fd(saved))) return typeset_failed;
     int rc = exec_replace(args, s::move(assigns), argv0, clear_env, child_trace,
                           trace_fd(saved));
     saved.commit();
     return rc;
   }
   if (only == Only::External) {
-    if (not finish_typeset(STDERR_FILENO)) return 1;
+    if (not finish_typeset(STDERR_FILENO)) return typeset_failed;
     return run_external(args, assigns, redirs, flags, child_trace);
   }
 
@@ -595,7 +658,7 @@ int Executor::exec_simple(vec<str> args,
     return 1;
   }
   if (fn == mCtx.functions.end() and not defp) {
-    if (not finish_typeset(STDERR_FILENO)) return 1;
+    if (not finish_typeset(STDERR_FILENO)) return typeset_failed;
     return run_external(args, assigns, redirs, flags, child_trace);
   }
 
@@ -633,16 +696,22 @@ int Executor::exec_simple(vec<str> args,
       mCtx.aborting = true;
       return rc;
     }
-    if (not finish_typeset(trace_fd(saved))) return 1;
+    if (not finish_typeset(trace_fd(saved))) return typeset_failed;
     // As zsh: PS4 and the assignments, then PS4 again before the words.
     if (tracing)
       write_trace(ps4 + trace_assigns(assigns) + trace_prompt() + traced,
                   trace_fd(saved));
   } else if (not finish_typeset(trace_fd(saved))) {
-    return 1;
+    return typeset_failed;
   }
   if (rc == 0) {
-    if (is_fn) {
+    if (is_fn and s::exchange(mReturnAfterCommand, false)) {
+      // A trap's `return` came during its words: as zsh's doshfunc clears
+      // retflag, the function doesn't run and the caller goes on, with the
+      // substitution's status.
+      mCtx.returning = false;
+      rc = mCtx.last_exit;
+    } else if (is_fn) {
       ProgRef body = fn->second;  // the function may redefine itself
       rc = call_function(body, args);
     } else {
@@ -652,10 +721,50 @@ int Executor::exec_simple(vec<str> args,
         auto p = mCtx.params.lookup(a.name);
         was_readonly.push_back(p and p->get().is_readonly());
       }
+      mTrapReturned = false;
+      mTrapAbort.reset();
+      mCtx.signal_in_builtin = false;
+      bool was_aborting = mCtx.aborting;
       rc = defp->fn(args, mCtx);
+      // The trap ran inside the builtin: one `read` handled, a signal that
+      // cut `wait` short, or one `kill` sent the shell itself.
+      bool own    = s::exchange(mCtx.signal_in_builtin, false);
+      bool inside = own or mTrapAbort.has_value();
       // A signal the builtin brought on (`kill -USR1 $$`) is handled before
-      // its status replaces $?, as in zsh.
-      if (mCtx.signals.has_pending()) handle_signals();
+      // its status replaces $?, as in zsh.  (One the builtin handled itself,
+      // as `read` does, has its trap's effects applied here too.)
+      if (mCtx.signals.has_pending()) {
+        bool was_self = s::exchange(mSelfSignal, own);
+        handle_signals();
+        mSelfSignal = was_self;
+      }
+      // zsh waits for a builtin's process substitutions, which is where its
+      // signal queue runs (drop_trap_signals).
+      if (mProcSubsts != substs_before) drop_trap_signals();
+      // A trap's `return` makes the function return with the builtin's
+      // status; a TRAPINT that returned non-zero gives its status, as
+      // zsh's dotrapargs (other signals keep the builtin's; a script
+      // makes a 0 of it 1, see exec_string).
+      // (At an interactive shell's top the line ends with it too.)
+      bool top_line = mCtx.opts.interactive() and mStringDepth == 1;
+      if (mTrapReturned and (mCtx.func_depth > 0 or top_line)) mCtx.return_val = rc;
+      if (mTrapAbort) {
+        // As zsh: when the trap ran inside the builtin, the builtin's status
+        // comes after the trap's (`kill -USR1 $$` 0, `read` 1, `wait`
+        // 128 + the signal); a signal that just arrived meanwhile leaves the
+        // trap's, and so do SIGINT and SIGQUIT.
+        if (not inside or mTrapAbort->first == SIGINT or mTrapAbort->first == SIGQUIT)
+          rc = mTrapAbort->second;
+        mCtx.last_exit = rc;
+      } else if (inside and mCtx.aborting and not was_aborting) {
+        // A trap the builtin brought on that ended the line otherwise (an
+        // interrupt), or the shell's own SIGINT: that status stays.
+        rc = mCtx.last_exit;
+        // `kill -INT $$`: no ^C was echoed, so no newline is owed.
+        if (own) mCtx.intr_echoed = false;
+      }
+      mTrapReturned = false;
+      mTrapAbort.reset();
       for (s::size_t k = 0; k < typeset_arrays.size() and rc == 0; ++k) {
         const auto& a = typeset_arrays[k];
         auto p = mCtx.params.lookup(a.name);
@@ -682,8 +791,19 @@ int Executor::exec_list(ExecState& es, ExecFlags flags) {
     WordCode w = es.fetch();
     if (wc_code(w) != WC_LIST) break;  // WC_END
     s::size_t end = es.pc + wc_list_skip(w);
-    if (mTrapDepth == 0 and mCtx.signals.traps().trapped(SIGDEBUG))
-      run_trap(SIGDEBUG);
+    // DEBUG runs before each command, with its text in $ZSH_DEBUG_CMD,
+    // or after it under NO_DEBUG_BEFORE_CMD, as in zsh.
+    if (mTrapDepth == 0 and mCtx.opts.get(OPT_DEBUGBEFORECMD)
+        and mCtx.signals.traps().trapped(SIGDEBUG)) {
+      (void)mCtx.params.set_scalar("ZSH_DEBUG_CMD", list_text(*es.prog, es.pc));
+      bool skip = run_debug_trap();
+      (void)mCtx.params.unset("ZSH_DEBUG_CMD");
+      // A trap that set ERR_EXIT skips the command, as zsh's donedebug.
+      if (skip and not interrupted()) {
+        es.pc = end;
+        continue;
+      }
+    }
     if (interrupted()) return mCtx.exiting ? mCtx.exit_val : rc;
     if (wc_list_flags(w) & WC_LIST_ASYNC) {
       bool        jc   = job_control();
@@ -705,7 +825,7 @@ int Executor::exec_list(ExecState& es, ExecFlags flags) {
         continue;
       }
       str text = sublist_text(*es.prog, es.pc);
-      pid_t pid = fork_child(0, false, ChildKind::Other);
+      pid_t pid = fork_child(0, false, ChildKind::Subshell);
       if (pid < 0) {
         rc = mCtx.last_exit = 1;
       } else if (pid == 0) {
@@ -713,16 +833,17 @@ int Executor::exec_list(ExecState& es, ExecFlags flags) {
           errno = 0;
           [[maybe_unused]] int r = ::nice(5);
         }
+        // Without job control a background job must not see Ctrl-C: as
+        // in zsh, it gets `trap '' INT QUIT`.
         if (not jc) {
-          // Without job control a background job must not see Ctrl-C.
-          ::signal(SIGINT,  SIG_IGN);
-          ::signal(SIGQUIT, SIG_IGN);
+          mCtx.signals.set_trap(SIGINT,  TrapAction::Ignore);
+          mCtx.signals.set_trap(SIGQUIT, TrapAction::Ignore);
         }
+        // The job's own failure doesn't set off ZERR or ERR_EXIT, as in
+        // zsh (`false &`); what it runs inside still does.
         ExecState se{es.prog, es.pc};
-        int child_rc = exec_sublist(se, lone ? EF_NOFORK : EF_NONE);
-        if (mCtx.exiting) child_rc = mCtx.exit_val;
-        s::fflush(nullptr);
-        _exit(child_rc);
+        exit_child(exec_sublist(se, static_cast<ExecFlags>(
+                                      EF_NOERRCHECK | (lone ? +EF_NOFORK : 0))));
       } else if (disown) {
         mCtx.last_bg_pid = pid;
         rc = mCtx.last_exit = 0;
@@ -744,9 +865,25 @@ int Executor::exec_list(ExecState& es, ExecFlags flags) {
     }
     es.pc = end;
     if (mCtx.exiting) return mCtx.exit_val;
-    if (interrupted()) return rc;
+    // (After the command, so the `trap … DEBUG` that sets it runs it too.)
+    if (not mCtx.opts.get(OPT_DEBUGBEFORECMD) and mTrapDepth == 0
+        and mCtx.signals.traps().trapped(SIGDEBUG) and not interrupted())
+      run_debug_trap();
+    if (interrupted()) {
+      // More was to run: an `always` block that ended in the error wasn't
+      // the last command (exit_child).
+      if (not es.at_end() and wc_code(es.peek()) == WC_LIST) mTryEndedChild = false;
+      return rc;
+    }
   }
   return rc;
+}
+
+bool Executor::trap_returned_in_words() noexcept {
+  if (not (mCtx.returning and mCtx.func_depth > 0 and s::exchange(mTrapReturned, false)))
+    return false;
+  mCtx.return_val = 0;
+  return true;
 }
 
 bool Executor::loop_done() noexcept {
@@ -816,18 +953,24 @@ int Executor::exec_sublist(ExecState& es, ExecFlags flags) {
       auto runs   = mCtx.code_runs;
       mCtx.err_reported = false;
       if (exempt) { ++mCtx.noerrexit; ++mCtx.noerrreturn; }
-      rc = exec_pline(es, flags);
+      rc = exec_pline(es, static_cast<ExecFlags>(flags & ~EF_NOERRCHECK));
       if (exempt) { --mCtx.noerrexit; --mCtx.noerrreturn; }
+      // A TRAPxxx's abort leaves its status, or whatever came after it, in
+      // $?: what an enclosing { }, if, loop or function returns doesn't
+      // replace it, as zsh's lastval.
+      if (mCtx.aborting and mCtx.trap_status >= 0) rc = mCtx.last_exit;
       if (f & WC_SUBLIST_NOT) rc = (rc == 0) ? 1 : 0;
       // zsh 5.9 forgets the `!` of `! f` once the function (or eval, or
       // sourced file) has run commands of its own.
       if (type == WC_SUBLIST_END and mCtx.code_runs != runs) exempt = false;
       mCtx.last_exit = rc;
-      if (rc != 0 and not exempt and counts and not interrupted())
+      if (rc != 0 and not exempt and counts and not interrupted()
+          and not (flags & EF_NOERRCHECK))
         on_command_error(rc);
     }
     es.pc = end;
     if (mCtx.signals.has_pending()) handle_signals();
+    if (mCtx.aborting and mCtx.trap_status >= 0) rc = mCtx.last_exit;   // as above
     if (interrupted()) return rc;
     if (type == WC_SUBLIST_END) return rc;
     skip = (type == WC_SUBLIST_AND) ? rc != 0 : rc == 0;
@@ -915,7 +1058,7 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
   vec<pid_t> pids;
   pid_t pgid = 0;
   for (s::uint32_t i = 0; i < forked; ++i) {
-    pid_t pid = fork_child(pgid, not async, ChildKind::Other);
+    pid_t pid = fork_child(pgid, not async, async ? ChildKind::Subshell : ChildKind::Stage);
     if (pid < 0) {
       close_pipes();
       // The stages already started still have to be waited for.
@@ -933,8 +1076,8 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
       }
       if (async and not jc) {
         // Without job control a background job must not see Ctrl-C.
-        ::signal(SIGINT,  SIG_IGN);
-        ::signal(SIGQUIT, SIG_IGN);
+        mCtx.signals.set_trap(SIGINT,  TrapAction::Ignore);
+        mCtx.signals.set_trap(SIGQUIT, TrapAction::Ignore);
       }
       if (rfds[i] >= 0) ::dup2(rfds[i], 0);
       if (wfds[i] >= 0) {
@@ -950,10 +1093,8 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
       }
       close_pipes();
       ExecState se{es.prog, stages[i].start};
-      int rc = exec_cmd(se, stage_flags);
-      if (mCtx.exiting) rc = mCtx.exit_val;
-      s::fflush(nullptr);
-      _exit(rc);
+      mStageChild = not async;
+      exit_child(exec_cmd(se, stage_flags));
     }
     if (i == 0) pgid = jc ? mChildPgid : pid;
     pids.push_back(pid);
@@ -1040,7 +1181,9 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
     for (auto& p : job.procs) {
       int status = 0;
       while (not p.done()) {
+        mCtx.signals.let_kept_through(true);
         pid_t got = ::waitpid(p.pid, &status, 0);
+        mCtx.signals.let_kept_through(false);
         if (got > 0) {
           mCtx.jobs.update(got, status);
         } else if (errno != EINTR) {
@@ -1052,6 +1195,7 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
     mCtx.pipestatus.clear();
     for (const auto& p : job.procs) mCtx.pipestatus.push_back(p.exit_code);
     mCtx.jobs.remove(jid);
+    drop_trap_signals();
   }
   if (in_shell) mCtx.pipestatus.push_back(last_rc);
   // PIPEFAIL: the rightmost stage that failed.
@@ -1173,8 +1317,17 @@ int Executor::exec_simple_cmd(ExecState& es, ExecFlags flags) {
       words.emplace_back(es.fetch_str());
     }
   }
-  return exec_simple(s::move(words), s::move(assigns), s::move(redirs),
-                     flags, s::move(typeset_args));
+  int rc = exec_simple(s::move(words), s::move(assigns), s::move(redirs),
+                       flags, s::move(typeset_args));
+  // A trap returned during its expansion: the function returns its status
+  // (an assignment's too).
+  bool assign_only = mCtx.returning and mCtx.func_depth > 0
+                     and s::exchange(mTrapReturned, false);
+  if (s::exchange(mReturnAfterCommand, false) or assign_only) {
+    mCtx.returning  = true;
+    mCtx.return_val = rc;
+  }
+  return rc;
 }
 
 // if := WC_IF(HEAD, skip) branch+; the first branch whose condition
@@ -1227,7 +1380,7 @@ int Executor::exec_while(ExecState& es, WordCode head) {
     // status for `while`, but `until` goes on into the body, which the
     // error skips, and so ends with 1 as an error in the body does.
     if (mCtx.aborting and not mCtx.interrupt) {
-      if (until) rc = 1;
+      rc = mCtx.trap_status >= 0 ? mCtx.last_exit : until ? 1 : rc;
       break;
     }
     if (interrupted()) {
@@ -1236,7 +1389,7 @@ int Executor::exec_while(ExecState& es, WordCode head) {
     }
     if ((status == 0) == until) break;
     rc = exec_list(es, EF_NONE);
-    if (mCtx.aborting and not mCtx.interrupt) rc = 1;
+    rc = loop_status(rc);
     if (loop_done()) break;
   }
   --mCtx.loop_depth;
@@ -1272,6 +1425,10 @@ int Executor::exec_for(ExecState& es, WordCode head) {
   if (not loop_values(es, head, names, values)) {
     es.pc = end;
     return 1;
+  }
+  if (trap_returned_in_words()) {
+    es.pc = end;
+    return 0;
   }
   s::size_t body = es.pc;
   int rc = 0;
@@ -1325,6 +1482,10 @@ int Executor::exec_for_cond(ExecState& es, WordCode head) {
     es.pc = end;
     return 1;
   }
+  if (trap_returned_in_words()) {
+    es.pc = end;
+    return 0;
+  }
   ++mCtx.loop_depth;
   for (;;) {
     if (not eval(cond, value)) {
@@ -1373,6 +1534,13 @@ int Executor::exec_case(ExecState& es, WordCode head) {
   };
   auto subject = ex.scalar(es.fetch_str());
   if (not subject) return fail(subject.error());
+  // A TRAPxxx that failed in the word ends the line with status 0 (zsh's
+  // execcase doesn't check errflag); a trap's `return` there makes the
+  // function return 0.
+  if ((mCtx.aborting and mCtx.trap_failed) or trap_returned_in_words()) {
+    es.pc = end;
+    return mCtx.last_exit = 0;
+  }
   int  rc   = 0;
   bool fall = false;
   while (es.pc < end) {
@@ -1438,6 +1606,19 @@ int Executor::exec_select(ExecState& es, WordCode head) {
     es.pc = end;
     return 1;
   }
+  // A trap's `return` in the words: zsh still runs the menu, and the
+  // function returns 0 after it.
+  bool return_after = trap_returned_in_words();
+  if (return_after) mCtx.returning = false;
+  struct ReturnAfter {
+    ExecContext& ctx;
+    bool         on;
+    ~ReturnAfter() {
+      if (not on) return;
+      ctx.returning  = true;
+      ctx.return_val = 0;
+    }
+  } return_after_guard{mCtx, return_after};
   s::size_t body = es.pc;
   int rc = 0;
   if (values.empty()) {
@@ -1504,6 +1685,10 @@ int Executor::exec_repeat(ExecState& es, WordCode head) {
     es.pc = end;
     return 1;
   }
+  if (trap_returned_in_words()) {
+    es.pc = end;
+    return 0;
+  }
   s::size_t body = es.pc;
   int rc = 0;
   ++mCtx.loop_depth;
@@ -1527,15 +1712,10 @@ int Executor::exec_subsh(ExecState& es, WordCode head, ExecFlags flags) {
     es.pc = end;
     return 1;
   }
-  if (pid == 0) {
-    mExitTrapRan = false;
-    int rc = exec_list(es, EF_NONE);
-    if (mCtx.exiting) rc = mCtx.exit_val;
-    else if (mCtx.returning) rc = mCtx.return_val;
-    rc = run_exit_trap(rc);
-    s::fflush(nullptr);
-    _exit(rc);
-  }
+  // A foreground pipeline's stage kept every trap; as the subshell it is,
+  // it resets them now.
+  if (pid == 0 and s::exchange(mStageChild, false)) enter_child(ChildKind::Subshell);
+  if (pid == 0) exit_child(exec_list(es, EF_NONE));
   es.pc = end;
   return wait_command(pid);
 }
@@ -1582,7 +1762,7 @@ int Executor::exec_funcdef(ExecState& es, WordCode head) {
     if (name.starts_with("TRAP"))
       if (auto sig = SignalTable::name_to_sig(strv(name).substr(4));
           sig and not s::isdigit(static_cast<unsigned char>(name[4])))
-        mCtx.signals.set_trap(*sig, TrapAction::Function);
+        mCtx.signals.set_trap(*sig, TrapAction::Function, {}, body);
     mCtx.autoloads.erase(name);
     mCtx.function_files[name] = mCtx.source_name.empty() ? mCtx.arg0 : mCtx.source_name;
     mCtx.functions[s::move(name)] = body;
@@ -1601,12 +1781,22 @@ static str trace_quote(strv w);
 // Under XTRACE the parts of the condition that were evaluated are
 // collected (operands expanded) and printed as one `[[ … ]]` line.
 int Executor::exec_cond(ExecState& es, WordCode head) {
-  if (mCondTrace or not mCtx.opts.xtrace()) return exec_cond_node(es, head);
-  str text;
-  mCondTrace = &text;
-  int rc = exec_cond_node(es, head);
-  mCondTrace = nullptr;
-  trace_text("[[ " + text + " ]]");
+  int rc = 0;
+  if (mCondTrace or not mCtx.opts.xtrace()) {
+    rc = exec_cond_node(es, head);
+  } else {
+    str text;
+    mCondTrace = &text;
+    rc = exec_cond_node(es, head);
+    mCondTrace = nullptr;
+    trace_text("[[ " + text + " ]]");
+  }
+  // A TRAPxxx that failed in a word leaves the test's status, the failed
+  // substitution expanding to nothing, as zsh's.  A trap's `return` there:
+  // the function returns the test's status.
+  if (mCtx.aborting and mCtx.trap_failed) mCtx.last_exit = rc;
+  if (mCtx.returning and mCtx.func_depth > 0 and s::exchange(mTrapReturned, false))
+    mCtx.return_val = rc;
   return rc;
 }
 
@@ -1749,6 +1939,9 @@ int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
       mCtx.aborting = mCtx.abort_line = true;
       error = true;
     }
+    // After a failed TRAPxxx, zsh's matheval gives 0 for every operand
+    // while errflag is set.
+    if (mCtx.aborting and mCtx.trap_failed) side[0] = side[1] = MathNum{};
     return finish(cond_numeric(op, side[0], side[1]));
   }
   auto lhs = ex.scalar(lhs_word);
@@ -1862,6 +2055,21 @@ int Executor::exec_arith(ExecState& es, WordCode) {
     expr = traced;
   }
   auto v = ex.math(expr);
+  // A TRAPxxx that failed during the expansion: 2.  zsh's execarith clears
+  // the error but not the trap's retflag, so the function returns 2, and
+  // at the top just the line ends (the EXIT trap still runs).
+  if (mCtx.aborting and mCtx.trap_failed) {
+    mCtx.aborting = mCtx.abort_line = false;
+    mCtx.end_trap_abort();
+    mCtx.returning   = true;
+    mCtx.return_val  = 2;
+    mCtx.return_line = true;
+    return mCtx.last_exit = 2;
+  }
+  if (mCtx.aborting and mCtx.trap_status >= 0) return mCtx.last_exit = 2;
+  // A trap's `return` there: the function returns the test's status.
+  if (mCtx.returning and mCtx.func_depth > 0 and s::exchange(mTrapReturned, false))
+    mCtx.return_val = v ? (v->truthy() ? 0 : 1) : 2;
   if (not v) {
     s::fprintf(stderr, "jfsh: %s\n", v.error().message.c_str());
     return 2;
@@ -1888,6 +2096,7 @@ int Executor::exec_always(ExecState& es, WordCode head) {
                        mCtx.return_val, mCtx.exiting, mCtx.exit_val};
   auto saved_try  = s::pair{mCtx.try_error, mCtx.try_interrupt};
   bool abort_line = mCtx.abort_line, interrupt = mCtx.aborting and mCtx.interrupt;
+  bool trap_abort = mCtx.aborting and mCtx.trap_status >= 0;
   mCtx.try_error     = mCtx.aborting and not interrupt ? 1 : 0;
   mCtx.try_interrupt = interrupt ? 1 : 0;
   mCtx.aborting    = mCtx.abort_line = false;
@@ -1902,13 +2111,20 @@ int Executor::exec_always(ExecState& es, WordCode head) {
   // first block's still stands; so is an interrupt.
   mCtx.aborting   = mCtx.try_error != 0 or mCtx.try_interrupt != 0;
   mCtx.abort_line = mCtx.aborting and abort_line;
+  if (not mCtx.aborting) mCtx.end_trap_abort();
   mCtx.interrupt  = mCtx.try_interrupt != 0;
   s::tie(mCtx.try_error, mCtx.try_interrupt) = saved_try;
   if (mCtx.break_level == 0 and not mCtx.returning and not mCtx.exiting) {
     s::tie(mCtx.break_level, mCtx.continuing, mCtx.returning,
            mCtx.return_val, mCtx.exiting, mCtx.exit_val) = held;
   }
+  // A TRAPxxx that failed in the first block also set zsh's retflag, which
+  // a TRY_BLOCK_ERROR=0 doesn't clear: the code goes on returning.
+  if (trap_abort and not mCtx.aborting and not mCtx.exiting)
+    mCtx.returning = mCtx.return_line = true;   // a script's top: just the line
   if (mCtx.returning) mCtx.return_val = rc;
+  mCtx.last_exit = rc;   // the try list's status, as zsh's exectry
+  mTryEndedChild = mCtx.aborting;
   return rc;
 }
 
@@ -2085,6 +2301,7 @@ static void stdin_from_null() {
 // Returns the read end for the parent to pass as /dev/fd/N.  On failure
 // returns -1.  Used for <(cmd).
 int Executor::procsubst_in(strv src) {
+  ++mProcSubsts;
   int pfd[2];
   if (not pipe_high(pfd)) return -1;
   s::fflush(nullptr);
@@ -2092,15 +2309,18 @@ int Executor::procsubst_in(strv src) {
   if (pid < 0) { ::close(pfd[0]); ::close(pfd[1]); return -1; }
   if (pid == 0) {
     bool jc = job_control();
-    mCtx.signals.child_reset(ChildKind::Other);
-    mCtx.jobs.clear();
+    enter_child(ChildKind::Subshell);
+    // As any asynchronous child without job control, zsh's `<( … )`
+    // doesn't see Ctrl-C.
+    if (not jc) {
+      mCtx.signals.set_trap(SIGINT,  TrapAction::Ignore);
+      mCtx.signals.set_trap(SIGQUIT, TrapAction::Ignore);
+    }
     ::close(pfd[0]);
     ::dup2(pfd[1], 1);
     ::close(pfd[1]);
     if (not jc) stdin_from_null();
-    int rc = exec_string(src);
-    s::fflush(nullptr);
-    _exit(rc);
+    exit_child(exec_string(src));
   }
   ::close(pfd[1]);
   return keep_open(pfd[0]);
@@ -2109,20 +2329,24 @@ int Executor::procsubst_in(strv src) {
 // Fork a subshell that runs `src` with its stdin piped from a fresh fd.
 // Returns the write end for the parent to pass as /dev/fd/N.
 int Executor::procsubst_out(strv src) {
+  ++mProcSubsts;
   int pfd[2];
   if (not pipe_high(pfd)) return -1;
   s::fflush(nullptr);
   pid_t pid = ::fork();
   if (pid < 0) { ::close(pfd[0]); ::close(pfd[1]); return -1; }
   if (pid == 0) {
-    mCtx.signals.child_reset(ChildKind::Other);
-    mCtx.jobs.clear();
+    bool jc = job_control();
+    enter_child(ChildKind::Subshell);
+    // As `<( … )`, an asynchronous child that doesn't see Ctrl-C.
+    if (not jc) {
+      mCtx.signals.set_trap(SIGINT,  TrapAction::Ignore);
+      mCtx.signals.set_trap(SIGQUIT, TrapAction::Ignore);
+    }
     ::close(pfd[1]);
     ::dup2(pfd[0], 0);
     ::close(pfd[0]);
-    int rc = exec_string(src);
-    s::fflush(nullptr);
-    _exit(rc);
+    exit_child(exec_string(src));
   }
   ::close(pfd[0]);
   return keep_open(pfd[1]);
@@ -2142,14 +2366,11 @@ str Executor::procsubst_eq(strv src) {
   if (pid < 0) { ::close(fd); ::unlink(tmpl.c_str()); return {}; }
   if (pid == 0) {
     bool jc = job_control();
-    mCtx.signals.child_reset(ChildKind::Other);
-    mCtx.jobs.clear();
+    enter_child(ChildKind::Subshell);
     ::dup2(fd, 1);
     ::close(fd);
     if (not jc) stdin_from_null();
-    int rc = exec_string(src);
-    s::fflush(nullptr);
-    _exit(rc);
+    exit_child(exec_string(src));
   }
   int status = 0;
   while (::waitpid(pid, &status, 0) < 0 and errno == EINTR) {}
@@ -2990,7 +3211,8 @@ int Executor::call_builtin(strv name,
 static constexpr long DEFAULT_FUNC_NEST = 700;
 
 int Executor::call_function(const ProgRef& body,
-                            vec<str>& args) {
+                            vec<str>& args,
+                            bool* returned) {
   // $FUNCNEST is an integer parameter in zsh: its text is evaluated
   // (`FUNCNEST=abc` is 0).
   s::int64_t limit = DEFAULT_FUNC_NEST;
@@ -3030,8 +3252,9 @@ int Executor::call_function(const ProgRef& body,
   // An empty body runs no commands.
   if (not body->empty() and wc_code(body->prog[0]) != WC_END) ++mCtx.code_runs;
   int rc = exec(*body);
+  bool did_return = mCtx.returning;
   if (mCtx.returning) {
-    mCtx.returning = false;
+    mCtx.returning = mCtx.return_line = false;
     rc = mCtx.return_val;
   }
 
@@ -3039,18 +3262,45 @@ int Executor::call_function(const ProgRef& body,
   // LOCAL_OPTIONS.  An EXIT trap set in the function runs now.  Under
   // POSIX_TRAPS (M12 Phase 12c), the frame is always isolated: traps set
   // in the function stay in the function, matching POSIX.
+  vec<s::pair<int, TrapAction>> restored;
   auto exit_trap = mCtx.signals.pop_trap_frame(
-      mCtx.opts.get(OPT_LOCALTRAPS) or mCtx.opts.get(OPT_POSIXTRAPS));
+      mCtx.opts.get(OPT_LOCALTRAPS) or mCtx.opts.get(OPT_POSIXTRAPS), &restored);
+  // The TRAPxxx functions follow the traps put back, as in zsh: one the
+  // function hid (`trap - EXIT`) comes back, one it defined goes
+  // (`TRAPEXIT() {…}` in a function is that function's EXIT trap).
+  for (const auto& [sig, was] : restored) {
+    const Trap& t = mCtx.signals.traps().get(sig);
+    str name = str("TRAP") + SignalTable::sig_to_name(sig);
+    if (t.action == TrapAction::Function and t.prog) mCtx.functions[name] = t.prog;
+    else if (was == TrapAction::Function)         mCtx.functions.erase(name);
+  }
   // It runs on an `exit` in the function too, which then goes on; there,
   // as in zsh, the trap sees $? 0.
-  if (exit_trap and exit_trap->action == TrapAction::Command) {
+  // Not inside a trap, though: zsh runs no EXIT trap there.
+  if (exit_trap and mTrapDepth == 0
+      and (exit_trap->action == TrapAction::Command
+           or (exit_trap->action == TrapAction::Function and exit_trap->prog))) {
     int  saved = mCtx.last_exit;
     auto exit = s::tuple{mCtx.exiting, mCtx.exit_val, mCtx.exit_now};
     if (mCtx.exiting) mCtx.last_exit = 0;
     mCtx.exiting = mCtx.exit_now = false;
     {
       TrapErrorScope scope{mCtx};
-      exec_string(exit_trap->command);
+      ++mTrapDepth;   // a function it calls runs no EXIT trap of its own
+      if (exit_trap->action == TrapAction::Command) {
+        run_trap_command(*exit_trap);
+      } else {
+        // A TRAPEXIT that ends with `return N` acts as `return N` in the
+        // trap's command would.
+        vec<str> fargs{"TRAPEXIT", "0"};
+        bool trap_returned = false;
+        int  trap_rc = call_function(exit_trap->prog, fargs, &trap_returned);
+        if (trap_returned and trap_rc != 0) {
+          mCtx.returning  = true;
+          mCtx.return_val = trap_rc;
+        }
+      }
+      --mTrapDepth;
     }
     if (not mCtx.exiting) {
       s::tie(mCtx.exiting, mCtx.exit_val, mCtx.exit_now) = exit;
@@ -3071,6 +3321,19 @@ int Executor::call_function(const ProgRef& body,
   if (mCtx.opts.get(OPT_LOCALOPTIONS)) mCtx.opts = saved_opts;
   mCtx.arg0       = s::move(saved_arg0);
   mCtx.positional = s::move(saved_positional);
+  // An `exit` in a function the EXIT trap called gives the final status
+  // but acts as `return` from that function, with $? 0, as zsh's zexit
+  // while the shell is exiting (shell_exiting == -1).
+  if (mInExitTrap and mCtx.exiting and mCtx.func_depth >= mExitTrapFuncDepth
+      and not mExitEndsExitTrap) {
+    mExitFromTrap = mCtx.exit_val;
+    mCtx.exiting  = mCtx.exit_now = false;
+    rc = 0;
+    // In a signal trap the EXIT trap brought on, after a -c string ran off
+    // its end, it ends the EXIT trap once that trap is done (run_trap).
+    if (mExitTrapRanOff and mSigTrapInExit) mExitInSigTrap = true;
+  }
+  if (returned) *returned = did_return;
   return rc;
 }
 
@@ -3241,12 +3504,21 @@ int Executor::wait_command(pid_t pid) {
     return wait_foreground_job(mCtx, jid);
   }
   int status = 0;
-  while (waitpid(pid, &status, 0) < 0) {
+  for (;;) {
+    mCtx.signals.let_kept_through(true);
+    pid_t got = ::waitpid(pid, &status, 0);
+    mCtx.signals.let_kept_through(false);
+    if (got >= 0) break;
     if (errno != EINTR) {
       s::fprintf(stderr, "jfsh: waitpid: %s\n", s::strerror(errno));
       return 1;
     }
+    // Hung up: as zsh, the shell goes at once, leaving the command be.
+    if (mCtx.signals.pending(SIGHUP) and not mCtx.signals.traps().trapped(SIGHUP)
+        and mCtx.signals.traps().get(SIGHUP).action != TrapAction::Ignore)
+      return 128 + SIGHUP;
   }
+  drop_trap_signals();
   if (WIFEXITED(status))   return WEXITSTATUS(status);
   if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
   return 1;
@@ -3379,6 +3651,7 @@ int Executor::source_file(const str& path, const vec<str>& args, const str& name
   // the error (the shell exits with its status, 1).
   if (mCtx.aborting and not mCtx.interrupt and not mCtx.opts.errexit()) {
     mCtx.aborting = mCtx.abort_line = false;
+    mCtx.end_trap_abort();
     rc = mCtx.last_exit = 126;
   }
   mCtx.source_name = s::move(saved_source);
@@ -3487,6 +3760,39 @@ void Executor::fill_command_hash() {
 
 // ---- Job control and signals -----------------------------------------------
 
+void Executor::enter_child(ChildKind kind) {
+  sigset_t keep = mCtx.signals.child_reset(kind, mCtx.opts.get(OPT_POSIXTRAPS));
+  mCtx.jobs.clear();
+  mExitTrapRan = false;
+  // The parent's running traps are not the child's: a trap it sets runs.
+  if (kind != ChildKind::Stage) mInTrap = {};
+  mQueued  = {};
+  mBacklog = {};
+  mExitFromTrap  = -1;
+  mTryEndedChild = false;
+  // fork_child's block ends; only what child_reset keeps stays blocked.
+  ::sigprocmask(SIG_SETMASK, &keep, nullptr);
+}
+
+void Executor::exit_child(int rc) {
+  if (mCtx.exiting)        rc = mCtx.exit_val;
+  else if (mCtx.returning) rc = mCtx.return_val;
+  else if (mCtx.aborting)  rc = mCtx.last_exit;
+  // An EXIT trap the child set runs as it ends, unless an error ended it
+  // (`$((1/0))`, `${x?}`): zsh's errflag is still set, and dotrapargs runs
+  // no trap then.
+  // (An error an `always` block ended the child with is cleared, as zsh
+  // runs that last command in exec mode.)
+  if ((mCtx.aborting and not mCtx.exiting and not mTryEndedChild) or mCtx.hard_error)
+    mExitTrapRan = true;
+  // An `exit` in a function that the parent's EXIT trap ran here gives the
+  // status, as zsh's exit_pending.
+  if (mExitFromTrap >= 0) rc = mExitFromTrap;
+  rc = run_exit_trap(rc);
+  s::fflush(nullptr);
+  _exit(rc);
+}
+
 pid_t Executor::fork_child(Pid pgid, bool foreground, ChildKind kind) {
   bool jc = job_control();
   s::fflush(nullptr);
@@ -3514,11 +3820,9 @@ pid_t Executor::fork_child(Pid pgid, bool foreground, ChildKind kind) {
       if (::setpgid(0, pgid) != 0) ::setpgid(0, 0);
       if (foreground) mCtx.signals.give_terminal(::getpgrp());
     }
-    mCtx.signals.child_reset(kind);
-    mCtx.jobs.clear();
+    enter_child(kind);   // which unblocks every signal
     mCtx.pipeline_pgid = 0;
     mCtx.pipeline_jid  = 0;
-    ::sigprocmask(SIG_SETMASK, &old, nullptr);
     return 0;
   }
   mChildPgid = 0;
@@ -3568,26 +3872,84 @@ void Executor::update_window_size() {
 }
 
 void Executor::handle_signals() {
-  auto bits = mCtx.signals.take_pending();
-  auto has  = [&](int sig) {
-    return sig < 64 ? (bits[0] >> sig) & 1 : (bits[1] >> (sig - 64)) & 1;
-  };
+  SignalCounts counts = mCtx.signals.take_pending();
+  auto has = [&](int sig) { return counts[static_cast<s::size_t>(sig)] > 0; };
   if (has(SIGCHLD)) {
     mCtx.signals.reap(mCtx.jobs);
+    // Without MONITOR nothing reports a finished background job: zsh
+    // forgets it at once (`jobs` doesn't list it, `wait %1` can't name it).
+    if (not mCtx.opts.monitor()) mCtx.jobs.forget_finished_async();
     continue_pipeline_stages();
   }
   if (has(SIGWINCH)) update_window_size();
   for (int sig = 1; sig <= MAX_SIG; ++sig) {
-    if (not has(sig)) continue;
-    if (mCtx.signals.traps().trapped(sig)) {
+    auto n = counts[static_cast<s::size_t>(sig)];
+    if (n == 0) continue;
+    // (SIGINT whose trap did `trap - INT` acts at once, as zsh's handler.)
+    if (mCtx.signals.running_trap(sig)
+        and (mCtx.signals.traps().trapped(sig) or sig != SIGINT
+             or not mCtx.signals.shell_handles(sig))) {
+      // Its trap is running: as zsh's signal queue, the signal waits for
+      // the trap to end (one that came while the trap waited for a
+      // command was dropped there, drop_trap_signals).
+      auto& q = mQueued[static_cast<s::size_t>(sig)];
+      q = static_cast<s::uint16_t>(q + n);
+    } else if (mCtx.signals.traps().trapped(sig)) {
+      // Each arrival runs the trap, one after the other, as zsh queues
+      // them; those still queued when the trap waits for a command (or in
+      // `wait`) are lost there (drop_trap_signals).
+      mBacklog[static_cast<s::size_t>(sig)] = static_cast<s::uint16_t>(n - 1);
       run_trap(sig);
-    } else if (sig == SIGINT and mCtx.signals.job_control()) {
-      mCtx.aborting = mCtx.interrupt = true;
-    } else if (sig == SIGHUP and mCtx.signals.job_control()) {
-      mCtx.hangup   = true;
-      mCtx.exiting  = true;
-      mCtx.exit_now = false;
-      mCtx.exit_val = 128 + SIGHUP;
+    } else if (mCtx.signals.shell_handles(sig)) {
+      untrapped_signal(sig);
+    }
+  }
+}
+
+bool Executor::run_debug_trap() {
+  // ERR_EXIT is off while the DEBUG trap runs, as zsh's execlist has it.
+  bool errexit = mCtx.opts.get(OPT_ERREXIT);
+  mCtx.opts.assign(OPT_ERREXIT, false);
+  run_trap(SIGDEBUG);
+  bool skip = mCtx.opts.get(OPT_ERREXIT);
+  mCtx.opts.assign(OPT_ERREXIT, errexit);
+  return skip;
+}
+
+void Executor::untrapped_signal(int sig) {
+  if (sig == SIGINT) {
+    // zsh's errflag |= ERRFLAG_INT and lastval = 128 + SIGINT: the command
+    // line ends.
+    mCtx.aborting = mCtx.interrupt = true;
+    mCtx.last_exit = 128 + SIGINT;
+    if (not mCtx.signals.running_trap(sig)) mCtx.intr_echoed = true;
+  } else if (sig == SIGHUP) {
+    // zsh's zexit(SIGHUP, …): the status is the signal's number, 1.
+    mCtx.hangup   = true;
+    mCtx.exiting  = true;
+    mCtx.exit_now = false;
+    mCtx.exit_val = SIGHUP;
+  }
+}
+
+void Executor::drop_trap_signals(bool backlog) {
+  // Arrived while a trap for them ran (or, with `backlog`, queued before
+  // it): zsh's queue is processed where the shell waits for a child, and
+  // there their trap is ZSIG_IGNORED, so they are lost; with the trap gone
+  // meanwhile (`trap - SIG`), the default acts at once.
+  for (int sig = 1; sig <= MAX_SIG; ++sig) {
+    if (not mCtx.signals.running_trap(sig)) continue;
+    mQueued[static_cast<s::size_t>(sig)] = 0;
+    if (backlog) mBacklog[static_cast<s::size_t>(sig)] = 0;
+    if (not mCtx.signals.pending(sig)) continue;
+    TrapAction now = mCtx.signals.traps().get(sig).action;
+    if (now == TrapAction::Command or now == TrapAction::Function or now == TrapAction::Ignore) {
+      mCtx.signals.clear_pending(sig);
+    } else if (mCtx.signals.shell_handles(sig)) {
+      mCtx.signals.clear_pending(sig);
+      untrapped_signal(sig);
+    } else {
+      mCtx.signals.raise_default(sig);
     }
   }
 }
@@ -3616,15 +3978,18 @@ void Executor::run_trap(int sig) {
   Trap trap = mCtx.signals.traps().get(sig);
   if (trap.action != TrapAction::Command and trap.action != TrapAction::Function)
     return;
-  if (mInTrap[static_cast<s::size_t>(sig)]) {
-    // Already running this trap: handle the signal once it is done.
-    if (is_real_signal(sig)) mCtx.signals.note(sig);
-    return;
-  }
+  if (mInTrap[static_cast<s::size_t>(sig)]) return;   // zsh's ZSIG_IGNORED
   mInTrap[static_cast<s::size_t>(sig)] = true;
   ++mTrapDepth;
+  mCtx.signals.begin_trap(sig, s::exchange(mSelfSignal, false));
+  // A signal trap the EXIT trap brought on (see call_function).
+  bool outer_sig_in_exit = mInExitTrap and is_real_signal(sig) and not mSigTrapInExit;
+  if (outer_sig_in_exit) mSigTrapInExit = true;
   int  saved_status = mCtx.last_exit;
   bool saved_err    = mCtx.err_reported;
+  bool was_returning = mCtx.returning;
+  opt<int> abort_status;
+  opt<int> errexit_status;
   opt<TrapErrorScope> scope;
   scope.emplace(mCtx);
   if (trap.action == TrapAction::Function) {
@@ -3633,26 +3998,116 @@ void Executor::run_trap(int sig) {
     if (fn != mCtx.functions.end()) {
       ProgRef body = fn->second;
       vec<str> args{name};
-      if (is_real_signal(sig))  args.push_back(s::to_string(sig));
-      else if (sig == SIGEXIT)  args.push_back("0");
-      int rc = call_function(body, args);
-      // A signal trap function that fails (not by an error) acts as if the
-      // signal had interrupted the shell.
+      args.push_back(s::to_string(SignalTable::zsh_number(sig)));
+      bool returned = false;
+      int  rc = call_function(body, args, &returned);
+      // A signal trap function that returns non-zero with `return` (not
+      // by an error, nor by just failing) acts as if the signal had
+      // interrupted the shell, as zsh's trapreturn.
       bool error = mCtx.aborting and not mCtx.interrupt;
-      if (rc != 0 and not error and is_real_signal(sig) and not mCtx.exiting)
-        mCtx.aborting = mCtx.interrupt = true;
+      // (dotrapargs does this for ZERR and DEBUG too.)
+      if (returned and rc != 0 and not error and sig != SIGEXIT and not mCtx.exiting)
+        abort_status = rc;
+      if (returned and rc != 0) errexit_status = rc;
     }
   } else {
-    exec_string(trap.command);
+    run_trap_command(trap);
+    if (mCtx.returning and not was_returning and mCtx.return_val != 0)
+      errexit_status = mCtx.return_val;
   }
+  // zsh: a trap that ended in an error or an interrupt leaves $? 1.
+  bool trap_err = mCtx.aborting and not abort_status;
   scope.reset();
-  if (not mCtx.exiting) mCtx.last_exit = saved_status;
+  // Under ERR_EXIT a trap's `return N` (N non-zero) is a failing command
+  // of the trap, as zsh's execlist sees it: the shell exits with N.
+  if (errexit_status and sig != SIGDEBUG and mCtx.opts.errexit() and mCtx.noerrexit == 0
+      and not mCtx.exiting) {
+    mCtx.exiting  = true;
+    mCtx.exit_now = false;
+    mCtx.exit_val = *errexit_status;
+  }
+  if (abort_status) {
+    // As zsh's dotrapargs: an interrupt for SIGINT and SIGQUIT, an error
+    // for the others (eval and $( … ) then fail with 1, a sourced file
+    // ends just itself), and lastval the trap's status.
+    mCtx.aborting    = true;
+    mCtx.interrupt   = sig == SIGINT or sig == SIGQUIT;
+    mCtx.trap_failed = not mCtx.interrupt;
+    mCtx.trap_status = *abort_status;
+  }
+  if (not mCtx.exiting)
+    mCtx.last_exit = abort_status ? *abort_status : trap_err ? 1 : saved_status;
+  // A `return` in the trap's command returns from the function the trap
+  // interrupted (at the top level it ends the script), as in zsh.
+  if (mCtx.returning and not was_returning and sig != SIGEXIT) mTrapReturned = true;
+  if (abort_status) mTrapAbort = {sig, *abort_status};
+  // An `exit` in a signal trap run from the EXIT trap gives the status
+  // but lets the EXIT trap finish, as in zsh (not for a -c string that ran
+  // off its end).
+  if (mInExitTrap and mCtx.exiting and is_real_signal(sig) and not mExitTrapRanOff) {
+    mExitFromTrap = mCtx.exit_val;
+    mCtx.exiting  = mCtx.exit_now = false;
+  }
+  // There, an `exit` in a function the trap ran ends the EXIT trap as the
+  // trap ends.
+  if (outer_sig_in_exit) {
+    mSigTrapInExit = false;
+    if (s::exchange(mExitInSigTrap, false)) {
+      mCtx.exiting  = true;
+      mCtx.exit_val = mExitFromTrap;
+      mExitEndsExitTrap = true;   // the functions around it don't stop it
+    }
+  }
   mCtx.err_reported = saved_err;
   --mTrapDepth;
   mInTrap[static_cast<s::size_t>(sig)] = false;
+  mCtx.signals.end_trap(sig);   // a `trap - SIG` in it takes effect now
+  if (is_real_signal(sig)) {
+    // What came meanwhile and waited: its trap runs again, once for each;
+    // with the trap gone the default disposition acts (the shell dies of
+    // SIGUSR1; SIGINT and SIGHUP go to handle_signals, as untrapped).
+    auto i      = static_cast<s::size_t>(sig);
+    auto queued = s::exchange(mQueued[i], 0) + s::exchange(mBacklog[i], 0);
+    TrapAction now = mCtx.signals.traps().get(sig).action;
+    if (queued > 0 and now != TrapAction::Ignore) {
+      if (now != TrapAction::Default or mCtx.signals.shell_handles(sig)) {
+        for (; queued > 0; --queued) mCtx.signals.note(sig);
+      } else {
+        mCtx.signals.raise_default(sig);
+      }
+    }
+  }
+  // A signal that came while the trap ran (its own, sent from inside it)
+  // is handled as soon as it ends, as in zsh.  The depth bounds the
+  // recursion of a trap that keeps raising its signal (zsh loops for
+  // ever); past it the signal waits for the next command.
+  if (mCtx.signals.has_pending() and mTrapChain < 32 and not mCtx.exiting) {
+    ++mTrapChain;
+    handle_signals();
+    --mTrapChain;
+  }
 }
 
-int Executor::run_exit_trap(int status) {
+int Executor::run_trap_command(const Trap& trap) {
+  // The trap holds what it parsed when it was set; it is kept alive here
+  // in case the trap resets itself.  A `return` in it is left for the
+  // caller (run_trap) to act on.
+  if (auto prog = trap.prog) {
+    StringDepth depth{*this};
+    return exec(*prog);
+  }
+  return exec_string(trap.command);
+}
+
+bool Executor::end_prompt_trap() noexcept {
+  if (not mCtx.returning or mCtx.func_depth > 0 or mCtx.exiting) return false;
+  mCtx.returning = mCtx.return_line = false;
+  mTrapReturned  = false;
+  mCtx.last_exit = mCtx.return_val;
+  return true;
+}
+
+int Executor::run_exit_trap(int status, bool ran_off) {
   if (mExitTrapRan or not mCtx.signals.traps().trapped(SIGEXIT)) return status;
   mExitTrapRan = true;
   Trap trap = mCtx.signals.traps().get(SIGEXIT);
@@ -3660,18 +4115,33 @@ int Executor::run_exit_trap(int status) {
   bool was_exiting = mCtx.exiting;
   int  was_val     = mCtx.exit_val;
   mCtx.exiting = mCtx.returning = mCtx.aborting = mCtx.exit_now = false;
+  mCtx.return_line = false;
+  mCtx.end_trap_abort();
   mCtx.break_level = 0;
   mCtx.last_exit   = status;
   ++mTrapDepth;
+  mInExitTrap = true;
+  mExitTrapRanOff = ran_off;
+  mExitEndsExitTrap = false;
+  mExitFromTrap = -1;
+  mExitTrapFuncDepth = mCtx.func_depth;
   if (trap.action == TrapAction::Command) {
-    exec_string(trap.command);
+    run_trap_command(trap);
+    // `return N` in it gives the shell's exit status.
+    if (mCtx.returning) {
+      mCtx.returning = false;
+      status = mCtx.return_val;
+    }
   } else if (auto fn = mCtx.functions.find("TRAPEXIT"); fn != mCtx.functions.end()) {
     ProgRef body = fn->second;
     vec<str> args{"TRAPEXIT", "0"};
     call_function(body, args);
   }
   --mTrapDepth;
+  mInExitTrap = false;
+  mExitEndsExitTrap = false;
   if (mCtx.exiting) return mCtx.exit_val;   // the trap called `exit`
+  if (mExitFromTrap >= 0) return mExitFromTrap;
   mCtx.exiting  = was_exiting;
   mCtx.exit_val = was_val;
   return status;

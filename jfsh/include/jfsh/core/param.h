@@ -225,7 +225,9 @@ struct ParamTable {
 
   vec<str> make_envp() const;
 
-  void for_each(func<void(const Param&)>) const;
+  // `filter`, when given, picks the parameters first: the others are
+  // neither refreshed nor passed to `fn`.
+  void for_each(func<void(const Param&)> fn, func<bool(const Param&)> filter = {}) const;
 
   int current_scope() const noexcept {
     return static_cast<int>(mScopes.size()) - 1;

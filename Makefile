@@ -118,7 +118,7 @@ test-jeff: build
 	ctest --test-dir $(BUILD_DIR) --output-on-failure -j $(JOBS)
 
 test-jfsh: jfsh
-	ctest --test-dir $(JFSH_BUILD_DIR) --output-on-failure -j $(JOBS)
+	ctest --test-dir $(JFSH_BUILD_DIR) --output-on-failure --timeout 300 -j $(JOBS) </dev/null
 
 # `make <binary>` builds that one target; with ARGS set it also runs it.
 $(BINARIES): $(CACHE)

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <pthread.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <exception>
@@ -172,14 +173,23 @@ struct Shell {
     s::fflush(nullptr);
     s::FILE* out = s::tmpfile();
     s::FILE* err = s::tmpfile();
+    int saved_in  = dup(STDIN_FILENO);
     int saved_out = dup(STDOUT_FILENO);
     int saved_err = dup(STDERR_FILENO);
+    // Never the test runner's stdin: a command that reads it (`cat` with
+    // nothing to read) would wait for ever.
+    if (int null = open("/dev/null", O_RDONLY); null >= 0) {
+      dup2(null, STDIN_FILENO);
+      close(null);
+    }
     dup2(fileno(out), STDOUT_FILENO);
     dup2(fileno(err), STDERR_FILENO);
     int rc = fn();
     s::fflush(nullptr);
+    dup2(saved_in, STDIN_FILENO);
     dup2(saved_out, STDOUT_FILENO);
     dup2(saved_err, STDERR_FILENO);
+    close(saved_in);
     close(saved_out);
     close(saved_err);
     return {rc, slurp(out), slurp(err)};

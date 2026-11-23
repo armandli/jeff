@@ -53,7 +53,9 @@ constexpr SigEntry SIG_NAMES[] = {
   {SIGINFO,  "INFO"},
 #endif
   {SIGSYS,   "SYS"},
+#ifdef __linux__
   {SIGCHLD,  "CLD"},
+#endif
   // Pseudo-signals
   {SIGEXIT,  "EXIT"},  {SIGZERR, "ZERR"},   {SIGDEBUG, "DEBUG"},
   {SIGZERR,  "ERR"},
@@ -109,7 +111,7 @@ void on_signal(int sig) {
 
 // ---- SignalTable -------------------------------------------------------------
 
-opt<int> SignalTable::name_to_sig(strv name) noexcept {
+opt<int> SignalTable::name_to_sig(strv name, bool any_case) noexcept {
   if (name.empty()) return s::nullopt;
   if (s::all_of(name.begin(), name.end(),
                 [](char c) { return s::isdigit(static_cast<unsigned char>(c)); })) {
@@ -121,10 +123,24 @@ opt<int> SignalTable::name_to_sig(strv name) noexcept {
     return n;
   }
   strv n = name;
-  if (n.size() > 3 and equal_upper(n.substr(0, 3), "SIG")) n = n.substr(3);
+  if (n.size() > 3 and (any_case ? equal_upper(n.substr(0, 3), "SIG") : n.starts_with("SIG")))
+    n = n.substr(3);
+  return bare_name_to_sig(n, any_case);
+}
+
+opt<int> SignalTable::bare_name_to_sig(strv name, bool any_case) noexcept {
   for (const auto& e : SIG_NAMES)
-    if (equal_upper(n, e.name)) return e.num;
+    if (any_case ? equal_upper(name, e.name) : name == e.name) return e.num;
   return s::nullopt;
+}
+
+int SignalTable::zsh_number(int sig_no) noexcept {
+  if (is_real_signal(sig_no)) return sig_no;
+  if (sig_no == SIGEXIT) return 0;
+  int last = 0;
+  for (const auto& e : SIG_NAMES)
+    if (is_real_signal(e.num)) last = s::max(last, e.num);
+  return last + (sig_no == SIGZERR ? 1 : 2);
 }
 
 const char* SignalTable::sig_to_name(int sig_no) noexcept {
@@ -139,7 +155,8 @@ const char* SignalTable::sig_message(int sig_no) noexcept {
   return "unknown signal";
 }
 
-void SignalTable::set(int sig, TrapAction action, str cmd) {
+void SignalTable::set(int sig, TrapAction action, str cmd,
+                      sptr<CompiledProgram> prog, bool alias) {
   if (sig < 0 or sig >= TRAP_TABLE_SIZE) return;
   auto& t = mTraps[static_cast<s::size_t>(sig)];
   if (not mFrames.empty()) {
@@ -148,8 +165,11 @@ void SignalTable::set(int sig, TrapAction action, str cmd) {
                            [&](const auto& e) { return e.first == sig; });
     if (not known) saved.emplace_back(sig, t);
   }
+  bool command = action == TrapAction::Command;
   t.action  = action;
-  t.command = action == TrapAction::Command ? s::move(cmd) : str{};
+  t.command = command ? s::move(cmd) : str{};
+  t.prog    = command or action == TrapAction::Function ? s::move(prog) : nullptr;
+  t.alias   = alias;
 }
 
 const Trap& SignalTable::get(int sig) const noexcept {
@@ -158,8 +178,8 @@ const Trap& SignalTable::get(int sig) const noexcept {
   return mTraps[static_cast<s::size_t>(sig)];
 }
 
-vec<int> SignalTable::pop_frame(bool restore, opt<Trap>& exit_trap) {
-  vec<int> changed;
+vec<s::pair<int, TrapAction>> SignalTable::pop_frame(bool restore, opt<Trap>& exit_trap) {
+  vec<s::pair<int, TrapAction>> changed;
   exit_trap.reset();
   if (mFrames.empty()) return changed;
   Frame frame = s::move(mFrames.back());
@@ -168,12 +188,13 @@ vec<int> SignalTable::pop_frame(bool restore, opt<Trap>& exit_trap) {
     auto& t = mTraps[static_cast<s::size_t>(sig)];
     if (sig == SIGEXIT) {
       if (t.action != TrapAction::Default) exit_trap = t;
+      changed.emplace_back(sig, t.action);
       t = s::move(old);
       continue;
     }
     if (restore) {
+      changed.emplace_back(sig, t.action);
       t = s::move(old);
-      changed.push_back(sig);
     } else if (not mFrames.empty()) {
       // The change outlives this function; an outer LOCAL_TRAPS function
       // still needs the value from before it.
@@ -186,12 +207,17 @@ vec<int> SignalTable::pop_frame(bool restore, opt<Trap>& exit_trap) {
   return changed;
 }
 
-void SignalTable::reset_for_child(bool keep_pseudo) {
+void SignalTable::reset_for_child(ChildKind kind, bool keep_ignored) {
   for (int sig = 0; sig < TRAP_TABLE_SIZE; ++sig) {
     auto& t = mTraps[static_cast<s::size_t>(sig)];
-    if (keep_pseudo and (sig == SIGZERR or sig == SIGDEBUG)) continue;
-    if (is_real_signal(sig) and t.action == TrapAction::Ignore) continue;
-    t = Trap{};
+    bool real = is_real_signal(sig);
+    bool keep = false;
+    if (sig == SIGEXIT)                    keep = false;
+    else if (kind == ChildKind::Stage)     keep = true;
+    else if (kind == ChildKind::Subshell)  keep = not real or t.action == TrapAction::Function
+                                               or (keep_ignored and t.action == TrapAction::Ignore);
+    else                                   keep = real and t.action == TrapAction::Ignore;
+    if (not keep) t = Trap{};
   }
   mFrames.clear();
 }
@@ -200,15 +226,50 @@ void SignalTable::reset_for_child(bool keep_pseudo) {
 
 static_assert(s::atomic<s::uint64_t>::is_always_lock_free,
               "the signal handler needs lock-free 64-bit atomics");
+static_assert(s::atomic<s::uint16_t>::is_always_lock_free,
+              "the signal handler needs lock-free 16-bit atomics");
 
 void PendingSignals::mark(int sig) noexcept {
   if (sig < 0 or sig >= 128) return;
+  // The count before the bit: take() reads the count of every bit it took.
+  if (sig <= MAX_SIG) count[static_cast<s::size_t>(sig)].fetch_add(1, s::memory_order_relaxed);
   if (sig < 64) lo.fetch_or(1ULL << sig, s::memory_order_relaxed);
   else          hi.fetch_or(1ULL << (sig - 64), s::memory_order_relaxed);
 }
 
+SignalCounts PendingSignals::take() noexcept {
+  // The counts are what arrived; the bits only say that something did, so
+  // a stale bit takes nothing and an arrival is never counted twice.
+  SignalCounts out{};
+  lo.exchange(0, s::memory_order_relaxed);
+  hi.exchange(0, s::memory_order_relaxed);
+  for (int sig = 1; sig <= MAX_SIG; ++sig)
+    out[static_cast<s::size_t>(sig)] =
+        count[static_cast<s::size_t>(sig)].exchange(0, s::memory_order_relaxed);
+  return out;
+}
+
+void PendingSignals::clear_all() noexcept {
+  lo = 0;
+  hi = 0;
+  for (auto& c : count) c.store(0, s::memory_order_relaxed);
+}
+
+void PendingSignals::clear(int sig) noexcept {
+  if (sig < 0 or sig >= 128) return;
+  // The bit may stay: take() then finds nothing for it.
+  if (sig <= MAX_SIG) {
+    count[static_cast<s::size_t>(sig)].exchange(0, s::memory_order_relaxed);
+    return;
+  }
+  if (sig < 64) lo.fetch_and(~(1ULL << sig), s::memory_order_relaxed);
+  else          hi.fetch_and(~(1ULL << (sig - 64)), s::memory_order_relaxed);
+}
+
 bool PendingSignals::test(int sig) const noexcept {
   if (sig < 0 or sig >= 128) return false;
+  if (sig >= 1 and sig <= MAX_SIG)
+    return count[static_cast<s::size_t>(sig)].load(s::memory_order_relaxed) > 0;
   if (sig < 64) return (lo.load(s::memory_order_relaxed) >> sig) & 1;
   return (hi.load(s::memory_order_relaxed) >> (sig - 64)) & 1;
 }
@@ -254,16 +315,70 @@ void SignalManager::open_self_pipe() noexcept {
   mSelfPipe[1] = pfd[1];
 }
 
+void SignalManager::begin_trap(int sig, bool self_sent) noexcept {
+  if (not is_real_signal(sig)) return;
+  mRunning[static_cast<s::size_t>(sig)]  = true;
+  mSelfSent[static_cast<s::size_t>(sig)] = self_sent;
+}
+
+void SignalManager::end_trap(int sig) noexcept {
+  if (not is_real_signal(sig)) return;
+  mRunning[static_cast<s::size_t>(sig)] = false;
+  install(sig);
+}
+
+void SignalManager::raise_default(int sig) noexcept {
+  switch (sig) {
+    // Ignored, or stopping, by default: nothing to do here.
+    case SIGCHLD: case SIGCONT: case SIGURG: case SIGWINCH: case SIGIO:
+#ifdef SIGINFO
+    case SIGINFO:
+#endif
+    case SIGTSTP: case SIGTTIN: case SIGTTOU: case SIGSTOP:
+      return;
+    default: ;
+  }
+  struct sigaction sa{};
+  sa.sa_handler = SIG_DFL;
+  sigemptyset(&sa.sa_mask);
+  ::sigaction(sig, &sa, nullptr);
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, sig);
+  ::sigprocmask(SIG_UNBLOCK, &set, nullptr);
+  ::raise(sig);
+}
+
+void SignalManager::let_kept_through(bool on) const noexcept {
+  if (mHaveKept) ::sigprocmask(on ? SIG_UNBLOCK : SIG_BLOCK, &mKeepBlocked, nullptr);
+}
+
+void SignalManager::unblock(int sig) noexcept {
+  if (not is_real_signal(sig) or not sigismember(&mKeepBlocked, sig)) return;
+  sigdelset(&mKeepBlocked, sig);
+  mHaveKept = false;
+  for (int other = 1; other <= MAX_SIG and not mHaveKept; ++other)
+    mHaveKept = sigismember(&mKeepBlocked, other) == 1;
+  sigset_t one;
+  sigemptyset(&one);
+  sigaddset(&one, sig);
+  ::sigprocmask(SIG_UNBLOCK, &one, nullptr);
+}
+
+void SignalManager::scan_start() noexcept {
+  if (mStartChecked) return;
+  for (int s = 1; s <= MAX_SIG; ++s) {
+    struct sigaction old{};
+    if (::sigaction(s, nullptr, &old) == 0)
+      mIgnoredAtStart[static_cast<s::size_t>(s)] = old.sa_handler == SIG_IGN;
+  }
+  mStartChecked = true;
+}
+
 void SignalManager::install(int sig) noexcept {
   if (not is_real_signal(sig) or sig == SIGKILL or sig == SIGSTOP) return;
-  if (not mStartChecked) {
-    for (int s = 1; s <= MAX_SIG; ++s) {
-      struct sigaction old{};
-      if (::sigaction(s, nullptr, &old) == 0)
-        mIgnoredAtStart[static_cast<s::size_t>(s)] = old.sa_handler == SIG_IGN;
-    }
-    mStartChecked = true;
-  }
+  if (mRunning[static_cast<s::size_t>(sig)]) return;   // see begin_trap
+  scan_start();
   struct sigaction sa{};
   sigemptyset(&sa.sa_mask);
   sa.sa_handler = SIG_DFL;
@@ -297,8 +412,13 @@ void SignalManager::install(int sig) noexcept {
     }
   } else if (mIgnoredAtStart[static_cast<s::size_t>(sig)]) {
     sa.sa_handler = SIG_IGN;
+  } else if (sig == SIGHUP) {
+    // As zsh, a script hung up runs its EXIT trap and exits (status 1).
+    catch_it = true;
   }
   if (catch_it) {
+    // A child's self-pipe is opened when it first catches a signal.
+    if (sig != SIGCHLD) open_self_pipe();
     sa.sa_handler = on_signal;
     sa.sa_flags   = restart ? SA_RESTART : 0;
   }
@@ -309,7 +429,24 @@ void SignalManager::init(bool interactive) {
   mInteractive = interactive;
   open_self_pipe();
   install(SIGCHLD);
-  if (not interactive) return;
+  install(SIGHUP);
+  if (not interactive) {
+    // zsh records a SIGQUIT ignored at start as `trap '' QUIT`.
+    if (mIgnoredAtStart[static_cast<s::size_t>(SIGQUIT)]) mTraps.set(SIGQUIT, TrapAction::Ignore);
+    return;
+  }
+
+  // Unlike a script, an interactive shell doesn't pass on the signals it
+  // was started with ignored (SIGPIPE from a Python parent, SIGHUP from
+  // nohup): as in zsh 5.9, its commands get the defaults and it handles
+  // SIGHUP itself.
+  for (int sig = 1; sig <= MAX_SIG; ++sig) {
+    auto i = static_cast<s::size_t>(sig);
+    if (not mIgnoredAtStart[i]) continue;
+    mIgnoredAtStart[i] = false;
+    if (sig != SIGCHLD) ::signal(sig, SIG_DFL);   // SIGCHLD keeps its handler
+  }
+  install(SIGHUP);
 
   // The terminal: /dev/tty, or stdin when that is one, kept on a high
   // close-on-exec fd.
@@ -364,24 +501,61 @@ void SignalManager::release_terminal() noexcept {
 }
 
 void SignalManager::save_shell_modes() noexcept {
-  if (mTtyFd >= 0) mHaveModes = ::tcgetattr(mTtyFd, &mShellModes) == 0;
+  if (mTtyFd < 0) return;
+  mHaveModes = ::tcgetattr(mTtyFd, &mShellModes) == 0;
+  // Canonical input and echo always come back for the next command line,
+  // as in zsh (`stty -echo` lasts only to the end of its line).
+  if (mHaveModes) mShellModes.c_lflag |= ICANON | ECHO;
 }
 
 void SignalManager::restore_shell_modes() noexcept {
-  if (mTtyFd >= 0 and mHaveModes) ::tcsetattr(mTtyFd, TCSADRAIN, &mShellModes);
+  if (mTtyFd < 0 or not mHaveModes) return;
+  // Only when something changed: the REPL calls this before every prompt.
+  struct termios now{};
+  if (::tcgetattr(mTtyFd, &now) == 0 and now.c_iflag == mShellModes.c_iflag
+      and now.c_oflag == mShellModes.c_oflag and now.c_cflag == mShellModes.c_cflag
+      and now.c_lflag == mShellModes.c_lflag
+      and s::memcmp(now.c_cc, mShellModes.c_cc, sizeof now.c_cc) == 0)
+    return;
+  ::tcsetattr(mTtyFd, TCSADRAIN, &mShellModes);
 }
 
 void SignalManager::write_modes(const struct termios& t) const noexcept {
   if (mTtyFd >= 0) ::tcsetattr(mTtyFd, TCSADRAIN, &t);
 }
 
-void SignalManager::child_reset(ChildKind kind) noexcept {
-  // Dispositions to redo: whatever a trap or job control changed.
+sigset_t SignalManager::child_reset(ChildKind kind, bool keep_ignored) noexcept {
+  // A child forked while a signal's command trap runs: as in zsh, a
+  // subshell starts with that signal blocked (and no trap for it); a
+  // pipeline stage, an external command and a TRAPxxx function's children
+  // get the trap's or the default disposition.
+  // The block lasts: that subshell's own children keep it.  A pipeline
+  // stage keeps the running marks for a `( … )` it is (exec_subsh).
+  auto running = mRunning;
+  if (kind != ChildKind::Stage) mRunning = {};
+  if (kind == ChildKind::Subshell)
+    for (int sig = 1; sig <= MAX_SIG; ++sig)
+      if (running[static_cast<s::size_t>(sig)] and mSelfSent[static_cast<s::size_t>(sig)]
+          and mTraps.get(sig).action == TrapAction::Command) {
+        sigaddset(&mKeepBlocked, sig);
+        mHaveKept = true;
+      }
+  sigset_t keep_blocked = mKeepBlocked;
+  // Dispositions to redo: whatever a trap or job control changed, and in
+  // a subshell the signals ignored when the shell started, which zsh's
+  // subshells don't keep either (POSIX_TRAPS keeps only `trap ''`).
   s::array<bool, MAX_SIG + 1> redo{};
   for (int sig = 1; sig <= MAX_SIG; ++sig)
-    if (mTraps.trapped(sig)) redo[static_cast<s::size_t>(sig)] = true;
+    if (mTraps.get(sig).action != TrapAction::Default) redo[static_cast<s::size_t>(sig)] = true;
   if (mJobControl)
     for (int sig : JOB_CONTROL_SIGNALS) redo[static_cast<s::size_t>(sig)] = true;
+  if (kind == ChildKind::Subshell) {
+    for (int sig = 1; sig <= MAX_SIG; ++sig) {
+      auto i = static_cast<s::size_t>(sig);
+      if (mIgnoredAtStart[i]) redo[i] = true;
+      mIgnoredAtStart[i] = false;
+    }
+  }
 
   mJobControl  = false;
   mOrigPgid    = -1;
@@ -389,15 +563,19 @@ void SignalManager::child_reset(ChildKind kind) noexcept {
   if (mTtyFd >= 0) ::close(mTtyFd);
   mTtyFd = -1;
   mHaveModes = false;
-  mTraps.reset_for_child(kind == ChildKind::Subshell);
+  mTraps.reset_for_child(kind, keep_ignored);
   mPending.clear_all();
-  // The parent's self-pipe must not see this process's signals.
+  // The parent's self-pipe must not see this process's signals; install
+  // opens one of the child's own for a trap it keeps.
   for (int& fd : mSelfPipe) {
     if (fd >= 0) ::close(fd);
     fd = -1;
   }
-  for (int sig = 1; sig <= MAX_SIG; ++sig)
-    if (redo[static_cast<s::size_t>(sig)]) install(sig);
+  for (int sig = 1; sig <= MAX_SIG; ++sig) {
+    auto i = static_cast<s::size_t>(sig);
+    if (redo[i] or (running[i] and kind != ChildKind::Stage)) install(sig);
+  }
+  return keep_blocked;
 }
 
 void SignalManager::reset_traps() {
@@ -410,13 +588,16 @@ void SignalManager::reset_traps() {
   mPending.clear_all();
 }
 
-opt<Trap> SignalManager::pop_trap_frame(bool restore) {
+opt<Trap> SignalManager::pop_trap_frame(bool restore,
+                                        vec<s::pair<int, TrapAction>>* changed) {
   opt<Trap> exit_trap;
-  for (int sig : mTraps.pop_frame(restore, exit_trap)) install(sig);
+  auto sigs = mTraps.pop_frame(restore, exit_trap);
+  for (const auto& [sig, _] : sigs) install(sig);
+  if (changed) *changed = s::move(sigs);
   return exit_trap;
 }
 
-s::array<s::uint64_t, 2> SignalManager::take_pending() noexcept {
+SignalCounts SignalManager::take_pending() noexcept {
   if (mSelfPipe[0] >= 0) {
     char buf[64];
     while (::read(mSelfPipe[0], buf, sizeof buf) > 0) {}

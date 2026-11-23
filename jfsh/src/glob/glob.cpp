@@ -616,6 +616,9 @@ Result<vec<str>> glob_expand(
     const GlobHooks*   hooks)
 {
   str        raw = pat.raw;
+  // A `?` right after a leading `%` is no wildcard, so job specs such as
+  // `%?foo` need no quoting (zsh's haswilds).
+  if (raw.starts_with("%?")) raw.insert(1, 1, '\\');
   bool extended = opts.extended_glob() or (pat.flags & GLOB_EXTGLOB);
   // An unclosed `(` or `[` is a bad pattern, as in zsh (`echo a[b`,
   // `echo (b`); a `[` alone is the word `[`.  Under NO_BAD_PATTERN the

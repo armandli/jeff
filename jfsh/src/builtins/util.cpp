@@ -60,12 +60,23 @@ str shell_quote(strv s) {
     return out + "'";
   }
   if (not special) return str(s);
-  str out = "'";
+  // As zsh's quotedzputs: quotes open only around what needs them, so a
+  // quote at either end is `\'` alone (`'a'` is `\''a'\'`).
+  str  out;
+  bool open = false;
   for (char c : s) {
-    if (c == '\'') out += "'\\''";
-    else           out += c;
+    if (c == '\'') {
+      if (open) out += '\'';
+      open = false;
+      out += "\\'";
+    } else {
+      if (not open) out += '\'';
+      open = true;
+      out += c;
+    }
   }
-  return out + "'";
+  if (open) out += '\'';
+  return out;
 }
 
 bool OptParse::has(char c) const noexcept {

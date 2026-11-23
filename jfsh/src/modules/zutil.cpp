@@ -96,6 +96,7 @@ struct StyleTable {
       ctx.executor->exec_string(code);
       if (ctx.aborting and not aborting) {
         ctx.aborting = false;
+        ctx.end_trap_abort();
         return s::nullopt;
       }
       opt<vec<str>> out;

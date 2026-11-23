@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <jfsh/builtins/builtins.h>
+#include <jfsh/builtins/util.h>
 #include <jfsh/core/aliases.h>
 #include <jfsh/exec/executor.h>
 #include <jfsh/parser/parser.h>
@@ -26,21 +27,6 @@ bool all_digits(strv s) noexcept {
   return not s.empty() and s::all_of(s.begin(), s.end(), [](char c) {
     return s::isdigit(static_cast<unsigned char>(c));
   });
-}
-
-// The trap action as `trap` lists it: bare when nothing in it needs
-// quoting, otherwise in single quotes.
-str trap_quote(strv s) {
-  bool plain = not s.empty() and s::all_of(s.begin(), s.end(), [](char c) {
-    return s::isalnum(static_cast<unsigned char>(c)) or s::strchr("_-./,:@%+", c);
-  });
-  if (plain) return str(s);
-  str out = "'";
-  for (char c : s) {
-    if (c == '\'') out += "'\\''";
-    else           out += c;
-  }
-  return out + "'";
 }
 
 str trap_function_name(int sig) {
@@ -62,22 +48,23 @@ str lower_first(const char* msg) {
   return s;
 }
 
-// The job ids named by `specs`, or the current job when there are none.
-// Prints an error for each spec that names no job.
-vec<int> jobs_named(const char* name, vec<str> specs,
-                    ExecContext& ctx, int& rc) {
-  if (specs.empty()) specs.push_back("%%");
-  vec<int> ids;
+// Calls `fn` for each job named by `specs` (the current job when there
+// are none), in order; a spec that names no job gets zsh's message, and
+// the status becomes 127 (1 for the missing current job).
+void for_each_named(const char* name, vec<str> specs, ExecContext& ctx, int& rc,
+                    const func<void(int)>& fn) {
+  bool implicit = specs.empty() or (specs.size() == 1 and specs[0] == "--");
+  if (not specs.empty() and specs[0] == "--") specs.erase(specs.begin());
+  if (implicit) specs = {"%%"};
   for (const auto& spec : specs) {
     auto id = ctx.jobs.find(spec);
     if (not id) {
       s::fprintf(stderr, "jfsh: %s: %s\n", name, id.error().message.c_str());
-      rc = 1;
+      rc = implicit ? 1 : 127;
       continue;
     }
-    ids.push_back(*id);
+    fn(*id);
   }
-  return ids;
 }
 
 }  // namespace
@@ -98,6 +85,7 @@ int builtin_trap(vec<str>& args, ExecContext& ctx) {
   if (i >= args.size()) {
     for (int sig : trap_listing_order()) {
       const Trap& t = traps.get(sig);
+      if (sig == SIGEXIT and not traps.exit_trap_here()) continue;
       if (t.action == TrapAction::Function) {
         str name = trap_function_name(sig);
         if (auto fn = ctx.functions.find(name); fn != ctx.functions.end())
@@ -105,8 +93,10 @@ int builtin_trap(vec<str>& args, ExecContext& ctx) {
         continue;
       }
       if (t.action != TrapAction::Command and t.action != TrapAction::Ignore) continue;
-      s::printf("trap -- %s %s\n", trap_quote(t.command).c_str(),
-                SignalTable::sig_to_name(sig));
+      // The command as it was parsed, as zsh's getpermtext gives it.
+      str text = t.prog ? program_text(*t.prog) : t.command;
+      s::printf("trap -- %s %s\n", shell_quote(text).c_str(),
+                t.alias ? "ERR" : SignalTable::sig_to_name(sig));
     }
     return 0;
   }
@@ -128,6 +118,17 @@ int builtin_trap(vec<str>& args, ExecContext& ctx) {
     return 0;
   }
 
+  // The command is parsed now, once: one that doesn't parse sets no trap.
+  ProgRef prog;
+  if (not first_is_signal and action != "-" and not action.empty()) {
+    auto parsed = ctx.executor->parse_string(action);
+    if (not parsed) {
+      ctx.executor->report_parse_error(parsed.error());
+      s::fprintf(stderr, "jfsh: trap: couldn't parse trap command\n");
+      return 1;
+    }
+    prog = s::move(*parsed);
+  }
   int rc = 0;
   for (; i < args.size(); ++i) {
     auto sig = SignalTable::name_to_sig(args[i]);
@@ -144,7 +145,8 @@ int builtin_trap(vec<str>& args, ExecContext& ctx) {
     if (traps.get(*sig).action == TrapAction::Function)
       ctx.functions.erase(trap_function_name(*sig));
     if (action.empty()) ctx.signals.set_trap(*sig, TrapAction::Ignore);
-    else                ctx.signals.set_trap(*sig, TrapAction::Command, action);
+    else                ctx.signals.set_trap(*sig, TrapAction::Command, action, prog,
+                                         args[i] == "ERR" or args[i] == "SIGERR");
   }
   return rc;
 }
@@ -156,6 +158,7 @@ int builtin_trap(vec<str>& args, ExecContext& ctx) {
 int builtin_jobs(vec<str>& args, ExecContext& ctx) {
   ctx.ran_jobs = true;
   ctx.signals.reap(ctx.jobs);   // list what is true now
+  if (not ctx.opts.monitor()) ctx.jobs.forget_finished_async();
   bool long_fmt = ctx.opts.get(OPT_LONGLISTJOBS);
   bool pgid = false, running = false, stopped = false;
   s::size_t i = 1;
@@ -174,26 +177,26 @@ int builtin_jobs(vec<str>& args, ExecContext& ctx) {
     }
   }
   int rc = 0;
-  vec<int> ids;
+  auto list = [&](int id) {
+    auto found = ctx.jobs.get(id);
+    if (not found) return;
+    Job& j = found->get();
+    if (running and not j.is_running()) return;
+    if (stopped and not j.is_stopped()) return;
+    s::printf("%s\n", ctx.jobs.format(j, long_fmt, pgid).c_str());
+    s::fflush(stdout);
+    j.flags &= ~JOB_CHANGED;
+    if (j.is_done()) ctx.jobs.remove(id);
+  };
   if (i < args.size()) {
-    ids = jobs_named("jobs", {args.begin() + static_cast<s::ptrdiff_t>(i), args.end()}, ctx, rc);
+    for_each_named("jobs", {args.begin() + static_cast<s::ptrdiff_t>(i), args.end()}, ctx, rc,
+                   list);
   } else {
     for (int id : ctx.jobs.ids()) {
       const Job& j = ctx.jobs.get(id)->get();
-      if (j.is_async() or j.is_stopped()) ids.push_back(id);
+      if (j.is_async() or j.is_stopped()) list(id);
     }
   }
-  for (int id : ids) {
-    auto found = ctx.jobs.get(id);
-    if (not found) continue;
-    Job& j = found->get();
-    if (running and not j.is_running()) continue;
-    if (stopped and not j.is_stopped()) continue;
-    s::printf("%s\n", ctx.jobs.format(j, long_fmt, pgid).c_str());
-    j.flags &= ~JOB_CHANGED;
-    if (j.is_done()) ctx.jobs.remove(id);
-  }
-  s::fflush(stdout);
   return rc;
 }
 
@@ -206,17 +209,16 @@ static int fg_bg(vec<str>& args, ExecContext& ctx, bool fg) {
     return 1;
   }
   int rc = 0;
-  for (int id : jobs_named(name, {args.begin() + 1, args.end()}, ctx, rc)) {
+  for_each_named(name, {args.begin() + 1, args.end()}, ctx, rc, [&](int id) {
     auto found = ctx.jobs.get(id);
-    if (not found) continue;
+    if (not found or ctx.aborting) return;
     if (not fg and found->get().is_running()) {
       s::fprintf(stderr, "jfsh: bg: job already in background\n");
       rc = 1;
-      continue;
+      return;
     }
     rc = resume_job(ctx, id, fg);
-    if (ctx.aborting) break;
-  }
+  });
   return rc;
 }
 
@@ -233,11 +235,12 @@ bool wait_interrupted(const ExecContext& ctx) {
       or (ctx.signals.job_control() and ctx.signals.pending(SIGINT));
 }
 
-// Forgets a finished job once `wait` has handed out its status.
+// Forgets a finished job once `wait` has handed out its status.  Its
+// processes' statuses stay for one `wait PID` each, as in zsh (`wait;
+// wait $!`).
 void drop_if_done(ExecContext& ctx, int jid) {
   auto found = ctx.jobs.get(jid);
   if (not found or not found->get().is_done()) return;
-  for (const auto& p : found->get().procs) (void)ctx.jobs.take_remembered(p.pid);
   ctx.jobs.remove(jid);
 }
 
@@ -261,10 +264,9 @@ int wait_job(ExecContext& ctx, int jid) {
 
 }  // namespace
 
-// wait [pid | job …]: with no arguments waits for every background job
-// and returns 0; otherwise returns the status of the last one named.
-// A trapped signal ends the wait with 128 + its number.
-int builtin_wait(vec<str>& args, ExecContext& ctx) {
+// The body of `wait` (builtin_wait).
+static int wait_for(vec<str>& args, ExecContext& ctx) {
+  if (args.size() > 1 and args[1] == "--") args.erase(args.begin() + 1);
   if (args.size() <= 1) {
     for (int id : ctx.jobs.ids()) {
       auto found = ctx.jobs.get(id);
@@ -311,21 +313,36 @@ int builtin_wait(vec<str>& args, ExecContext& ctx) {
   return rc;
 }
 
+// wait [pid | job …]: with no arguments waits for every background job
+// and returns 0; otherwise returns the status of the last one named.
+// A trapped signal ends the wait with 128 + its number.
+int builtin_wait(vec<str>& args, ExecContext& ctx) {
+  bool waits = args.size() > 1;
+  for (int id : ctx.jobs.ids()) waits = waits or ctx.jobs.get(id)->get().is_async();
+  int rc = wait_for(args, ctx);
+  if (wait_interrupted(ctx)) ctx.signal_in_builtin = true;
+  // A signal whose own trap is running (this `wait` is in it) cut the wait
+  // short, or was queued before the trap, and is dropped, as zsh's
+  // ZSIG_IGNORED: the trap doesn't run again.  (Only when it waited.)
+  if (waits and ctx.executor) ctx.executor->drop_trap_signals();
+  return rc;
+}
+
 // ---- disown ----------------------------------------------------------------
 
 // disown [job …]: forget the jobs (the current one by default), so they
 // are not listed and get no SIGHUP when the shell exits.
 int builtin_disown(vec<str>& args, ExecContext& ctx) {
   int rc = 0;
-  for (int id : jobs_named("disown", {args.begin() + 1, args.end()}, ctx, rc)) {
+  for_each_named("disown", {args.begin() + 1, args.end()}, ctx, rc, [&](int id) {
     auto found = ctx.jobs.get(id);
-    if (not found) continue;
+    if (not found) return;
     if (found->get().is_stopped())
       s::fprintf(stderr,
                  "jfsh: disown: warning: job is suspended, use `kill -CONT -%d' to resume\n",
                  static_cast<int>(found->get().pgid));
     ctx.jobs.remove(id);
-  }
+  });
   return rc;
 }
 
@@ -333,25 +350,55 @@ int builtin_disown(vec<str>& args, ExecContext& ctx) {
 
 namespace {
 
-// A signal for kill: a number 0 … MAX_SIG or a real signal's name.
-opt<int> kill_signal(strv s) {
-  if (all_digits(s)) {
-    if (s.size() > 3) return s::nullopt;
-    int n = s::atoi(str(s).c_str());
-    if (n > MAX_SIG) return s::nullopt;
-    return n;
-  }
-  auto sig = SignalTable::name_to_sig(s);
+// zsh's zstrtol in base 10: blanks, a sign, digits.  `rest` is what
+// follows; `used` says whether anything at all was taken.
+struct Number {
+  long long value = 0;
+  strv      rest;
+  bool      used  = false;
+};
+
+Number read_number(strv s) {
+  Number n;
+  s::size_t i = 0;
+  while (i < s.size() and (s[i] == ' ' or s[i] == '\t')) ++i;
+  bool neg = false;
+  if (i < s.size() and (s[i] == '-' or s[i] == '+')) neg = s[i++] == '-';
+  for (; i < s.size() and s::isdigit(static_cast<unsigned char>(s[i])); ++i)
+    if (n.value < 1'000'000'000'000LL) n.value = n.value * 10 + (s[i] - '0');
+  if (neg) n.value = -n.value;
+  n.used = i > 0;
+  n.rest = s.substr(i);
+  return n;
+}
+
+str upper(strv s) {
+  str u(s);
+  for (char& c : u) c = static_cast<char>(s::toupper(static_cast<unsigned char>(c)));
+  return u;
+}
+
+// A real signal's name, as kill takes it: case is ignored, and so is a
+// leading SIG when `sig_any_case` (`kill -sigint`), else only "SIG"
+// (`kill -l SIGINT`, not `kill -l sigint`).
+opt<int> kill_signal_name(strv name, bool sig_any_case) {
+  strv n = name;
+  if (n.size() >= 3 and (sig_any_case ? upper(n.substr(0, 3)) == "SIG" : n.starts_with("SIG")))
+    n.remove_prefix(3);
+  auto sig = SignalTable::bare_name_to_sig(n, /*any_case=*/true);
   if (sig and is_real_signal(*sig)) return sig;
   return s::nullopt;
 }
 
-int unknown_signal(strv s, bool hint) {
+int unknown_signal(strv name) {
   s::fprintf(stderr, "jfsh: kill: unknown signal: SIG%.*s\n",
-             static_cast<int>(s.size()), s.data());
-  if (hint) s::fprintf(stderr, "jfsh: kill: type kill -l for a list of signals\n");
+             static_cast<int>(name.size()), name.data());
+  s::fprintf(stderr, "jfsh: kill: type kill -l for a list of signals\n");
   return 1;
 }
+
+// The number of failures, as zsh's kill returns it.
+int failures(int n) { return n < 126 ? n : 1; }
 
 int kill_list(const vec<str>& args, s::size_t i) {
   if (i >= args.size()) {
@@ -365,70 +412,119 @@ int kill_list(const vec<str>& args, s::size_t i) {
     s::printf("%s\n", line.c_str());
     return 0;
   }
-  int rc = 0;
+  int errors = 0;
   for (; i < args.size(); ++i) {
-    const str& a = args[i];
-    if (all_digits(a)) {
-      // An exit status such as 130 names the signal that caused it.
-      long n = s::strtol(a.c_str(), nullptr, 10);
-      if (n > 128) n -= 128;
-      const char* name = n >= 1 and n <= MAX_SIG ? SignalTable::sig_to_name(static_cast<int>(n))
-                                                 : "UNKNOWN";
-      if (s::strcmp(name, "UNKNOWN") == 0) s::printf("%ld\n", n);
-      else                                 s::printf("%s\n", name);
-    } else if (auto sig = kill_signal(a)) {
-      s::printf("%d\n", *sig);
+    strv a = args[i];
+    Number n = read_number(a);
+    if (not n.used) {
+      // A name: its number.
+      if (auto sig = kill_signal_name(a, false)) {
+        s::printf("%d\n", *sig);
+        continue;
+      }
+      strv rest = a.starts_with("SIG") ? a.substr(3) : a;
+      s::fprintf(stderr, "jfsh: kill: unknown signal: SIG%.*s\n",
+                 static_cast<int>(rest.size()), rest.data());
+      ++errors;
+    } else if (not n.rest.empty()) {
+      s::fprintf(stderr, "jfsh: kill: unknown signal: SIG%.*s\n",
+                 static_cast<int>(n.rest.size()), n.rest.data());
+      ++errors;
     } else {
-      rc = unknown_signal(a, false);
+      // A number is an exit status, as WIFSIGNALED / WTERMSIG read it:
+      // 130 names INT.
+      auto sig = static_cast<int>(n.value);
+      int  low = sig & 0177;
+      if (low != 0 and low != 0177) sig = low;
+      const char* name = sig >= 1 and sig <= MAX_SIG ? SignalTable::sig_to_name(sig)
+                                                     : "UNKNOWN";
+      if (s::strcmp(name, "UNKNOWN") == 0) s::printf("%d\n", sig);
+      else                                 s::printf("%s\n", name);
     }
   }
-  return rc;
+  s::fflush(stdout);
+  return failures(errors);
 }
 
 }  // namespace
 
-// kill [-s SIG | -n NUM | -SIG] pid|job …, kill -l [sig …]
+// kill [-s SIG | -n NUM | -SIG | -NUM] [-|--] pid|job …, kill -l [sig …]
+// The parsing and messages are zsh's bin_kill.
 int builtin_kill(vec<str>& args, ExecContext& ctx) {
   int sig = SIGTERM;
   s::size_t i = 1;
-  if (i < args.size() and (args[i] == "-l" or args[i] == "-L")) return kill_list(args, i + 1);
-  if (i < args.size() and (args[i] == "-s" or args[i] == "-n")) {
-    if (i + 1 >= args.size()) {
-      s::fprintf(stderr, "jfsh: kill: -%c requires an argument\n", args[i][1]);
-      return 1;
+  if (i < args.size() and args[i].starts_with('-')) {
+    strv a = args[i];
+    if (a == "-l") return kill_list(args, i + 1);
+    if (a == "-s" or a == "-n") {
+      if (i + 1 >= args.size()) {
+        s::fprintf(stderr, "jfsh: kill: %s: argument expected\n", args[i].c_str());
+        return 1;
+      }
+      strv v = args[i + 1];
+      if (a == "-n") {
+        Number n = read_number(v);
+        if (not n.rest.empty()) {
+          s::fprintf(stderr, "jfsh: kill: invalid signal number: %s\n", args[i + 1].c_str());
+          return 1;
+        }
+        sig = static_cast<int>(n.value);
+      } else if (v.empty()) {
+        s::fprintf(stderr, "jfsh: kill: -: signal name expected\n");
+        return 1;
+      } else if (v == "0") {
+        sig = 0;
+      } else if (auto named = kill_signal_name(v, true)) {
+        sig = *named;
+      } else {
+        str u = upper(v);
+        return unknown_signal(strv(u).starts_with("SIG") ? strv(u).substr(3) : strv(u));
+      }
+      i += 2;
+    } else if (a != "--") {
+      strv spec = a.substr(1);
+      if (spec.empty()) {
+        s::fprintf(stderr, "jfsh: kill: -: signal name expected\n");
+        return 1;
+      }
+      if (s::isdigit(static_cast<unsigned char>(spec[0]))) {
+        // A number goes to kill(2) as it is: `kill -99` fails there.
+        Number n = read_number(spec);
+        if (not n.rest.empty()) {
+          s::fprintf(stderr, "jfsh: kill: invalid signal number: %s\n", args[i].c_str());
+          return 1;
+        }
+        sig = static_cast<int>(n.value);
+      } else if (auto named = kill_signal_name(spec, true)) {
+        sig = *named;
+      } else {
+        str u = upper(spec);
+        return unknown_signal(strv(u).starts_with("SIG") ? strv(u).substr(3) : strv(u));
+      }
+      ++i;
     }
-    auto s = kill_signal(args[i + 1]);
-    if (not s or (args[i] == "-n" and not all_digits(args[i + 1])))
-      return unknown_signal(args[i + 1], true);
-    sig = *s;
-    i += 2;
-  } else if (i < args.size() and args[i].size() > 1 and args[i][0] == '-' and args[i] != "--") {
-    auto s = kill_signal(strv(args[i]).substr(1));
-    if (not s) return unknown_signal(strv(args[i]).substr(1), true);
-    sig = *s;
-    ++i;
   }
-  if (i < args.size() and args[i] == "--") ++i;
+  if (i < args.size() and (args[i] == "--" or args[i] == "-")) ++i;
   if (i >= args.size()) {
     s::fprintf(stderr, "jfsh: kill: not enough arguments\n");
     return 1;
   }
 
-  int rc = 0;
+  int errors = 0;
   for (; i < args.size(); ++i) {
     const str& target = args[i];
     if (target.starts_with('%')) {
       auto id = ctx.jobs.find(target);
       if (not id) {
         s::fprintf(stderr, "jfsh: kill: %s\n", id.error().message.c_str());
-        rc = 1;
+        ++errors;
         continue;
       }
       const Job& j = ctx.jobs.get(*id)->get();
       if (auto r = signal_job(j, sig); not r) {
         s::fprintf(stderr, "jfsh: kill: kill %s failed: %s\n", target.c_str(),
                    lower_first(s::strerror(errno)).c_str());
-        rc = 1;
+        ++errors;
         continue;
       }
       // A stopped job can't act on most signals until it runs again.
@@ -437,21 +533,29 @@ int builtin_kill(vec<str>& args, ExecContext& ctx) {
       if (j.is_stopped() and needs_cont) (void)signal_job(j, SIGCONT);
       continue;
     }
-    strv digits = target;
-    if (digits.starts_with('-')) digits.remove_prefix(1);
-    if (not all_digits(digits) or digits.size() > 10) {
+    // zsh's isanum: digits and '-' only, read as atoi reads them.
+    bool anum = not target.empty() and s::all_of(target.begin(), target.end(), [](char c) {
+      return c == '-' or s::isdigit(static_cast<unsigned char>(c));
+    });
+    if (not anum) {
       s::fprintf(stderr, "jfsh: kill: illegal pid: %s\n", target.c_str());
-      rc = 1;
+      ++errors;
       continue;
     }
-    Pid pid = static_cast<Pid>(s::strtol(target.c_str(), nullptr, 10));
-    if (::kill(pid, sig) != 0) {
+    long long value = read_number(target).value;
+    if (value == ::getpid() or value == 0 or value == -::getpgrp()) ctx.signal_in_builtin = true;
+    // A pid that doesn't fit is no process at all (zsh's atoi would wrap
+    // it, possibly to -1: every process).
+    int err = 0;
+    if (value < INT32_MIN or value > INT32_MAX) err = ESRCH;
+    else if (::kill(static_cast<Pid>(value), sig) != 0) err = errno;
+    if (err) {
       s::fprintf(stderr, "jfsh: kill: kill %s failed: %s\n", target.c_str(),
-                 lower_first(s::strerror(errno)).c_str());
-      rc = 1;
+                 lower_first(s::strerror(err)).c_str());
+      ++errors;
     }
   }
-  return rc;
+  return failures(errors);
 }
 
 }  // namespace jfsh

@@ -990,8 +990,8 @@ output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
   `fg`/`bg` say `no job control in this shell.`
 - **Children:** `Executor::fork_child` blocks every signal across `fork`; the child joins
   the job's process group, takes the terminal if it's in the foreground, resets
-  dispositions and traps (`SignalManager::child_reset`: ignored signals stay ignored,
-  `( … )` keeps ZERR and DEBUG), forgets the parent's jobs, then unblocks. Command and
+  dispositions and traps (`SignalManager::child_reset`; since the review by zsh's
+  entersubsh rules, see Review fixes), forgets the parent's jobs, then unblocks. Command and
   process substitution and here-doc writers reset too. A background job without job
   control ignores SIGINT and SIGQUIT; with it and BG_NICE it runs at nice 5. A lone
   background pipeline and every pipeline stage `exec` their command instead of forking
@@ -1020,8 +1020,8 @@ output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
   signal numbers, `0` for EXIT, `--`, `undefined signal: X`; the listing is zsh's
   (`trap -- 'echo hi' INT`, in signal order). Traps run between commands, and right
   after a builtin that raised the signal, with `$?` preserved (B16). `TRAPINT() { … }`
-  functions get the signal number as `$1`; one that returns non-zero aborts the command
-  line; `trap` and `TRAPxxx` replace each other. EXIT runs when the shell exits (all
+  functions get the signal number as `$1`; one that returns non-zero with `return`
+  aborts the command line (see Review fixes); `trap` and `TRAPxxx` replace each other. EXIT runs when the shell exits (all
   of `-c`, scripts, stdin and the REPL), when a `( … )` subshell that set it exits, and
   at the end of a function that set it. DEBUG runs before each command, ZERR after a
   failing one; neither runs inside another trap. LOCAL_TRAPS is decided when the
@@ -1035,26 +1035,342 @@ output is from zsh 5.9 (`zsh -f -c`, `zsh -f -i`).
   returns) and acts at every level.
 - **Exit:** CHECK_JOBS warns `you have suspended jobs.` (or, with
   CHECK_RUNNING_JOBS, `running jobs`) once; exiting again, or after `jobs`, goes ahead.
-  With HUP, jobs left behind get SIGHUP (and SIGCONT if stopped):
-  `jfsh: warning: N jobs SIGHUPed`.
+  With HUP, running jobs left behind get SIGHUP (stopped ones too, with SIGCONT, only
+  after a hangup): `jfsh: warning: N jobs SIGHUPed`.
 - **Line editor:** Ctrl-C drops the line, or at PS2 the whole command (B24); EOF or a
   hung-up terminal ends the read instead of spinning (B29); the editor polls the signal
   self-pipe so traps run and job notices print while it waits, then redraws.
 
+**Review fixes** (branch jfsh-m6-review): `kill` follows zsh's bin_kill: `-l` takes
+exit statuses as WIFSIGNALED/WTERMSIG read them (`kill -l 1000` is 104, `-5` 123, `256`
+256), names in any case but `SIG` in upper case (`kill -l sigint` fails), only `-l`
+lists (`-L` is a signal name); `-NAME`/`-s NAME` take any case with or without SIG,
+`-s 30` and `-L` are unknown signals (upper-cased in the message), `-99` goes to kill(2)
+("failed: invalid argument"), `-1x` and `-n INT` are "invalid signal number", `-s` with
+nothing is "argument expected", a lone `-` is "signal name expected" before the
+targets and skipped after them, targets are zsh's isanum (`' 5'`, `+5` illegal), a pid
+that doesn't fit is "no such process" (zsh's atoi could turn it into -1), and the status
+is the number of failures. `trap` takes only upper-case names (`trap x sigint` is an
+undefined signal), parses its command when it is set ("couldn't parse trap command",
+status 1, nothing set; `Trap::prog` keeps the parsed program, so a trap is never parsed
+again: a DEBUG trap over 100000 commands 0.12 s → 0.07, zsh 0.14) and lists the parsed
+text (`program_text`, zsh's getpermtext: `$'if true\nthen\n\techo a\nfi'`, `'a=b '`)
+quoted as zsh's quotedzputs, which `shell_quote` now is for `typeset -p` too (`\''a'\'`);
+`trap … ERR` is listed as ERR; in a function only that function's EXIT trap is listed;
+CLD is an alias on Linux only. Traps and `return`: a `return` in a signal trap returns
+from the function it interrupted with the interrupted builtin's status (`kill`'s 0,
+`wait`'s 128 + the signal), or the trap's after an external command (round 4: through
+any compound command too), and at the top
+ends the script with its status; ZERR's returns with its own; an EXIT trap's gives the
+exit status. A TRAPxxx function aborts the line only when it ends with an explicit
+non-zero `return` (`TRAPUSR1() { false }` doesn't), and the status is then the
+builtin's in a -c string and 1 in a script (the trap's own for SIGINT), the trap's after
+an external command or in a subshell (old Left item). TRAPZERR and TRAPDEBUG get zsh's numbers as `$1`
+(`SignalTable::zsh_number`: 32 and 33 on macOS). DEBUG sets `$ZSH_DEBUG_CMD` (`list_text`)
+and runs after each command under NO_DEBUG_BEFORE_CMD. Children follow zsh's entersubsh
+(`ChildKind` Subshell / Stage / Other, `Executor::enter_child`/`exit_child`): `( )`,
+`$( )`, `<( )`, `>( )`, `=( )`, background jobs and background pipeline stages put
+signal traps and ignored signals back to their defaults (also signals ignored when the
+shell started; POSIX_TRAPS keeps `trap ''`, and a SIGQUIT ignored at start is one),
+keep TRAPxxx functions, ZERR and DEBUG,
+and run an EXIT trap they set (`x=$(trap 'echo e' EXIT)`); a foreground pipeline stage
+keeps every trap; a background job without job control lists `trap -- '' INT` and QUIT;
+a background job's own failure sets off no ZERR or ERR_EXIT (`false &`; `EF_NOERRCHECK`).
+An interactive shell no longer passes on signals it was started with ignored (SIGPIPE
+from a Python parent, SIGHUP from nohup), and a script that gets SIGHUP runs its EXIT
+trap and exits 1.
+Jobs: without MONITOR a finished background job is forgotten as it is reaped (`jobs`
+doesn't list it, `wait %1` is "no such job", `wait $!` still has the status; old Left
+item); bad job specs give 127 (1 for a missing current job) and are reported in order;
+`wait --`; `%?str` isn't a pattern (zsh's haswilds); job texts are zsh's getjobtext
+(`( a; b; )`, `if a; then; b; fi`, `{; a; } always {; b; }`, `f () { ... }`, a background
+`a && b` is `b`); a notice prints every line before removing finished jobs, so the marks
+are the ones jobs had, and `fg %-` prints `-`. Interactive: a foreground job killed by
+Ctrl-C or Ctrl-\ runs the INT / QUIT trap and the line goes on (zsh's update_job; an
+untrapped Ctrl-\ now ends the line), a TRAPINT that returns non-zero ends it with its
+status; a pipeline a signal killed part of is reported a process a line (`jfsh: killed
+sh -c … | ` / `jfsh: done       cat`); what a job that finished set with stty lasts
+(`stty intr ^X`), with ICANON and ECHO put back before each prompt; the `exit` that only
+warned about jobs has status 0; on `exit` a stopped job is left to the kernel's SIGHUP of
+an orphaned group, without "SIGHUPed" (zsh's killrunjobs). Performance: each external
+command refreshed every special parameter for its environment (`make_envp` now
+refreshes only exported ones; `$userdirs` reads the user database): 50 externals 1.44 s
+→ 0.20 (zsh 0.08), 2000 `/usr/bin/true &` 51.7 s → 0.99 (zsh 1.15). Tests:
+`JobsM6Review.*` and `TrapsM6Review.*` in `tests/jobs_test.cpp`, `InteractiveM6Review.*`
+in `tests/interactive_test.cpp`; `SignalTable.ChildrenResetTrapsByKind`, `JobText.*`
+and three older tests changed to zsh's behaviour.
+Round 2: a `( … )` that is a forked stage of a foreground pipeline is reset as the
+subshell it is (`(trap) | cat` lists nothing; `Executor::mStageChild`); an interactive
+shell resets SIGHUP ignored at start too (zsh's HUP option stays on); POSIX_TRAPS keeps
+only `trap ''` entries, and a SIGQUIT ignored at start is recorded as `trap -- '' QUIT`,
+as zsh does; only Ctrl-C owes the newline the REPL prints before the prompt
+(`ExecContext::intr_echoed`), so Ctrl-\ and a TRAPINT that ends the line leave no blank
+line; `wait` and `wait %N` leave each process's status for one `wait PID` (`wait;
+wait $!`, already wrong on main); a TRAPEXIT defined in a function is that function's
+EXIT trap, and a TRAPxxx the function's frame hid comes back with its trap (`Trap::prog`
+holds the function body); a TRAPUSR1 returning non-zero leaves `kill`'s status in a -c
+string and 1 in a script, as zsh; a signal sent from its own trap is handled when the trap
+ends rather than after the next command (round 3 reworked how); without
+MONITOR `jobs` lists each process of a pipeline; array assignments are written
+`x=(a b)` in trap listings and `functions` (was `x=( a b )`, on main too);
+`ParamTable::for_each` takes a filter, which `make_envp` uses. Tests:
+`TrapsM6Review.ASubshellStageResetsTraps`, `PosixTrapsKeepsOnlyTrapIgnores`,
+`AFunctionsTrapexitIsItsExitTrap`, `ASignalFromItsOwnTrapIsHandledWhenTheTrapEnds`,
+`ArrayAssignmentsAreWrittenAsZsh`, `JobsM6Review.BareWaitKeepsStatusesForWaitPid`,
+`PipelineStagesListedSeparatelyWithoutMonitor`,
+`InteractiveM6Review.NoBlankLineAfterQuitOrATrapThatEndsTheLine`, and HUP in
+`InteractiveM6Review.SignalsIgnoredAtStartAreNotPassedOn`.
+Round 3: the signal mask of round 2 is gone (a program `exec`ed in a trap inherited it);
+a signal's running trap now follows zsh's ZSIG_IGNORED model: while it runs, its
+disposition stays (`SignalManager::begin_trap`/`end_trap`, so `trap - SIG` takes effect
+when the trap ends); the same signal is kept for after it (`Executor::mQueued`) and then runs the trap
+again, or with the trap gone acts as the default disposition (`raise_default`) — round 4
+corrected which arrivals are dropped and what a subshell forked meanwhile gets. A TRAPxxx that
+returns non-zero is an error, as zsh's trapreturn (ERRFLAG_ERROR), except for SIGINT
+and SIGQUIT (an interrupt): `ExecContext::trap_failed`; `eval` and `$( … )` then fail
+with 1 (a signal that came during `$( … )` is handled there; round 4 made the command
+around it stop and gave `eval` zsh's retflag), a sourced file ends just
+itself, `read` gives 1 (the trap's status for SIGINT) and stops on a trap's `return`,
+a loop keeps its status, a script turns 0 into 1; the explicit-return flag is passed
+back by `call_function` instead of a member a nested call overwrote; no EXIT trap runs
+inside a trap; a TRAPEXIT's `return N` acts as `return N` in the function; the TRAPxxx
+functions follow every trap a frame restores (`pop_frame` reports each with the action
+it had, EXIT always), so `trap - EXIT` in a function only hides an outer TRAPEXIT and a
+TRAPUSR1 defined under LOCAL_TRAPS goes. Trapping or resetting a signal forgets that it
+was ignored at start (zsh's settrap). An interactive shell started with SIGCHLD ignored
+keeps its handler. Without job control `<( … )` ignores INT and QUIT. A hung-up shell
+leaves a command it waits for at once. `array_words` keeps `<( )`, `>( )`, `=( )` and
+`$[ ]`. The DEBUG trap no longer pays sigprocmask: 100000 commands 0.08 s (zsh 0.14).
+Executor's bools are packed (round 4: 1 byte of padding left). Tests: `TrapsM6Review.
+NoExitTrapRunsInsideATrap`, `AFailingTrapFunctionIsAnErrorWhereverItStrikes`,
+`ASignalWhileItsTrapRunsIsHandledAsZsh`, `TrappingASignalForgetsItWasIgnoredAtStart`,
+`ProcessSubstitutionIgnoresIntAndQuitWithoutJobControl`, `JobsM6Review.
+AHangupEndsAWaitAtOnce`, `InteractiveM6Review.SigchldIgnoredAtStartStillReportsJobs`,
+and new cases in `AFunctionsTrapexitIsItsExitTrap` and `ArrayAssignmentsAreWrittenAsZsh`.
+Round 4, from zsh 5.9's source (signals.c zhandler/dotrapargs/handletrap/queue_traps,
+jobs.c waitforpid/zwaitjob, builtin.c eval, init.c loop): a TRAPxxx's non-zero `return`
+sets errflag (ERRFLAG_INT for SIGINT and SIGQUIT, ERRFLAG_ERROR otherwise), retflag,
+`breaks = loops` and `lastval = N`; whatever command the trap ran inside then sets $?
+after it. jfsh now keeps the trap's status (`ExecContext::trap_status`) through every
+enclosing `{ }`, if, case, loop, function and `always` (zsh 7 where jfsh gave 0 or 1);
+a builtin's own status comes after the trap's only when the trap ran inside it (`kill`
+sent the shell the signal, `read` handled it, `wait` was cut short:
+`ExecContext::signal_in_builtin`), otherwise an arrival between commands keeps N; SIGQUIT
+is an interrupt as SIGINT is (`TRAPQUIT() { return 5 }` gives 5). A failed TRAPxxx during
+a command's expansion (`echo a $(kill -USR1 $$) b`, `$(( ))`, backquotes, externals)
+skips the command with status 1. `trap_failed`/`trap_status` are cleared wherever
+`aborting` is (TrapErrorScope, `always`, sched, zle widgets, the REPL, `source`), and
+`eval` and `read` test them together with `aborting`. `eval` keeps the trap's retflag:
+the enclosing function returns 1, at a script's top only the line ends
+(`ExecContext::return_line`), as zsh's loop() goes on; a `TRY_BLOCK_ERROR=0` doesn't
+clear that retflag either. Under ERR_EXIT a trap's `return N` exits with N (zsh's
+execlist checks the trap's own commands). A function called from an EXIT trap runs no
+EXIT trap of its own. An `exit` in a signal trap run from a script's EXIT trap lets the
+EXIT trap finish. `>( … )` ignores INT and QUIT without job control, as `<( … )`.
+Signals follow zsh's queue: arrivals are counted, not merged (`SignalCounts`), and each
+runs the trap in turn; while a signal's trap runs, a new arrival waits for it to end,
+unless it comes while the trap waits for a child (an external command, `$( … )`, a
+builtin's process substitution, a `wait` that waited), where zsh's trap queue drains
+and ZSIG_IGNORED drops it (`Executor::drop_trap_signals`; the arrivals queued with the
+one that started the trap, `mBacklog`, are dropped there too). A subshell forked during
+a command trap has the signal blocked, not `trap ''` (a TRAPxxx's subshell neither), and
+its children keep the block. `raise_default` no longer kills an interactive shell:
+SIGINT (with job control or interactive) and SIGHUP whose trap was reset in their own
+trap act as untrapped (`Executor::untrapped_signal`): SIGINT ends the trap and the line
+with $? 1 (a trap that ended in an error or interrupt leaves 1, zsh's traperr), SIGHUP
+is queued and then exits with 1, zsh's zexit(SIGHUP) status, for an interactive shell
+too (was 129). A trap run at the prompt that ends the line doesn't reach the next line.
+Ctrl-C killing a job inside the INT trap lets the trap go on without a newline. Header
+layout follows E2/E3 (StringDepth with PipeLast, end_string and run_trap_command
+protected). Tests: `TrapsM6Review.TrapFailuresQueueingAndExitTrapsAsZshC` (36 cases from
+`zsh -f -c`), `InteractiveM6Review.AResetIntOrHupInItsOwnTrapIsTheShellsOwn`,
+`InteractiveM6Review.CtrlCInsideTheIntTrapLetsItFinish`.
+
+Round 5: the trap-failure state a failed TRAPxxx leaves (`return_line`, `trap_failed`,
+`trap_status`) is cleared with `aborting` where a string ends, before the EXIT trap and
+in `eval`'s error branch (`ExecContext::end_trap_abort`), so an error in an `eval` the
+EXIT trap runs ends just the eval (a script prints `ev 1`, status 1); a -c string that
+an error or interrupt ended runs no EXIT trap, as zsh's errflag (`${x?}` still runs it).
+A failed TRAPxxx inside `$( … )` gives zsh's statuses: the command word's 1, an
+assignment's (or backquote's) 1, or 2 for SIGINT and SIGQUIT (`x=$(kill -INT $$)`),
+and `(( $(…) ))` 2. A trap's
+plain `return` there ends the line at the top (status 3) and, in a function, lets the
+command run and the function return its status. A trap set inside a subshell a trap
+forked runs (the parent's running-trap marks, queue and backlog are reset in the
+child); the signal stays blocked there only when the shell sent it to itself, and a
+pipeline stage keeps the marks for the `( … )` it runs. While such a subshell waits for
+a child the kept signals come through (`SignalManager::let_kept_through`, zsh's
+sigsuspend), so it dies of a default one while its children keep the block. A Command
+or Function trap unblocks its signal (`SignalManager::unblock`). `SignalCounts` keeps counts only. An
+untrapped `kill -INT $$` ends the line with 130 and owes no newline. SIGHUP during a
+foreground job exits at once with 1 and SIGHUPs the job (was after the job ended). The
+DEBUG trap runs with ERR_EXIT off, a TRAPDEBUG or TRAPZERR that returns N aborts with N,
+and a DEBUG trap that sets ERR_EXIT skips the next command (zsh's donedebug). An `exit`
+in a function the EXIT trap calls lets the trap finish. A trap that fails at the prompt
+ends its line with a newline. Hang guards: ctest runs with a 120 s per-test and 300 s
+overall timeout and stdin /dev/null, `Rig::finish` and `run_binary` have deadlines, and
+the tests' `popen`s read /dev/null. Tests: 20 more rows in
+`TrapsM6Review.TrapFailuresQueueingAndExitTrapsAsZshC`,
+`TrapsM6Review.AnEvalErrorInTheExitTrapAfterATrapFailure`,
+`InteractiveM6Review.KillIntToTheShellGives130`,
+`InteractiveM6Review.AFailedTrapAtThePromptEndsItsLine`,
+`InteractiveM6Review.HangupDuringAForegroundJobExitsAtOnce`.
+
+Round 6, from zsh 5.9's source: a substitution keeps its own status (zsh's cmdoutval);
+the 1 or 2 of a failed TRAPxxx is an assignment's (`lastval = errflag ? errflag :
+cmdoutval`). So, after a failed TRAPxxx in a word: typeset, local, export and readonly
+don't run; case gives 0 (execcase doesn't check errflag; a script still turns that 0
+into 1); `(( ))` gives 2, and since
+execarith clears the error but not the trap's retflag, the enclosing function returns
+2 and at the top the EXIT trap still runs. (Round 7 corrects typeset's status and
+`[[ ]]`, below.) A trap's plain `return` while a for or case word is expanded in a
+function makes the function return 0 without running the command; `[[ ]]` and `(( ))` run and the function returns their status, as a simple
+command does; a function called with such a word doesn't run (doshfunc clears retflag),
+and the caller goes on with the substitution's status. A forked child that an error
+ended (`$((1/0))`, `${x?}`) runs no EXIT trap of its own, in `$( )`, `<( )`, pipeline
+stages and `( )` (errflag is still set in its dotrapargs). An `exit` in a function the
+EXIT trap runs acts as `return` from that function with $? 0, and the shell exits with
+its status (zexit while the shell is exiting). An `exit` in a signal trap run from the
+EXIT trap ends the EXIT trap when a -c string ran off its end, as zsh's. `${x?}` in a
+function runs no global EXIT trap (zsh exits from there). A trap's `return` at the
+prompt ends there (`Executor::end_prompt_trap`): $? is its status, the next line runs,
+and its output ends with a newline; in a typed line it ends the line with the status of
+the builtin it ran in (`kill`'s 0). On SIGHUP during a foreground job the terminal stays
+the job's, so the hangup reaches it under NO_HUP too, and a job started in a function
+(zsh's STAT_NOPRINT, pline_level) is left to that hangup and not counted.
+`let_kept_through` reads a cached `mHaveKept`. Tests: 24 rows under `// Round 6.` in
+`TrapsM6Review.TrapFailuresQueueingAndExitTrapsAsZshC` (renamed from Round4…),
+`InteractiveM6Review.ATrapReturnAtThePromptEndsThere`,
+`InteractiveM6Review.ATrapReturnInALineKeepsTheBuiltinsStatus`.
+
+Round 7: a child forked inside the EXIT trap (`x=$(g)`, `g &`, `( g )`) exits with the
+status of an `exit` in a function there, as zsh's _realexit uses exit_val with
+exit_pending (`mExitFromTrap` is reset in `enter_child` and used by `exit_child`). After
+a -c string ran off its end, an `exit` in a function a signal trap runs inside the EXIT
+trap ends the EXIT trap once that trap is done (`mSigTrapInExit`, `mExitInSigTrap`). A
+substitution a failed TRAPxxx ended expands to nothing, and `[[ ]]` gives the test's own
+status with it (`[[ -n $(kill -USR1 $$) ]]` 1, `[[ -z … ]]` 0; for -eq … -ge see
+Round 8). typeset, local, export
+and readonly give 0 after such a failure. A child whose last command is an `always`
+block that ended in an error still runs its EXIT trap (zsh runs that command in exec
+mode with errflag cleared); with more code after the block it doesn't
+(`mTryEndedChild`). A trap's `return` in a repeat, select or `for (( ))` word in a
+function makes the function return 0: repeat and `for (( ))` don't run, select shows
+its menu first, as zsh's. Tests: 23 rows under `// Round 7.` in
+`TrapsM6Review.TrapFailuresQueueingAndExitTrapsAsZshC`.
+
+Round 8: once an `exit` in a signal trap's function has ended the EXIT trap (a -c string
+that ran off its end), the functions around that signal trap no longer turn it back
+into a return (`mExitEndsExitTrap`, cleared by run_exit_trap), so `f` calling `kill
+-USR1 $$` from the EXIT trap gives zsh's `hi ex u`, status 5, also from TRAPEXIT and
+through two functions. After a failed TRAPxxx, `[[ ]]`'s -eq … -ge compare 0 with 0, as
+zsh's matheval gives 0 for every operand while errflag is set (math.c): `-eq` 0, `-ne`
+1. Tests: 10 rows under `// Round 8.` in
+`TrapsM6Review.TrapFailuresQueueingAndExitTrapsAsZshC`.
+
 **Left**
-- zsh turns the rest of a loop whose command was suspended into a suspended job of its
-  own; jfsh ends the command line instead.
+- Done elsewhere: POSIX_TRAPS (M12c); the editor re-laying out on SIGWINCH (M9, B27).
+  Planned elsewhere: `suspend`, `time`/JOB_TIMED and `$ZSH_SUBSHELL` (M17); TRAPS_ASYNC,
+  POSIX_JOBS, AUTO_CONTINUE, AUTO_RESUME and the rest of a suspended loop becoming a job
+  of its own (M19; jfsh ends the command line instead).
 - A CHLD trap runs for the stages of a foreground pipeline (`trap … CHLD; (sleep
-  0.3; echo a) | cat`); zsh's doesn't.
-- TRAPS_ASYNC, POSIX_TRAPS, POSIX_JOBS, AUTO_CONTINUE and AUTO_RESUME are not
-  implemented; neither are `suspend`, `time` (JOB_TIMED) or `$ZSH_SUBSHELL`.
-- A non-interactive shell keeps finished background jobs in its table until `jobs` or
-  `wait` reports them.
-- Trap return statuses: `TRAPINT() { return 1 }` should make the shell exit with 1
-  (zsh), and a `return 4` in a trap string run inside a function should leave the
-  caller's `$?` at 0.
-- The editor doesn't re-layout on SIGWINCH yet: `$COLUMNS`/`$LINES` are updated, but
-  the editor doesn't use them (B26, B27).
+  0.3; echo a) | cat`); zsh's doesn't. Reason: zsh reaps those stages in its own wait
+  loop without running traps; jfsh's reaping is shared by every wait, a wider change.
+- zsh/parameter's `$jobstates`, `$jobtexts`, `$jobdirs` are missing (zsh autoloads them).
+  Reason: module work (M10/M11), and jobs don't record their directory yet.
+- `jobs -Z name` (rename the shell process) is a bad option. Reason: needs rewriting
+  argv in place, which is platform-specific and unrelated to jobs.
+- Without MONITOR, `! a | b &` (a sublist run in a subshell) is listed on one line; zsh
+  lists its pipeline's processes. Reason: that job has a single process (the subshell).
+- In a subshell zsh still finds the parent's jobs for `kill %1`; jfsh has none.
+  Reason: needs a read-only copy of the job table in every child (zsh's oldjobtab) and
+  rules for which builtins see it.
+- Several jobs reaped together are reported in job order; zsh reports them as it reaps
+  them. Reason: deliberate; zsh's order depends on timing.
+- A trap's commands overwrite `$pipestatus` in zsh (`trap 'echo int' INT; sleep 5 |
+  cat` + Ctrl-C leaves it `0`); jfsh keeps the pipeline's. Reason: deliberate, the
+  pipeline's statuses are the useful ones and `$?` agrees with them.
+- A WINCH trap for `kill -WINCH $$` runs at once in jfsh, later in zsh. Reason: a zsh
+  quirk of when it handles SIGWINCH; not worth copying.
+- A trap that keeps raising its own signal (or two traps raising each other's) loops
+  for ever in zsh; jfsh handles 32 in a row and then lets the next command run.
+  Reason: deliberate, bounds the recursion.
+- After `fg` of a job stopped with echo off, zsh still echoes `^C`; jfsh restores the
+  job's modes as saved. Reason: unclear zsh rule for when it saves a job's tty modes.
+- `trap 'echo (' INT` is a parse error in jfsh; zsh parses `echo (` and fails at run time
+  with "bad pattern". Reason: the parser's handling of a lone `(` (M3/M4).
+- An unterminated quote at the end of a string (`trap "'a" INT`, `eval "echo 'a"`) is
+  accepted by the lexer; zsh says "unmatched '". Reason: lexer (M3).
+- An exported special keeps updating in the environment (`export SECONDS`); zsh's
+  environment copy changes only on assignment. Reason: parameters (M3/M17), as on main.
+- `typeset -p` writes ESC as `$'\e'`; zsh as `$'\C-['`. Reason: shell_quote's control
+  characters, as on main (M7).
+- In an interactive shell zsh prints builtin errors without `zsh:` (`fg: no current
+  job`); jfsh always prefixes `jfsh:`. Reason: how all of jfsh's errors are reported.
+- `source /dev/null` is "no such file or directory". Reason: M7's lookup takes regular
+  files only.
+- zsh 5.9's entersubsh loop stops before the last signal (SIGUSR2 on macOS), so a trap
+  on it survives into subshells (`trap 'echo x' USR2; (trap)` lists it). Reason:
+  deliberate, a zsh bug; jfsh resets it as any other.
+- `TRAPEXIT() { return 3 }` at the top gives zsh -c status 3 (a script 0); jfsh 0.
+  Reason: a -c-only quirk of zsh's exit path.
+- In a function, `${x?}` runs the function's own EXIT trap in zsh (other errors don't);
+  jfsh doesn't. (Neither runs the shell's.) Reason: zsh's hard-error flag escapes its
+  "no trap after an error" check; a distinction jfsh's error flags don't make.
+- `x=$(…) &` is a parse error in zsh; jfsh runs it. Reason: the parser (M2).
+- `x=( $(case a in a) echo hi;; esac) )` doesn't parse in jfsh. Reason: the lexer's
+  `$(` scan (M3).
+- A failed TRAPxxx in a redirection word's `$( … )` (`cat < $(kill -USR1 $$)`) leaves
+  zsh's status at the trap's N; jfsh gives 1 as for an argument word. Reason: jfsh
+  expands redirection and argument words together.
+- A here-document whose `$( … )` sets off a failed TRAPUSR1 exits 3 in a zsh script
+  (the trap's status), 1 in jfsh. Reason: zsh expands here-documents in the forked
+  command, after the point where jfsh fails the command.
+- A plain `return` (status 0) in a trap run at the prompt leaves $? 1 in zsh; jfsh 0
+  (`return 3` gives 3 in both). Reason: zsh's bin_return gives lastval, 0 there, so
+  the 1 comes from zle's handling of a retflag while it reads; not found in its source.
+- A failed TRAPxxx in `typeset x=$(kill -USR1 $$; exit 7)` gives jfsh 0; zsh sometimes
+  gives 7 (a script 7 rather than 1). Only a child that does an immediate `exit N` can
+  give N in zsh (`false`, `(exit 6)`, `sh -c "exit 6"` all give 0). Reason: zsh's
+  status there depends on whether that child has exited when the trap runs; jfsh
+  always waits first.
+- An `always` block's marker for a child's EXIT trap (`mTryEndedChild`) can outlive the
+  block: when `eval` or `source` clears the error in between, with `{…} always {…} ||
+  echo x` (or `&&`) as the child's last command, or with an always block ending a
+  function body that is the subshell's last command, jfsh prints the child's EXIT trap
+  output (`e`) and zsh doesn't (also on main). Reason: zsh clears errflag only for the
+  command it runs in exec mode as the child's last (exec.c), which jfsh approximates
+  without tracking that exec mode.
+- A subshell inside the EXIT trap runs its own EXIT trap when it ends by itself; zsh
+  doesn't: `trap 'echo t; ( trap "echo ie" EXIT; echo more); echo after $?' EXIT; true`
+  gives zsh `t more after 0` (also on main). So `x=$(trap "echo ie" EXIT; g)`, with g
+  doing `exit 4`, now captures `ie` too. Reason: zsh's child keeps the parent's
+  exiting state (exit_pending, in_exit_trap), under which its dotrapargs runs no EXIT
+  trap; jfsh resets the child's EXIT trap state in enter_child.
+- A failed TRAPxxx in the words of for, repeat, select or `for (( ))` at the top of a
+  -c string gives jfsh 0, zsh 1 (execfor and the others return 1 when errflag is set);
+  `for ((i=$(kill -USR1 $$; echo 0); …))` also prints "bad math expression" in jfsh,
+  nothing in zsh. Reason: those loops check the expansion's error, not errflag; left
+  to keep round 8 narrow.
+- After a failed TRAPxxx inside `[[ ]]`, zsh still evaluates the other side of `||`
+  and `&&` (evalcond's COND_OR/COND_AND have no errflag check, cond.c); jfsh stops at
+  the abort, so `TRAPUSR1() { return 3 }; [[ 1 -lt $(kill -USR1 $$; echo 5) || 1 ]]`
+  gives -c status 1, zsh 0 (main 0 by accident, since it compared 1 with the empty
+  substitution's value; script mode now matches zsh). The same holds for string tests
+  (`[[ $(kill -USR1 $$; echo 1) == 2 || 1 ]]`, also on main). Reason: exec_cond breaks
+  on `interrupted()`; left to keep round 8 narrow.
+- `wait` inside a trap with two jobs, where the trap's signal arrives: zsh returns 0
+  (a SIGCHLD that comes later replaces its last_signal), jfsh 158. Reason: depends on
+  zsh's signal timing.
+- `kill -CHLD $$` runs a CHLD trap in jfsh; zsh runs it only when a child is reaped.
+  Reason: jfsh reaps children in several places and runs the trap per arrival.
+- In a loop, Ctrl-\ killing a job prints `jfsh: quit` and Ctrl-C a newline; zsh prints
+  neither there. Reason: cosmetic, zsh's printjob rule for jobs in loops.
+- A Ctrl-C that kills a job inside a loop is followed by a newline in jfsh; zsh prints
+  none there (only after a job that ends the line), so the next output follows `^C`.
+  Reason: cosmetic, and zsh's rule for it (printjob) is unclear; main does the same.
+- A Ctrl-C while lines are typed ahead and not yet read drops them (also on main).
+  Reason: the line editor's terminal-mode switches (M9).
 
 ### M7. Builtins [builtin/*]
 

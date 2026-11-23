@@ -239,7 +239,7 @@ InvocationRun run_as(std::string name, std::string command) {
   std::string dst = std::string(dir) + "/" + name;
   std::string cp  = std::string("cp ") + JFSH_BINARY + " " + dst;
   std::system(cp.c_str());
-  std::string cmd = dst + " -c " + "'" + command + "'" + " 2>&1";
+  std::string cmd = dst + " -c " + "'" + command + "'" + " 2>&1 </dev/null";
   FILE* p = ::popen(cmd.c_str(), "r");
   if (not p) return {-1, ""};
   std::string out;

@@ -178,7 +178,10 @@ void install_zle_hooks(Executor& ex) {
     ed.resume_raw_mode();
     // An error throws the line away, as zsh does.
     if (ctx.aborting) ed.abort_line();
-    if (--*depth == 0) ctx.aborting = ctx.abort_line = false;
+    if (--*depth == 0) {
+      ctx.aborting = ctx.abort_line = false;
+      ctx.end_trap_abort();
+    }
     ctx.params.pop_scope();
     if (rc < 0) {
       ed.set_message("No such shell function `" + fn + "'");
@@ -215,7 +218,10 @@ void install_zle_hooks(Executor& ex) {
     }
     // Only an expansion error goes on to unwind the widgets that ran this
     // one; others end here.
-    if (--*depth == 0 or not ctx.abort_line) ctx.aborting = ctx.abort_line = false;
+    if (--*depth == 0 or not ctx.abort_line) {
+      ctx.aborting = ctx.abort_line = false;
+      ctx.end_trap_abort();
+    }
     unbind_completion_params(ctx);
     ctx.params.pop_scope();
     return rc;

@@ -47,6 +47,9 @@ enum ExecFlags : s::uint32_t {
   EF_STAGEERR = 1 << 7,
   // With EF_ASYNC: `&|` / `&!`, not made a job.
   EF_DISOWN   = 1 << 8,
+  // The sublist a background job's child runs: its own failure doesn't
+  // set off ZERR or ERR_EXIT (only exec_sublist reads it).
+  EF_NOERRCHECK = 1 << 9,
 };
 
 struct Executor;
@@ -89,6 +92,13 @@ struct ShellHooks {
 };
 
 struct ExecContext {
+  // Clears trap_failed and trap_status (below); wherever `aborting` is
+  // cleared.
+  void end_trap_abort() noexcept {
+    trap_failed = false;
+    trap_status = -1;
+  }
+
   ParamTable&    params;
   OptionState&   opts;
   JobTable&      jobs;
@@ -128,6 +138,23 @@ struct ExecContext {
   s::int64_t try_error     = -1;
   s::int64_t try_interrupt = -1;
   bool hangup      = false; // SIGHUP reached an interactive shell
+  // Ctrl-C ended the command line: the terminal echoed ^C without a
+  // newline, which the REPL then prints before the prompt.
+  bool intr_echoed = false;
+  // A TRAPxxx that ended with `return N`, N non-zero, ended the line (zsh's
+  // trapreturn): `trap_failed` for any signal but SIGINT and SIGQUIT, which
+  // zsh counts as an interrupt rather than an error.  Cleared with
+  // `aborting` where the line ends.
+  bool trap_failed = false;
+  // N while that abort is in effect (else -1): what dotrapargs leaves in
+  // lastval, which the commands around then keep.
+  int  trap_status = -1;
+  // With `returning`: a return that at the top of a script ends just the
+  // current line (the trap's return an `eval` keeps, zsh's retflag).
+  bool return_line = false;
+  // The builtin running took a signal itself: `kill` sent one to the
+  // shell, or `wait` was cut short by one.
+  bool signal_in_builtin = false;
   // Under job control, the process group of a pipeline whose last stage
   // runs in the shell: it keeps the terminal while that stage runs, so a
   // foreground job started there gives the terminal back to it.
@@ -286,6 +313,17 @@ struct Executor {
   // for scripts and sourced files, so an alias defined on one line is
   // used on the next.
   int exec_string(strv src, bool by_line = false);
+  // Parses `src` as exec_string would, without running it.
+  Result<ProgRef> parse_string(strv src);
+  void            report_parse_error(const ShellError& e);
+  // Runs a program parsed by parse_string as exec_string runs its text.
+  int exec_parsed(const CompiledProgram& prog);
+  // In a freshly forked child that runs shell code: signals and traps
+  // reset for `kind` (SignalManager::child_reset), the parent's jobs
+  // forgotten.  exit_child ends such a child with status `rc` (or its
+  // `exit` / `return` status) after running an EXIT trap it set.
+  void enter_child(ChildKind kind);
+  [[noreturn]] void exit_child(int rc);
   // `.`/`source`: runs the file at `path` in this shell, with `args` (if
   // any) as the positional parameters meanwhile.  `name` is what errors
   // and $0 call it.
@@ -331,6 +369,16 @@ struct Executor {
   void handle_signals();
   // Runs the trap for `sig` (a real or pseudo-signal), keeping $?.
   void run_trap(int sig);
+  // After waiting for a command: drops a signal whose trap is running, as
+  // zsh does there (see the definition); with `backlog`, also the arrivals
+  // queued before the trap started.
+  void drop_trap_signals(bool backlog = true);
+  // What an untrapped signal the shell handles itself does: SIGINT ends
+  // the command line, SIGHUP the shell.
+  void untrapped_signal(int sig);
+  // Runs the DEBUG trap with ERR_EXIT off, as zsh does; true when the trap
+  // set ERR_EXIT, which skips the command that follows.
+  bool run_debug_trap();
   // While the shell runs the last stage of a pipeline under job control,
   // the other stages can't be suspended without it: when one was stopped
   // (Ctrl-Z), says so and continues them, as zsh does.
@@ -340,9 +388,16 @@ struct Executor {
   // (traps, reaping, continuing stopped pipeline stages) as between
   // commands.
   void wait_for_input();
+  // The shell's EXIT trap won't run (`${x?}` in a function, as zsh's zexit).
+  void drop_exit_trap() noexcept { mExitTrapRan = true; }
+  // A trap's `return` at the prompt (outside any function): it ends there,
+  // and $? is its status, as zsh's.  False when there was none.
+  bool end_prompt_trap() noexcept;
   // Runs the EXIT trap once, as the shell exits with `status`; returns the
-  // status to exit with (the trap may call `exit`).
-  int  run_exit_trap(int status);
+  // status to exit with (the trap may call `exit`).  `ran_off`: a -c
+  // string that ended by itself, where zsh lets an `exit` in a signal trap
+  // end the EXIT trap at once.
+  int  run_exit_trap(int status, bool ran_off = false);
   // Sets $COLUMNS and $LINES from the terminal.
   void update_window_size();
   // What prompt expansion needs from this shell: PROMPT_SUBST's
@@ -367,8 +422,11 @@ protected:
   int exec_compound(ExecState& es, ExecFlags);
   int exec_if      (ExecState& es, WordCode head);
   int exec_while   (ExecState& es, WordCode head);
-  // A loop that an error ended has status 1, as in zsh.
+  // A loop that an error ended has status 1, as in zsh; one a TRAPxxx's
+  // failure ended has the trap's (zsh's trapreturn breaks out of the
+  // loops and leaves lastval).
   int loop_status(int rc) const noexcept {
+    if (mCtx.aborting and mCtx.trap_status >= 0) return mCtx.last_exit;
     return mCtx.aborting and not mCtx.interrupt ? 1 : rc;
   }
   int exec_for     (ExecState& es, WordCode head);
@@ -399,6 +457,10 @@ protected:
   // After a loop's body: whether the loop stops.  Consumes one level of a
   // pending `break N`/`continue N`.
   bool loop_done() noexcept;
+  // A trap's `return` came while a for, case, repeat, select or `for (( ))`
+  // word was expanded in a function: the command doesn't run and the
+  // function returns 0, as zsh's.
+  bool trap_returned_in_words() noexcept;
 
   int  do_fork(ExecState& es, ExecFlags) { return 0; }
   // Forks.  With job control the child joins process group `pgid` (0: a
@@ -502,9 +564,11 @@ public:
     vec<str>& args,
     ExecContext& ctx);
   // Runs a shell function: `args[0]` is its name, the rest become $1 …
+  // `returned`, when given, says whether it ended with `return`.
   int  call_function(
     const ProgRef& body,
-    vec<str>& args);
+    vec<str>& args,
+    bool* returned = nullptr);
   // The builtins' names, sorted (whence -m, `builtin` listings).
   vec<str> builtin_names() const;
 
@@ -515,6 +579,11 @@ protected:
   int  exec_replace(const vec<str>& args, vec<Assignment> assigns,
                     const str& argv0, bool clear_env, const str* traced,
                     int trace_to);
+  // What exec_string does once the code has run: a top-level `return` and
+  // an aborted line end the string.
+  int end_string(int rc);
+  // A trap's command string, run as exec_string would run it.
+  int run_trap_command(const Trap& trap);
 
 public:
   ExecContext& context() noexcept { return mCtx; }
@@ -525,6 +594,14 @@ private:
   struct PipeLast {
     pid_t    pid = -1;
     vec<str> tmp_files{};
+  };
+  // Counts an exec_string or exec_parsed while it runs.
+  struct StringDepth {
+    explicit StringDepth(Executor& ex) : d(ex.mStringDepth) { ++d; }
+    ~StringDepth() { --d; }
+    StringDepth(const StringDepth&) = delete;
+    StringDepth& operator=(const StringDepth&) = delete;
+    int& d;
   };
 
   ExecContext& mCtx;
@@ -539,12 +616,38 @@ private:
   // Under job control, the process group fork_child put its last child
   // in, for its job.
   Pid                    mChildPgid = 0;
+  s::uint32_t            mProcSubsts = 0;   // `<( )` and `>( )` made so far
 
   s::array<bool, TRAP_TABLE_SIZE> mInTrap{};
+  // Arrivals of a signal while its own trap ran (mQueued), and those that
+  // came with the one that started it (mBacklog), for after it.
+  s::array<s::uint16_t, MAX_SIG + 1> mQueued{};
+  s::array<s::uint16_t, MAX_SIG + 1> mBacklog{};
   int            mTrapDepth  = 0;     // traps being run
   int            mStringDepth = 0;   // nested exec_string calls
+  // A TRAPxxx run by handle_signals aborted with a status: {signal, status}.
+  opt<s::pair<int, int>> mTrapAbort;
+  // The status of an `exit` in a signal trap run from the EXIT trap, or -1.
+  int            mExitFromTrap = -1;
+  int            mExitTrapFuncDepth = 0;   // func_depth when the EXIT trap began
   bool           mExitTrapRan = false;
+  bool           mInExitTrap  = false;
+  bool           mExitTrapRanOff = false;   // run_exit_trap's ran_off
+  // An `always` block ended with the error still set, and nothing came
+  // after it: a child's EXIT trap still runs (exit_child).
+  bool           mTryEndedChild = false;
+  bool           mSigTrapInExit = false;   // run_trap: a signal trap in the EXIT trap
+  bool           mExitInSigTrap = false;   // an `exit` in a function there
+  bool           mExitEndsExitTrap = false;   // ... which now ends the EXIT trap
+  bool           mTrapReturned = false;   // a trap handle_signals ran did `return`
+  bool           mReturnAfterCommand = false;   // see exec_simple
+  bool           mSelfSignal  = false;   // handle_signals after `kill` to the shell
   bool           mParseFailed = false;   // exec_string hit a parse error (source)
+  // In a forked foreground pipeline stage, until its command starts: a
+  // `( … )` there is reset as a subshell (exec_subsh).
+  bool           mStageChild = false;
+  bool           mHashFull  = false;   // fill_command_hash() since cleared
+  s::uint8_t     mTrapChain = 0;   // run_trap handling what came during a trap
   str*           mCondTrace   = nullptr;   // xtrace text of the [[ ]] being run
   // `case` and `[[ = ]]` patterns compiled, by their text after expansion
   // and the options compile() takes (cached_pattern).
@@ -552,7 +655,6 @@ private:
   HashTable<str> mCmdHash;     // command name → resolved path
   str            mHashedPath;  // $PATH the hash was built against
   s::uint64_t    mHashedGen = 0;   // ParamTable::path_generation() then
-  bool           mHashFull  = false;   // fill_command_hash() since cleared
   uptr<Zle>              mOwnZle;
   uptr<CompletionEngine> mOwnCompletion;
 };
@@ -592,9 +694,9 @@ Result<void> signal_job(const Job& job, int sig);
 // control) interrupts the wait.
 int wait_background_process(ExecContext& ctx, int jid, s::size_t proc_index);
 
-// Sends SIGHUP (and SIGCONT to stopped ones) to the jobs an exiting
-// interactive shell leaves behind, unless NO_HUP or disowned.  Returns
-// how many it signalled.
+// Sends SIGHUP to the running jobs an exiting interactive shell leaves
+// behind, unless NO_HUP or disowned; after a SIGHUP of its own, stopped
+// ones too (with SIGCONT).  Returns how many it signalled.
 int hangup_jobs(ExecContext& ctx);
 
 // ---- $PATH (src/exec/executor.cpp) -------------------------------------------

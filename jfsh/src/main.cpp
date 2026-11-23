@@ -269,6 +269,7 @@ int main(int argc, char* argv[]) {
   startup.zsh_compat = inv.zsh_compat_rc;
   jfsh::run_startup_files(executor, startup);
   ctx.aborting = false;
+  ctx.end_trap_abort();
 
   // History, after the startup files have had their say on HISTFILE,
   // HISTSIZE and the history options.  Only an interactive shell keeps
@@ -283,7 +284,7 @@ int main(int argc, char* argv[]) {
 
   // Exiting, as zsh's zexit does: the history is saved, a login shell reads
   // its logout files, then the EXIT trap and the zshexit hook run.
-  auto finish = [&](int rc) {
+  auto finish = [&](int rc, bool ran_off = false) {
     if (ctx.exiting) rc = ctx.exit_val;
     if (save_history) {
       auto hist_opts = jfsh::history_options(ctx);
@@ -293,7 +294,7 @@ int main(int argc, char* argv[]) {
     ctx.last_exit = rc;
     jfsh::run_logout_files(executor, startup);
     if (ctx.exiting) rc = ctx.exit_val;
-    rc = executor.run_exit_trap(rc);
+    rc = executor.run_exit_trap(rc, ran_off);
     ctx.exiting = false;
     jfsh::run_hook(executor, "zshexit");
     s::fflush(nullptr);
@@ -302,7 +303,10 @@ int main(int argc, char* argv[]) {
 
   if (ctx.exiting) return finish(ctx.exit_val);   // `exit` in a startup file
 
-  if (inv.command) return finish(executor.exec_string(*inv.command));
+  if (inv.command) {
+    int rc = executor.exec_string(*inv.command);
+    return finish(rc, not ctx.exiting);
+  }
 
   if (not inv.script.empty()) {
     s::FILE* f = s::fopen(inv.script.c_str(), "r");
@@ -329,6 +333,17 @@ int main(int argc, char* argv[]) {
       bool printed = jfsh::Signals.pending_trapped() != 0;
       if (printed) editor.trash();
       executor.handle_signals();
+      // A trap run at the prompt that ended in an error, an interrupt or a
+      // `return` doesn't reach the line being typed (zsh resets errflag
+      // and retflag there).
+      bool returned = executor.end_prompt_trap();
+      if ((ctx.aborting or returned) and not ctx.exiting) {
+        // (The trap's output ends a line of its own, as zsh's.)
+        s::fputc('\n', stderr);
+        printed = true;
+        ctx.aborting = ctx.abort_line = ctx.interrupt = ctx.intr_echoed = false;
+        ctx.end_trap_abort();
+      }
       if (opts.monitor() and opts.get(jfsh::OPT_NOTIFY) and ctx.jobs.has_changes()) {
         if (not printed) editor.trash();
         ctx.jobs.notify_changes();
@@ -355,14 +370,21 @@ int main(int argc, char* argv[]) {
         return false;
       }
       warned = true;
+      // The `exit` that didn't leave has status 0, as in zsh.
+      ctx.last_exit = 0;
       return true;
     };
 
     for (;;) {
+      // The terminal as the shell keeps it: what the last command left set
+      // (`stty intr ^X`), with echo and canonical input back.
+      jfsh::Signals.restore_shell_modes();
       // 1–2. Run traps, reap jobs and report the ones that changed.
       executor.handle_signals();
       if (opts.monitor()) ctx.jobs.notify_changes();
       ctx.aborting = false;
+      ctx.end_trap_abort();
+      (void)executor.end_prompt_trap();
       if (ctx.exiting) {   // SIGHUP, or an EXIT-ing trap
         if (not exit_blocked()) break;
         ctx.exiting = false;
@@ -370,6 +392,7 @@ int main(int argc, char* argv[]) {
       // 3–4. precmd, periodic, sched, mail.
       jfsh::before_prompt(executor, s::time(nullptr));
       ctx.aborting = false;
+      ctx.end_trap_abort();
       if (ctx.exiting) {
         if (not exit_blocked()) break;
         ctx.exiting = false;
@@ -460,7 +483,7 @@ int main(int argc, char* argv[]) {
         ctx.ran_jobs = false;
         if (not ctx.exiting) ctx.last_exit = executor.exec_string(line);
         // Ctrl-C: the terminal echoed ^C; start the prompt on a new line.
-        if (ctx.aborting) s::fputc('\n', stderr);
+        if (s::exchange(ctx.intr_echoed, false)) s::fputc('\n', stderr);
       }
       if (ctx.hist_current) {
         history.set_last_elapsed(static_cast<s::uint32_t>(s::time(nullptr) - started));
@@ -481,7 +504,8 @@ int main(int argc, char* argv[]) {
       prev_ran_jobs = ctx.ran_jobs;
     }
 
-    // HUP: jobs left running get SIGHUP (stopped ones SIGCONT too).
+    // HUP: jobs left running get SIGHUP (stopped ones too, with SIGCONT,
+    // after a hangup).
     if (jfsh::Signals.job_control())
       if (int n = jfsh::hangup_jobs(ctx); n > 0)
         s::fprintf(stderr, "jfsh: warning: %d jobs SIGHUPed\n", n);

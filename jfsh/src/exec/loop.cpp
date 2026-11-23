@@ -225,6 +225,7 @@ void run_sched(Executor& ex, s::time_t now) {
     events.erase(events.begin());
     ex.exec_string(cmd);
     ctx.aborting = false;
+    ctx.end_trap_abort();
   }
 }
 
