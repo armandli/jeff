@@ -3,8 +3,12 @@
 
 #include <jfsh/exec/loop.h>
 
+#include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <dirent.h>
 #include <pwd.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -13,6 +17,7 @@
 
 #include <jfsh/core/aliases.h>
 #include <jfsh/exec/subst.h>
+#include <jfsh/parser/parser.h>
 
 namespace jfsh {
 
@@ -23,20 +28,22 @@ str param(ExecContext& ctx, strv name) {
   return (p and p->get().is_set()) ? p->get().scalar() : str{};
 }
 
-// $ZDOTDIR, else $HOME, else the home directory in the password file.
-str zdotdir(ExecContext& ctx) {
-  if (str z = param(ctx, "ZDOTDIR"); not z.empty()) return z;
-  if (str h = param(ctx, "HOME"); not h.empty()) return h;
-  if (struct passwd* pw = ::getpwuid(::getuid()); pw and pw->pw_dir) return pw->pw_dir;
-  return "/";
+// The directory of the user's startup files: $ZDOTDIR when it is set (even
+// to nothing), else $HOME, else the home directory in the password file
+// (zsh's sourcehome and its `home`).
+opt<str> zdotdir(ExecContext& ctx) {
+  for (strv name : {strv("ZDOTDIR"), strv("HOME")})
+    if (auto p = ctx.params.lookup(name); p and p->get().is_set()) return p->get().scalar();
+  if (struct passwd* pw = ::getpwuid(::getuid()); pw and pw->pw_dir) return str(pw->pw_dir);
+  return s::nullopt;
 }
 
-// Sources `path` when it exists, as zsh does: a missing startup file is no
-// error.  Returns false once the shell is exiting.
+// Sources `path` when it can be read, as zsh's source() does: a missing
+// startup file is no error.  Returns false once the shell is exiting.
 bool source_if_exists(Executor& ex, const str& path) {
   struct stat st{};
   if (::stat(path.c_str(), &st) != 0 or S_ISDIR(st.st_mode)) return true;
-  ex.source_file(path, {}, path);
+  ex.source_file(path, {}, path, /*startup=*/true);
   return not ex.context().exiting;
 }
 
@@ -53,9 +60,10 @@ struct Startup {
   }
   bool user(strv name, strv zsh_name) {
     if (not rcs()) return true;
-    if (not source_if_exists(ex, zdotdir(ctx()) + "/" + str(name))) return false;
+    if (auto dir = zdotdir(ctx()); dir and not source_if_exists(ex, *dir + "/" + str(name)))
+      return false;
     if (cfg.zsh_compat and rcs())
-      return source_if_exists(ex, zdotdir(ctx()) + "/" + str(zsh_name));
+      if (auto dir = zdotdir(ctx())) return source_if_exists(ex, *dir + "/" + str(zsh_name));
     return true;
   }
 };
@@ -82,6 +90,23 @@ struct KeepStatus {
   }
 };
 
+// zsh's ispwd: `path` is absolute, names the current directory, and has no
+// `.` or `..` element.
+bool is_pwd(const str& path) {
+  if (path.empty() or path[0] != '/') return false;
+  struct stat here{}, there{};
+  if (::stat(".", &here) != 0 or ::stat(path.c_str(), &there) != 0) return false;
+  if (here.st_dev != there.st_dev or here.st_ino != there.st_ino) return false;
+  for (s::size_t i = 0; i < path.size();) {
+    s::size_t end = path.find('/', i);
+    if (end == str::npos) end = path.size();
+    strv elem = strv(path).substr(i, end - i);
+    if (elem == "." or elem == "..") return false;
+    i = end + 1;
+  }
+  return true;
+}
+
 constexpr s::pair<strv, strv> TIED_SPECIALS[] = {
   {"PATH", "path"}, {"FPATH", "fpath"}, {"CDPATH", "cdpath"}, {"MANPATH", "manpath"},
   {"MAILPATH", "mailpath"}, {"FIGNORE", "fignore"}, {"PSVAR", "psvar"},
@@ -97,6 +122,54 @@ s::int64_t int_param(ExecContext& ctx, strv name, s::int64_t def) {
   return static_cast<s::int64_t>(s::strtoll(v.c_str(), nullptr, 10));
 }
 
+// zsh's checkmailpath: each `file` or `file?message` of `entries`.  New
+// mail is a file written since it was last read and since the last check;
+// a directory's files are checked in turn.  The message is expanded with $_
+// set to the file.
+void check_mail_files(Executor& ex, const vec<str>& entries) {
+  ExecContext& ctx = ex.context();
+  for (const auto& entry : entries) {
+    auto q = entry.find('?');
+    str file = entry.substr(0, q);
+    if (file.empty()) {
+      s::fprintf(stderr, "jfsh: empty MAILPATH component: %s\n", entry.c_str());
+      continue;
+    }
+    struct stat st{};
+    if (::stat(file.c_str(), &st) != 0) {
+      if (errno != ENOENT) s::fprintf(stderr, "jfsh: %s: %s\n", s::strerror(errno), file.c_str());
+      continue;
+    }
+    if (S_ISDIR(st.st_mode)) {
+      vec<str> inside;
+      if (DIR* dir = ::opendir(file.c_str())) {
+        while (struct dirent* d = ::readdir(dir)) {
+          strv name = d->d_name;
+          if (name == "." or name == "..") continue;
+          inside.push_back(file + "/" + str(name) + (q != str::npos ? entry.substr(q) : str{}));
+        }
+        ::closedir(dir);
+      }
+      check_mail_files(ex, inside);
+      continue;
+    }
+    if (st.st_size != 0 and st.st_atime <= st.st_mtime and st.st_mtime >= ctx.loop.last_mailcheck) {
+      if (q == str::npos) {
+        s::fputs("You have new mail.\n", stderr);
+      } else {
+        str saved = s::exchange(ctx.underscore, file);
+        Expander expander{ex, ctx};
+        expander.no_process_substitution();
+        if (auto m = expander.scalar(entry.substr(q + 1))) s::fprintf(stderr, "%s\n", m->c_str());
+        ctx.underscore = s::move(saved);
+      }
+    }
+    if (ctx.opts.get(OPT_MAILWARNING) and st.st_atime > st.st_mtime
+        and st.st_atime > ctx.loop.last_mailcheck and st.st_size != 0)
+      s::fprintf(stderr, "The mail in %s has been read.\n", file.c_str());
+  }
+}
+
 }  // namespace
 
 void init_shell_params(ExecContext& ctx) {
@@ -104,22 +177,36 @@ void init_shell_params(ExecContext& ctx) {
   auto exported = [&](str name, str value) {
     params.assign(s::move(name), s::move(value), PM_SCALAR | PM_EXPORTED);
   };
+  // $SHLVL is an integer, shown in base 10 as zsh's special is.
   str lvl = param(ctx, "SHLVL");
-  exported("SHLVL", s::to_string((lvl.empty() ? 0 : s::strtol(lvl.c_str(), nullptr, 10)) + 1));
+  Param& shlvl = params.assign("SHLVL",
+      s::int64_t{(lvl.empty() ? 0 : s::strtoll(lvl.c_str(), nullptr, 10)) + 1},
+      PM_INTEGER | PM_EXPORTED);
+  shlvl.base = 10;
 
-  // $PWD from the environment keeps the path the user took (through
-  // symlinks) when it still names this directory.
-  str pwd = param(ctx, "PWD");
-  struct stat here{}, there{};
-  bool same = not pwd.empty() and pwd[0] == '/' and ::stat(".", &here) == 0
-          and ::stat(pwd.c_str(), &there) == 0
-          and here.st_dev == there.st_dev and here.st_ino == there.st_ino;
-  if (not same) {
-    char buf[4096];
+  // $PWD keeps the path the user took (through symlinks): the home
+  // directory, else the environment's $PWD, when it names this directory
+  // (zsh's ispwd); else the real path.  $OLDPWD starts the same, whatever
+  // the environment says.  (zsh takes the home directory from the password
+  // file; $HOME, which is that as a rule, saves a slow getpwuid here.)
+  str pwd;
+  str home = param(ctx, "HOME");
+  if (home.empty())
+    if (struct passwd* pw = ::getpwuid(::getuid()); pw and pw->pw_dir) home = pw->pw_dir;
+  if (is_pwd(home)) {
+    pwd = s::move(home);
+  } else if (str env = param(ctx, "PWD"); is_pwd(env)) {
+    pwd = s::move(env);
+  } else {
+    char buf[PATH_MAX];
     pwd = ::getcwd(buf, sizeof buf) ? str(buf) : str(".");
   }
   exported("PWD", pwd);
-  if (param(ctx, "OLDPWD").empty()) exported("OLDPWD", pwd);
+  exported("OLDPWD", pwd);
+  // Mail is new when written after the shell started.
+  ctx.loop.last_mailcheck = s::time(nullptr);
+  if (auto m = params.lookup("MAILCHECK"); not m or not m->get().is_set())
+    params.assign("MAILCHECK", s::int64_t{60}, PM_INTEGER);
 
   // zsh's tied specials; an environment value goes into the array.
   for (auto [scalar, array] : TIED_SPECIALS) {
@@ -146,32 +233,40 @@ void init_shell_params(ExecContext& ctx) {
 
 void run_startup_files(Executor& ex, const StartupConfig& cfg) {
   Startup st{ex, cfg};
-  auto& o = ex.context().opts;
-  // jfshenv is read even with NO_RCS, as zsh reads /etc/zshenv.
-  if (not source_if_exists(ex, cfg.sysconfdir + "/jfshenv")) return;
-  if (not st.user(".jfshenv", ".zshenv")) return;
-  if (o.login()) {
-    if (not st.system("jfsh_profile")) return;
-    if (not st.user(".jfsh_profile", ".zprofile")) return;
-  }
-  if (o.interactive()) {
-    if (not st.system("jfshrc")) return;
-    if (not st.user(".jfshrc", ".zshrc")) return;
-  }
-  if (o.login()) {
-    if (not st.system("jfsh_login")) return;
-    st.user(".jfsh_login", ".zlogin");
-  }
+  auto& ctx = ex.context();
+  auto& o   = ctx.opts;
+  ctx.in_startup = true;
+  [&] {
+    // jfshenv is read even with NO_RCS, as zsh reads /etc/zshenv.
+    if (not source_if_exists(ex, cfg.sysconfdir + "/jfshenv")) return;
+    if (not st.user(".jfshenv", ".zshenv")) return;
+    if (o.login()) {
+      if (not st.system("jfsh_profile")) return;
+      if (not st.user(".jfsh_profile", ".zprofile")) return;
+    }
+    if (o.interactive()) {
+      if (not st.system("jfshrc")) return;
+      if (not st.user(".jfshrc", ".zshrc")) return;
+    }
+    if (o.login()) {
+      if (not st.system("jfsh_login")) return;
+      st.user(".jfsh_login", ".zlogin");
+    }
+  }();
+  ctx.in_startup = false;
 }
 
 void run_logout_files(Executor& ex, const StartupConfig& cfg) {
-  if (not ex.context().opts.login()) return;
+  ExecContext& ctx = ex.context();
+  // zsh's zexit: only an interactive login shell with RCS reads them.
+  if (not ctx.opts.login() or not ctx.opts.interactive() or not ctx.opts.get(OPT_RCS)) return;
   Startup st{ex, cfg};
-  // `exit` in a logout file doesn't stop the other one.
-  ex.context().exiting = false;
+  // `exit` in a logout file ends that file only; its status is the shell's.
+  ctx.exiting = false;
   st.user(".jfsh_logout", ".zlogout");
-  ex.context().exiting = false;
+  ctx.exiting = false;
   st.system("jfsh_logout");
+  ctx.exiting = false;
 }
 
 bool run_hook(Executor& ex, strv name, const vec<str>& args) {
@@ -194,26 +289,28 @@ bool run_hook(Executor& ex, strv name, const vec<str>& args) {
 }
 
 void before_prompt(Executor& ex, s::time_t now) {
+  // zsh's preprompt: precmd, periodic, the mail check, then the sched
+  // events and the modules' hooks; an error stops it.
   ExecContext& ctx = ex.context();
+  auto stop = [&] { return ctx.exiting or ctx.aborting; };
   run_hook(ex, "precmd");
-  if (ctx.exiting) return;
+  if (stop()) return;
   // periodic: when $PERIOD seconds have passed since it last ran.
-  if (s::int64_t period = int_param(ctx, "PERIOD", 0); period > 0
-      and now > ctx.loop.last_periodic + period) {
+  if (s::int64_t period = int_param(ctx, "PERIOD", 0); period != 0
+      and now - ctx.loop.last_periodic > period) {
     if (run_hook(ex, "periodic")) ctx.loop.last_periodic = now;
-    if (ctx.exiting) return;
+    if (stop()) return;
   }
+  if (s::int64_t every = int_param(ctx, "MAILCHECK", 0); every != 0
+      and now - ctx.loop.last_mailcheck > every)
+    check_mail(ex, now);
   run_sched(ex, now);
   if (ctx.exiting) return;
   for (const auto& [_, hook] : ctx.hooks.before_prompt) hook();
-  if (s::int64_t every = int_param(ctx, "MAILCHECK", 60); every > 0
-      and now - ctx.loop.last_mailcheck > every) {
-    check_mail(ex, now);
-  }
 }
 
-void before_exec(Executor& ex, const str& line) {
-  run_hook(ex, "preexec", {line, line, line});
+void before_exec(Executor& ex, const str& line, const CompiledProgram& prog) {
+  run_hook(ex, "preexec", {line, job_text(prog), program_text(prog)});
 }
 
 void run_sched(Executor& ex, s::time_t now) {
@@ -223,6 +320,7 @@ void run_sched(Executor& ex, s::time_t now) {
   while (not events.empty() and events.front().when <= now and not ctx.exiting) {
     str cmd = s::move(events.front().cmd);
     events.erase(events.begin());
+    if (ctx.opts.get(OPT_VERBOSE)) s::fprintf(stderr, "%s\n", cmd.c_str());
     ex.exec_string(cmd);
     ctx.aborting = false;
     ctx.end_trap_abort();
@@ -231,42 +329,16 @@ void run_sched(Executor& ex, s::time_t now) {
 
 void check_mail(Executor& ex, s::time_t now) {
   ExecContext& ctx = ex.context();
+  // $mailpath when its first entry isn't empty, else $MAIL.
   vec<str> entries;
-  if (auto p = ctx.params.lookup("mailpath"); p and p->get().is_set() and p->get().is_array()) {
+  if (auto p = ctx.params.lookup("mailpath"); p and p->get().is_set() and p->get().is_array())
     entries = p->get().array();
-  } else if (str mp = param(ctx, "MAILPATH"); not mp.empty()) {
-    s::size_t start = 0;
-    for (;;) {
-      s::size_t colon = mp.find(':', start);
-      entries.push_back(mp.substr(start, colon - start));
-      if (colon == str::npos) break;
-      start = colon + 1;
-    }
-  } else if (str mail = param(ctx, "MAIL"); not mail.empty()) {
-    entries.push_back(mail);
+  if (entries.empty() or entries.front().empty()) {
+    entries.clear();
+    if (str mail = param(ctx, "MAIL"); not mail.empty()) entries.push_back(s::move(mail));
   }
-  s::time_t since = ctx.loop.last_mailcheck;
+  check_mail_files(ex, entries);
   ctx.loop.last_mailcheck = now;
-  for (const auto& entry : entries) {
-    if (entry.empty()) continue;
-    auto q = entry.find('?');
-    str file = entry.substr(0, q);
-    struct stat st{};
-    if (::stat(file.c_str(), &st) != 0 or S_ISDIR(st.st_mode)) continue;
-    // New mail: something was written after it was last read, and after
-    // the last check.
-    if (st.st_size == 0 or st.st_atime > st.st_mtime or st.st_mtime < since) continue;
-    str msg = "You have new mail.";
-    if (q != str::npos) {
-      // The message is expanded with $_ set to the file.
-      ctx.params.assign("_", file, PM_SCALAR);
-      Expander expander{ex, ctx};
-      expander.no_process_substitution();
-      auto m = expander.scalar(entry.substr(q + 1));
-      msg = m ? *m : entry.substr(q + 1);
-    }
-    s::fprintf(stderr, "%s\n", msg.c_str());
-  }
   s::fflush(stderr);
 }
 
@@ -277,11 +349,12 @@ HistOptions history_options(const ExecContext& ctx) {
   };
   const OptionState& o = ctx.opts;
   HistOptions h;
+  // zsh's defaults when they are unset: 30 and 0.
   str size = param("HISTSIZE");
-  h.histsize = size.empty() ? 1000
+  h.histsize = size.empty() ? 30
              : static_cast<int>(s::clamp(s::strtol(size.c_str(), nullptr, 10), 1L, 1L << 30));
   str save = param("SAVEHIST");
-  h.savehist = save.empty() ? h.histsize
+  h.savehist = save.empty() ? 0
              : static_cast<int>(s::clamp(s::strtol(save.c_str(), nullptr, 10), 0L, 1L << 30));
   h.histfile      = param("HISTFILE");
   h.append        = o.get(OPT_APPENDHISTORY);

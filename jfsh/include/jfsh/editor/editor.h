@@ -92,7 +92,6 @@ struct Editor {
   // about to print calls trash() first.
   using WakeFn = func<bool(bool& quit)>;
   void set_wake(int fd, WakeFn hook) { mWakeFd = fd; mWake = s::move(hook); }
-
   // Clears the prompt and line from the screen, leaving the cursor where
   // the prompt started, so other output can go there; the next refresh
   // draws them again.
@@ -101,6 +100,10 @@ struct Editor {
   // The last read_line ended with Ctrl-C: the line (and, for a PS2 line,
   // the whole command) is to be dropped.
   bool interrupted() const noexcept { return mInterrupted; }
+  // The last read_line ended with Ctrl-D under IGNORE_EOF.
+  bool eof_ignored() const noexcept { return mEofIgnored; }
+  // The interrupted read was ended by send-break (^G), not by VINTR.
+  bool sent_break() const noexcept { return mSentBreak; }
 
   // ---- What `zle` and user widgets see -----------------------------------
   bool active() const noexcept { return mReading; }
@@ -517,6 +520,8 @@ private:
   bool                     mContinuation  = false;  // prompting with PS2
   bool                     mInterrupted   = false;  // Ctrl-C ended the read
   bool                     mEof           = false;  // input closed or hung up
+  bool                     mEofIgnored    = false;  // Ctrl-D under IGNORE_EOF
+  bool                     mSentBreak     = false;  // send-break ended the read
   int                      mWakeFd        = -1;
   WakeFn                   mWake;
 };

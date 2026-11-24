@@ -323,8 +323,14 @@ bool Parser::par_sublist() {
   opt<s::size_t> prev;   // the element before a `&&` / `||`
   for (;;) {
     s::size_t head = emit(make_wc_sublist(0, 0));
+    // Each element's own cmplx (zsh's par_sublist2), passed on to what
+    // encloses it.
+    bool outer_cmplx = s::exchange(mCmplx, false);
     WordCode flags = eat(TokType::TK_BANG) ? WC_SUBLIST_NOT : 0;
+    if (flags & WC_SUBLIST_NOT) mCmplx = true;
     if (not par_pline()) return false;
+    bool cmplx = mCmplx;
+    mCmplx = outer_cmplx or cmplx;
     if (mNull) {
       if (flags & WC_SUBLIST_NOT) {
         // `! nocorrect` keeps its sublist, an empty command negated
@@ -347,6 +353,9 @@ bool Parser::par_sublist() {
     WordCode skip = words_after(*mProg, head);
     if      (at(TokType::TK_AMPAMP))   flags |= WC_SUBLIST_AND;
     else if (at(TokType::TK_PIPEPIPE)) flags |= WC_SUBLIST_OR;
+    // Before `&` it is run as a job (zsh's par_sublist sets cmplx).
+    if (at(TokType::TK_AMP)) mCmplx = cmplx = true;
+    if (not cmplx) flags |= WC_SUBLIST_SIMPLE;
     patch(head, make_wc_sublist(flags, skip));
     if ((flags & WC_SUBLIST_TYPE) == WC_SUBLIST_END) return true;
     prev = head;
@@ -374,6 +383,7 @@ bool Parser::par_pline() {
     }
     ++n;
     if (not (at(TokType::TK_PIPE) or at(TokType::TK_PIPEAMP))) break;
+    mCmplx = true;   // a pipeline (zsh's par_pline)
     if (at(TokType::TK_PIPEAMP)) stderr_mask |= (1u << (n - 1));
     mLex.consume();
     skip_newlines();
@@ -536,6 +546,82 @@ static str assignment_value(strv word, s::size_t len,
   return value;
 }
 
+// Whether an assignment's value runs a process substitution: an unquoted
+// `<(` or `>(`, or `=(` at its start (zsh's par_simple looks for the Inang,
+// OutangProc and Equals tokens before an Inpar).
+static bool runs_procsubst(strv value) {
+  if (value.starts_with("=(")) return true;
+  char quote = 0;
+  for (s::size_t i = 0; i + 1 < value.size(); ++i) {
+    char c = value[i];
+    if (quote) {
+      if (c == '\\' and quote == '"') ++i;
+      else if (c == quote) quote = 0;
+      continue;
+    }
+    if (c == '\\') ++i;
+    else if (c == '\'' or c == '"') quote = c;
+    else if ((c == '<' or c == '>') and value[i + 1] == '(') return true;
+  }
+  return false;
+}
+
+// The tokens' spans of `text` from the lexer alone (array elements).
+static vec<s::pair<s::size_t, s::size_t>> lexed_spans(strv text) {
+  vec<s::pair<s::size_t, s::size_t>> spans;
+  StringInputSource in{str(text)};
+  Lexer lex{in};
+  lex.record_spans(&spans);
+  while (not lex.next_token().is_eof()) {}
+  return spans;
+}
+
+// With word spans being recorded (history's HIST_REDUCE_BLANKS), an array
+// assignment word, the last span, is split as zsh lexes it (ENVARRAY then
+// par_nl_wordlist): `name=(`, each element, then `)`.
+void Parser::split_array_span(strv text, s::size_t open) {
+  auto* spans = mLex.spans();
+  if (not spans or spans->empty()) return;
+  auto [begin, end] = spans->back();
+  // (Only a word read as written, not one an alias or a joined line made.)
+  if (end - begin != text.size() or text.size() < open + 1) return;
+  spans->back() = {begin, begin + open};
+  for (auto [b, e] : lexed_spans(text.substr(open, text.size() - open - 1)))
+    spans->emplace_back(begin + open + b, begin + open + e);
+  spans->emplace_back(end - 1, end);
+}
+
+// The same for `for (( a; b; c ))`, which read_arith took as one span:
+// zsh's lexer has `((`, each expression from its first non-blank up to its
+// `;`, each `;`, and the last expression with the `))` after it.
+void Parser::split_for_cond_span(strv text) {
+  auto* spans = mLex.spans();
+  if (not spans or spans->empty()) return;
+  auto [begin, end] = spans->back();
+  // (`((` text `))`, read as written.)
+  if (end - begin != text.size() + 4) return;
+  spans->back() = {begin, begin + 2};
+  s::size_t at = begin + 2;
+  s::size_t start = 0;
+  int depth = 0;
+  for (s::size_t i = 0; i <= text.size(); ++i) {
+    char c = i < text.size() ? text[i] : ';';
+    if (c == '(') ++depth;
+    else if (c == ')') --depth;
+    if (c != ';' or depth > 0) continue;
+    strv part = text.substr(start, i - start);
+    s::size_t lead = part.find_first_not_of(" \t\n");
+    if (i == text.size()) {
+      spans->emplace_back(lead == strv::npos ? end - 2 : at + start + lead, end);
+      break;
+    }
+    // An expression runs up to its `;`, blanks before that and all.
+    if (lead != strv::npos) spans->emplace_back(at + start + lead, at + i);
+    spans->emplace_back(at + i, at + i + 1);
+    start = i + 1;
+  }
+}
+
 // simple := (assign | redir)* WC_SIMPLE(argc) WC_STRING{argc}
 //         | (assign | redir)* WC_TYPESET(n) item{n}
 // A word list followed by `()` is a function definition instead.
@@ -548,6 +634,9 @@ bool Parser::par_simple() {
   };
   vec<str>  words;
   vec<Item> items;   // typeset arguments, in order
+  // zsh's `c`: cmplx before the words, which a function definition goes
+  // back to (only nocorrect, an array or a redirection add to it).
+  bool entry_cmplx = mCmplx;
   bool typeset = false;
   bool nocorrect = false;   // a `nocorrect` was taken
   int  nassign = 0;
@@ -582,6 +671,7 @@ bool Parser::par_simple() {
         and tok.text == "nocorrect") {
       mLex.consume();
       nocorrect = true;
+      mCmplx = true;
       continue;
     }
     if (expand_alias(cmdpos)) continue;
@@ -592,6 +682,10 @@ bool Parser::par_simple() {
       if (len) {
         WordCode flags = 0;
         str value = assignment_value(tok.text, len, append, flags);
+        // An array, or a process substitution in the value, needs a job
+        // (zsh's par_simple).
+        if ((flags & WC_ASSIGN_ARRAY) or runs_procsubst(value)) mCmplx = true;
+        if (flags & WC_ASSIGN_ARRAY) split_array_span(tok.text, len + (append ? 2 : 1) + 1);
         if (typeset) {
           items.push_back({tok.text.substr(0, len), s::move(value), flags, true});
         } else {
@@ -623,6 +717,7 @@ bool Parser::par_simple() {
       and nassign == 0 and nredir == 0) {
     mLex.consume();
     if (not expect(TokType::TK_RPAREN)) return false;
+    mCmplx = entry_cmplx or nocorrect;   // zsh's par_simple: *cmplx = c
     return par_funcdef_body(s::move(words));
   }
   if (words.empty() and nassign == 0 and nredir == 0) {
@@ -630,6 +725,7 @@ bool Parser::par_simple() {
     mNull = true;
     return true;
   }
+  if (not words.empty()) mCmplx = true;   // a command word (zsh's par_simple)
   if (typeset) {
     emit(make_wc(WC_TYPESET, static_cast<WordCode>(items.size())));
     for (auto& item : items) {
@@ -859,6 +955,7 @@ bool Parser::par_for() {
     mLex.consume();
     auto text = mLex.read_arith();
     if (not text) return error_near(mLex.peek());
+    split_for_cond_span(*text);
     vec<str> parts;
     if (not split_for_cond(*text, parts)) {
       error("parse error near `((" + *text + "))'");
@@ -993,6 +1090,7 @@ bool Parser::par_case() {
 // select := WC_SELECT(IN|ARGS, skip), laid out like for.
 bool Parser::par_select() {
   mLex.consume(); // select
+  mCmplx = true;
   s::size_t head  = emit(make_wc_cmd(WC_SELECT, 0, 0));
   return par_for_words(head, WC_SELECT);
 }
@@ -1017,6 +1115,7 @@ bool Parser::par_subsh() {
   bool inout = mLex.peek().inout;
   mLex.consume();  // (
   if (inout and eat(TokType::TK_RPAREN)) return par_anon_function();
+  mCmplx = true;   // a subshell (zsh's par_cmd)
   s::size_t head = emit(make_wc_cmd(WC_SUBSH, 0, 0));
   if (not par_body() or not expect(TokType::TK_RPAREN)) return false;
   patch(head, make_wc_cmd(WC_SUBSH, 0, words_after(*mProg, head)));
@@ -1054,6 +1153,7 @@ bool Parser::par_anon_function() {
     args.push_back(mLex.peek().text);
     mLex.consume();
   }
+  if (not args.empty()) mCmplx = true;   // zsh's par_funcdef
   emit_words(s::move(args));
   patch(head, make_wc_cmd(WC_FUNCDEF, WC_FUNCDEF_ANON, words_after(*mProg, head)));
   return true;
@@ -1097,7 +1197,19 @@ bool Parser::split_open_brace() {
   return true;
 }
 
+// The body's own cmplx stays inside it, as zsh parses it with a cmplx of
+// its own.
 bool Parser::par_function_body() {
+  bool outer_cmplx = mCmplx;
+  bool outer_redirs = s::exchange(mBodyRedirs, false);
+  bool ok = par_function_body_inner();
+  // Redirections after the body are the command's own (zsh's par_cmd).
+  mCmplx = outer_cmplx or mBodyRedirs;
+  mBodyRedirs = outer_redirs;
+  return ok;
+}
+
+bool Parser::par_function_body_inner() {
   // As in zsh, separators may come before the body: `f(); echo hi`.
   while (eat(TokType::TK_NEWLINE) or eat(TokType::TK_SEMI)) {}
   if (split_open_brace()) {
@@ -1119,6 +1231,15 @@ bool Parser::par_function_body() {
   s::size_t start = mProg->prog.size();
   if (not par_sublist_body()) return false;
   if (mProg->prog.size() == start + 1) return error_near(mLex.peek());
+  // Its command has no line of its own: it runs with the $LINENO of the
+  // line that calls the function (zsh's par_simple gives it line 0).
+  for (s::size_t k = start; k < mProg->prog.size(); ++k) {
+    WordCode c = wc_code(mProg->prog[k]);
+    if (c != WC_LIST and c != WC_SUBLIST and c != WC_PIPE) {
+      mProg->line_map[k] = 0;
+      break;
+    }
+  }
   return true;
 }
 
@@ -1129,6 +1250,7 @@ bool Parser::wrap_body_redirs(s::size_t start) {
   // A process substitution there is an argument of an anonymous
   // function: `() { … } =(cmd)`.
   if (not at(TokType::TK_REDIR) or is_procsubst(mLex.peek().text)) return true;
+  mBodyRedirs = true;
   insert(start, make_wc_cmd(WC_CURSH, 0, 0));
   patch(start, make_wc_cmd(WC_CURSH, 0, words_after(*mProg, start)));
   if (not par_trailing_redirs(start)) return false;
@@ -1446,6 +1568,21 @@ static bool op_to_redir_type(strv op, RedirType& out) noexcept {
   return false;
 }
 
+opt<vec<s::pair<s::size_t, s::size_t>>> word_spans(strv text, bool comments,
+                                                   const AliasTable* aliases) {
+  vec<s::pair<s::size_t, s::size_t>> spans;
+  StringInputSource in{str(text)};
+  Lexer lex{in};
+  if (comments) lex.push_state(LEX_SKIPCOMMENTS);
+  lex.record_spans(&spans);
+  // Parsed as the shell parses the line, with its aliases, so here-documents
+  // and array assignments are read as zsh's lexer reads them.
+  Parser parser{lex};
+  parser.set_aliases(aliases);
+  if (not parser.parse() or lex.had_heredoc()) return s::nullopt;
+  return spans;
+}
+
 // Quote removal on a here-doc delimiter, reporting whether any quoting
 // was there (which makes the body literal).  Inside '…' everything is
 // literal; inside "…" a backslash escapes only " $ ` and \; elsewhere
@@ -1477,6 +1614,7 @@ str heredoc_delimiter(strv raw, bool& quoted) {
 }
 
 bool Parser::par_redir() {
+  mCmplx = true;   // zsh's par_cmd and par_simple
   // (A process substitution in its own place is a word: par_simple and
   // par_trailing_redirs take it before calling this.)
   LexToken op_tok = mLex.next_token();

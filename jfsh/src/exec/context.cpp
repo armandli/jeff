@@ -2,6 +2,7 @@
 // read, as zsh's params.c does with its getfn/setfn pairs.
 
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -9,9 +10,11 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <random>
+#include <tuple>
 
 #include <jfsh/core/aliases.h>
 #include <jfsh/exec/executor.h>
@@ -29,23 +32,81 @@ struct Handlers {
   func<void(str)>      set_scalar{};
   func<vec<str>()>     get_array{};
   func<void(vec<str>)> set_array{};
+  func<double()>       get_float{};
 };
 
-// Adds `name` with `flags` and the given handlers, replacing any value the
-// environment gave it.
+// Adds `name` with `flags` and the given handlers.  A value the environment
+// gave it goes through its setter, and keeps it exported, unless `import`
+// is false (zsh's PM_DONTIMPORT) or it is read-only.  An integer is shown
+// in base 10 (`typeset -i10`), as zsh's specials are.
 void special(ParamTable& params, str name, ParamValue initial, s::uint32_t flags,
-             Handlers h) {
+             Handlers h, bool import = true) {
+  opt<str> env;
+  if (auto p = params.lookup(name); p and p->get().is_exported() and p->get().is_set())
+    env = p->get().scalar();
   Param& p   = params.assign(s::move(name), s::move(initial), flags | PM_SPECIAL);
+  if (flags & PM_INTEGER) p.base = 10;
   p.handlers = s::make_unique<ParamHandlers>();
   p.handlers->get_scalar = s::move(h.get_scalar);
   p.handlers->set_scalar = s::move(h.set_scalar);
   p.handlers->get_array  = s::move(h.get_array);
   p.handlers->set_array  = s::move(h.set_array);
+  p.handlers->get_float  = s::move(h.get_float);
+  if (env and import and not (flags & PM_READONLY) and p.handlers->set_scalar) {
+    p.handlers->set_scalar(s::move(*env));
+    p.flags |= PM_EXPORTED;
+  }
 }
 
 s::int64_t to_int(const str& v) {
   return static_cast<s::int64_t>(s::strtoll(v.c_str(), nullptr, 10));
 }
+
+// The clock $SECONDS counts from, as zsh's shtimer: whole seconds and
+// nanoseconds.  The seconds wrap (unsigned) as zsh's C arithmetic does, so
+// SECONDS=9223372036854775807 reads back.
+struct SecondsTimer {
+  s::uint64_t sec  = 0;
+  s::int64_t  nsec = 0;
+
+  static SecondsTimer now() {
+    auto ns = chr::duration_cast<chr::nanoseconds>(
+        chr::steady_clock::now().time_since_epoch()).count();
+    return {static_cast<s::uint64_t>(ns / 1'000'000'000), ns % 1'000'000'000};
+  }
+  // zsh's intsecondsgetfn: the whole seconds since, rounded down.
+  s::int64_t whole() const {
+    SecondsTimer t = now();
+    return static_cast<s::int64_t>(t.sec - sec) - (t.nsec < nsec ? 1 : 0);
+  }
+  // floatsecondsgetfn.
+  double real() const {
+    SecondsTimer t = now();
+    return static_cast<double>(static_cast<s::int64_t>(t.sec - sec))
+         + static_cast<double>(t.nsec - nsec) / 1e9;
+  }
+  // intsecondssetfn / floatsecondssetfn: `x` seconds ago.
+  void set(s::int64_t x) {
+    *this = now();
+    sec -= static_cast<s::uint64_t>(x);
+  }
+  void set(double x) {
+    SecondsTimer t = now();
+    // (A value past the 64-bit range is held at its end, where C's cast
+    // would be undefined.)
+    x = s::isnan(x) ? 0.0 : s::clamp(x, -9.2e18, 9.2e18);
+    auto whole_x = static_cast<s::int64_t>(x);
+    sec  = t.sec - static_cast<s::uint64_t>(whole_x);
+    nsec = t.nsec - static_cast<s::int64_t>((x - static_cast<double>(whole_x)) * 1e9);
+    if (nsec < 0) {
+      nsec += 1'000'000'000;
+      --sec;
+    } else if (nsec >= 1'000'000'000) {
+      nsec -= 1'000'000'000;
+      ++sec;
+    }
+  }
+};
 
 }  // namespace
 
@@ -58,15 +119,15 @@ void install_special_params(ExecContext& ctx) {
   ParamTable& params = ctx.params;
 
   // $SECONDS: seconds since the shell started; assigning sets the count.
-  auto start = s::make_shared<chr::steady_clock::time_point>(chr::steady_clock::now());
+  // `typeset -F SECONDS` makes it count fractions of a second.
+  auto timer = s::make_shared<SecondsTimer>(SecondsTimer::now());
   special(params, "SECONDS", s::int64_t{0}, PM_INTEGER, {
-    .get_scalar = [start] {
-      auto d = chr::steady_clock::now() - *start;
-      return s::to_string(chr::duration_cast<chr::seconds>(d).count());
+    .get_scalar = [timer] { return s::to_string(timer->whole()); },
+    .set_scalar = [timer](str v) {
+      if (v.find_first_of(".eEnN") != str::npos) timer->set(s::strtod(v.c_str(), nullptr));
+      else                                       timer->set(to_int(v));
     },
-    .set_scalar = [start](str v) {
-      *start = chr::steady_clock::now() - chr::seconds(to_int(v));
-    },
+    .get_float  = [timer] { return timer->real(); },
   });
 
   // $RANDOM: 0 … 32767; assigning seeds the sequence, so it repeats.
@@ -87,11 +148,11 @@ void install_special_params(ExecContext& ctx) {
   special(params, "TRY_BLOCK_ERROR", s::int64_t{-1}, PM_INTEGER, {
     .get_scalar = [&ctx] { return s::to_string(ctx.try_error); },
     .set_scalar = [&ctx](str v) { ctx.try_error = to_int(v); },
-  });
+  }, /*import=*/false);
   special(params, "TRY_BLOCK_INTERRUPT", s::int64_t{-1}, PM_INTEGER, {
     .get_scalar = [&ctx] { return s::to_string(ctx.try_interrupt); },
     .set_scalar = [&ctx](str v) { ctx.try_interrupt = to_int(v); },
-  });
+  }, /*import=*/false);
 
   // $HISTCMD: the history number of the command being run; 0 without
   // history.
@@ -101,11 +162,21 @@ void install_special_params(ExecContext& ctx) {
     },
   });
 
+  // $HISTSIZE (at least 1) and $SAVEHIST (at least 0), 30 and 0 to start
+  // with, as zsh's histsizesetfn and savehistsizesetfn keep them.
+  for (auto [name, initial, least] : {s::tuple{"HISTSIZE", 30, 1}, s::tuple{"SAVEHIST", 0, 0}}) {
+    auto value = s::make_shared<s::int64_t>(initial);
+    special(params, name, s::int64_t{initial}, PM_INTEGER, {
+      .get_scalar = [value] { return s::to_string(*value); },
+      .set_scalar = [value, least](str v) { *value = s::max<s::int64_t>(to_int(v), least); },
+    });
+  }
+
   special(params, "status", s::int64_t{0}, PM_INTEGER | PM_READONLY, {
     .get_scalar = [&ctx] { return s::to_string(ctx.last_exit); },
   });
 
-  special(params, "pipestatus", vec<str>{"0"}, PM_ARRAY, {
+  special(params, "pipestatus", vec<str>{}, PM_ARRAY, {
     .get_array = [&ctx] {
       vec<str> out;
       for (int rc : ctx.pipestatus) out.push_back(s::to_string(rc));
@@ -168,6 +239,24 @@ void install_special_params(ExecContext& ctx) {
     .set_array = [&ctx](vec<str> v) { ctx.dirstack = s::move(v); },
   });
 
+  // $_: the last word of the command before (not taken from the
+  // environment).
+  special(params, "_", str{}, PM_SCALAR, {
+    .get_scalar = [&ctx] { return ctx.underscore; },
+    .set_scalar = [&ctx](str v) { ctx.underscore = s::move(v); },
+  }, /*import=*/false);
+
+  // $zsh_scheduled_events: the `sched` events as `time:flags:command`.
+  special(params, "zsh_scheduled_events", vec<str>{}, PM_ARRAY | PM_READONLY, {
+    .get_array = [&ctx] {
+      vec<str> out;
+      for (const auto& e : ctx.loop.sched)
+        out.push_back(s::to_string(static_cast<long long>(e.when)) + (e.trash_zle ? ":-o:" : "::")
+                      + e.cmd);
+      return out;
+    },
+  });
+
   // $argv is the positional parameters.
   special(params, "argv", vec<str>{}, PM_ARRAY, {
     .get_array = [&ctx] { return ctx.positional; },
@@ -177,7 +266,7 @@ void install_special_params(ExecContext& ctx) {
   special(params, "OPTIND", s::int64_t{1}, PM_INTEGER, {
     .get_scalar = [&ctx] { return s::to_string(ctx.optind); },
     .set_scalar = [&ctx](str v) { ctx.optind = to_int(v); },
-  });
+  }, /*import=*/false);
   special(params, "OPTARG", str{}, PM_SCALAR, {
     .get_scalar = [&ctx] { return ctx.optarg; },
     .set_scalar = [&ctx](str v) { ctx.optarg = s::move(v); },

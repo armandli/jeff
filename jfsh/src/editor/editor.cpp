@@ -43,6 +43,7 @@ void map_chars(str& text, s::size_t from, s::size_t to, char32_t (*f)(char32_t))
 
 Editor::Editor(const OptionState& opts, HistoryManager& hist, PromptRenderer& prompt, Zle& zle)
   : mOpts(opts), mHist(hist), mPrompt(prompt), mZle(zle) {
+  if (mZle.tty_out >= 0) mOut = mZle.tty_out;
   if (mOpts.get(OPT_VI)) mZle.select_main(true);
 }
 
@@ -155,6 +156,8 @@ opt<str> Editor::run(str initial) {
   mLastResult.reset();
   mAutoSuffix.reset();
   mInterrupted  = false;
+  mEofIgnored   = false;
+  mSentBreak    = false;
   mEof          = false;
   mDone         = false;
   mDrawn        = false;
@@ -241,17 +244,16 @@ opt<str> Editor::run(str initial) {
     if (mEof) break;
     if (seq.empty()) continue;
     if (seq == "\x03") {                // Ctrl-C (VINTR): drop the line
+      if (mZle.on_interrupt and not mZle.on_interrupt(*this)) continue;
       mInterrupted = true;
       mDone = true;
       break;
     }
     // Ctrl-D (VEOF) on an empty line is EOF, whatever it is bound to.
     if (seq == "\x04" and mBuf.text.empty() and not mVared) {
-      if (mOpts.get(OPT_IGNOREEOF)) {
-        mMessage = "jfsh: use 'exit' to exit.";
-        refresh();
-        continue;
-      }
+      // IGNORE_EOF: the read ends all the same, with a message; the shell
+      // counts the ignored EOFs (zsh's zleread and use_exit_printed).
+      mEofIgnored = mOpts.get(OPT_IGNOREEOF);
       eof_key = true;
       mDone = true;
       break;
@@ -297,6 +299,11 @@ opt<str> Editor::run(str initial) {
   exit_raw_mode();
   mReading = false;
   mZle.active = outer;
+  if (mEofIgnored) {
+    s::fprintf(stderr, "\a%s\n", mOpts.login() ? "jfsh: use 'logout' to logout."
+                                                 : "jfsh: use 'exit' to exit.");
+    s::fflush(stderr);
+  }
   if (eof_key) return s::nullopt;
   if (mInterrupted) return str{};
   return mBuf.text;
@@ -612,6 +619,8 @@ bool Editor::w_accept_line_and_down_history() {
 }
 
 bool Editor::w_send_break() {
+  beep();   // as zsh's send-break, which rings the bell
+  mSentBreak   = true;
   mInterrupted = true;
   mDone = true;
   return true;
@@ -1262,6 +1271,7 @@ bool Editor::incremental_search(bool backward) {
     str seq = read_binding(b);
     if (mEof) return false;
     if (seq == "\x03") {
+      if (mZle.on_interrupt and not mZle.on_interrupt(*this)) continue;
       mMessage.clear();
       mInterrupted = true;
       mDone = true;

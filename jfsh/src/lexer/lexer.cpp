@@ -43,6 +43,7 @@ int LexInput::next_char() {
   while (not mPushed.empty()) {
     auto& top = mPushed.back();
     if (top.pos < top.text.size()) {
+      mInAlias = top.alias or top.names;
       mFromRaw.push_back(false);
       if (mFromRaw.size() > 32) mFromRaw.erase(mFromRaw.begin());
       return static_cast<unsigned char>(top.text[top.pos++]);
@@ -51,6 +52,7 @@ int LexInput::next_char() {
     if (top.alias and (last == ' ' or last == '\t')) mBlankDone = true;
     mPushed.pop_back();
   }
+  mInAlias = false;
   mFromRaw.push_back(true);
   if (mFromRaw.size() > 32) mFromRaw.erase(mFromRaw.begin());
   return mRaw.next_char();
@@ -72,6 +74,16 @@ void LexInput::unget(int c) {
     return;
   }
   mRaw.unget(c);
+}
+
+s::size_t LexInput::pos() const noexcept {
+  // (Only source text read ahead counts: an alias's text has no place in
+  // the source.)
+  s::size_t unread = 0;
+  for (const auto& p : mPushed)
+    if (not p.alias and not p.names) unread += p.text.size() - p.pos;
+  s::size_t raw = mRaw.pos();
+  return raw >= unread ? raw - unread : 0;
 }
 
 void LexInput::push(str text, sptr<const vec<str>> names) {
@@ -380,6 +392,10 @@ LexToken Lexer::read_token() {
   mTokAliases.reset();
   mTokAfterBlank = false;
   LexToken tok = read_token_raw();
+  // A token from an alias's text adds no word to the line (zsh's ihwend
+  // drops a word that put nothing in chline).
+  if (mSpans and not tok.is_eof() and not mTokInAlias)
+    mSpans->emplace_back(mTokBegin, mSrc.pos());
   tok.aliases           = s::move(mTokAliases);
   tok.after_alias_blank = mTokAfterBlank;
   return tok;
@@ -389,6 +405,10 @@ LexToken Lexer::read_token_raw() {
   for (;;) {
     int c = mSrc.next_char();
     if (c == -1) return {TokType::TK_EOF, {}, mSrc.line()};
+    if (mSpans) {
+      mTokBegin   = mSrc.pos() - 1;
+      mTokInAlias = mSrc.in_alias();
+    }
     if (c == '#' and (mFlags & LEX_SKIPCOMMENTS)) {
       while ((c = mSrc.next_char()) != -1 and c != '\n') {}
       if (c == '\n') return newline_token();
@@ -549,7 +569,12 @@ opt<str> Lexer::read_arith() {
         --depth;
       } else {
         int n = mSrc.next_char();
-        if (n == ')') return text;
+        if (n == ')') {
+          // `(( … ))` is one word, from the `((` token on (zsh's DINPAR).
+          if (mSpans and not mSpans->empty() and not mTokInAlias)
+            mSpans->back().second = mSrc.pos();
+          return text;
+        }
         if (n == -1) return s::nullopt;
         text += ')';
         c = n;
@@ -577,6 +602,10 @@ opt<str> Lexer::read_cond_pattern(str prefix) {
     }
   }
   if (c == -1) return s::nullopt;
+  // Its span: a word of its own, or with a `(` taken as a token before it.
+  bool joined = not prefix.empty();
+  s::size_t begin = mSrc.pos() - 1;
+  bool from_alias = mSrc.in_alias();
   str text = s::move(prefix);
   int depth = text.empty() ? 0 : 1;
   for (; c != -1; c = mSrc.next_char()) {
@@ -618,6 +647,10 @@ opt<str> Lexer::read_cond_pattern(str prefix) {
     }
   }
   if (text.empty()) return s::nullopt;
+  if (mSpans and not from_alias) {
+    if (joined and not mSpans->empty()) mSpans->back().second = mSrc.pos();
+    else                               mSpans->emplace_back(begin, mSrc.pos());
+  }
   return text;
 }
 

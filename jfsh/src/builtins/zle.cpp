@@ -545,6 +545,24 @@ int builtin_vared(vec<str>& args, ExecContext& ctx) {
   str ps  = o.arg('p') ? *o.arg('p') : str{};
   str rps = o.arg('r') ? *o.arg('r') : str{};
   auto result = ed.edit(initial, ps, rps);
+  // Ctrl-C ends the command line as an interrupt would (zsh's zleread
+  // under its SIGINT handler): with $? 130, or the status of the INT trap
+  // that broke the read.  send-break ends it leaving $? alone.
+  if (ed.interrupted() and not ctx.exiting) {
+    // zsh's handler sets errflag without breaks: a loop around vared ends
+    // with 1, as after an error; after a TRAPINT's `return N`, with N
+    // (dotrapargs, as `trap_status`).
+    auto& tb = zle.trap_break;
+    ctx.interrupt = tb.has_value();
+    if (tb) {
+      ctx.last_exit   = *s::exchange(tb, s::nullopt);
+      ctx.trap_status = ctx.last_exit;
+    } else if (not ed.sent_break()) {
+      ctx.last_exit = 128 + SIGINT;
+    }
+    ctx.aborting = true;
+    return ctx.last_exit;
+  }
   if (not result or ed.interrupted()) return 1;
   Result<void> set;
   if (array) {

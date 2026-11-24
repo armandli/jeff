@@ -64,6 +64,7 @@ int builtin_dot       (vec<str>&, ExecContext&);
 int builtin_eval      (vec<str>&, ExecContext&);
 int builtin_exec      (vec<str>&, ExecContext&);
 int builtin_exit      (vec<str>&, ExecContext&);
+int builtin_logout    (vec<str>&, ExecContext&);
 int builtin_export    (vec<str>&, ExecContext&);
 int builtin_readonly  (vec<str>&, ExecContext&);
 int builtin_return    (vec<str>&, ExecContext&);

@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <jfsh/core/aliases.h>
+#include <jfsh/core/read_file.h>
 #include <jfsh/exec/executor.h>
 #include <jfsh/modules/support.h>
 
@@ -19,26 +20,6 @@
 namespace jfsh {
 
 namespace {
-
-opt<str> read_file(const str& path) {
-  int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd < 0) return s::nullopt;
-  struct stat st{};
-  if (::fstat(fd, &st) != 0 or S_ISDIR(st.st_mode)) {
-    ::close(fd);
-    return s::nullopt;
-  }
-  str out;
-  char buf[8192];
-  for (;;) {
-    ssize_t n = ::read(fd, buf, sizeof buf);
-    if (n < 0 and errno == EINTR) continue;
-    if (n <= 0) break;
-    out.append(buf, static_cast<s::size_t>(n));
-  }
-  ::close(fd);
-  return out;
-}
 
 void write_file(const str& path, strv text) {
   int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);

@@ -788,9 +788,14 @@ TEST(History, ListsAndReruns) {
   EXPECT_EQ(out(sh, "fc -ln 1 2"), "echo a\necho b\n");
   EXPECT_EQ(out(sh, "fc -lr 1 2"), "    2  echo b\n    1  echo a\n");
   EXPECT_EQ(out(sh, "fc -l echo"), "    2  echo b\n    3  ls x\n");
-  EXPECT_EQ(out(sh, "fc -s a=Z 1"), "echo Z\nZ\n");
-  EXPECT_EQ(out(sh, "r b=B echo"), "echo Z\nZ\n");   // the latest `echo …` is now `echo Z`
-  EXPECT_EQ(out(sh, "fc -e - 2"), "echo b\nb\n");
+  // The command run again is shown on stderr and added to the history
+  // (zsh's stuff()); an `old=new` that applies nowhere stops it (fclist).
+  auto r = sh.run("fc -s a=Z 1");
+  EXPECT_EQ(r.out + r.err, "Z\necho Z\n");
+  EXPECT_EQ(hist.entries().back().text, "echo Z");
+  EXPECT_EQ(sh.run("r b=B echo").err, "jfsh: fc: no substitutions performed\n");
+  EXPECT_EQ(out(sh, "r Z=Y echo"), "Y\n");
+  EXPECT_EQ(out(sh, "fc -e - 2"), "b\n");
   EXPECT_EQ(sh.run("fc -l 99").err, "jfsh: fc: no such event: 99\n");
   sh.ctx.history = nullptr;
   // As zsh -c, whose history is empty.

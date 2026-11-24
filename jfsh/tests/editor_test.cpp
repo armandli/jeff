@@ -107,8 +107,14 @@ TEST(Editor, EofAndInterrupt) {
   EXPECT_EQ(t.line("ab\x01\x04\r"), "b");      // not on an empty line: delete-char
   EXPECT_EQ(t.line("abc\x03"), "");
   EXPECT_TRUE(t.ed->interrupted());
+  EXPECT_FALSE(t.ed->eof_ignored());
+  // IGNORE_EOF: the read ends all the same and says so; the shell counts
+  // the ignored EOFs (zsh's zleread).
   t.sh.opts.set(OPT_IGNOREEOF);
-  EXPECT_EQ(t.line("\x04x\r"), "x");
+  EXPECT_EQ(t.line("\x04"), s::nullopt);
+  EXPECT_TRUE(t.ed->eof_ignored());
+  EXPECT_EQ(t.line("x\r"), "x");
+  EXPECT_FALSE(t.ed->eof_ignored());
 }
 
 // ---- History ------------------------------------------------------------------

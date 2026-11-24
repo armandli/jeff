@@ -14,6 +14,7 @@
 #include <jfsh/exec/executor.h>
 #include <jfsh/glob/glob.h>
 #include <jfsh/history/history.h>
+#include <jfsh/parser/parser.h>
 
 namespace jfsh {
 
@@ -28,26 +29,36 @@ str format_time(s::time_t t, char style) {
   return buf;
 }
 
-// Applies `old=new` substitutions (the first occurrence of each).
-str substitute(str text, const vec<str>& subs) {
+// Applies `old=new` substitutions (the first occurrence of each); `done`
+// is set when one applied (zsh's fcsubs).
+str substitute(str text, const vec<str>& subs, bool& done) {
   for (const auto& s : subs) {
     auto eq = s.find('=');
     str from = s.substr(0, eq), to = s.substr(eq + 1);
     if (from.empty()) continue;
-    if (auto at = text.find(from); at != str::npos) text.replace(at, from.size(), to);
+    if (auto at = text.find(from); at != str::npos) {
+      text.replace(at, from.size(), to);
+      done = true;
+    }
   }
   return text;
 }
 
+// zsh's stuff() and loop(): the command is shown on stderr, then read as
+// the next history event, after the line that ran fc.
 int run_again(strv cmd, str text, ExecContext& ctx) {
   (void)cmd;
-  s::printf("%s\n", text.c_str());
   s::fflush(stdout);
-  // The line that ran fc is replaced by the command it runs (it is in the
-  // history already when the interactive loop added it before running it).
+  s::fprintf(stderr, "%s\n", text.c_str());
+  s::fflush(stderr);
+  // Read as an input line, it goes into the history as one (zsh's hend,
+  // with histreduceblanks).
   if (ctx.history) {
-    if (ctx.hist_current) ctx.history->replace_last(text);
-    else                  ctx.history->add(text);
+    bool comments = not ctx.opts.interactive() or ctx.opts.get(OPT_INTERACTIVECOMMENTS);
+    const auto& o = ctx.history->options();
+    const AliasTable* aliases = ctx.opts.get(OPT_ALIASES) ? &ctx.aliases : nullptr;
+    ctx.history->add(HistoryManager::hend_text(
+        text, o.reduce_blanks ? word_spans(text, comments, aliases) : s::nullopt, o));
   }
   return ctx.executor->exec_string(text);
 }
@@ -126,7 +137,18 @@ int fc_common(vec<str>& args, ExecContext& ctx, bool list_mode) {
   if (rest.size() > 1 and not resolve(rest[1], last_num)) return 1;
   if (not listing and entries.empty())
     return builtin_error(cmd, "current history line would recurse endlessly, aborted");
-  if (last_num < 0) last_num = listing and first_num < curhist ? curhist - 1 : first_num;
+  if (last_num < 0) {
+    // Listing stops before the line being run, but never before the first
+    // event (zsh's firsthist), so a first `history` lists itself.
+    last_num = first_num;
+    if (listing and first_num < curhist) {
+      last_num = ctx.hist_current or not ctx.history ? curhist - 1 : curhist;
+      if (not all.empty()) last_num = s::max(last_num, static_cast<long>(all.front().num));
+    }
+  }
+  // A listing sees the line being run as well (zsh's fclist walks the
+  // whole ring); re-running leaves it out.
+  if (listing) entries = all;
   if (first_num < 0) {
     first_num = listing ? s::max(1L, curhist - 16) : curhist - 1;
     if (last_num < first_num) last_num = first_num;
@@ -146,6 +168,7 @@ int fc_common(vec<str>& args, ExecContext& ctx, bool list_mode) {
     return builtin_error(cmd, "no events in that range");
   }
   bool reverse = o.has('r') != (first_num > last_num);
+  bool substituted = false;
 
   if (listing) {
     vec<s::size_t> order;
@@ -171,10 +194,13 @@ int fc_common(vec<str>& args, ExecContext& ctx, bool list_mode) {
         s::snprintf(d, sizeof d, "%u:%02u  ", e.elapsed / 60, e.elapsed % 60);
         line += d;
       }
-      line += substitute(e.text, subs);
+      line += substitute(e.text, subs, substituted);
       s::printf("%s\n", line.c_str());
     }
-    // zsh's fclist when -m matched nothing in the range.
+    // zsh's fclist when -m matched nothing in the range, or no `old=new`
+    // applied.
+    if (not subs.empty() and any and not substituted)
+      return builtin_error(cmd, "no substitutions performed");
     if (not any) return builtin_error(cmd, "no matching events found");
     return 0;
   }
@@ -186,8 +212,11 @@ int fc_common(vec<str>& args, ExecContext& ctx, bool list_mode) {
     if (match and not match->matches(entries[i].text)) continue;
     if (any) text += '\n';
     any = true;
-    text += substitute(entries[i].text, subs);
+    text += substitute(entries[i].text, subs, substituted);
   }
+  // zsh's fclist: with `old=new`, nothing is done unless one applied.
+  if (not subs.empty() and any and not substituted)
+    return builtin_error(cmd, "no substitutions performed");
   if (not any) return builtin_error(cmd, "no matching events found");
   if (reexec) return run_again(cmd, text, ctx);
 

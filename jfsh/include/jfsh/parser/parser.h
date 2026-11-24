@@ -82,9 +82,12 @@ protected:
   bool par_funcdef();
   bool par_anon_function();
   bool split_open_brace();
+  void split_array_span(strv text, s::size_t open);
+  void split_for_cond_span(strv text);
   bool par_funcdef_body(vec<str> names);
   // `{ list }`, or any single command (`f() echo hi`).
   bool par_function_body();
+  bool par_function_body_inner();
   bool wrap_body_redirs(s::size_t start);
   bool par_cond();
   bool par_cond_expr();
@@ -170,6 +173,10 @@ private:
   // it, which zsh's par_simple returns as nothing (no code, no error), for
   // the pipeline, sublist and list around it to decide.
   bool             mNull = false;
+  // zsh's cmplx: what was parsed since the enclosing sublist began has a
+  // command word, a redirection, a subshell, select, `|`, `!` or `&`.
+  bool             mCmplx = false;
+  bool             mBodyRedirs = false;   // a function body took redirections
   vec<s::size_t> mPendingHeredocs;   // strs indices awaiting bodies
   // Redirections at [mid, end) that go in front of the command at start.
   struct RedirMove {
@@ -188,6 +195,15 @@ bool is_incomplete(strv src, bool comments = true);
 // makes the body literal.
 str heredoc_delimiter(strv raw, bool& quoted);
 
+// The [begin, end) of each word of a line, as zsh's history keeps chwords
+// for histreduceblanks (an array assignment's `name=(`, elements and `)`
+// each one; a comment goes with the newline after it; an alias's name is a
+// word, the words of its text none).  Nothing when the line has a
+// here-document or doesn't parse, which zsh's hend keeps as typed: its
+// lexer didn't reach the end of the line there.
+opt<vec<s::pair<s::size_t, s::size_t>>> word_spans(strv text, bool comments,
+                                                   const AliasTable* aliases = nullptr);
+
 // Human-readable listing of the bytecode, one instruction per line
 // (src/parser/text.cpp).  Used by tests and for debugging.
 str disassemble(const CompiledProgram& prog);
@@ -199,6 +215,8 @@ str disassemble(const CompiledProgram& prog);
 str      pipeline_text(const CompiledProgram& prog, s::size_t pc);
 vec<str> pipeline_stage_texts(const CompiledProgram& prog, s::size_t pc);
 str      sublist_text(const CompiledProgram& prog, s::size_t pc);
+// A whole program on one line the same way (preexec's $2).
+str      job_text(const CompiledProgram& prog);
 
 // A function definition as `functions` prints it (src/parser/text.cpp):
 // `names () {`, the body one command per line indented by tabs, `}`.

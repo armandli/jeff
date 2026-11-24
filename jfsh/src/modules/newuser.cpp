@@ -122,6 +122,8 @@ int builtin_newuser_install(vec<str>& args, ExecContext& ctx) {
 
 bool newuser_needed(ExecContext& ctx) {
   str dir = rc_dir(ctx);
+  // A directory that isn't there gets no files written to it.
+  if (struct stat st{}; ::stat(dir.c_str(), &st) != 0 or not S_ISDIR(st.st_mode)) return false;
   for (const char* f : {".jfshenv", ".jfsh_profile", ".jfshrc", ".jfsh_login"}) {
     struct stat st{};
     if (::stat((dir + "/" + f).c_str(), &st) == 0) return false;

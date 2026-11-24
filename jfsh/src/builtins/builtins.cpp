@@ -26,6 +26,7 @@ void BuiltinTable::register_all() {
   add({"eval",     builtin_eval,       BINF_SPECIAL});
   add({"exec",     builtin_exec,       BINF_SPECIAL});
   add({"exit",     builtin_exit,       BINF_SPECIAL});
+  add({"logout",   builtin_logout,     BINF_NONE});
   add({"export",   builtin_export,     BINF_SPECIAL | BINF_ASSIGN});
   add({"readonly", builtin_readonly,   BINF_SPECIAL | BINF_ASSIGN});
   add({"return",   builtin_return,     BINF_SPECIAL});

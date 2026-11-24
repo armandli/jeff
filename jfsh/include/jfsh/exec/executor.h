@@ -71,6 +71,14 @@ struct LoopState {
   vec<SchedEvent> sched{};            // sorted by `when`
   s::time_t       last_periodic  = 0; // when `periodic` last ran
   s::time_t       last_mailcheck = 0; // when the mail files were last checked
+  // Saves the interactive shell's history, before `exec` replaces it.
+  func<void()>    save_history{};
+  // -t ended the script or standard input: only the EXIT trap runs.
+  bool            single_done = false;
+  // A trap's `exit` came while the line editor was reading (zsh's zexit
+  // from the signal handler): the history is saved and the EXIT trap
+  // runs, but no logout files and no zshexit hook.
+  bool            exit_in_editor = false;
 };
 
 // Where modules hook into the running shell (M11).  Each hook is tagged
@@ -168,6 +176,9 @@ struct ExecContext {
   // from a condition still returns on a failure inside it (zsh 5.9).
   int  noerrreturn = 0;
   bool err_reported = false; // ZERR already ran for the status in hand
+  // While the startup files run: no ZERR and no ERR_EXIT, and ERR_RETURN
+  // only inside a function (zsh's run_init_scripts sets noerrexit).
+  bool in_startup   = false;
   // Counts the function bodies, evals and sourced files run: a `! f` whose
   // f ran commands is not exempt from ERR_EXIT and ZERR, as in zsh 5.9.
   s::uint64_t code_runs = 0;
@@ -187,6 +198,9 @@ struct ExecContext {
   vec<str>           dirstack{};   // pushd/popd, without $PWD ($dirstack)
   int                source_depth = 0;   // `.`/`source` files being read
   str                source_name{};      // the file being read, if any
+  // What %N names (zsh's scriptname): the function or sourced file being
+  // run, `jfsh` for a -c string; empty for $0.
+  str                script_name{};
   // Loadable and compiled-in modules (M10).  `modules.math_funcs()` feeds
   // the arithmetic evaluator; `modules.all_builtins()` is folded into the
   // builtin dispatch when a module registers new builtins.
@@ -202,12 +216,13 @@ struct ExecContext {
   Zle*            zle      = nullptr;
 
   vec<str> positional{};    // $1 … $N, also $@ $* $argv
+  str      underscore{};    // $_: the last word of the command before
   str      arg0 = "jfsh";   // $0
   Pid      shell_pid = ::getpid();  // $$, unchanged in subshells
 
   ShellHooks  hooks{};         // module hooks (zsh/zprof, zsh/watch)
 
-  vec<int>    pipestatus{0};   // $pipestatus: each stage of the last pipeline
+  vec<int>    pipestatus{};    // $pipestatus: each stage of the last pipeline
   // $funcstack and $functrace: the functions (and eval, sourced files)
   // being run, outermost first, each with where it was called from.
   struct Frame { str name, caller; };
@@ -337,7 +352,7 @@ struct Executor {
   // stop there.
   bool take_top_return() noexcept { return s::exchange(mTopReturn, false); }
   // Parses `src` as exec_string would, without running it.
-  Result<ProgRef> parse_string(strv src);
+  Result<ProgRef> parse_string(strv src, int first_line = 1);
   void            report_parse_error(const ShellError& e);
   // Runs a program parsed by parse_string as exec_string runs its text.
   int exec_parsed(const CompiledProgram& prog);
@@ -349,8 +364,12 @@ struct Executor {
   [[noreturn]] void exit_child(int rc);
   // `.`/`source`: runs the file at `path` in this shell, with `args` (if
   // any) as the positional parameters meanwhile.  `name` is what errors
-  // and $0 call it.
-  int source_file(const str& path, const vec<str>& args, const str& name);
+  // and $0 call it.  A `startup` file (zsh's source() without bin_dot)
+  // leaves $0 alone and is skipped silently when it can't be read; for
+  // `.` that gives SOURCE_NOT_FOUND, with errno set.
+  static constexpr int SOURCE_NOT_FOUND = -1;
+  int source_file(const str& path, const vec<str>& args, const str& name,
+                  bool startup = false);
   // Defines autoloaded function `name` from the first file of that name
   // in $fpath.  Prints why and returns false when it can't.  A ksh-style
   // file becomes a body that, once run, calls what it defined
@@ -375,12 +394,15 @@ struct Executor {
   }
   // `typeset_args` are the `name=value` arguments of typeset and its
   // variants: expanded like assignments, then passed on as `name=value`.
+  // `simple`: the command is a WC_SUBLIST_SIMPLE sublist of its own (zsh's
+  // execsimple), which assignments alone run through.
   int exec_simple(
     vec<str>         args,
     vec<Assignment>  assigns,
     vec<Redirection> redirs,
     ExecFlags flags = EF_NONE,
-    vec<Assignment>  typeset_args = {});
+    vec<Assignment>  typeset_args = {},
+    bool simple = false);
 
   // Path to run for a command name: the name itself when it contains `/`,
   // otherwise a $PATH search (cached while HASH_CMDS is set).  Fails with
@@ -440,11 +462,11 @@ protected:
   int exec_sublist(ExecState& es, ExecFlags);
   int exec_pline  (ExecState& es, ExecFlags);
   int exec_cmd    (ExecState& es, ExecFlags);
-  int exec_simple_cmd(ExecState& es, ExecFlags);
+  int exec_simple_cmd(ExecState& es, ExecFlags, bool simple);
 
   // Compound commands: es.pc is just past the header `head`, and is left
   // at the end of the construct.
-  int exec_compound(ExecState& es, ExecFlags);
+  int exec_compound(ExecState& es, ExecFlags, bool simple);
   int exec_if      (ExecState& es, WordCode head);
   int exec_while   (ExecState& es, WordCode head);
   // A loop that an error ended has status 1, as in zsh; one a TRAPxxx's
@@ -507,6 +529,7 @@ protected:
     const str* traced = nullptr);
   // The child's side of run_external: applies the redirections, makes the
   // assignments, finds the command (unless `found` already has) and execs.
+  void leave_shell(bool explicit_exec);
   [[noreturn]] void exec_external_child(
     const vec<str>&         args,
     vec<Assignment>         assigns,
@@ -655,6 +678,10 @@ private:
   // The status of an `exit` in a signal trap run from the EXIT trap, or -1.
   int            mExitFromTrap = -1;
   int            mExitTrapFuncDepth = 0;   // func_depth when the EXIT trap began
+  int            mStatusBeforeParseError = 0;   // $? when exec_string hit one
+  // The function depth a trap's command text runs at, while one does: its
+  // commands don't set $LINENO there.  -1 otherwise.
+  int            mEvalTrapFuncDepth = -1;
   bool           mExitTrapRan = false;
   bool           mInExitTrap  = false;
   bool           mExitTrapRanOff = false;   // run_exit_trap's ran_off
@@ -668,6 +695,7 @@ private:
   bool           mReturnAfterCommand = false;   // see exec_simple
   bool           mSelfSignal  = false;   // handle_signals after `kill` to the shell
   bool           mParseFailed = false;   // exec_string hit a parse error (source)
+  bool           mSimpleSublist = false;   // the sublist being run is WC_SUBLIST_SIMPLE
   bool           mTopReturn   = false;   // see take_top_return
   // In a forked foreground pipeline stage, until its command starts: a
   // `( … )` there is reset as a subshell (exec_subsh).

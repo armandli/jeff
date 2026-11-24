@@ -10,6 +10,11 @@ namespace jfsh {
 
 int StringInputSource::next_char() {
   if (mPos >= mSrc.size()) return -1;
+  if (mOnLine and mPos >= mSeen) {
+    s::size_t nl = mSrc.find('\n', mPos);
+    mSeen = nl == str::npos ? mSrc.size() : nl + 1;
+    mOnLine(strv(mSrc).substr(mPos, mSeen - mPos));
+  }
   int c = static_cast<unsigned char>(mSrc[mPos++]);
   if (c == '\n') ++mLine;
   return c;
