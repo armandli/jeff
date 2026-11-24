@@ -1627,8 +1627,6 @@ trap.
   the hashed path alone. Reason: an edge of zsh's hashed-command path.
 - An unterminated quote at the end of a script read from standard input runs; zsh
   says "unmatched '" with status 1. Reason: the lexer (M3), as for `eval` (M6's Left).
-- zsh keeps both the `fc -s`/`r` line and the command it reruns in the history;
-  jfsh replaces the first by the second. Reason: history recording is M8's.
 - `x=$(nocorrect)` is a parse error in zsh (its par_event in the substitution); jfsh
   runs nothing there. Reason: jfsh parses the substitution's text as a list.
 - `if true; then nocorrect; fi` is a parse error in both, near `fi` in zsh and near `;`
@@ -1658,72 +1656,290 @@ startup files, hooks, `sched` events and mail checks are in `src/exec/loop.cpp`
 (`include/jfsh/exec/loop.h`), the special parameters in `src/exec/context.cpp`, and
 `src/main.cpp` strings them together. Tests: `tests/startup_test.cpp` (in-process, plus
 the `jfsh` binary run with arguments) and the M8 cases in `tests/interactive_test.cpp`.
-- **Invocation:** zsh's rules: letter clusters (`-xe`, `+x`, `-xc cmd`), `-o name`/`+o
-  name`/`-oname`, `--name`/`--no-name` for any option, `-c` taking the first argument
-  after the options (later ones are `$0` and the positional parameters), `script
-  args…`, `-s args…`, `-i`, `-l`/`--login` (or a `$0` starting with `-`), `-f`
-  (NO_RCS), `-d` (NO_GLOBAL_RCS), `--` and `-`. `--help`, `--version`. Errors are
-  zsh's and exit 1: `bad option: -q`, `no such option: x`, `string expected after
-  -c`/`-o`; an unknown `--router` or `--provider` value is an error too (B32). A
-  script that can't be opened: `can't open input file: x`, 127.
+- **Invocation:** zsh's parseopts and parseargs: letter clusters (`-xe`, `+x`, `-xc
+  cmd`), `-o name`/`+o name`/`-oname`, `--name`/`--no-name` and `+-name` for any option,
+  `--emulate name` before any other option, `-b` ending the options after its
+  argument, `--`, `-`, `+` and `+-` ending them, blanks allowed at the end of an
+  argument; `-c` taking the first argument after the options (later ones are `$0` and
+  the positional parameters, or all positional with `-s`), `script args…`, `-s
+  args…`, `-i`, `-l`/`--login` (or a `$0` starting with `-`), `-f` (NO_RCS), `-d`
+  (NO_GLOBAL_RCS), `-t` (one command from the script, standard input or the
+  terminal, then the EXIT trap and out), `-v`
+  (VERBOSE: each line shown as it is read, a -c string whole). `--help`, `--version`
+  (jfsh's own text). Interactive by default when standard input is a terminal and
+  there is no command, script or `-t`. The shell opens its terminal as zsh's
+  init_io (SHTTY: the one stdin names, else stdin or stdout, else /dev/tty; above fd
+  9, close-on-exec); the line editor draws there, so `jfsh > file` prompts on the
+  terminal; MONITOR is turned off without one.
+  Errors are zerr's, named by `$0` (by `jfsh` once `-c` is seen), and exit 1: `bad
+  option: -q` (also for `+q`), `bad option string: '-x-y'`, `no such option: x`,
+  `string expected after -cx`/`-o`, `--emulate: must precede other options`; an
+  unknown `--router` or `--provider` value is an error too (B32). A script that isn't
+  a readable file (a directory too; with PATH_SCRIPT, searched in `$path`): `$0: can't
+  open input file: x`, 127. `$ZSH_EXECUTION_STRING` and `$ZSH_SCRIPT` are set.
 - **Startup files**, in zsh's order: `SYSCONFDIR/jfshenv` (always), `$ZDOTDIR/.jfshenv`,
   then for a login shell `jfsh_profile`/`.jfsh_profile`, for an interactive one
-  `jfshrc`/`.jfshrc`, for a login shell `jfsh_login`/`.jfsh_login`; a login shell reads
-  `.jfsh_logout` then `SYSCONFDIR/jfsh_logout` on exit. RCS and GLOBAL_RCS are checked
-  before each file, `$ZDOTDIR` (default `$HOME`) is re-read before each, `exit` in a
-  file ends the shell. `SYSCONFDIR` is the CMake cache variable `JFSH_SYSCONFDIR`
-  (default `/etc`).
+  `jfshrc`/`.jfshrc`, for a login shell `jfsh_login`/`.jfsh_login`. RCS and GLOBAL_RCS
+  are checked before each file, `$ZDOTDIR` (set even to nothing; else `$HOME`, else the
+  password file's home) is re-read before each, `exit` in a file ends the shell. Each
+  is read as zsh's source(): one that can't be read is skipped silently, `$0` stays the
+  shell's (a script becomes `$0` only after them; `0=x` there stays), SHINSTDIN is off,
+  an error abandons that file only with `$?` as it left it, and ERR_EXIT, ZERR and (at
+  the top) ERR_RETURN are off meanwhile (zsh's noerrexit). `SYSCONFDIR` is the CMake
+  cache variable `JFSH_SYSCONFDIR` (default `/etc`).
   - **Decision on `.zshrc`:** not read by default, since a real `.zshrc` usually needs
     ZLE, `compinit` and modules jfsh doesn't have yet. `--zsh-compat-rc` reads the
     user's `.zshenv`, `.zprofile`, `.zshrc`, `.zlogin` and `.zlogout` right after the
     matching jfsh file (not `/etc/zsh*`).
-- **Exit**, as zsh's `zexit`: the history is saved (when `HISTFILE` is set and
-  `SAVEHIST` isn't 0), a login shell reads its logout files, then the EXIT trap runs,
-  then the `zshexit` hook.
-- **The interactive loop**, each iteration: traps and job reaping, job notices,
-  `precmd` (and `precmd_functions`), `periodic` when `$PERIOD` seconds have passed,
-  due `sched` events, mail (`$mailpath`, `$MAILPATH` or `$MAIL`, every `$MAILCHECK`
-  seconds, default 60; `file?message` with `$_` set to the file); the prompt from
-  `$PS1` as it is now (B38); the line is added to the history **before** it runs, so
-  `$HISTCMD` is its number, `fc`/`history`/`r` leave it out, and `r`/`fc -s` replace it
-  with the command they run; `preexec` (and `preexec_functions`) with the line as `$1`,
-  `$2` and `$3`; then the line. Hooks keep `$?` and `$pipestatus`. History settings
-  (`HISTFILE`, `HISTSIZE`, `SAVEHIST`) are read after the startup files.
-- **`sched`** (`src/builtins/sched.cpp`): `sched [-o] [+]hh:mm[:ss]|[+]secs cmd…`,
-  `sched` lists in zsh's format, `sched -N` removes.
+- **Exit**, as zsh's `zexit`: an interactive shell with RCS saves its history (not when
+  it exits in a startup file; HISTFILE, SAVEHIST > 0), an interactive login shell with
+  RCS reads `.jfsh_logout` then `SYSCONFDIR/jfsh_logout` (`$?` there is still the last
+  command's, an `exit` in them sets the status), then the EXIT trap runs, then the
+  `zshexit` hook. `logout` is `exit` in a login shell, else "not login shell". `exec`
+  saves the history first, and `exec` in the shell itself makes `$SHLVL` one less.
+- **The interactive loop**, each iteration: traps and job reaping, job notices; zsh's
+  preprompt: `precmd` (and `precmd_functions`), `periodic` when `$PERIOD` seconds have
+  passed, mail (`$mailpath` when its first entry isn't empty, else `$MAIL`, every
+  `$MAILCHECK` seconds, 60 from startup; directories are looked into; `file?message`
+  expanded with `$_` set to the file; MAIL_WARNING), due `sched` events, the modules'
+  hooks — an error stops it; the prompt from `$PS1` as it is now (B38); the line is
+  added to the history **before** it runs, so `$HISTCMD` is its number and `fc -l`
+  stops before it unless asked for it (a first `history` lists itself); `r`/`fc -s`
+  keep their line and add the command they rerun after it, shown on stderr (zsh's
+  stuff()); the line is parsed, then `preexec` (and `preexec_functions`) gets `$1` the
+  line read (history-expanded, also when the history drops it), `$2` the parsed line
+  on one line, `$3` in full (getjobtext and getpermtext); then it runs. `$LINENO`
+  counts the lines read. Hooks keep `$?` and `$pipestatus`. Ctrl-C at the prompt
+  leaves `$?` 130. History settings (`HISTFILE`, `HISTSIZE`, `SAVEHIST`) are read after
+  the startup files, and the file only with RCS. IGNORE_EOF: Ctrl-D says "use 'exit'
+  to exit." (or `logout`), the tenth in a row exits.
+- **`sched`** (`src/builtins/sched.cpp`, bin_sched): `sched [-o] [--] [+]hh:mm[:ss][am|pm]
+  | [+]secs cmd…`, `sched` lists in zsh's format (a command starting with `-` after
+  `-- `), `sched -N` removes, zsh's messages; `$zsh_scheduled_events`.
 - **Special parameters** (getters and setters in `ParamHandlers`, which `ParamTable` now
   calls on every lookup and assignment, so expansion, arithmetic, `typeset` and the
-  environment all see them): `$SECONDS` (assignable), `$RANDOM` (assigning seeds it),
-  `$LINENO` (lines of the script, `-c` string, sourced file or `eval` text; in a
-  function, counted from the line its definition starts on), `$HISTCMD`, `$status`,
-  `$pipestatus`, `$PPID` (fixed at startup, readonly), `$EPOCHSECONDS`,
-  `$EPOCHREALTIME`. `$SHLVL` is incremented and `$PWD`/`$OLDPWD` set and exported at
-  startup. Each command's first word now records the line the command starts on (the
-  parser emits a command's words after the lexer has read past the end of its line).
+  environment all see them): `$SECONDS` (assignable, rounded down, wraps as zsh's;
+  `typeset -F` makes it fractional), `$RANDOM` (assigning seeds it), `$HISTSIZE` (30, at
+  least 1) and `$SAVEHIST` (0, at least 0), `$LINENO` (lines of the script, `-c` string,
+  sourced file or `eval` text; in a function counted from its definition's line as 0;
+  a short `f() cmd` body keeps the caller's line; a trap's text leaves it; `$( … )`
+  counts on from its line; put back after each list as zsh's execlist, so an EXIT
+  trap sees the line before a -c string or where reading got to in a script, and
+  DEBUG sees the command's line), `$HISTCMD`, `$status`, `$pipestatus` (empty at first; a
+  command a simple sublist runs as zsh's execsimple leaves it: assignments alone, a
+  function definition, `(( ))`, `[[ ]]`, `if`, `case`, …; any other sets it), `$_` (the last word of the
+  command before, after precommand modifiers; words expanding to nothing leave it;
+  compound commands empty it as zsh's execcmd_exec; a program finds its path in it), `$PPID` (fixed at startup,
+  readonly), `$EPOCHSECONDS`, `$EPOCHREALTIME`, `$MAILCHECK` (60). Integer specials
+  show as `typeset -i10`; SECONDS, RANDOM, HISTSIZE and SAVEHIST take a value from
+  the environment. `$SHLVL` is incremented (an integer) and `$PWD`/`$OLDPWD` set and
+  exported at startup as zsh's setupvals: `$HOME` or the environment's `$PWD` when it
+  names this directory without `.` or `..`, else the real path; `$OLDPWD` the same.
+  Each command's first word records the line the command starts on.
 - **Scripts** were already run a command at a time (`Parser::parse_line`), so a syntax
   error at the end no longer stops the lines before it from running.
 
+**Review fixes** (branch jfsh-m8-review), against zsh 5.9 (about 610 new probe runs:
+`-c`, script, standard input, arbitrary argv and per-probe HOME/ZDOTDIR startup files,
+and pty runs; with M7's 3304-run corpus and 194 standard-input runs run again three
+ways, 0 regressions against main). Invocation is a port of parseopts/parseargs (was:
+`+`, `+-name`, `-b`, `--emulate`, blanks, `-s` with `-c`, `-cx` messages, `$0` naming
+the errors were all wrong or missing; a directory "script" ran nothing with status 0;
+interactivity also needed a terminal on stdout). Startup files are read as zsh's
+source(): an error there no longer ends a non-interactive shell (a file sourced with
+no command around it is not the top level any more), `$0`, SHINSTDIN, unreadable files,
+an empty `$ZDOTDIR`, noerrexit. Exit: only interactive shells with RCS save history
+and read logout files (non-interactive login shells read `.jfsh_logout` before), and a
+shell that exited during its startup files no longer rewrites HISTFILE with an empty
+history; `$?` and `exit` in the logout files; `logout`; `exec` saves history and
+lowers `$SHLVL`. History: `r`/`fc -s`/`fc -e` keep their own line (M7's Left), `old=new`
+that applies nowhere is "no substitutions performed", listings can show the current
+line. The loop: preprompt order (mail before sched; an error stops it), mail
+(`$mailpath` being an empty array hid `$MAIL`; directories, MAIL_WARNING, `$_` put
+back, first check from startup), preexec `$2`/`$3`, IGNORE_EOF (the count and the
+message), `$LINENO` per line, VERBOSE (not implemented before), `-t` (also
+interactive), INC_APPEND_HISTORY and SHARE_HISTORY writing only with `$SAVEHIST`.
+The new-user setup ran `zsh-newuser-install` as an external command ("command not
+found") since M11; it runs the builtin now, for an existing `$ZDOTDIR`. `sched` is bin_sched (`--`
+after the time stays in the command, `sched -0`, `-`, `+-5`, insertion order,
+`$zsh_scheduled_events`). Specials: `$SECONDS` floor/wrap/float, `typeset -i10`,
+HISTSIZE/SAVEHIST/MAILCHECK, env import, `$_`, `$pipestatus`, `$LINENO` in one-line
+functions, short bodies, traps and `$( … )`, `$PWD`/`$OLDPWD`, SHLVL as an integer.
+Performance was on a par (`jfsh -f -c :` 12.7 ms, all but about 1 ms of it loading the
+dynamic libraries, as `jfsh --version` takes 11.5 ms; zsh 3.4 ms; a getpwuid the fix
+first added at startup, 0.8 ms, was taken out again; 100000-line HISTFILE read and
+saved 0.04 s vs zsh 0.16; 200000 `$RANDOM`/`$SECONDS` reads 0.22 s vs 0.11, the
+executor's own pace; the prompt loop about 0.1 ms per line in both). Tests:
+`StartupM8Review.InvocationAsZsh`, `StartupM8Review.StartupFilesAsZsh`,
+`StartupM8Review.SpecialParametersAsZsh`, `StartupM8Review.SchedAsZsh`,
+`StartupM8Review.PwdFromTheEnvironment`,
+`InteractiveM8Review.RerunKeepsItsLineAndHistoryListsItself`,
+`InteractiveM8Review.PreexecGetsTheParsedLine`, `InteractiveM8Review.LinenoAndVerbose`,
+`InteractiveM8Review.IgnoreEofAndLogout`, `InteractiveM8Review.LogoutFileStatus`,
+`InteractiveM8Review.NoHistoryFileWithoutRcs`; tests updated to zsh's output:
+`Invocation.ScriptAndStdin`, `Invocation.Errors`, `Specials.StatusAndPipestatus`,
+`Hooks.PreexecGetsTheLine`, `Sched.QueuesListsRemovesAndRuns`,
+`Mail.BeforePromptChecksEveryMailcheckSeconds`, `History.TheLineBeingRunIsLeftOut`,
+`History.ListsAndReruns`, `Editor.EofAndInterrupt`,
+`Interactive.LineIsInHistoryWhileItRuns`, `Binary.BadOptionsFail`,
+`Binary.OptionsReachTheShell`, `Binary.StartupFilesAndLogout`,
+`Binary.B5HistoryFileGetsOnlyNewLines`.
+
+Round 2 (review findings): the shell opens its terminal (SHTTY) as zsh's init_io and
+the line editor draws there (`jfsh > file` from a terminal wrote the prompt into the
+file once interactivity no longer needed a terminal on stdout); preexec's `$1` is the
+line read even when the history drops it; execlist's `$LINENO` save and restore (an
+EXIT trap saw the last command's line; DEBUG saw 1; an `exit` that leaves at once keeps
+its line for the trap); preexec's `$2` has newlines as blanks (taddstr); zshexit sees the exit status, not
+the EXIT trap's; -t ending a script runs only the EXIT trap; `exec` with nothing read
+writes no HISTFILE; `$_` is left by words expanding to nothing and set after
+precommand modifiers; `$OPTARG` comes from the environment; `jfsh ''` is "can't open
+input file" (Invocation::script is optional); one close-on-exec `read_file`
+(`include/jfsh/core/read_file.h`) for scripts, sourced files and `$mapfile`.
+`src/exec/invocation.cpp` (parseopts, parseargs) and `src/builtins/sched.cpp`
+(bin_sched, zstrtol) carry zsh's attribution and licence. Tests: rows added to
+`StartupM8Review.InvocationAsZsh` and `StartupM8Review.SpecialParametersAsZsh`,
+`StartupM8Review.ExecWithoutHistoryWritesNoFile`,
+`InteractiveM8Review.PreexecGetsTheLineTheHistoryDrops`,
+`InteractiveM8Review.EditorUsesTheTerminalWhenStdoutIsAFile`.
+
+Round 3: the shell's terminal is opened once and shared with job control (zsh's SHTTY
+serves init_io and acquire_pgrp; jfsh held two); it is the shell's own, as zsh's
+FDT_INTERNAL: `>&10` is "bad file descriptor" and `{fd}>&-` on it is "file descriptor 10
+used by shell, not closed" (the editor lost its terminal before). `$_` and compound
+commands (reworked in round 4); an anonymous function's last argument sets it; array
+assignments alone and a bare `exec` run nothing and leave it. `$LINENO` after an `exit` in a sourced file, and at end of input (interactive and
+standard input, blank lines counted). preexec's `$1` is the line as HIST_REDUCE_BLANKS
+keeps it (the reduction itself reworked in round 4). Ctrl-C at the prompt or at PS2
+leaves `$?` 130 (reworked in round 4 for trapped and ignored INT and send-break). `read_file` refuses a directory by fstat (`. dir` still reads
+nothing). Tests: rows in `StartupM8Review.SpecialParametersAsZsh`,
+`InteractiveM8Review.TheShellsTerminalFdIsInternal`,
+`InteractiveM8Review.CtrlCAtThePromptSetsStatus`,
+`InteractiveM8Review.LinenoAtEofAndReducedBlanks`.
+
+Round 4: `$_` follows zsh's parser instead of the command's type. The parser keeps
+zsh's `cmplx` (`Parser::mCmplx`): a command word, a redirection, an array assignment or
+a process substitution in an assignment, a subshell, select, `|`, `!`, `&` or an
+anonymous function's arguments set it, it passes out of every
+enclosing construct but not out of a function body, and each sublist without it is
+marked WC_SUBLIST_SIMPLE (zsh's set_sublist_code). A compound command in a simple
+sublist runs as zsh's execsimple and leaves `$_`; any other empties it (`case x in y)
+echo q;; esac` and `{ $empty; }` empty it, `if [[ -n x ]]; then fi`, `for i in x; do
+done` and `repeat 1 [[ -n x ]]` leave it). The interrupt key at the prompt and at PS2
+acts as zsh's SIGINT handler there: with INT ignored it does nothing (the line stays);
+trapped, the trap runs and the line goes on, unless a TRAPINT returns non-zero, which
+ends the line with that status; otherwise `$?` is 130. send-break (^G) rings the bell
+and leaves `$?` 1 unless it was already non-zero (zsh's loop: `if (tok == LEXERR &&
+!lastval) lastval = 1`). HIST_REDUCE_BLANKS is zsh's histreduceblanks over the lexer's
+word spans (`word_spans`, zsh's chwords; a line with a here-document stays as typed, see round 5):
+the first character of each gap between words is kept, blanks inside words (`$(  a  )`,
+quotes, `${x:-a   b}`, `$((  1 ))`) and a comment after the last word stay, leading
+blanks go unless HIST_IGNORE_SPACE; it applies to lines read (and `r`, `:p`), not to
+`print -s`. `{fd}>&-` on a closed fd is "failed to close file descriptor 50: bad file
+descriptor" with status 0, and `. unreadable` is "permission denied" with status 127
+(zsh's bin_dot). Tests: `StartupM8Review.UnderscoreFollowsZshsCmplx` (15 rows),
+`InteractiveM8Review.CtrlCAtThePromptRunsTheIntTrap`, ^G rows in
+`InteractiveM8Review.CtrlCAtThePromptSetsStatus`, `History.ReduceBlanksCollapsesWhitespaceRuns`
+rewritten for the word rule.
+
+Round 5: the word spans come from parsing the line (no aliases), as zsh's lexer reads
+it: `LexInput::pos()` leaves out text read ahead and pushed back (the `((` lookahead
+recorded `(( 1 ))))) ;`), `(( … ))` and a `[[ ]]` pattern are a word each, `for ((`
+has a word per expression (blanks before its `;` kept), and an array assignment has
+`name=(`, each element and `)` (`a=(  1   2  )` → `a=( 1 2 )`). zsh's hend reduces a
+line only when its last word ends at the line's end, so a line with a here-document
+or a parse error (`echo   a  )  b`, `echo a;;  `) stays as typed;
+`HistoryManager::hend_text` does this for the loop and `r`/`fc`. An `exit` in the INT
+trap at the prompt, at PS2 or in isearch leaves at once, with nothing typed after the
+Ctrl-C (it waited for Enter). Assignments alone clear `$_` only in a simple sublist or
+with redirections (`! x=1`, `nocorrect x=1`, `x=<(:)` leave it); the parser looks for
+an unquoted `<(`/`>(` or a leading `=(` (`x='<(:)'` is simple). `$pipestatus` is set by
+every command except one run by zsh's execsimple (`(( 0 ))`, `[[ -z x ]]`, `{ (( 1 )); }`,
+`if`, `case`, `f() { :; }` leave it; `f() { :; } >/dev/null` sets it): the parser's cmplx goes
+back to its value before the words at `f()` (zsh's `*cmplx = c`) and redirections after
+a function body set it (par_cmd). The interrupt-key hook is the `Zle`'s
+(`Zle::on_interrupt`, `Zle::trap_break`), so vared's Ctrl-C runs the INT trap as at the
+prompt: untrapped it ends the command line with `$?` 130, a TRAPINT returning 6 with 6,
+`trap 'echo T' INT` or `trap '' INT` let editing go on; send-break ends the line with `$?`
+left. Tests: rows in `History.ReduceBlanksCollapsesWhitespaceRuns` (`((`, `[[`, `for ((`,
+arrays, here-documents, parse errors),
+`InteractiveM8Review.ExitInTheIntTrapAtThePromptLeavesAtOnce`,
+`InteractiveM8Review.CtrlCInVaredRunsTheIntTrap`.
+
+Round 6: the word spans come from parsing the line with the shell's aliases
+(`word_spans(text, comments, aliases)`, from the loop and `r`/`fc`), so a line that
+parses only through an alias is reduced (`alias b='{'`: `b   echo   a ;  }` → `b echo
+a ; }`). A token that starts in an alias's text has no span (zsh's ihwend drops a word
+that put nothing in chline), and `LexInput::pos()` counts only source text pushed back
+(`LexInput::in_alias`). An `exit` from a trap while the line editor reads at the prompt
+(INT, or any trap run by the editor's signal wake-up) saves the history and runs the
+EXIT trap but no logout files and no zshexit hook, as zsh 5.9's zexit from the signal
+handler (`LoopState::exit_in_editor`); under vared a command runs and both still run.
+vared's untrapped Ctrl-C is the error kind of abort, so a loop around it ends with 1
+(zsh's execfor/execwhile `lastval = 1`), 130 elsewhere; a TRAPINT's `return 5` gives
+5 in a loop too (`trap_status`). `Zle::tty_out` moved next to `next_hist_index`
+(packing); the lexer records a token's start only while recording spans. Tests:
+alias rows in `History.ReduceBlanksCollapsesWhitespaceRuns`, a login shell with a
+logout file, zshexit and HISTFILE in
+`InteractiveM8Review.ExitInTheIntTrapAtThePromptLeavesAtOnce`, loop rows in
+`InteractiveM8Review.CtrlCInVaredRunsTheIntTrap`.
+
 **Left**
+- Ctrl-C at a `select` prompt: zsh reads the reply with zleread under its SIGINT
+  handler (untrapped, the command line ends with `$?` 130; a trap runs and the read
+  goes on); jfsh reads it from the terminal in cooked mode, so the `^C` is echoed and
+  the loop goes on. Reason:
+  select's reading is the executor's, not the line editor's (M2/M9).
+- After an `exit` in a trap at the prompt, jfsh draws the prompt line again before
+  the EXIT trap's output (`% EX`); zsh leaves the screen as it is. Reason: the
+  editor's display (M9) finishes the line it was reading.
+- `$TMOUT` isn't implemented: no SIGALRM at the prompt after `$TMOUT` seconds, so
+  `TMOUT=1; trap 'exit 3' ALRM` doesn't exit. Reason: zsh's zleread timeout is M9's.
+- With HIST_REDUCE_BLANKS, a line jfsh can't parse is stored as typed (zsh's hend
+  rule), so `time …`, `coproc …` and `$(case … esac)` lines keep their blanks where
+  zsh reduces them. Reason: `time` and `coproc` are parse errors (M17); the lines
+  don't run either.
+- vared and isearch redraw differently from zsh (vared draws the buffer again after a
+  key, the isearch prompt goes on a line of its own); the text read is the same.
+  Reason: the editor's display (M9).
 - `sched` events only run before a prompt; zsh also runs them while the line editor
-  waits for input. `sched -o` is accepted but there is no line to clear.
-- Mail: maildir directories and `MAIL_WARNING` aren't handled; the message is expanded
-  for parameters but not prompt escapes.
-- `preexec`'s `$2` should be a size-limited single-line version of the command (zsh
-  elides function bodies); it is the whole line.
-- Some zsh specials are still missing: `$TTYIDLE`, `$ZSH_SUBSHELL`, `$funcfiletrace`
-  (`$UID`…`$EGID`, `$USERNAME` and `$funcstack` came in M15c; they are not assignable).
-  `local SECONDS` doesn't make a local copy of a special; `unset` drops the special
-  meaning for good, as in zsh.
-- `$LINENO` in a one-line function (`f() { echo $LINENO; }`) is 1; not checked against
-  zsh. `$pipestatus` after a function call is that call's status, not the last
-  pipeline inside it; also not checked against zsh.
-- `PRIVILEGED` doesn't skip the user's startup files.
-- An error in a startup file of a non-interactive shell ends the shell, as one in a
-  script does; zsh only abandons that file.
-- zsh couldn't be run on this machine while M8 was written (it isn't installed, and
-  running a downloaded copy was blocked), so the expected outputs come from zsh's
-  documentation and source rather than from running it, except `$LINENO` in a function
-  and `$SHLVL`.
+  waits for input (a timed fd watch). `sched -o` is accepted but there is no line to
+  clear. Planned in M16.
+- `preexec`'s `$2` (and job texts) aren't cut at zsh's 80-character JOBTEXTSIZE, which
+  drops the words that don't fit. Reason: text.c's limited buffer, shared with jobs (M6).
+- The last command of a `-c` string forks where zsh execs it in place (execlist's
+  `last1`), so `$SHLVL` and `$PPID` in it are one level off. Reason: an executor
+  change (M2's lone-command path).
+- RESTRICTED (`-r`, `-o restricted`) is accepted and does nothing; zsh's restrictions
+  (cd, PATH, redirections, …) aren't implemented anywhere.
+- Single-letter options under `--emulate sh` or an `sh` `$0` are zsh's, as M12 chose;
+  zsh switches to the sh letters (`sh -f` is NOGLOB). Startup files under sh/ksh
+  emulation (`/etc/profile`, `~/.profile`, `$ENV`) are M12's.
+- Error messages name the shell (`jfsh:`), not the file or function zsh names
+  (`~/.zshenv:3:`, `f:`), and interactive builtin errors keep the prefix zsh drops.
+  Reason: M17's error-message prefixes.
+- `local LINENO` is "read-only variable" with status 1 in a `-c` string where zsh
+  leaves 0 (and `local LINENO` without a value gives zsh a local 0); `local SECONDS`
+  set back the shell's clock on return. Reason: local specials are M17's.
+- `$funcfiletrace` and the other missing specials are M17's; zsh/datetime's
+  `$EPOCHSECONDS` is loaded at startup (M10's decision; `zsh -f` doesn't).
+- PRIVILEGED doesn't skip the user's startup files (M17).
+- A subshell that leaves by `exit` runs no `zshexit` hook; zsh's does (`(exit 4)` calls
+  zexit, whose callhookfunc runs in the child). Reason: exit_child is M6's subshell exit
+  path, without the hooks of the loop.
+- An EXIT trap's `$LINENO` after a -c string ending in a compound command (zsh: its
+  line, as the last command runs in exiting mode) or after a parse error in a script
+  (zsh: the line after, as its lexer flushes the rest of the line) differs by a line.
+  Reason: zsh's execstring `exiting` and inerrflush, tied to the last-command exec above.
+- jfsh keeps fds of its own at 10 and up in every shell (the signal self-pipe), so
+  `{fd}` starts higher than zsh's and `{fd}>&-` on one of them is "used by shell"
+  where zsh, which has no such fds in a non-interactive shell, says "failed to close".
+- `${(k)mapfile}` leaves out directories; zsh lists them. Reason: zsh/mapfile (M11).
+- Job notices, the IGNORE_EOF message and "you have suspended jobs" go to stderr;
+  zsh writes them to its terminal (shout), so `jfsh 2>file` differs. Reason: the job
+  table (M6) prints to a stdio stream.
+- The new-user setup (M11) is offered whenever `$ZDOTDIR` exists without jfsh's
+  startup files; zsh's only runs where its `newuser` script is installed.
 
 ### M9. Line editor (ZLE), completion, prompt, history
 
@@ -3522,16 +3738,15 @@ superseded: compsys is zsh's shell-function library, run as is.
   setuid/setgid (readable since M15c).
 - `$ZSH_SUBSHELL` auto-incremented on fork.
 - `$funcfiletrace`, `$funcsourcetrace` (`$funcstack`, `$functrace` came in M15c),
-  `$ZSH_EVAL_CONTEXT`, `$ZSH_SCRIPT`, `$ZSH_ARGZERO`, `$HISTCHARS` (already
-  have `$histchars`).
+  `$ZSH_EVAL_CONTEXT`, `$ZSH_ARGZERO`, `$HISTCHARS` (already have
+  `$histchars`; `$ZSH_SCRIPT` came in the M8 review).
 - `local SECONDS` makes a local copy of the special and preserves live-
-  update semantics (M8 left item).
-- `unset` on a special drops its special meaning for good; next assignment
-  is a plain scalar (M8 left item).
-- `$LINENO` in a one-line function (`f() { echo $LINENO; }`) is 1; check
-  against zsh (M8 left item).
-- `$pipestatus` after a function call is the function body's last pipeline
-  (M8 left item).
+  update semantics; jfsh's copy shares the clock and puts it back by value on
+  return (zsh 5.9: `f(){ local SECONDS=50; sleep 1.1 }; f; echo $SECONDS` is 1,
+  jfsh 0) (M8 left item).
+- `unset` on a special: zsh 5.9 keeps some special (`unset SECONDS;
+  SECONDS=5; sleep 1.1; echo $SECONDS` is 6); jfsh drops the special meaning
+  for good (M8 left item).
 
 **History options**
 - `HIST_EXPIRE_DUPS_FIRST`: when trimming to `$SAVEHIST`, drop duplicates

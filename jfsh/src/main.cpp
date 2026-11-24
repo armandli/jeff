@@ -1,9 +1,12 @@
 #include <cerrno>
+#include <csignal>
 #include <clocale>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -16,6 +19,7 @@
 #include <jfsh/core/jobs.h>
 #include <jfsh/core/options.h>
 #include <jfsh/core/param.h>
+#include <jfsh/core/read_file.h>
 #include <jfsh/core/signals.h>
 #include <jfsh/core/types.h>
 #include <jfsh/editor/editor.h>
@@ -73,6 +77,7 @@ extern char** environ;
 namespace {
 
 namespace s = std;
+using jfsh::opt;
 using jfsh::str;
 using jfsh::vec;
 
@@ -109,6 +114,33 @@ jfsh::ProviderConfig provider_config(const jfsh::Invocation& inv) {
   return cfg;
 }
 
+// Whether `path` names something that is not a directory.
+bool is_file(const str& path) {
+  struct stat st{};
+  return ::stat(path.c_str(), &st) == 0 and not S_ISDIR(st.st_mode);
+}
+
+// zsh's init_io: the shell's own terminal (SHTTY), read and written, on a
+// close-on-exec fd above 9: the one standard input names, else standard
+// input or output themselves, else /dev/tty.  -1 when there is none.
+int open_shell_tty() {
+  auto rdwr = [](int fd) { return (::fcntl(fd, F_GETFL, 0) & O_ACCMODE) == O_RDWR; };
+  auto high = [](int fd) {
+    if (fd < 0) return fd;
+    int moved = ::fcntl(fd, F_DUPFD_CLOEXEC, 10);
+    ::close(fd);
+    return moved;
+  };
+  if (::isatty(STDIN_FILENO)) {
+    if (const char* name = ::ttyname(STDIN_FILENO))
+      if (int fd = high(::open(name, O_RDWR | O_NOCTTY | O_CLOEXEC)); fd >= 0) return fd;
+    if (rdwr(STDIN_FILENO)) return ::fcntl(STDIN_FILENO, F_DUPFD_CLOEXEC, 10);
+  }
+  if (::isatty(STDOUT_FILENO) and rdwr(STDOUT_FILENO))
+    return ::fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 10);
+  return high(::open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC));
+}
+
 str param(jfsh::ParamTable& params, s::string_view name) {
   auto p = params.lookup(name);
   return (p and p->get().is_set()) ? p->get().scalar() : str{};
@@ -124,7 +156,7 @@ int main(int argc, char* argv[]) {
   std::setlocale(LC_COLLATE, "");
   auto parsed = jfsh::parse_invocation(vec<str>(argv, argv + argc));
   if (not parsed) {
-    s::fprintf(stderr, "jfsh: %s\n", parsed.error().message.c_str());
+    s::fprintf(stderr, "%s\n", parsed.error().message.c_str());
     return 1;
   }
   jfsh::Invocation& inv = *parsed;
@@ -137,9 +169,10 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  // Interactive, unless told otherwise, when commands come from a terminal.
+  // Interactive, unless told otherwise, when standard input is a terminal
+  // and there is neither a command, nor a script, nor -t (zsh's parseargs).
   bool interactive = inv.interactive.value_or(
-      inv.shinstdin and isatty(STDIN_FILENO) and isatty(STDOUT_FILENO));
+      isatty(STDIN_FILENO) and not inv.command and not inv.script and not inv.single);
 
   jfsh::ParamTable  params;
   jfsh::OptionState opts;
@@ -151,12 +184,20 @@ int main(int argc, char* argv[]) {
     opts.apply_emulation(inv.emulation, /*full=*/true);
   opts.assign(jfsh::OPT_INTERACTIVE,   interactive);
   opts.assign(jfsh::OPT_SHINSTDIN,     inv.shinstdin);
-  opts.assign(jfsh::OPT_MONITOR,       inv.monitor.value_or(interactive));
+  // MONITOR needs a terminal: zsh's init_io turns it off when it finds none.
+  // An interactive shell draws its line editor there, so `jfsh > file`
+  // still prompts on the terminal.
+  int shell_tty = open_shell_tty();
+  opts.assign(jfsh::OPT_MONITOR,       inv.monitor.value_or(interactive) and shell_tty >= 0);
+  if (not interactive and shell_tty >= 0) {
+    ::close(shell_tty);
+    shell_tty = -1;
+  }
   opts.assign(jfsh::OPT_ZLE,           inv.zle.value_or(interactive));
   opts.assign(jfsh::OPT_LOGIN,         inv.login);
   opts.assign(jfsh::OPT_RCS,           inv.rcs);
   opts.assign(jfsh::OPT_GLOBALRCS,     inv.global_rcs);
-  opts.assign(jfsh::OPT_SINGLECOMMAND, false);
+  opts.assign(jfsh::OPT_SINGLECOMMAND, inv.single);
   // HASH_DIRS defaults to INTERACTIVE, as zsh's init sets it.
   opts.assign(jfsh::OPT_HASHDIRS,      interactive);
   for (auto [idx, on] : inv.options) opts.assign(idx, on);
@@ -169,7 +210,7 @@ int main(int argc, char* argv[]) {
                   jfsh::PM_SCALAR | jfsh::PM_EXPORTED);
   }
 
-  jfsh::Signals.init(interactive);
+  jfsh::Signals.init(interactive, shell_tty);
   // However main returns, the terminal goes back to the process group that
   // started the shell, as zsh's release_pgrp does in zexit.
   struct ReleaseTerminal {
@@ -185,6 +226,9 @@ int main(int argc, char* argv[]) {
   ctx.positional = inv.positional;
   jfsh::Executor executor(ctx);
   jfsh::init_shell_params(ctx);
+  // As zsh's setupvals.
+  if (inv.command)            params.assign("ZSH_EXECUTION_STRING", *inv.command);
+  if (inv.script) params.assign("ZSH_SCRIPT", *inv.script);
 
   // M10: register the shipped modules.  Register makes `zmodload NAME`
   // able to find them; the four modules jfsh ships today are auto-loaded
@@ -259,13 +303,14 @@ int main(int argc, char* argv[]) {
     str visual = param(params, "VISUAL"), editor = param(params, "EDITOR");
     ctx.zle->select_main((visual.empty() ? editor : visual).find("vi") != str::npos);
   }
+  ctx.zle->tty_out = shell_tty;
 
   // zsh/newuser (M11): an interactive shell with no user startup files
   // offers to write a starter ~/.jfshrc first, so the one it writes is
   // read straight away.
   if (interactive and ctx.opts.get(jfsh::OPT_RCS) and ::isatty(STDIN_FILENO)
       and jfsh::newuser_needed(ctx) and ctx.modules.load("zsh/newuser", &ctx))
-    (void)executor.run_command({"zsh-newuser-install"});
+    (void)executor.exec_string("zsh-newuser-install");
 
   jfsh::StartupConfig startup;
   startup.zsh_compat = inv.zsh_compat_rc;
@@ -275,53 +320,88 @@ int main(int argc, char* argv[]) {
 
   // History, after the startup files have had their say on HISTFILE,
   // HISTSIZE and the history options.  Only an interactive shell keeps
-  // one.
+  // one, and only with RCS does it read and save the file (zsh's init_misc
+  // and zexit).  A shell that exits in a startup file saves nothing.
   jfsh::HistoryManager history(jfsh::history_options(ctx));
-  bool save_history = interactive;   // to $HISTFILE as it is on the way out
+  bool save_history = interactive and not ctx.exiting;
   if (interactive) {
     auto hist_opts = jfsh::history_options(ctx);
-    if (not hist_opts.histfile.empty()) (void)history.load(hist_opts.histfile);
+    if (not hist_opts.histfile.empty() and ctx.opts.get(jfsh::OPT_RCS))
+      (void)history.load(hist_opts.histfile);
     ctx.history = &history;   // fc, history, r, $HISTCMD
   }
+  // `exec` in this shell saves the history first, as zsh's execute does.
+  // Nothing is written without history to write (zsh's savehistfile
+  // returns without a hist_ring).
+  auto write_history = [&] {
+    if (not save_history or not ctx.opts.get(jfsh::OPT_RCS) or history.size() == 0) return;
+    auto hist_opts = jfsh::history_options(ctx);
+    history.set_options(hist_opts);
+    (void)history.save(hist_opts.histfile);
+  };
+  ctx.loop.save_history = write_history;
 
   // Exiting, as zsh's zexit does: the history is saved, a login shell reads
-  // its logout files, then the EXIT trap and the zshexit hook run.
+  // its logout files, then the EXIT trap and the zshexit hook run (neither
+  // the logout files nor the hook after a trap's `exit` at the prompt).  $? in
+  // the logout files is still the last command's; an `exit` there sets the
+  // shell's status.
   auto finish = [&](int rc, bool ran_off = false) {
     if (ctx.exiting) rc = ctx.exit_val;
-    if (save_history) {
-      auto hist_opts = jfsh::history_options(ctx);
-      history.set_options(hist_opts);
-      (void)history.save(hist_opts.histfile);
-    }
+    write_history();
+    save_history  = false;
+    ctx.exit_val  = rc;
+    if (not ctx.loop.exit_in_editor) jfsh::run_logout_files(executor, startup);
+    rc = ctx.exit_val;
     ctx.last_exit = rc;
-    jfsh::run_logout_files(executor, startup);
-    if (ctx.exiting) rc = ctx.exit_val;
+    int status = rc;
     rc = executor.run_exit_trap(rc, ran_off);
     ctx.exiting = false;
-    jfsh::run_hook(executor, "zshexit");
+    // zshexit sees the exit status, not the EXIT trap's (dotrap puts
+    // lastval back); after -t ended a script, zsh leaves without it
+    // (realexit).
+    if (not ctx.loop.single_done and not ctx.loop.exit_in_editor) {
+      ctx.last_exit = status;
+      jfsh::run_hook(executor, "zshexit");
+    }
     s::fflush(nullptr);
     return rc;
   };
 
   if (ctx.exiting) return finish(ctx.exit_val);   // `exit` in a startup file
+  ctx.lineno = 1;   // as zsh's setupshin, once there is input to number
 
   if (inv.command) {
+    // %N and the like name the -c string as the shell (zsh's scriptname).
+    ctx.source_name = ctx.script_name = "jfsh";
+    if (opts.get(jfsh::OPT_VERBOSE)) s::fprintf(stderr, "%s\n", inv.command->c_str());
     int rc = executor.exec_string(*inv.command);
     return finish(rc, not ctx.exiting);
   }
 
-  if (not inv.script.empty()) {
-    s::FILE* f = s::fopen(inv.script.c_str(), "r");
-    if (not f) {
-      s::fprintf(stderr, "jfsh: can't open input file: %s\n", inv.script.c_str());
+  if (inv.script) {
+    const str& script = *inv.script;
+    // zsh's setupshin: the script as named, unless that is no file; then,
+    // with PATH_SCRIPT and no `/` in the name, the first one in $path.
+    str file = script;
+    if (not is_file(file)) {
+      file.clear();
+      if (opts.get(jfsh::OPT_PATHSCRIPT) and script.find('/') == str::npos)
+        if (auto p = params.lookup("path"); p and p->get().is_array())
+          for (const auto& dir : p->get().array())
+            if (str f = dir + "/" + script; is_file(f)) {
+              file = s::move(f);
+              break;
+            }
+    }
+    opt<str> source = file.empty() ? s::nullopt : jfsh::read_file(file);
+    if (not source) {
+      s::fprintf(stderr, "%s: can't open input file: %s\n", inv.arg0.c_str(), script.c_str());
       return 127;
     }
-    str source;
-    char buf[4096];
-    s::size_t n;
-    while ((n = s::fread(buf, 1, sizeof buf, f)) > 0) source.append(buf, n);
-    s::fclose(f);
-    return finish(executor.exec_string(source, /*by_line=*/true));
+    // $0 is the script from now on; the startup files saw the shell's.
+    ctx.arg0 = script;
+    return finish(executor.exec_string(*source, /*by_line=*/true));
   }
 
   if (interactive) {
@@ -353,14 +433,48 @@ int main(int argc, char* argv[]) {
       }
       s::fflush(nullptr);
       quit = ctx.exiting;
+      if (quit) ctx.loop.exit_in_editor = true;
       return printed;
     });
+
+    // The interrupt key in the line editor (the prompt, PS2, isearch, vared)
+    // acts as zsh's SIGINT handler there:
+    // an ignored INT does nothing, a trapped one runs its trap (the signal
+    // goes through the shell's own handler and wakes the editor), and only
+    // an untrapped one ends the line.
+    // A trap that fails (a TRAPINT returning non-zero) ends the line as an
+    // interrupt would, with its status in $? (zsh's dotrap leaves errflag).
+    ctx.zle->on_interrupt = [&](jfsh::Editor& ed) {
+      auto action = jfsh::Signals.traps().get(SIGINT).action;
+      if (action == jfsh::TrapAction::Ignore) return false;
+      if (action != jfsh::TrapAction::Command and action != jfsh::TrapAction::Function)
+        return true;
+      ed.trash();
+      ::kill(::getpid(), SIGINT);
+      executor.handle_signals();
+      bool returned = executor.end_prompt_trap();
+      s::fflush(nullptr);
+      // An `exit` in the trap leaves at once (zsh's zexit from the
+      // handler): the read ends and the loop goes no further.
+      // (Under vared a command is running, and zsh's exit is the usual one.)
+      if (ctx.exiting) {
+        if (&ed == &editor) ctx.loop.exit_in_editor = true;
+        return true;
+      }
+      if (not (ctx.aborting or returned)) return false;
+      ctx.zle->trap_break = ctx.last_exit;
+      ctx.aborting = ctx.abort_line = ctx.interrupt = ctx.intr_echoed = false;
+      ctx.end_trap_abort();
+      return true;
+    };
 
     // CHECK_JOBS: the first attempt to exit with stopped (or, with
     // CHECK_RUNNING_JOBS, running) jobs only warns.  Exiting again right
     // away, or after `jobs`, goes ahead.
     bool warned        = false;
     bool prev_ran_jobs = false;
+    int  line_no       = 1;   // the next line's number, for $LINENO
+    int  eofs_ignored  = 0;   // Ctrl-Ds under IGNORE_EOF since the last command
     auto exit_blocked = [&] {
       if (ctx.hangup or warned or prev_ran_jobs) return false;
       if (not opts.get(jfsh::OPT_CHECKJOBS) or not jfsh::Signals.job_control()) return false;
@@ -378,6 +492,8 @@ int main(int argc, char* argv[]) {
     };
 
     for (;;) {
+      // $LINENO is the next line's between commands, as zsh's lexer has it.
+      if (not (ctx.exiting and ctx.exit_now)) ctx.lineno = static_cast<s::uint32_t>(line_no);
       // The terminal as the shell keeps it: what the last command left set
       // (`stty intr ^X`), with echo and canonical input back.
       jfsh::Signals.restore_shell_modes();
@@ -404,35 +520,67 @@ int main(int argc, char* argv[]) {
       // other shells added.
       auto hist_opts = jfsh::history_options(ctx);
       history.set_options(hist_opts);
-      if (hist_opts.share and not hist_opts.histfile.empty()) (void)history.sync(hist_opts.histfile);
+      if (hist_opts.share and not hist_opts.histfile.empty())
+        (void)history.sync(hist_opts.histfile);
 
       // 5–6. The prompt, from $PS1 as it is now, and the line.
       prompt_renderer.reload();
       editor.set_prebuffer({});
       auto line_opt = editor.read_line();
       if (not line_opt) {   // EOF or hangup
+        // IGNORE_EOF: the tenth Ctrl-D in a row exits (zsh's noexitct).
+        if (not ctx.exiting and editor.eof_ignored() and ++eofs_ignored < 10) continue;
         if (ctx.exiting or not exit_blocked()) break;
         continue;
       }
-      if (editor.interrupted()) continue;
+      // The line was dropped: by the interrupt key, $? is 130 (zsh's SIGINT
+      // handler sets lastval); by send-break, the parser's error leaves 1
+      // unless $? already says something went wrong (zsh's loop).
+      auto interrupted = [&] {
+        if (ctx.exiting)              return;
+        if (auto& tb = ctx.zle->trap_break; tb) ctx.last_exit = *s::exchange(tb, s::nullopt);
+        else if (not editor.sent_break()) ctx.last_exit = 128 + SIGINT;
+        else if (ctx.last_exit == 0)  ctx.last_exit = 1;
+      };
+      if (editor.interrupted()) {
+        interrupted();
+        continue;
+      }
 
       str line = s::move(*line_opt);
+      // $LINENO counts the lines read, as zsh's lexer does.
+      int first_line = line_no++;
       if (line.empty()) continue;
       // An unfinished `if`, loop, quote or here-document goes on over the
       // next lines, read after PS2.  Ctrl-C there drops the whole command.
       bool comments = opts.get(jfsh::OPT_INTERACTIVECOMMENTS);
+      // A line as it goes into the history: HIST_REDUCE_BLANKS closes up
+      // the blanks between its words (zsh's histreduceblanks in hend).
+      auto history_text = [&](const str& text) {
+        const jfsh::AliasTable* aliases = opts.get(jfsh::OPT_ALIASES) ? &ctx.aliases : nullptr;
+        return jfsh::HistoryManager::hend_text(
+            text, hist_opts.reduce_blanks ? jfsh::word_spans(text, comments, aliases) : s::nullopt,
+            hist_opts);
+      };
       while (jfsh::is_incomplete(line, comments)) {
         editor.set_prebuffer(line + "\n");
         auto more = editor.read_line(/*continuation=*/true);
         if (not more) break;
         if (editor.interrupted()) {
+          interrupted();
           line.clear();
           break;
         }
         line += '\n';
         line += *more;
+        ++line_no;
       }
       if (line.empty()) continue;
+      // VERBOSE: the line as it was read, before history expansion.
+      if (opts.get(jfsh::OPT_VERBOSE)) {
+        s::fprintf(stderr, "%s\n", line.c_str());
+        s::fflush(stderr);
+      }
 
       // Bang history.  An expanded line is shown before it runs; with
       // HIST_VERIFY it comes back to be edited instead, and :p only shows
@@ -451,16 +599,19 @@ int main(int argc, char* argv[]) {
         }
         s::fprintf(stderr, "%s\n", line.c_str());
         if (expanded->print_only) {
-          history.add(line);
+          history.add(history_text(line));
           continue;
         }
       }
       // The line is in the history before it runs, as in zsh: `history`
-      // and $HISTCMD see it, and `r` replaces it with what it runs.
-      ctx.hist_current = history.add(line) != 0;
-      bool inc_append = not hist_opts.histfile.empty()
+      // and $HISTCMD see it.  Written at once (INC_APPEND_HISTORY,
+      // SHARE_HISTORY) only with $SAVEHIST, as zsh's savehistfile.
+      str stored = history_text(line);
+      ctx.hist_current = history.add(stored) != 0;
+      bool inc_append = not hist_opts.histfile.empty() and hist_opts.savehist > 0
           and (hist_opts.share or opts.get(jfsh::OPT_INCAPPENDHISTORY));
-      if (inc_append and ctx.hist_current) (void)history.save(hist_opts.histfile, jfsh::HistSave::Append);
+      if (inc_append and ctx.hist_current)
+        (void)history.save(hist_opts.histfile, jfsh::HistSave::Append);
       s::time_t started = s::time(nullptr);
 
       // System 1 routing
@@ -480,10 +631,21 @@ int main(int argc, char* argv[]) {
           ctx.last_exit = 0;
         }
       } else {
-        // 7–8. preexec, then the line; $? and ZERR come from the executor.
-        jfsh::before_exec(executor, line);
+        // 7–8. The line is parsed, preexec sees it, then it runs; $? and
+        // ZERR come from the executor.
         ctx.ran_jobs = false;
-        if (not ctx.exiting) ctx.last_exit = executor.exec_string(line);
+        if (auto prog = executor.parse_string(line, first_line); not prog) {
+          executor.report_parse_error(prog.error());
+          ctx.last_exit = 1;
+        } else {
+          // $1 is the line as read and history-expanded, as the history
+          // has it (HIST_REDUCE_BLANKS): zsh keeps it in the ring while it
+          // runs even when the history then drops it.
+          jfsh::before_exec(executor, stored, **prog);
+          // An `exit` leaves $? as it was, for the logout files.
+          if (not ctx.exiting)
+            if (int rc = executor.exec_parsed(**prog); not ctx.exiting) ctx.last_exit = rc;
+        }
         // Ctrl-C: the terminal echoed ^C; start the prompt on a new line.
         if (s::exchange(ctx.intr_echoed, false)) s::fputc('\n', stderr);
       }
@@ -491,7 +653,7 @@ int main(int argc, char* argv[]) {
         history.set_last_elapsed(static_cast<s::uint32_t>(s::time(nullptr) - started));
         // INC_APPEND_HISTORY_TIME: written once it is done, with its time.
         if (opts.get(jfsh::OPT_INCAPPENDHISTORYTIME) and not opts.get(jfsh::OPT_INCAPPENDHISTORY)
-            and not hist_opts.share and not hist_opts.histfile.empty())
+            and not hist_opts.share and not hist_opts.histfile.empty() and hist_opts.savehist > 0)
           (void)history.save(hist_opts.histfile, jfsh::HistSave::Append);
       }
       ctx.hist_current = false;
@@ -504,6 +666,14 @@ int main(int argc, char* argv[]) {
       }
       warned        = false;
       prev_ran_jobs = ctx.ran_jobs;
+      eofs_ignored  = 0;
+      // -t: after one line the shell runs its EXIT trap and leaves at once
+      // (zsh's loop: dotrap, realexit), without the rest of zexit.
+      if (opts.get(jfsh::OPT_SINGLECOMMAND)) {
+        int rc = executor.run_exit_trap(ctx.last_exit);
+        s::fflush(nullptr);
+        return rc;
+      }
     }
 
     // HUP: jobs left running get SIGHUP (stopped ones too, with SIGCONT,
@@ -546,6 +716,9 @@ int main(int argc, char* argv[]) {
       if (not blank) ctx.last_exit = executor.exec_string(pending, true, line_no);
       line_no += static_cast<int>(s::count(pending.begin(), pending.end(), '\n'));
       pending.clear();
+      // Between commands $LINENO is where reading has got to, blank lines
+      // included (an EXIT trap at the end sees the line after the last).
+      if (not (ctx.exiting and ctx.exit_now)) ctx.lineno = static_cast<s::uint32_t>(line_no);
       // A `return` at the top ends the script, as it ends a file.
       return not ctx.exiting and not executor.take_top_return();
     };

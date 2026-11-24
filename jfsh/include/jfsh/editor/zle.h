@@ -94,11 +94,21 @@ struct Zle {
   // next prompt starts from.
   opt<str>                next_buffer;
   int                     next_hist_index = -1;
+  // The terminal editors draw on (zsh's SHTTY/shout), opened by the shell
+  // at startup; -1 for standard output.
+  int                     tty_out         = -1;
 
   ZleHooks                hooks;
   const ParamTable*       params     = nullptr;
   CompletionEngine*       completion = nullptr;
   Editor*                 active     = nullptr;   // the editor reading a line
+  // What the interrupt key (VINTR) does in any editor (the prompt's,
+  // vared's), as the shell's SIGINT handler would: true to end the read as
+  // an interrupt; false to go on editing (INT ignored, or its trap ran).
+  // A trap that broke the read leaves its status in `trap_break`.  Unset,
+  // the key always interrupts.
+  func<bool(Editor&)>     on_interrupt;
+  opt<int>                trap_break;
 
   sptr<Keymap> keymap(strv name) const;
   // The name a keymap is listed under (its primary name), for $KEYMAP.

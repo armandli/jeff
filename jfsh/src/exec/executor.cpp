@@ -26,6 +26,7 @@
 #include <jfsh/builtins/cond.h>
 #include <jfsh/builtins/math.h>
 #include <jfsh/core/aliases.h>
+#include <jfsh/core/read_file.h>
 #include <jfsh/core/stack.h>
 #include <jfsh/editor/completion.h>
 #include <jfsh/editor/zle.h>
@@ -74,8 +75,8 @@ static void set_comments(Lexer& lex, const OptionState& opts) {
     lex.push_state(LEX_SKIPCOMMENTS);
 }
 
-Result<ProgRef> Executor::parse_string(strv src) {
-  StringInputSource in{str(src)};
+Result<ProgRef> Executor::parse_string(strv src, int first_line) {
+  StringInputSource in{str(src), first_line};
   Lexer lex{in};
   set_comments(lex, mCtx.opts);
   Parser parser{lex};
@@ -91,16 +92,23 @@ int Executor::exec_string(strv src, bool by_line, int first_line) {
   auto parse_failed = [&](const ShellError& e) {
     report_parse_error(e);
     mParseFailed = true;
+    mStatusBeforeParseError = mCtx.last_exit;
     mCtx.last_exit = 1;
     return 1;
   };
   if (not by_line) {
-    auto prog = parse_string(src);
+    auto prog = parse_string(src, first_line);
     if (not prog) return parse_failed(prog.error());
     return exec_parsed(**prog);
   }
   StringDepth depth{*this};
   StringInputSource in{str(src), first_line};
+  // VERBOSE: each line is shown as it is read (zsh's inputline).
+  in.on_line([this](strv line) {
+    if (not mCtx.opts.get(OPT_VERBOSE)) return;
+    s::fwrite(line.data(), 1, line.size(), stderr);
+    s::fflush(stderr);
+  });
   Lexer lex{in};
   set_comments(lex, mCtx.opts);
   Parser parser{lex};
@@ -110,10 +118,21 @@ int Executor::exec_string(strv src, bool by_line, int first_line) {
     parser.set_aliases(mCtx.opts.get(OPT_ALIASES) ? &mCtx.aliases : nullptr);
     auto prog = parser.parse_line();
     if (not prog) return parse_failed(prog.error());
-    if ((*prog)->prog.size() > 1) rc = exec(**prog);
+    bool ran = (*prog)->prog.size() > 1;
+    if (ran) rc = exec(**prog);
+    // Between commands $LINENO is where reading has got to, as zsh's
+    // lexer counts it (an EXIT trap at the end sees the line after).
+    if (not (mCtx.exiting and mCtx.exit_now)) mCtx.lineno = static_cast<s::uint32_t>(in.line());
     if (mCtx.returning and mCtx.return_line and mCtx.func_depth == 0 and mStringDepth == 1) {
       mCtx.returning = mCtx.return_line = false;
       rc = mCtx.last_exit = mCtx.return_val;
+    }
+    // -t (SINGLE_COMMAND): the script or standard input ends after its
+    // first command, as zsh's top-level loop does.
+    if (ran and mStringDepth == 1 and mCtx.opts.get(OPT_SINGLECOMMAND) and not mCtx.exiting) {
+      mCtx.exiting  = true;
+      mCtx.exit_val = rc;
+      mCtx.loop.single_done = true;
     }
     if (parser.at_eof() or interrupted()) break;
   }
@@ -329,7 +348,8 @@ int Executor::exec_simple(vec<str> args,
                           vec<Assignment>  assigns,
                           vec<Redirection> redirs,
                           ExecFlags flags,
-                          vec<Assignment>  typeset_args) {
+                          vec<Assignment>  typeset_args,
+                          bool simple) {
   opt<int> subst_status;
   // `noglob cmd`: the words are not globbed.
   bool noglob = false;
@@ -365,6 +385,7 @@ int Executor::exec_simple(vec<str> args,
   vec<s::size_t> counts;
   bool fatal = true;
   auto substs_before = mProcSubsts;
+  bool had_words = not args.empty();
   bool expanded = expand_command(args, redirs, subst_status, fatal,
                                  typeset_args.empty() ? nullptr : &counts);
   for (auto& a : typeset_args) {
@@ -532,6 +553,11 @@ int Executor::exec_simple(vec<str> args,
   // or $READNULLCMD (more) for a lone `<file`; under SH_NULLCMD it is `:`.
   // With CSH_NULLCMD, an empty $NULLCMD or after a precommand modifier it
   // is an error, which ends the command line, as in zsh.
+  // $_ is the command's last word from now on, after the precommand
+  // modifiers (zsh's setunderscore); words that expand to nothing leave
+  // it, and `exec` with only redirections empties it.
+  if (not args.empty())                          mCtx.underscore = args.back();
+  else if (replace and not redirs.empty())        mCtx.underscore.clear();
   if (args.empty() and not redirs.empty() and assigns.empty() and not replace) {
     auto param = [&](strv name) {
       auto p = mCtx.params.lookup(name);
@@ -550,6 +576,7 @@ int Executor::exec_simple(vec<str> args,
       args.push_back(s::move(readnullcmd));
     else
       args.push_back(s::move(nullcmd));
+    mCtx.underscore = args.back();
   }
   if (bare_prefix) return 0;
 
@@ -606,6 +633,10 @@ int Executor::exec_simple(vec<str> args,
     int rc = apply_assigns(assigns, temporary ? AssignTo::Prefix : AssignTo::Shell,
                            assign_status);
     if (temporary) mCtx.params.pop_scope();
+    // Assignments alone clear $_ (also `_=x`) when run by zsh's execsimple
+    // (a simple sublist) or with redirections (execcmd_exec); otherwise
+    // execcmd_exec returns before setunderscore and leaves it.
+    if (not had_words and (not redirs.empty() or simple)) mCtx.underscore.clear();
     if (assign_status) subst_status = assign_status;
     // A TRAPxxx that failed in `x=$( … )`: 1, or 2 for SIGINT and SIGQUIT,
     // as zsh's `lastval = errflag ? errflag : cmdoutval`.
@@ -797,16 +828,45 @@ int Executor::exec_simple(vec<str> args,
   return rc;
 }
 
+// $LINENO for the command at es.pc: its line in the script, -c string,
+// sourced file or eval text, or in a function counted from the line the
+// definition starts on (line 0), as zsh's par_funcdef numbers the body.
+static opt<s::uint32_t> line_at(const ExecState& es) noexcept {
+  const auto& lines = es.prog->line_map;
+  if (es.pc >= lines.size()) return s::nullopt;
+  s::uint32_t l = lines[es.pc];
+  if (l == 0) return s::nullopt;   // a command with no line (see above)
+  if (es.prog->line_base == 0) return l;
+  return l >= es.prog->line_base ? l - es.prog->line_base : 0;
+}
+
 int Executor::exec_list(ExecState& es, ExecFlags flags) {
+  // $LINENO is put back once the list is done, as zsh's execlist does;
+  // not after an `exit` that leaves at once (zsh exits from inside it, so
+  // the EXIT trap sees the line of the `exit`).
+  struct KeepLineno {
+    ExecContext& ctx;
+    s::uint32_t  lineno;
+    ~KeepLineno() {
+      if (not (ctx.exiting and ctx.exit_now)) ctx.lineno = lineno;
+    }
+  } keep_lineno{mCtx, mCtx.lineno};
   int rc = 0;
   while (not es.at_end()) {
     WordCode w = es.fetch();
     if (wc_code(w) != WC_LIST) break;  // WC_END
     s::size_t end = es.pc + wc_list_skip(w);
     // DEBUG runs before each command, with its text in $ZSH_DEBUG_CMD,
-    // or after it under NO_DEBUG_BEFORE_CMD, as in zsh.
+    // or after it under NO_DEBUG_BEFORE_CMD, as in zsh; $LINENO is the
+    // command's line by then (execlist's lnp1).
     if (mTrapDepth == 0 and mCtx.opts.get(OPT_DEBUGBEFORECMD)
         and mCtx.signals.traps().trapped(SIGDEBUG)) {
+      ExecState first{es.prog, es.pc};
+      while (not first.at_end() and (wc_code(first.peek()) == WC_SUBLIST
+                                     or wc_code(first.peek()) == WC_PIPE))
+        ++first.pc;
+      if (mEvalTrapFuncDepth != mCtx.func_depth)
+        if (auto line = line_at(first)) mCtx.lineno = *line;
       (void)mCtx.params.set_scalar("ZSH_DEBUG_CMD", list_text(*es.prog, es.pc));
       bool skip = run_debug_trap();
       (void)mCtx.params.unset("ZSH_DEBUG_CMD");
@@ -939,7 +999,7 @@ void Executor::on_command_error(int rc) {
   // chain, and act once per failure (a function whose last command failed
   // already set them off).  ERR_RETURN only minds the command's own place
   // and acts at every level, so a failure returns through each caller.
-  bool exempt = mCtx.noerrexit > 0 or mCtx.err_reported;
+  bool exempt = mCtx.noerrexit > 0 or mCtx.err_reported or mCtx.in_startup;
   mCtx.err_reported = true;
   // Neither ZERR nor DEBUG runs inside another trap.
   if (not exempt and mTrapDepth == 0 and mCtx.signals.traps().trapped(SIGZERR))
@@ -949,7 +1009,8 @@ void Executor::on_command_error(int rc) {
     mCtx.exiting  = true;
     mCtx.exit_now = true;
     mCtx.exit_val = rc;
-  } else if (mCtx.opts.get(OPT_ERRRETURN) and mCtx.noerrreturn == 0) {
+  } else if (mCtx.opts.get(OPT_ERRRETURN) and mCtx.noerrreturn == 0
+             and not (mCtx.in_startup and mCtx.func_depth == 0)) {
     mCtx.returning  = true;
     mCtx.return_val = rc;
   }
@@ -971,6 +1032,7 @@ int Executor::exec_sublist(ExecState& es, ExecFlags flags) {
       auto runs   = mCtx.code_runs;
       mCtx.err_reported = false;
       if (exempt) { ++mCtx.noerrexit; ++mCtx.noerrreturn; }
+      mSimpleSublist = f & WC_SUBLIST_SIMPLE;
       rc = exec_pline(es, static_cast<ExecFlags>(flags & ~EF_NOERRCHECK));
       if (exempt) { --mCtx.noerrexit; --mCtx.noerrreturn; }
       // A TRAPxxx's abort leaves its status, or whatever came after it, in
@@ -1013,8 +1075,11 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
   flags = static_cast<ExecFlags>(flags & ~(EF_ASYNC | EF_DISOWN | EF_PIPELAST | EF_STAGEOUT
                                            | EF_STAGEERR));
   if (n == 1 and not async) {
+    // A simple sublist runs as zsh's execsimple, which sets no
+    // $pipestatus; anything else runs as a job, whose status it is.
+    bool simple = mSimpleSublist;
     int rc = exec_cmd(es, flags);
-    mCtx.pipestatus.assign(1, rc);
+    if (not simple) mCtx.pipestatus.assign(1, rc);
     return rc;
   }
   bool jc = job_control();
@@ -1223,20 +1288,15 @@ int Executor::exec_pline(ExecState& es, ExecFlags flags) {
   return rc;
 }
 
-// $LINENO for the command at es.pc: its line in the script, -c string,
-// sourced file or eval text, or in a function counted from the line the
-// definition starts on.
-static s::uint32_t line_at(const ExecState& es) noexcept {
-  const auto& lines = es.prog->line_map;
-  if (es.pc >= lines.size()) return 0;
-  s::uint32_t l = lines[es.pc];
-  if (es.prog->line_base == 0) return l;
-  return l > es.prog->line_base ? l - es.prog->line_base : 1;
-}
-
 int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
+  // Whether the sublist this command makes up was parsed as simple; any
+  // other command reached from here (a pipeline stage) is not.
+  bool simple = s::exchange(mSimpleSublist, false);
   if (es.at_end()) return 0;
-  mCtx.lineno = line_at(es);
+  // A command with no line of its own (the body of a short `f() cmd`)
+  // keeps the line it was run from, as does a trap's own code.
+  if (mEvalTrapFuncDepth != mCtx.func_depth)
+    if (auto line = line_at(es)) mCtx.lineno = *line;
   // Process substitutions in the command's words (`for f in <(cmd)`) last
   // until it is done; those made outside any command go with the
   // outermost one.
@@ -1258,10 +1318,10 @@ int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
   while (wc_code(es.prog->prog[pc]) == WC_REDIR) pc += 2;
   switch (wc_code(es.prog->prog[pc])) {
     case WC_ASSIGN: case WC_SIMPLE: case WC_TYPESET:
-      return exec_simple_cmd(es, flags);
+      return exec_simple_cmd(es, flags, simple);
     default: break;
   }
-  if (pc == es.pc) return exec_compound(es, flags);
+  if (pc == es.pc) return exec_compound(es, flags, simple);
 
   vec<Redirection> redirs;
   while (wc_code(es.peek()) == WC_REDIR) redirs.push_back(fetch_redir(es));
@@ -1272,13 +1332,17 @@ int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
   SavedFds saved;
   s::fflush(nullptr);
   if (not apply_redirects(redirs, saved, flags)) return 1;
-  int rc = exec_compound(es, flags);
+  int rc = exec_compound(es, flags, simple);
   s::fflush(nullptr);
   return rc;
 }
 
-int Executor::exec_compound(ExecState& es, ExecFlags flags) {
+int Executor::exec_compound(ExecState& es, ExecFlags flags, bool simple) {
   WordCode head = es.fetch();
+  // A compound command has no words: run as a job (zsh's execcmd_exec) it
+  // empties $_ from its start; a simple sublist (WC_SUBLIST_SIMPLE, zsh's
+  // execsimple) leaves it.  A function definition sees to its own.
+  if (wc_code(head) != WC_FUNCDEF and not simple) mCtx.underscore.clear();
   switch (wc_code(head)) {
     case WC_IF:       return exec_if(es, head);
     case WC_WHILE:    return exec_while(es, head);
@@ -1304,7 +1368,7 @@ int Executor::exec_compound(ExecState& es, ExecFlags flags) {
 
 // simple := (assign | redir)* WC_SIMPLE(argc) WC_STRING{argc}
 //         | (assign | redir)* WC_TYPESET(n) item{n}
-int Executor::exec_simple_cmd(ExecState& es, ExecFlags flags) {
+int Executor::exec_simple_cmd(ExecState& es, ExecFlags flags, bool simple) {
   auto fetch_assign = [&] {
     WordCode f = wc_data(es.fetch());
     Assignment a;
@@ -1336,7 +1400,7 @@ int Executor::exec_simple_cmd(ExecState& es, ExecFlags flags) {
     }
   }
   int rc = exec_simple(s::move(words), s::move(assigns), s::move(redirs),
-                       flags, s::move(typeset_args));
+                       flags, s::move(typeset_args), simple);
   // A trap returned during its expansion: the function returns its status
   // (an assignment's too).
   bool assign_only = mCtx.returning and mCtx.func_depth > 0
@@ -1759,6 +1823,8 @@ int Executor::exec_funcdef(ExecState& es, WordCode head) {
       s::fprintf(stderr, "jfsh: %s\n", args.error().message.c_str());
       return 1;
     }
+    // $_ is its last argument, as for any command.
+    mCtx.underscore = args->empty() ? str{} : args->back();
     args->insert(args->begin(), "(anon)");
     return call_function(body, *args);
   }
@@ -1785,6 +1851,7 @@ int Executor::exec_funcdef(ExecState& es, WordCode head) {
     mCtx.function_files[name] = mCtx.source_name.empty() ? mCtx.arg0 : mCtx.source_name;
     mCtx.functions[s::move(name)] = body;
   }
+  mCtx.underscore.clear();
   es.pc = end;
   return 0;
 }
@@ -2598,11 +2665,16 @@ bool Executor::apply_redirects(const vec<Redirection>& redirs,
   };
   // `N>&M` and `N<&M`: M, which must not be one of the shell's own fds,
   // is duplicated onto N.
+  // The shell's own fds (zsh's FDT_INTERNAL): those it moved high, the
+  // self-pipe, and its terminal.
+  auto internal = [&](int fd) {
+    const auto& sig = mCtx.signals;
+    return is_shell_fd(fd) or fd == sig.wake_fd() or fd == sig.self_pipe_write_fd()
+        or fd == sig.tty_fd() or (mCtx.zle and fd == mCtx.zle->tty_out);
+  };
   auto dup_fd = [&](int src, int dst, bool output) {
     if (not finish(src)) return abandon();
-    const auto& sig = mCtx.signals;
-    bool user = src >= 0 and not is_shell_fd(src) and src != sig.wake_fd()
-            and src != sig.self_pipe_write_fd() and src != sig.tty_fd();
+    bool user = src >= 0 and not internal(src);
     errno = EBADF;
     int fd = user ? ::fcntl(src, F_DUPFD_CLOEXEC, 10) : -1;
     if (fd < 0) {
@@ -2649,7 +2721,14 @@ bool Executor::apply_redirects(const vec<Redirection>& redirs,
                    r.varid.c_str());
         return abandon();
       }
-      if (::close(*fd) != 0) return report(v);
+      if (*fd >= 10 and internal(*fd)) {
+        s::fprintf(stderr, "jfsh: file descriptor %d used by shell, not closed\n", *fd);
+        return abandon();
+      }
+      // A close that fails is only reported (zsh's "failed to close").
+      if (::close(*fd) != 0)
+        s::fprintf(stderr, "jfsh: failed to close file descriptor %d: %s\n", *fd,
+                   errno_text(errno).c_str());
       return true;
     }
     int fd = -1;
@@ -3302,6 +3381,9 @@ int Executor::call_function(const ProgRef& body,
       mCtx.positional, vec<str>(args.begin() + 1, args.end()));
   str saved_arg0 = mCtx.arg0;
   if (mCtx.opts.get(OPT_FUNCTIONARGZERO)) mCtx.arg0 = args[0];
+  str saved_script = s::exchange(mCtx.script_name, args[0]);
+  // $_ is put back once the function is done (zsh's doshfunc).
+  str saved_underscore = mCtx.underscore;
   OptionState saved_opts  = mCtx.opts;
   mCtx.signals.push_trap_frame();
   int saved_noerrreturn = s::exchange(mCtx.noerrreturn, 0);
@@ -3406,6 +3488,8 @@ int Executor::call_function(const ProgRef& body,
   }
   if (mCtx.opts.get(OPT_LOCALOPTIONS)) mCtx.opts = saved_opts;
   mCtx.arg0       = s::move(saved_arg0);
+  mCtx.script_name = s::move(saved_script);
+  mCtx.underscore  = s::move(saved_underscore);
   mCtx.positional = s::move(saved_positional);
   // An `exit` in a function the EXIT trap called gives the final status
   // but acts as `return` from that function, with $? 0, as zsh's zexit
@@ -3539,9 +3623,34 @@ static int exec_program(const str& path, vec<str> argv, vec<str>& env,
   return (err == EACCES or err == ENOEXEC) ? 126 : 127;
 }
 
+// zsh's zexecve: the program finds its own path in $_ (absolute, from $PWD
+// when it is relative).
+static void put_underscore(vec<str>& env, const str& path) {
+  str value = path;
+  if (not path.starts_with('/')) {
+    auto pwd = s::find_if(env.begin(), env.end(),
+                          [](const str& e) { return e.starts_with("PWD="); });
+    value = (pwd != env.end() ? pwd->substr(4) : str(".")) + "/" + path;
+  }
+  s::erase_if(env, [](const str& e) { return e.starts_with("_="); });
+  env.push_back("_=" + value);
+}
+
 static bool assigns_path(const vec<Assignment>& assigns) {
   return s::any_of(assigns.begin(), assigns.end(),
                    [](const Assignment& a) { return a.name == "PATH"; });
+}
+
+// The shell itself (not a subshell) is about to become another program:
+// one level fewer in $SHLVL, and before an `exec` the interactive shell's
+// history is saved, as zsh's execute does.
+void Executor::leave_shell(bool explicit_exec) {
+  if (::getpid() != mCtx.shell_pid) return;
+  if (auto p = mCtx.params.lookup("SHLVL"); p and p->get().is_set()) {
+    s::int64_t lvl = s::strtoll(p->get().scalar().c_str(), nullptr, 10);
+    (void)mCtx.params.set_scalar("SHLVL", s::to_string(lvl - 1));
+  }
+  if (explicit_exec and mCtx.loop.save_history) mCtx.loop.save_history();
 }
 
 int Executor::run_external(const vec<str>& args,
@@ -3561,8 +3670,10 @@ int Executor::run_external(const vec<str>& args,
   // on this process directly, unless an `=(…)` file has to be removed once
   // it is done.
   bool tmp_files = mPsubst and not mPsubst->tmp_files.empty();
-  if ((flags & EF_NOFORK) and not tmp_files)
+  if ((flags & EF_NOFORK) and not tmp_files) {
+    leave_shell(false);
     exec_external_child(args, assigns, redirs, s::move(found), traced, flags);
+  }
 
   pid_t pid = fork_command(flags, ChildKind::Other);
   if (pid < 0) return 1;
@@ -3636,6 +3747,7 @@ void Executor::exec_external_child(const vec<str>&         args,
     _exit(found->error().kind == ErrorKind::PermissionDenied ? 126 : 127);
   }
   vec<str> env = mCtx.params.make_envp();
+  put_underscore(env, **found);
   _exit(exec_program(**found, args, env, args[0]));
 }
 
@@ -3668,8 +3780,10 @@ int Executor::exec_replace(const vec<str>& args, vec<Assignment> assigns,
     s::fprintf(stderr, "jfsh: %s\n", path.error().message.c_str());
     return fail(path.error().kind == ErrorKind::PermissionDenied ? 126 : 127);
   }
+  leave_shell(true);
   // `exec -c`: an empty environment, without even the assignments.
   vec<str> env = clear_env ? vec<str>{} : mCtx.params.make_envp();
+  if (not clear_env) put_underscore(env, *path);
   vec<str> argv_s = args;
   if (argv0 == "-")        argv_s[0] = "-" + argv_s[0];
   else if (not argv0.empty()) argv_s[0] = argv0;
@@ -3691,42 +3805,55 @@ int Executor::exec_replace(const vec<str>& args, vec<Assignment> assigns,
   return fail(rc);
 }
 
-static opt<str> read_file(const str& path) {
-  s::FILE* f = s::fopen(path.c_str(), "r");
-  if (not f) return s::nullopt;
-  str text;
-  char buf[4096];
-  s::size_t n;
-  while ((n = s::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
-  s::fclose(f);
-  return text;
-}
 
-int Executor::source_file(const str& path, const vec<str>& args, const str& name) {
+int Executor::source_file(const str& path, const vec<str>& args, const str& name,
+                          bool startup) {
   auto text = read_file(path);
-  if (not text) {
-    s::fprintf(stderr, "jfsh: %s: %s\n", s::strerror(errno), name.c_str());
-    return 1;
-  }
+  // A directory reads as nothing, as zsh's source() finds it.
+  if (not text and errno == EISDIR) text = str{};
+  // One that can't be opened is zsh's SOURCE_NOT_FOUND: a startup file is
+  // skipped, `.` says why (errno is left for it).
+  if (not text) return startup ? 0 : SOURCE_NOT_FOUND;
   vec<str> saved_positional;
   bool     set_args = not args.empty();
   if (set_args) saved_positional = s::exchange(mCtx.positional, args);
   FuncFrame frame{mCtx, name};
-  str saved_arg0   = mCtx.arg0;
+  // `.` names $0 after the file under FUNCTION_ARGZERO and puts it back
+  // after (zsh's bin_dot); otherwise, and for a startup file, $0 is left
+  // alone, also when the file assigns it.
+  opt<str> saved_arg0;
+  if (not startup and mCtx.opts.get(OPT_FUNCTIONARGZERO))
+    saved_arg0 = s::exchange(mCtx.arg0, name);
   str saved_source = s::exchange(mCtx.source_name, path);
-  if (mCtx.opts.get(OPT_FUNCTIONARGZERO)) mCtx.arg0 = name;
+  str saved_script = s::exchange(mCtx.script_name, path);
   // The file is not inside the caller's loops, as zsh's source sets
   // `loops` to 0: a `break` in it is an error.
   int saved_loops = s::exchange(mCtx.loop_depth, 0);
+  s::uint32_t saved_lineno = mCtx.lineno;
+  // Commands come from the file, not standard input (zsh's source()).
+  bool saved_shinstdin = mCtx.opts.get(OPT_SHINSTDIN);
+  mCtx.opts.assign(OPT_SHINSTDIN, false);
   mCtx.interrupt = false;
   mParseFailed   = false;
   ++mCtx.source_depth;
   ++mCtx.code_runs;
-  int rc = exec_string(*text, /*by_line=*/true);
+  int rc;
+  {
+    // A file read with no command around it (a startup file) is still not
+    // the shell's top level: an error ends the file, not the shell.
+    opt<StringDepth> outer;
+    if (mStringDepth == 0) outer.emplace(*this);
+    rc = exec_string(*text, /*by_line=*/true);
+  }
   --mCtx.source_depth;
-  // A parse error in the file gives the caller 126, as in zsh.
-  if (s::exchange(mParseFailed, false)) rc = mCtx.last_exit = 126;
+  mCtx.opts.assign(OPT_SHINSTDIN, saved_shinstdin);
+  // A parse error in the file gives `.` 126, as in zsh's bin_dot; a
+  // startup file leaves the status as the error left it.
+  if (s::exchange(mParseFailed, false))
+    rc = mCtx.last_exit = startup ? mStatusBeforeParseError : 126;
   mCtx.loop_depth = saved_loops;
+  // (Not after an `exit` that leaves at once: the EXIT trap sees its line.)
+  if (not (mCtx.exiting and mCtx.exit_now)) mCtx.lineno = saved_lineno;
   // `return` in the file ends the file.
   if (mCtx.returning) {
     mCtx.returning = false;
@@ -3735,13 +3862,15 @@ int Executor::source_file(const str& path, const vec<str>& args, const str& name
   // An error ends the file but not the caller, which sees status 126, as
   // in zsh.  An interrupt goes on unwinding, and under ERR_EXIT so does
   // the error (the shell exits with its status, 1).
-  if (mCtx.aborting and not mCtx.interrupt and not mCtx.opts.errexit()) {
+  if (mCtx.aborting and not mCtx.interrupt
+      and not (mCtx.opts.errexit() and not mCtx.in_startup)) {
     mCtx.aborting = mCtx.abort_line = false;
     mCtx.end_trap_abort();
-    rc = mCtx.last_exit = 126;
+    rc = startup ? mCtx.last_exit : (mCtx.last_exit = 126);
   }
   mCtx.source_name = s::move(saved_source);
-  mCtx.arg0        = s::move(saved_arg0);
+  mCtx.script_name = s::move(saved_script);
+  if (saved_arg0) mCtx.arg0 = s::move(*saved_arg0);
   if (set_args) mCtx.positional = s::move(saved_positional);
   return rc;
 }
@@ -3943,7 +4072,7 @@ PromptHooks Executor::prompt_hooks() {
     mCtx.jobs.for_each([&](const Job&) { ++n; });
     return n;
   };
-  h.script_name = [this] { return mCtx.source_name.empty() ? mCtx.arg0 : mCtx.source_name; };
+  h.script_name = [this] { return mCtx.script_name.empty() ? mCtx.arg0 : mCtx.script_name; };
   h.eval_depth  = [this] { return s::max(0, mStringDepth - 1); };
   return h;
 }
@@ -4180,6 +4309,19 @@ void Executor::run_trap(int sig) {
 }
 
 int Executor::run_trap_command(const Trap& trap) {
+  // Its commands leave $LINENO at the line the trap came in on, unless a
+  // function they call sets it (zsh's IN_EVAL_TRAP).
+  s::uint32_t saved_lineno = mCtx.lineno;
+  int saved_depth = s::exchange(mEvalTrapFuncDepth, mCtx.func_depth);
+  struct Restore {
+    Executor& ex;
+    s::uint32_t lineno;
+    int depth;
+    ~Restore() {
+      ex.mCtx.lineno = lineno;
+      ex.mEvalTrapFuncDepth = depth;
+    }
+  } restore{*this, saved_lineno, saved_depth};
   // The trap holds what it parsed when it was set; it is kept alive here
   // in case the trap resets itself.  A `return` in it is left for the
   // caller (run_trap) to act on.

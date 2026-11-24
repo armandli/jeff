@@ -1,7 +1,10 @@
 // Builtins that run code or end it: `.`, source, eval, exit, return,
 // autoload and functions.
 
+#include <cctype>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -50,7 +53,16 @@ int source_common(vec<str>& args, ExecContext& ctx, bool cwd_first) {
     return 127;
   }
   vec<str> rest(args.begin() + 2, args.end());
-  return ctx.executor->source_file(*path, rest, args[1]);
+  int rc = ctx.executor->source_file(*path, rest, args[1]);
+  if (rc == Executor::SOURCE_NOT_FOUND) {
+    // zsh's bin_dot: "%e: %s", status 127 (zsh's %e starts lower-case).
+    str why = s::strerror(errno);
+    if (why.size() > 1 and not s::isupper(static_cast<unsigned char>(why[1])))
+      why[0] = static_cast<char>(s::tolower(static_cast<unsigned char>(why[0])));
+    builtin_error(cmd, why + ": " + args[1]);
+    return 127;
+  }
+  return rc;
 }
 
 // `exit`/`return`'s argument, an arithmetic expression; the last status
@@ -133,7 +145,20 @@ int builtin_exit(vec<str>& args, ExecContext& ctx) {
   ctx.exit_val = *n & 0xff;
   // Outside a function zsh exits at once; in one, the exit unwinds it.
   ctx.exit_now = ctx.func_depth == 0;
-  return ctx.exit_val;
+  // $? stays as it was until the shell has gone through its logout files
+  // (zsh's zexit sets lastval to the exit value only after them).
+  return ctx.last_exit;
+}
+
+// logout [n]: exit, in a login shell; elsewhere an error that ends the
+// command line (zsh's zerrnam).
+int builtin_logout(vec<str>& args, ExecContext& ctx) {
+  if (not ctx.opts.login()) {
+    builtin_error(args[0], "not login shell");
+    ctx.aborting = true;
+    return 1;
+  }
+  return builtin_exit(args, ctx);
 }
 
 // return [n]: leaves the function or sourced file (outside both, the

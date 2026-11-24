@@ -92,10 +92,13 @@ static void refresh(Param& p) noexcept {
     p.value = p.handlers->get_hash();
   } else if (p.handlers->get_array) {
     p.value = p.handlers->get_array();
+  } else if (p.is_float() and p.handlers->get_float) {
+    p.value = p.handlers->get_float();
   } else if (p.handlers->get_scalar) {
     str v = p.handlers->get_scalar();
-    if (p.is_integer()) p.value = static_cast<s::int64_t>(s::strtoll(v.c_str(), nullptr, 10));
-    else                p.value = s::move(v);
+    if (p.is_integer())    p.value = static_cast<s::int64_t>(s::strtoll(v.c_str(), nullptr, 10));
+    else if (p.is_float()) p.value = s::strtod(v.c_str(), nullptr);
+    else                   p.value = s::move(v);
   }
   active.pop_back();
 }

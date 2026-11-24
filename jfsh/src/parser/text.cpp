@@ -762,6 +762,14 @@ vec<str> pipeline_stage_texts(const CompiledProgram& prog,
   return Decompiler{{prog, pc}}.stages();
 }
 
+str job_text(const CompiledProgram& prog) {
+  // On one line: newlines in words become blanks, as zsh's taddstr makes
+  // them for job texts.
+  str text = Decompiler{{prog, 0}}.body();
+  s::replace(text.begin(), text.end(), '\n', ' ');
+  return text;
+}
+
 str sublist_text(const CompiledProgram& prog, s::size_t pc) {
   // zsh names a background `a && b` (or `! a`) by its last pipeline.
   Decompiler d{{prog, pc}};

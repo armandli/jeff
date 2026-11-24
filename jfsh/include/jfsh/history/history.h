@@ -70,6 +70,15 @@ struct HistoryManager {
 
   // Returns the assigned history number, or 0 if suppressed.
   s::uint32_t add(str text, s::uint32_t elapsed = 0);
+  // HIST_REDUCE_BLANKS, as zsh's histreduceblanks: `line` with the blanks
+  // between its `words` ([begin, end) from the lexer, zsh's chwords)
+  // closed up.  The interactive loop applies it to the lines it reads.
+  static str reduce_blanks(strv line, const vec<s::pair<s::size_t, s::size_t>>& words,
+                           bool keep_leading);
+  // A line as zsh's hend puts it in the history: reduced (with these
+  // options) only when its words were read to its end (`words` set).
+  static str hend_text(strv line, const opt<vec<s::pair<s::size_t, s::size_t>>>& words,
+                       const HistOptions& o);
 
   // Bang history: !!, !N, !-N, !str, !?str?, !#, !{…}, ^old^new, word
   // designators (:0 ^ $ * x-y %) and modifiers (:h :t :r :e :s :gs :&
@@ -88,11 +97,6 @@ struct HistoryManager {
 
   const vec<HistEntry>& entries() const noexcept { return mEntries; }
 
-  // Changes the text of the newest entry: `r` and `fc -s` leave the
-  // command they ran in place of their own line, as zsh does.
-  void replace_last(str text) {
-    if (not mEntries.empty()) mEntries.back().text = s::move(text);
-  }
   // Records how long the newest entry took (INC_APPEND_HISTORY_TIME and
   // EXTENDED_HISTORY write it).
   void set_last_elapsed(s::uint32_t secs) {

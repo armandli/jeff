@@ -8,6 +8,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -21,6 +22,8 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -40,7 +43,9 @@ struct Pty {
 
   // The startup files come from `zdotdir`: by default one that doesn't
   // exist, so the user's own files stay out of the tests.
-  explicit Pty(const std::string& zdotdir = "/nonexistent/jfsh-test-zdotdir") {
+  // `flag` is one more option for the shell (`-l`, `-f`).
+  explicit Pty(const std::string& zdotdir = "/nonexistent/jfsh-test-zdotdir",
+               const char* flag = nullptr) {
     pid = ::forkpty(&fd, nullptr, nullptr, nullptr);
     if (pid == 0) {
       ::setenv("PS1", "%% ", 1);
@@ -50,7 +55,7 @@ struct Pty {
       // vi editing would follow an $EDITOR that mentions vi.
       ::unsetenv("EDITOR");
       ::unsetenv("VISUAL");
-      ::execl(JFSH_BINARY, JFSH_BINARY, "--norouter", "-i", static_cast<char*>(nullptr));
+      ::execl(JFSH_BINARY, JFSH_BINARY, "--norouter", "-i", flag, static_cast<char*>(nullptr));
       _exit(127);
     }
   }
@@ -421,9 +426,11 @@ TEST(Interactive, LineIsInHistoryWhileItRuns) {
   sh.line("echo $HISTCMD");
   EXPECT_TRUE(sh.expect("2\r\n")) << sh.out;
   sh.line("r");
-  EXPECT_TRUE(sh.expect("echo $HISTCMD\r\n3")) << sh.out;   // r reran line 2 as event 3
+  // As zsh 5.9: `r` stays event 3 and reruns line 2 as event 4.
+  EXPECT_TRUE(sh.expect("echo $HISTCMD\r\n4")) << sh.out;
   sh.line("fc -l");
-  EXPECT_TRUE(sh.expect("    1  echo one\r\n    2  echo $HISTCMD\r\n    3  echo $HISTCMD\r\n"))
+  EXPECT_TRUE(sh.expect("    1  echo one\r\n    2  echo $HISTCMD\r\n    3  r\r\n"
+                        "    4  echo $HISTCMD\r\n"))
       << sh.out;
 }
 
@@ -800,6 +807,362 @@ TEST(InteractiveM7Review, PushdAloneWithAnEmptyStackGoesHome) {
   }
   std::error_code ec;
   std::filesystem::remove_all(d, ec);
+}
+
+// ---- M8 review: zsh 5.9's output for the same keystrokes -------------------------
+
+// `r` stays in the history and what it reruns comes after it, run at once
+// (zsh's fc: stuff() and loop()); a first `history` lists itself.
+TEST(InteractiveM8Review, RerunKeepsItsLineAndHistoryListsItself) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("history");
+  EXPECT_TRUE(sh.expect("    1  history\r\n")) << sh.out;
+  sh.line("echo one");
+  ASSERT_TRUE(sh.expect("one\r\n")) << sh.out;
+  sh.line("r; echo after");
+  EXPECT_TRUE(sh.expect("echo one\r\none\r\nafter\r\n")) << sh.out;
+  sh.line("fc -l");
+  EXPECT_TRUE(sh.expect("    1  history\r\n    2  echo one\r\n    3  r; echo after\r\n"
+                        "    4  echo one\r\n")) << sh.out;
+}
+
+// preexec's $2 and $3 are the parsed line, on one line and in full.
+TEST(InteractiveM8Review, PreexecGetsTheParsedLine) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("preexec() { print -r -- \"1[$1]\"; print -r -- \"2[$2]\"; print -r -- \"3[$3]\" }");
+  sh.line("for i in 1; do echo $i; done");
+  EXPECT_TRUE(sh.expect("1[for i in 1; do echo $i; done]\r\n2[for i in 1; do; echo $i; done]\r\n"
+                        "3[for i in 1\r\ndo\r\n\techo $i\r\ndone]\r\n1\r\n")) << sh.out;
+}
+
+// $LINENO counts the lines read; a function counts from its definition.
+TEST(InteractiveM8Review, LinenoAndVerbose) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("echo L$LINENO");
+  ASSERT_TRUE(sh.expect("L1\r\n")) << sh.out;
+  sh.line("echo L$LINENO");
+  EXPECT_TRUE(sh.expect("L2\r\n")) << sh.out;
+  sh.line("f() { echo F$LINENO; }; f");
+  EXPECT_TRUE(sh.expect("F0\r\n")) << sh.out;
+  sh.line("set -v");
+  sh.line("echo V$((1))");
+  EXPECT_TRUE(sh.expect("echo V$((1))\r\nV1\r\n")) << sh.out;
+}
+
+// IGNORE_EOF: each Ctrl-D says how to leave; the tenth leaves.
+TEST(InteractiveM8Review, IgnoreEofAndLogout) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("logout");
+  EXPECT_TRUE(sh.expect("logout: not login shell\r\n")) << sh.out;
+  sh.line("setopt ignoreeof");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  for (int i = 0; i < 9; ++i) {
+    std::this_thread::sleep_for(100ms);
+    sh.send("\x04");
+    ASSERT_TRUE(sh.expect("jfsh: use 'exit' to exit.\r\n")) << i << sh.out;
+  }
+  int st = 0;
+  EXPECT_FALSE(sh.exits(st, 300ms)) << sh.out;
+  sh.send("\x04");
+  ASSERT_TRUE(sh.exits(st)) << sh.out;
+  EXPECT_TRUE(WIFEXITED(st) and WEXITSTATUS(st) == 0) << st;
+}
+
+// A login shell's logout file sees $? as it was before `exit`, and an
+// `exit` in it sets the shell's status (zsh's zexit).
+TEST(InteractiveM8Review, LogoutFileStatus) {
+  char tmpl[] = "/tmp/jfsh_m8_XXXXXX";
+  ASSERT_NE(::mkdtemp(tmpl), nullptr);
+  std::string d = tmpl;
+  std::ofstream(d + "/.jfshenv") << ":\n";
+  std::ofstream(d + "/.jfsh_logout") << "echo LO $?; exit 7\n";
+  {
+    Pty sh(d, "-l");
+    ASSERT_TRUE(sh.expect("% "));
+    sh.line("exit 4");
+    EXPECT_TRUE(sh.expect("LO 0\r\n")) << sh.out;
+    int st = 0;
+    ASSERT_TRUE(sh.exits(st)) << sh.out;
+    EXPECT_TRUE(WIFEXITED(st) and WEXITSTATUS(st) == 7) << st;
+  }
+  std::filesystem::remove_all(d);
+}
+
+// Without RCS (-f) the history file is neither read nor written.
+TEST(InteractiveM8Review, NoHistoryFileWithoutRcs) {
+  char tmpl[] = "/tmp/jfsh_m8_XXXXXX";
+  ASSERT_NE(::mkdtemp(tmpl), nullptr);
+  std::string d = tmpl;
+  {
+    Pty sh(d, "-f");
+    ASSERT_TRUE(sh.expect("% "));
+    sh.line("HISTFILE=" + d + "/h; SAVEHIST=10");
+    sh.line("echo saved");
+    ASSERT_TRUE(sh.expect("saved\r\n")) << sh.out;
+    sh.line("exit");
+    int st = 0;
+    ASSERT_TRUE(sh.exits(st)) << sh.out;
+  }
+  EXPECT_FALSE(std::filesystem::exists(d + "/h"));
+  std::filesystem::remove_all(d);
+}
+
+// preexec's $1 is the line read, also when the history drops it.
+TEST(InteractiveM8Review, PreexecGetsTheLineTheHistoryDrops) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("setopt histignoredups histignorespace; preexec() { print -r -- \"1[$1]\" }");
+  sh.line("echo a");
+  ASSERT_TRUE(sh.expect("1[echo a]\r\na\r\n")) << sh.out;
+  sh.line("echo a");
+  EXPECT_TRUE(sh.expect("1[echo a]\r\na\r\n")) << sh.out;
+  sh.line(" echo sp");
+  EXPECT_TRUE(sh.expect("1[ echo sp]\r\nsp\r\n")) << sh.out;
+}
+
+// `jfsh > file` on a terminal: the line editor draws on the terminal (zsh's
+// SHTTY), and only the commands' output goes to the file.
+TEST(InteractiveM8Review, EditorUsesTheTerminalWhenStdoutIsAFile) {
+  char tmpl[] = "/tmp/jfsh_m8_XXXXXX";
+  ASSERT_NE(::mkdtemp(tmpl), nullptr);
+  std::string d = tmpl;
+  std::string file = d + "/out";
+  int fd = -1;
+  pid_t pid = ::forkpty(&fd, nullptr, nullptr, nullptr);
+  if (pid == 0) {
+    int o = ::open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ::dup2(o, 1);
+    ::close(o);
+    ::setenv("PS1", "P> ", 1);
+    ::setenv("TERM", "xterm", 1);
+    ::setenv("ZDOTDIR", "/nonexistent/jfsh-test-zdotdir", 1);
+    ::unsetenv("HISTFILE");
+    ::execl(JFSH_BINARY, JFSH_BINARY, "--norouter", "-f", static_cast<char*>(nullptr));
+    _exit(127);
+  }
+  std::string got;
+  auto pump = [&](std::chrono::milliseconds t, std::string_view until) {
+    auto end = std::chrono::steady_clock::now() + t;
+    while (std::chrono::steady_clock::now() < end and got.find(until) == std::string::npos) {
+      struct pollfd p{fd, POLLIN, 0};
+      if (::poll(&p, 1, 20) <= 0) continue;
+      char buf[4096];
+      ssize_t n = ::read(fd, buf, sizeof buf);
+      if (n <= 0) break;
+      got.append(buf, static_cast<std::size_t>(n));
+    }
+  };
+  pump(5000ms, "P> ");
+  EXPECT_NE(got.find("P> "), std::string::npos) << got;
+  ::write(fd, "echo hi\n", 8);
+  pump(3000ms, "hi\r\n");
+  ::write(fd, "exit\n", 5);
+  int st = 0;
+  bool reaped = false;
+  for (int i = 0; i < 100 and not reaped; ++i) {
+    pump(50ms, "\x01");
+    reaped = ::waitpid(pid, &st, WNOHANG) == pid;
+  }
+  if (not reaped) {
+    ::kill(pid, SIGKILL);
+    ::waitpid(pid, &st, 0);
+  }
+  ::close(fd);
+  std::ifstream f(file);
+  std::string written((std::istreambuf_iterator<char>(f)), {});
+  EXPECT_EQ(written, "hi\n");
+  std::filesystem::remove_all(d);
+}
+
+// The shell's terminal fd is its own (zsh's FDT_INTERNAL): a redirection
+// can't use it and `{fd}>&-` won't close it.
+TEST(InteractiveM8Review, TheShellsTerminalFdIsInternal) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("echo hi10 >&10; echo st=$?");
+  EXPECT_TRUE(sh.expect("10: bad file descriptor\r\nst=1\r\n")) << sh.out;
+  sh.line("fd=10; exec {fd}>&-; echo st=$?");
+  EXPECT_TRUE(sh.expect("file descriptor 10 used by shell, not closed\r\nst=1\r\n")) << sh.out;
+  sh.line("echo alive");
+  EXPECT_TRUE(sh.expect("alive\r\n")) << sh.out;
+}
+
+// Ctrl-C at the prompt or at PS2 leaves $? 130; a trapped one doesn't.
+TEST(InteractiveM8Review, CtrlCAtThePromptSetsStatus) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("true");
+  ASSERT_TRUE(sh.expect("% "));
+  std::this_thread::sleep_for(200ms);
+  sh.send("abc");
+  std::this_thread::sleep_for(200ms);
+  sh.send("\x03");
+  std::this_thread::sleep_for(200ms);
+  sh.line("echo st=$?");
+  EXPECT_TRUE(sh.expect("st=130\r\n")) << sh.out;
+  sh.line("if true");
+  ASSERT_TRUE(sh.expect("> ")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  sh.send("\x03");
+  std::this_thread::sleep_for(200ms);
+  sh.line("echo st3=$?");
+  EXPECT_TRUE(sh.expect("st3=130\r\n")) << sh.out;
+  // send-break (^G) ends the line with 1 unless $? already says so.
+  sh.line("true");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  sh.send("abc\x07");
+  std::this_thread::sleep_for(200ms);
+  sh.line("echo st4=$?");
+  EXPECT_TRUE(sh.expect("st4=1\r\n")) << sh.out;
+  sh.line("(exit 5)");
+  std::this_thread::sleep_for(200ms);
+  sh.send("abc\x07");
+  std::this_thread::sleep_for(200ms);
+  sh.line("echo st5=$?");
+  EXPECT_TRUE(sh.expect("st5=5\r\n")) << sh.out;
+}
+
+// With INT ignored the interrupt key does nothing; trapped, its trap runs
+// and the line goes on, unless a TRAPINT returns non-zero, which ends the
+// line with that status (zsh's SIGINT handler and dotrap).
+TEST(InteractiveM8Review, CtrlCAtThePromptRunsTheIntTrap) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("trap '' INT; true");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  sh.send("echo a");
+  sh.send("\x03");
+  std::this_thread::sleep_for(300ms);
+  sh.line("b; echo st=$?");
+  EXPECT_TRUE(sh.expect("ab\r\nst=0\r\n")) << sh.out;
+  sh.line("trap 'echo T' INT; false");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  sh.send("\x03");
+  EXPECT_TRUE(sh.expect("T\r\n")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  sh.line("echo st2=$?");
+  EXPECT_TRUE(sh.expect("st2=1\r\n")) << sh.out;
+  sh.line("trap - INT; TRAPINT() { echo TI $1; return 3 }");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  sh.send("yz");
+  sh.send("\x03");
+  EXPECT_TRUE(sh.expect("TI 2")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  sh.line("echo st3=$?");
+  EXPECT_TRUE(sh.expect("st3=3\r\n")) << sh.out;
+}
+
+// An `exit` in the INT trap at the prompt leaves at once, with nothing
+// typed after the Ctrl-C.  As zsh 5.9's zexit from the signal handler, the
+// history is saved and the EXIT trap runs, but a login shell reads no
+// logout file and zshexit doesn't run (EX, status 3).
+TEST(InteractiveM8Review, ExitInTheIntTrapAtThePromptLeavesAtOnce) {
+  char tmpl[] = "/tmp/jfsh_m8_XXXXXX";
+  ASSERT_NE(::mkdtemp(tmpl), nullptr);
+  std::string d = tmpl;
+  std::ofstream(d + "/.jfshrc") << "HISTFILE=" << d << "/hf; SAVEHIST=10\n";
+  std::ofstream(d + "/.jfsh_logout") << "echo LOGOUT\n";
+  {
+    Pty sh(d, "-l");
+    ASSERT_TRUE(sh.expect("% "));
+    sh.line("zshexit() { echo Z$((6*7)) }; trap 'echo EX' EXIT; trap 'exit 3' INT");
+    ASSERT_TRUE(sh.expect("% ")) << sh.out;
+    std::this_thread::sleep_for(200ms);
+    sh.send("abc");
+    sh.send("\x03");
+    EXPECT_TRUE(sh.expect("EX\r\n")) << sh.out;
+    int st = 0;
+    ASSERT_TRUE(sh.exits(st)) << sh.out;
+    EXPECT_TRUE(WIFEXITED(st));
+    EXPECT_EQ(WEXITSTATUS(st), 3);
+    EXPECT_EQ(sh.out.find("LOGOUT"), std::string::npos) << sh.out;
+    EXPECT_EQ(sh.out.find("Z42"), std::string::npos) << sh.out;
+  }
+  std::ifstream hf(d + "/hf");
+  std::string saved((std::istreambuf_iterator<char>(hf)), std::istreambuf_iterator<char>());
+  EXPECT_NE(saved.find("trap 'exit 3' INT"), std::string::npos) << saved;
+  std::filesystem::remove_all(d);
+}
+
+// Ctrl-C in vared goes through the INT trap as at the prompt (zsh 5.9):
+// untrapped it ends the command line with $? 130; a trap that returns
+// ends it with that status; a trap that doesn't break lets editing go on.
+TEST(InteractiveM8Review, CtrlCInVaredRunsTheIntTrap) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  std::this_thread::sleep_for(200ms);
+  sh.line("x=abc; vared x; echo st=$? x=$x");
+  ASSERT_TRUE(sh.expect("abc")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  sh.send("d");
+  sh.send("\x03");
+  std::this_thread::sleep_for(300ms);
+  sh.line("echo s1=$? x=$x");
+  EXPECT_TRUE(sh.expect("s1=130 x=abc\r\n")) << sh.out;
+  EXPECT_EQ(sh.out.find("st=1"), std::string::npos) << sh.out;   // the rest didn't run
+  sh.line("trap 'echo T' INT; x=abc; vared x; echo st=$? x=$x");
+  std::this_thread::sleep_for(300ms);
+  sh.send("d");
+  sh.send("\x03");
+  EXPECT_TRUE(sh.expect("T")) << sh.out;
+  std::this_thread::sleep_for(300ms);
+  sh.send("\r");
+  EXPECT_TRUE(sh.expect("st=0 x=abcd\r\n")) << sh.out;
+  sh.line("trap - INT; TRAPINT() { return 6 }; vared x; echo st=$?");
+  std::this_thread::sleep_for(300ms);
+  sh.send("\x03");
+  std::this_thread::sleep_for(300ms);
+  sh.line("echo s2=$?");
+  EXPECT_TRUE(sh.expect("s2=6\r\n")) << sh.out;
+  // In a loop the trap's status stays; untrapped, the loop ends with 1,
+  // as after an error (zsh's execfor and execwhile).
+  std::this_thread::sleep_for(200ms);
+  sh.line("for i in 1 2; do vared x; echo i=$i; done");
+  std::this_thread::sleep_for(500ms);
+  sh.send("\x03");
+  std::this_thread::sleep_for(300ms);
+  sh.line("echo s3=$?");
+  EXPECT_TRUE(sh.expect("s3=6\r\n")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  sh.line("unfunction TRAPINT; while true; do vared x; done");
+  std::this_thread::sleep_for(500ms);
+  sh.send("\x03");
+  std::this_thread::sleep_for(300ms);
+  sh.line("echo s4=$?");
+  EXPECT_TRUE(sh.expect("s4=1\r\n")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  sh.line("f() { for i in 1; do vared x; done }; f");
+  std::this_thread::sleep_for(500ms);
+  sh.send("\x03");
+  std::this_thread::sleep_for(300ms);
+  sh.line("echo s5=$?");
+  EXPECT_TRUE(sh.expect("s5=1\r\n")) << sh.out;
+}
+
+// At end of input the EXIT trap sees the line after the last one read; and
+// preexec's $1 is the line as HIST_REDUCE_BLANKS keeps it.
+TEST(InteractiveM8Review, LinenoAtEofAndReducedBlanks) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("setopt histreduceblanks; preexec() { print -r -- \"1[$1]\" }");
+  sh.line("echo \"a  b\"   c   ");
+  EXPECT_TRUE(sh.expect("1[echo \"a  b\" c]\r\na  b c\r\n")) << sh.out;
+  sh.line("trap 'echo T $LINENO' EXIT");
+  sh.line(":");
+  ASSERT_TRUE(sh.expect("1[:]\r\n")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  sh.send("\x04");
+  EXPECT_TRUE(sh.expect("T 5\r\n")) << sh.out;
+  int st = 0;
+  EXPECT_TRUE(sh.exits(st)) << sh.out;
 }
 
 }  // namespace

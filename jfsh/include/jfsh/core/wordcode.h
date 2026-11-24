@@ -155,7 +155,11 @@ inline constexpr WordCode WC_SUBLIST_AND  = 1u;    // &&
 inline constexpr WordCode WC_SUBLIST_OR   = 2u;    // ||
 inline constexpr WordCode WC_SUBLIST_NOT  = 4u;    // !
 inline constexpr WordCode WC_SUBLIST_TYPE = 3u;    // mask for END/AND/OR
-inline constexpr int      WC_SUBLIST_FLAG_BITS = 3;
+// Its pipeline is "simple" as zsh's parser has it (no command word,
+// redirection, subshell, select, `|`, `!` or `&` anywhere in it, zsh's
+// cmplx clear): zsh runs it by execsimple, which leaves $_ alone.
+inline constexpr WordCode WC_SUBLIST_SIMPLE = 8u;
+inline constexpr int      WC_SUBLIST_FLAG_BITS = 4;
 
 inline constexpr WordCode WC_ASSIGN_APPEND = 1u;   // name+=value
 inline constexpr WordCode WC_ASSIGN_ARRAY  = 2u;   // name=(…)

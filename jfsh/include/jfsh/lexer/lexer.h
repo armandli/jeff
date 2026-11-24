@@ -92,6 +92,9 @@ struct InputSource {
   virtual int  next_char() = 0;
   virtual void unget(int c) = 0;
   virtual int  line() const noexcept { return 0; }
+  // How far into its text reading has got (for word spans); 0 when the
+  // source can't say.
+  virtual s::size_t pos() const noexcept { return 0; }
 };
 
 // The lexer's input: the source, with alias text pushed in front of it.
@@ -103,6 +106,9 @@ struct LexInput : InputSource {
   int  next_char() override;
   void unget(int c) override;
   int  line() const noexcept override { return mRaw.line(); }
+  // The source's position less what was read ahead and pushed back but
+  // not read again (alias text has no position of its own).
+  s::size_t pos() const noexcept override;
 
   void push(str text, sptr<const vec<str>> names);
   // Puts back text the lexer read ahead; unlike an alias's text, a blank
@@ -112,6 +118,8 @@ struct LexInput : InputSource {
   const sptr<const vec<str>>& current_aliases() const noexcept;
   // An alias text ending in a blank was read past since the last call.
   bool take_blank_flag() noexcept { return s::exchange(mBlankDone, false); }
+  // The last character read came from an alias's text, not the source.
+  bool in_alias() const noexcept { return mInAlias; }
 
 private:
   struct Pushed {
@@ -124,6 +132,7 @@ private:
   vec<Pushed>   mPushed;
   vec<bool>     mFromRaw;      // where recent characters came from
   bool          mBlankDone = false;
+  bool          mInAlias   = false;
 };
 
 struct Lexer {
@@ -150,6 +159,9 @@ struct Lexer {
   // Puts a token back so the next peek or next_token returns it; nothing
   // may be peeked already.
   void unread(LexToken tok) { mPeeked = s::move(tok); }
+  // Records each token's [begin, end) in the source into `spans`.
+  void record_spans(vec<s::pair<s::size_t, s::size_t>>* spans) { mSpans = spans; }
+  vec<s::pair<s::size_t, s::size_t>>* spans() const noexcept { return mSpans; }
   // Puts `text` back in front of the input, to be read as tokens again.
   void push_back_text(str text) { mSrc.push_back_text(s::move(text)); }
   // Reads a peeked word that starts with `(` again under the current
@@ -191,7 +203,11 @@ struct Lexer {
   // end of that line, and take_heredocs() hands them over.
   void register_heredoc(str delim, bool strip_tabs, bool expand) {
     mHeredocQueue.push_back({s::move(delim), strip_tabs, expand});
+    mHadHeredoc = true;
   }
+  // A here-document was registered (word spans: zsh's hend doesn't
+  // reduce such a line).
+  bool had_heredoc() const noexcept { return mHadHeredoc; }
   vec<str> take_heredocs();
 
   // The input ended inside a quote, after a trailing backslash, or before
@@ -225,7 +241,12 @@ private:
   str               mLastText;
   // Captured as each token starts (see read_token).
   sptr<const vec<str>> mTokAliases;
+  // When set, each token's [begin, end) in the source is added to it.
+  vec<s::pair<s::size_t, s::size_t>>* mSpans = nullptr;
+  s::size_t            mTokBegin = 0;
   bool                 mTokAfterBlank = false;
+  bool                 mHadHeredoc    = false;
+  bool                 mTokInAlias    = false;   // (spans) it began in alias text
   LexFlags          mFlags       = LEX_NORMAL;
   bool              mAliasExpand = true;
   bool              mIncomplete  = false;

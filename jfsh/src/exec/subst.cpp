@@ -1045,7 +1045,9 @@ struct Scan {
         ::dup2(pfd[1], 1);
         ::close(pfd[1]);
       }
-      ex.exec().exit_child(ex.exec().exec_string(src));
+      // Its lines go on from the line it is on, as zsh's parse_string
+      // counts on from lineno.
+      ex.exec().exit_child(ex.exec().exec_string(src, false, static_cast<int>(ctx().lineno)));
     }
     ::close(pfd[1]);
     str out;

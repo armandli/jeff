@@ -222,19 +222,34 @@ void HistoryManager::trim_to_limit() {
                    mEntries.begin() + static_cast<s::ptrdiff_t>(mEntries.size() - limit));
 }
 
-s::uint32_t HistoryManager::add(str text, s::uint32_t elapsed) {
-  if (mOpts.reduce_blanks) {
-    str trimmed;
-    bool last_ws = false;
-    for (char c : text) {
-      bool ws = c == ' ' or c == '\t';
-      if (not ws or not last_ws) trimmed += c;
-      last_ws = ws;
-    }
-    while (not trimmed.empty() and (trimmed.back() == ' ' or trimmed.back() == '\t'))
-      trimmed.pop_back();
-    text = s::move(trimmed);
+// zsh's histreduceblanks: the words close up to one blank between them
+// (the first character of each gap is kept); leading blanks go, unless
+// HIST_IGNORE_SPACE wants them; what follows the last word stays as it is
+// unless it is only blanks.  Blanks inside a word (quotes, `$( … )`) stay.
+str HistoryManager::reduce_blanks(strv line, const vec<s::pair<s::size_t, s::size_t>>& words,
+                                  bool keep_leading) {
+  s::size_t spacecount = 0;
+  if (keep_leading)
+    while (spacecount < line.size() and line[spacecount] == ' ') ++spacecount;
+  str out(line.substr(0, spacecount));
+  for (s::size_t i = 0; i < words.size(); ++i) {
+    auto [begin, end] = words[i];
+    out += line.substr(begin, end - begin);
+    if (i + 1 < words.size() and words[i + 1].first > end) out += line[end];
   }
+  s::size_t last = words.empty() ? 0 : words.back().second;
+  strv tail = line.substr(s::min(last, line.size()));
+  if (tail.find_first_not_of(" \t\n") != strv::npos) out += tail;
+  return out;
+}
+
+str HistoryManager::hend_text(strv line, const opt<vec<s::pair<s::size_t, s::size_t>>>& words,
+                              const HistOptions& o) {
+  if (not o.reduce_blanks or not words) return str(line);
+  return reduce_blanks(line, *words, o.ignore_space);
+}
+
+s::uint32_t HistoryManager::add(str text, s::uint32_t elapsed) {
   if (should_suppress(text)) return 0;
   // B58: HIST_IGNORE_ALL_DUPS drops the older copy and keeps the new one.
   if (mOpts.ignore_all) {

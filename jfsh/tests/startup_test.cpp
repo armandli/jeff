@@ -75,13 +75,13 @@ TEST(Invocation, CommandTakesArg0AndPositionals) {
 TEST(Invocation, ScriptAndStdin) {
   auto inv = parse({"jfsh", "s.sh", "a", "-x"});
   EXPECT_EQ(inv.script, "s.sh");
-  EXPECT_EQ(inv.arg0, "s.sh");
+  EXPECT_EQ(inv.arg0, "jfsh");   // $0 becomes the script after the startup files
   EXPECT_EQ(inv.positional, (vec<str>{"a", "-x"}));   // options end at the script
   EXPECT_TRUE(inv.options.empty());
 
   inv = parse({"jfsh", "-s", "a", "b"});
   EXPECT_TRUE(inv.shinstdin);
-  EXPECT_TRUE(inv.script.empty());
+  EXPECT_FALSE(inv.script);
   EXPECT_EQ(inv.positional, (vec<str>{"a", "b"}));
 
   inv = parse({"jfsh"});
@@ -132,18 +132,20 @@ TEST(Invocation, JfshLongOptions) {
 
 // B32: nothing unknown is ignored any more.
 TEST(Invocation, Errors) {
-  EXPECT_EQ(parse_error({"jfsh", "-q"}), "bad option: -q");
-  EXPECT_EQ(parse_error({"jfsh", "+q"}), "bad option: +q");
-  EXPECT_EQ(parse_error({"jfsh", "-c"}), "string expected after -c");
-  EXPECT_EQ(parse_error({"jfsh", "-o"}), "string expected after -o");
-  EXPECT_EQ(parse_error({"jfsh", "-o", "nosuch"}), "no such option: nosuch");
-  EXPECT_EQ(parse_error({"jfsh", "--nosuch"}), "no such option: nosuch");
-  EXPECT_EQ(parse_error({"jfsh", "--router"}), "--router: argument expected");
+  // Named by $0, or by the shell once -c is seen, as zsh's zerr.
+  EXPECT_EQ(parse_error({"jfsh", "-q"}), "jfsh: bad option: -q");
+  EXPECT_EQ(parse_error({"/x/jfsh", "+q"}), "/x/jfsh: bad option: -q");
+  EXPECT_EQ(parse_error({"/x/jfsh", "-c"}), "jfsh: string expected after -c");
+  EXPECT_EQ(parse_error({"jfsh", "-cx"}), "jfsh: string expected after -cx");
+  EXPECT_EQ(parse_error({"jfsh", "-o"}), "jfsh: string expected after -o");
+  EXPECT_EQ(parse_error({"jfsh", "-o", "nosuch"}), "jfsh: no such option: nosuch");
+  EXPECT_EQ(parse_error({"jfsh", "--nosuch"}), "jfsh: no such option: nosuch");
+  EXPECT_EQ(parse_error({"jfsh", "--router"}), "jfsh: --router: argument expected");
   EXPECT_EQ(parse_error({"jfsh", "--router", "x"}),
-            "--router: unknown router: x (jeff, jev or heuristic)");
+            "jfsh: --router: unknown router: x (jeff, jev or heuristic)");
   EXPECT_EQ(parse_error({"jfsh", "--provider", "x"}),
-            "--provider: unknown provider: x (openai, anthropic, ollama or openrouter)");
-  EXPECT_EQ(parse_error({"jfsh", "--norouter=1"}), "bad option: --norouter=1");
+            "jfsh: --provider: unknown provider: x (openai, anthropic, ollama or openrouter)");
+  EXPECT_EQ(parse_error({"jfsh", "--norouter=1"}), "jfsh: no such option: norouter=1");
 }
 
 // ---- special parameters ---------------------------------------------------------
@@ -181,8 +183,10 @@ TEST(Specials, StatusAndPipestatus) {
   EXPECT_EQ(out(sh, "false; echo $status $?"), "1 1\n");
   EXPECT_EQ(out(sh, "true | false | (exit 3); echo $pipestatus"), "0 1 3\n");
   EXPECT_EQ(out(sh, "false; echo $pipestatus"), "1\n");
-  // An assignment is a pipeline too, so the next command sees its status.
+  // An array assignment is a pipeline too, so the next command sees its
+  // status; a scalar one or a function definition leaves it (zsh 5.9).
   EXPECT_EQ(out(sh, "pipestatus=(4 5); echo $pipestatus"), "0\n");
+  EXPECT_EQ(out(sh, "true | false; x=1; f() { :; }; echo $pipestatus"), "0 1\n");
   EXPECT_EQ(sh.run("status=3").err, "jfsh: read-only variable: status\n");
 }
 
@@ -324,6 +328,20 @@ TEST(Startup, MissingFilesAreNoError) {
   EXPECT_EQ(r.out, "");
 }
 
+// zsh's setupvals: an environment $PWD with a `.` or `..` element is not
+// kept, and $OLDPWD starts as $PWD whatever the environment says.
+TEST(StartupM8Review, PwdFromTheEnvironment) {
+  char buf[4096];
+  str cwd = ::getcwd(buf, sizeof buf);
+  for (str env : {cwd + "/.", cwd + "/../" + sf::path(cwd).filename().string()}) {
+    Shell sh;
+    sh.params.assign("PWD", env, PM_SCALAR | PM_EXPORTED);
+    sh.params.assign("OLDPWD", str("/"), PM_SCALAR | PM_EXPORTED);
+    init_shell_params(sh.ctx);
+    EXPECT_EQ(out(sh, "echo $PWD $OLDPWD"), cwd + " " + cwd + "\n") << env;
+  }
+}
+
 TEST(Startup, InitShellParams) {
   Shell sh;
   sh.params.assign("SHLVL", str("4"), PM_SCALAR | PM_EXPORTED);
@@ -352,8 +370,13 @@ TEST(Hooks, PrecmdThenItsFunctionsArray) {
 TEST(Hooks, PreexecGetsTheLine) {
   Shell sh;
   sh.run("preexec() { print -r -- \"[$1][$2][$3]\" }");
-  auto r = sh.call([&] { before_exec(sh.exec, "ls  -l"); return 0; });
-  EXPECT_EQ(r.out, "[ls  -l][ls  -l][ls  -l]\n");
+  // $2 and $3 are the parsed line, as zsh's getjobtext and getpermtext
+  // give it (zsh 5.9).
+  auto prog = sh.exec.parse_string("ls  -l; for i in 1; do echo $i; done");
+  ASSERT_TRUE(prog);
+  auto r = sh.call([&] { before_exec(sh.exec, "ls  -l", **prog); return 0; });
+  EXPECT_EQ(r.out, "[ls  -l][ls -l; for i in 1; do; echo $i; done]"
+                   "[ls -l\nfor i in 1\ndo\n\techo $i\ndone]\n");
 }
 
 TEST(Hooks, PeriodicRunsEveryPeriodSeconds) {
@@ -382,7 +405,8 @@ TEST(Sched, QueuesListsRemovesAndRuns) {
   EXPECT_TRUE(list.starts_with("  1 ")) << list;
   EXPECT_NE(list.find(" echo sooner\n  2 "), str::npos) << list;
   EXPECT_NE(list.find(" echo later\n  3 "), str::npos) << list;
-  EXPECT_TRUE(list.ends_with(" -o -- -x\n")) << list;
+  // `--` after the time is part of the command, shown after zsh's own.
+  EXPECT_TRUE(list.ends_with(" -o -- -- -x\n")) << list;
   EXPECT_EQ(sh.run("sched -3").rc, 0);
   EXPECT_EQ(sh.run("sched -3").err, "jfsh: sched: not that many entries\n");
   ASSERT_EQ(sh.ctx.loop.sched.size(), 2u);
@@ -450,6 +474,8 @@ TEST(Mail, BeforePromptChecksEveryMailcheckSeconds) {
   struct timespec ts[2] = {{100, 0}, {200, 0}};
   ::utimensat(AT_FDCWD, box.c_str(), ts, 0);
   sh.params.assign("MAIL", box.string(), PM_SCALAR);
+  sh.run("MAILCHECK=60");   // as the shell starts it
+  sh.ctx.loop.last_mailcheck = 0;
   auto prompt = [&](s::time_t t) {
     return sh.call([&] { before_prompt(sh.exec, t); return 0; }).err;
   };
@@ -472,12 +498,25 @@ TEST(History, TheLineBeingRunIsLeftOut) {
   hist.add("fc -l");
   sh.ctx.hist_current = true;
   EXPECT_EQ(out(sh, "fc -l"), "    1  echo a\n    2  echo b\n");
-  hist.replace_last("r");
-  EXPECT_EQ(out(sh, "r"), "echo b\nb\n");
-  EXPECT_EQ(hist.entries().back().text, "echo b");   // `r` became what it ran
-  EXPECT_EQ(hist.size(), 3u);
-  hist.add("fc -s -2");
-  EXPECT_EQ(out(sh, "fc -s -2"), "echo b\nb\n");
+  // Listed by number, the line being run is there (zsh's fclist).
+  EXPECT_EQ(out(sh, "fc -l 2 3"), "    2  echo b\n    3  fc -l\n");
+  sh.ctx.hist_current = false;
+  sh.ctx.history = nullptr;
+  HistoryManager hist2{HistOptions{}};
+  hist2.add("echo a");
+  hist2.add("echo b");
+  hist2.add("r");
+  sh.ctx.history = &hist2;
+  sh.ctx.hist_current = true;
+  auto r = sh.run("r");
+  EXPECT_EQ(r.out, "b\n");
+  EXPECT_EQ(r.err, "echo b\n");
+  // zsh keeps the `r` line and adds what it ran after it.
+  EXPECT_EQ(hist2.entries()[2].text, "r");
+  EXPECT_EQ(hist2.entries().back().text, "echo b");
+  EXPECT_EQ(hist2.size(), 4u);
+  hist2.add("fc -s 2");
+  EXPECT_EQ(sh.run("fc -s 2").err, "echo b\n");
   sh.ctx.hist_current = false;
   sh.ctx.history = nullptr;
 }
@@ -521,14 +560,16 @@ Proc jfsh(const vec<str>& args, const vec<str>& env = {}, strv input = "") {
 }
 
 TEST(Binary, BadOptionsFail) {
+  // zsh names these by its $0 (here the binary's path), or by the shell
+  // after -c.
   auto p = jfsh({"-q"});
   EXPECT_EQ(p.rc, 1);
-  EXPECT_EQ(p.err, "jfsh: bad option: -q\n");
+  EXPECT_EQ(p.err, JFSH_BINARY ": bad option: -q\n");
   p = jfsh({"-c"});
   EXPECT_EQ(p.err, "jfsh: string expected after -c\n");
   p = jfsh({"/nonexistent/script"});
   EXPECT_EQ(p.rc, 127);
-  EXPECT_EQ(p.err, "jfsh: can't open input file: /nonexistent/script\n");
+  EXPECT_EQ(p.err, JFSH_BINARY ": can't open input file: /nonexistent/script\n");
 }
 
 TEST(Binary, OptionsReachTheShell) {
@@ -540,7 +581,7 @@ TEST(Binary, OptionsReachTheShell) {
   EXPECT_EQ(jfsh({"-s", "a", "b"}, {zd}, "echo $@ $-\n").out, "a b 569Xs\n");
   auto x = jfsh({"-xc", "echo x"}, {zd});
   EXPECT_EQ(x.out, "x\n");
-  EXPECT_EQ(x.err, "+" JFSH_BINARY ":1> echo x\n");
+  EXPECT_EQ(x.err, "+jfsh:1> echo x\n");   // %N of a -c string, as zsh's "zsh"
   EXPECT_EQ(jfsh({"--version"}).out.starts_with("jfsh "), true);
 }
 
@@ -552,12 +593,18 @@ TEST(Binary, StartupFilesAndLogout) {
   str zd = "ZDOTDIR=" + home.path.string();
   EXPECT_EQ(jfsh({"-c", "print cmd"}, {zd}).out, "env\ncmd\n");
   EXPECT_EQ(jfsh({"-f", "-c", "print cmd"}, {zd}).out, "cmd\n");
+  // Only an interactive login shell reads its logout files (zsh's zexit).
   auto p = jfsh({"-l", "-c", "print cmd; exit 4"}, {zd});
+  EXPECT_EQ(p.out, "env\nprofile\ncmd\n");
+  EXPECT_EQ(p.rc, 4);
+  p = jfsh({"-l", "-i"}, {zd}, "print cmd; exit 4\n");
   EXPECT_EQ(p.out, "env\nprofile\ncmd\nlogout\n");
   EXPECT_EQ(p.rc, 4);
   // The EXIT trap and zshexit come after the logout file.
-  home.file(".jfshenv", "trap 'print trap' EXIT; zshexit() { print zshexit }\n", sf::perms::owner_all);
-  EXPECT_EQ(jfsh({"-l", "-c", "print cmd"}, {zd}).out, "profile\ncmd\nlogout\ntrap\nzshexit\n");
+  home.file(".jfshenv", "trap 'print trap' EXIT; zshexit() { print zshexit }\n",
+            sf::perms::owner_all);
+  EXPECT_EQ(jfsh({"-l", "-i"}, {zd}, "print cmd\n").out, "profile\ncmd\nlogout\ntrap\nzshexit\n");
+  EXPECT_EQ(jfsh({"-l", "-c", "print cmd"}, {zd}).out, "profile\ncmd\ntrap\nzshexit\n");
   // `exit` in a startup file ends the shell before the command.
   home.file(".jfshenv", "exit 7\n", sf::perms::owner_all);
   p = jfsh({"-c", "print cmd"}, {zd});
@@ -583,7 +630,8 @@ TEST(Binary, ScriptRunsUpToASyntaxError) {
 TEST(Binary, B5HistoryFileGetsOnlyNewLines) {
   TempDir home;
   str file = (home.path / "hist").string();
-  vec<str> env{"ZDOTDIR=" + home.path.string(), "HISTFILE=" + file};
+  // Nothing is saved without $SAVEHIST (zsh's default is 0).
+  vec<str> env{"ZDOTDIR=" + home.path.string(), "HISTFILE=" + file, "SAVEHIST=100"};
   jfsh({"-i"}, env, "echo a\n");
   jfsh({"-i"}, env, "echo b\n");
   s::ifstream f{file};
@@ -636,6 +684,240 @@ TEST(Binary, InteractiveShellGivesTheTerminalBack) {
   ::waitpid(pid, nullptr, 0);
   ::close(master);
   EXPECT_NE(got.find("done"), str::npos) << got;
+}
+
+// ---- M8 review: zsh 5.9's output for the same runs ------------------------------
+//
+// Each row runs the jfsh binary with HOME and ZDOTDIR set to a fresh
+// directory holding `files`; `@B` in the expected text stands for the
+// binary's path (zsh's $0) and `@D` for the directory.  The startup files
+// are named as jfsh's (zsh's .zshenv is .jfshenv, and so on).
+
+struct M8Row {
+  vec<str> args;
+  vec<s::pair<str, str>> files;
+  str input;
+  str out;
+  str err;
+  vec<str> env;   // added to the environment
+  int rc;
+};
+
+str m8_expand(str text, const str& dir) {
+  for (auto [token, value] : {s::pair<strv, str>{"@B", JFSH_BINARY}, s::pair<strv, str>{"@D", dir}})
+    for (s::size_t at; (at = text.find(token)) != str::npos;) text.replace(at, 2, value);
+  return text;
+}
+
+void m8_rows(const vec<M8Row>& rows) {
+  for (const auto& row : rows) {
+    TempDir home;
+    str dir = home.path.string();
+    for (const auto& [name, body] : row.files) {
+      sf::create_directories((home.path / name).parent_path());
+      home.file(name, m8_expand(body, dir), sf::perms::owner_all);
+    }
+    vec<str> env{"HOME=" + dir, "ZDOTDIR=" + dir, "SHLVL=1", "PWD=" + dir};
+    for (const auto& e : row.env) env.push_back(m8_expand(e, dir));
+    vec<str> args;
+    for (const auto& a : row.args) args.push_back(m8_expand(a, dir));
+    auto p = jfsh(args, env, row.input);
+    str what;
+    for (const auto& a : row.args) what += " [" + a + "]";
+    EXPECT_EQ(p.out, m8_expand(row.out, dir)) << what;
+    EXPECT_EQ(p.err, m8_expand(row.err, dir)) << what;
+    EXPECT_EQ(p.rc, row.rc) << what;
+  }
+}
+
+TEST(StartupM8Review, InvocationAsZsh) {
+  m8_rows({
+    // -s: every argument is positional, also with -c.
+    {{"-f", "-s", "-c", "echo $0 $# $*", "a0", "b"}, {}, "", "@B 2 a0 b\n", "", {}, 0},
+    // `+-name` turns an option off, `+-no-name` on; a lone `+` ends the
+    // options as `-` does.
+    {{"-f", "+-no-errexit", "-c", "[[ -o errexit ]] && echo E"}, {}, "", "E\n", "", {}, 0},
+    {{"-f", "-e", "+-errexit", "-c", "[[ -o errexit ]] || echo noE"}, {}, "", "noE\n", "", {}, 0},
+    {{"-f", "+"}, {}, "echo read\n", "read\n", "", {}, 0},
+    {{"-f", "+", "-c", "echo"}, {}, "", "", "@B: can't open input file: -c\n", {}, 127},
+    {{"-f", "-x-errexit", "-c", ":"}, {}, "", "", "@B: bad option string: '-x-errexit'\n", {}, 1},
+    {{"-f", "--errexit=1", "-c", ":"}, {}, "", "", "@B: no such option: errexit=1\n", {}, 1},
+    {{"-f", "-x y", "-c", ":"}, {}, "", "", "@B: bad option string: '-x y'\n", {}, 1},
+    {{"-f", "-e ", "-c", "[[ -o errexit ]] && echo E"}, {}, "", "E\n", "", {}, 0},
+    {{"-f", "+q"}, {}, "", "", "@B: bad option: -q\n", {}, 1},
+    {{"-f", "-cx"}, {}, "", "", "jfsh: string expected after -cx\n", {}, 1},
+    // -b ends the options with its argument.
+    {{"-f", "-bx", "-c", ":"}, {}, "", "", "@B: can't open input file: -c\n", {}, 127},
+    {{"-f", "--emulate", "sh", "-c", ":"}, {}, "", "",
+     "@B: --emulate: must precede other options\n", {}, 1},
+    {{"--emulate"}, {}, "", "", "@B: --emulate: argument required\n", {}, 1},
+    {{"--emulate", "sh", "-c", "[[ -o shwordsplit ]] && echo SWS"}, {}, "", "SWS\n", "", {}, 0},
+    // A directory is no script.
+    {{"-f", "@D/sub"}, {{"sub/x", ""}}, "", "", "@B: can't open input file: @D/sub\n", {}, 127},
+    // -t: one command, then the shell exits.
+    {{"-f", "-t"}, {}, "\necho a; false\necho b\n", "a\n", "", {}, 1},
+    {{"-f", "-t", "@D/s"}, {{"s", "echo a\necho b\n"}}, "", "a\n", "", {}, 0},
+    // VERBOSE shows each line as it is read, and a -c string whole.
+    {{"-f", "-v", "-c", "echo hi"}, {}, "", "hi\n", "echo hi\n", {}, 0},
+    {{"-f"}, {}, "echo a\nset -v\necho b\n", "a\nb\n", "echo b\n", {}, 0},
+    {{"-f", "-c", "echo $ZSH_EXECUTION_STRING"}, {}, "", "echo $ZSH_EXECUTION_STRING\n", "", {}, 0},
+    // An empty name is a script that can't be opened.
+    {{"-f", ""}, {}, "echo no\n", "", "@B: can't open input file: \n", {}, 127},
+    // zshexit sees the exit status, not the EXIT trap's; -t ending a
+    // script runs only the EXIT trap.
+    {{"-f", "-c", "trap 'echo T $?' EXIT; zshexit() { echo ZE $?; }; exit 2"}, {}, "",
+     "T 2\nZE 2\n", "", {}, 2},
+    {{"-f", "-c", "trap 'echo T; return 5' EXIT; zshexit() { echo ZE $?; }; exit 2"}, {}, "",
+     "T\nZE 2\n", "", {}, 5},
+    {{"-f", "-t"}, {}, "zshexit() { echo ZE; }; trap 'echo T' EXIT; echo a\necho b\n",
+     "a\nT\n", "", {}, 0},
+  });
+}
+
+TEST(StartupM8Review, StartupFilesAsZsh) {
+  m8_rows({
+    // An error abandons the file, not the shell; $? stays as it left it.
+    {{"-c", "echo body $?"}, {{".jfshenv", "echo a\nreadonly r=1; r=2\necho b\n"}}, "",
+     "a\nbody 1\n", "jfsh: read-only variable: r\n", {}, 0},
+    {{"-c", "echo body $?"}, {{".jfshenv", "echo a\nfi\n"}}, "", "a\nbody 0\n",
+     "jfsh:2: parse error near `fi'\n", {}, 0},
+    // No ERR_EXIT, ZERR or ERR_RETURN while the startup files run.
+    {{"-e", "-c", "echo body"}, {{".jfshenv", "false; echo after\n"}}, "",
+     "after\nbody\n", "", {}, 0},
+    {{"-c", "false; echo body"}, {{".jfshenv", "TRAPZERR() { echo ZERR }; false; echo after\n"}},
+     "", "after\nZERR\nbody\n", "", {}, 0},
+    {{"-c", "echo body"}, {{".jfshenv", "setopt errreturn; false; echo after\n"}}, "",
+     "after\nbody\n", "", {}, 0},
+    // $0 is the shell's there, the script's only after; `0=x` stays.
+    {{"-c", "echo c0=$0", "zz"}, {{".jfshenv", "echo env0=$0\n"}}, "",
+     "env0=zz\nc0=zz\n", "", {}, 0},
+    {{"@D/s"}, {{".jfshenv", "echo env0=$0\n"}, {"s", "echo s0=$0\n"}}, "",
+     "env0=@B\ns0=@D/s\n", "", {}, 0},
+    {{"-c", "echo $0"}, {{".jfshenv", "0=foo\n"}}, "", "foo\n", "", {}, 0},
+    // SHINSTDIN is off while a file is read.
+    {{}, {{".jfshenv", "[[ -o shinstdin ]] && echo S || echo noS\n"}}, "echo body\n",
+     "noS\nbody\n", "", {}, 0},
+    // A non-interactive login shell reads no logout file.
+    {{"-l", "-c", "exit 3"}, {{".jfsh_logout", "echo logout\n"}}, "", "", "", {}, 3},
+    // An empty $ZDOTDIR is a directory too: nothing is read from $HOME.
+    {{"-c", "echo body"}, {{".jfshenv", "echo env\n"}}, "", "body\n", "", {"ZDOTDIR="}, 0},
+  });
+}
+
+TEST(StartupM8Review, SpecialParametersAsZsh) {
+  m8_rows({
+    {{"-f", "-c", "SECONDS=-5; echo $SECONDS"}, {}, "", "-5\n", "", {}, 0},
+    {{"-f", "-c", "SECONDS=9223372036854775807; echo $SECONDS"}, {}, "",
+     "9223372036854775807\n", "", {}, 0},
+    {{"-f", "-c", "typeset -F SECONDS; [[ $SECONDS == *.* ]] && echo float"}, {}, "", "float\n",
+     "", {}, 0},
+    {{"-f", "-c", "echo $SECONDS"}, {}, "", "1000\n", "", {"SECONDS=1000"}, 0},
+    {{"-f", "-c", "typeset -p HISTSIZE SAVEHIST SHLVL"}, {}, "",
+     "typeset -i10 HISTSIZE=30\ntypeset -i10 SAVEHIST=0\nexport -i10 SHLVL=2\n", "", {}, 0},
+    {{"-f", "-c", "HISTSIZE=0; SAVEHIST=-4; echo $HISTSIZE $SAVEHIST $MAILCHECK"}, {}, "",
+     "1 0 60\n", "", {}, 0},
+    {{"-f", "-c", "echo \"[$pipestatus]\"; false; x=1; f() { :; }; echo $pipestatus; a=(1)"
+                  "; echo $pipestatus"}, {}, "", "[]\n1\n0\n", "", {}, 0},
+    {{"-f", "-c", "echo a b; echo $_; f() { echo x y; }; f c; echo $_; _=z; echo \"[$_]\""},
+     {}, "", "a b\nb\nx y\nc\n[]\n", "", {}, 0},
+    {{"-f", "-c", "f() { echo $LINENO; }\nf\ng() echo $LINENO\n\ng\n"
+                  "echo $(\necho $LINENO)\ntrap 'echo t $LINENO' USR1\n\nkill -USR1 $$"},
+     {}, "", "0\n5\n7\nt 10\n", "", {}, 0},
+    // $_ is left by words that expand to nothing and by a bare `builtin`;
+    // `exec` with only redirections empties it.
+    {{"-f", "-c", "echo k l >/dev/null; $empty; echo \"<$_>\"; echo o p >/dev/null; x=1 $empty"
+                  "; echo \"<$_>\"; echo q r >/dev/null; exec 3>/dev/null; echo \"<$_>\""
+                  "; echo u v >/dev/null; builtin; echo \"<$_>\""},
+     {}, "", "<l>\n<p>\n<>\n<v>\n", "", {}, 0},
+    // A compound command empties $_ unless nothing in it is a command
+    // word, a redirection, a subshell, `!` or `&` (zsh's cmplx clear: it
+    // runs by execsimple); array assignments and a bare `exec` run nothing
+    // and leave it.
+    {{"-f", "-c",
+      "echo a q >/dev/null; ( ); echo \"[$_]\"; echo a q >/dev/null; { }; echo \"[$_]\"; "
+      "echo a q >/dev/null; case a in b) ;; esac; echo \"[$_]\"; echo a q >/dev/null; "
+      "{ } >/dev/null; echo \"[$_]\"; echo a q >/dev/null; ! { }; echo \"[$_]\"; "
+      "echo a q >/dev/null; x=(1 2); echo \"[$_]\"; echo a q >/dev/null; exec; "
+      "echo \"[$_]\"; echo a q >/dev/null; if [[ a = b ]]; then :; fi; echo \"[$_]\""},
+     {}, "", "[]\n[q]\n[q]\n[]\n[]\n[q]\n[q]\n[]\n", "", {}, 0},
+    // $OPTARG is taken from the environment.
+    {{"-f", "-c", "echo \"[$OPTARG]\""}, {}, "", "[e]\n", "", {"OPTARG=e"}, 0},
+    // $LINENO is put back after a list (zsh's execlist): an EXIT trap sees
+    // the line before the -c string, or where reading got to in a script;
+    // DEBUG and ZERR see the command's line.
+    {{"-f", "-c", "trap 'echo ex $LINENO' EXIT\n\n\ntrue"}, {}, "", "ex 1\n", "", {}, 0},
+    {{"-f", "@D/s"}, {{"s", "trap 'echo ex $LINENO' EXIT\n\n\ntrue\n"}}, "", "ex 5\n", "", {}, 0},
+    {{"-f", "-c", "trap 'echo dbg $LINENO' DEBUG\n\necho x"}, {}, "", "dbg 3\nx\n", "", {}, 0},
+    // ... also in a sourced file, and at the end of standard input, blank
+    // lines counted.
+    {{"-f", "-c", "trap 'echo T $LINENO' EXIT; . @D/sx"}, {{"sx", ":\n\n\nexit 3\n"}}, "",
+     "T 4\n", "", {}, 3},
+    {{"-f"}, {}, "trap 'echo T $LINENO' EXIT\n:\n\n\n\n", "T 6\n", "", {}, 0},
+    // ... but an `exit` leaves at once: the trap sees its line.
+    {{"-f", "-c", "\n\ntrap 'echo ex $LINENO' EXIT\n\nexit"}, {}, "", "ex 5\n", "", {}, 0},
+    {{"-f", "-c", "f() {\n exit 3\n}\ntrap 'echo ex $LINENO' EXIT\n\nf"}, {}, "", "ex 6\n", "",
+     {}, 3},
+    {{"-f", "-c", "trap 'echo err $LINENO' ZERR\n\nfalse\necho $LINENO"}, {}, "", "err 3\n4\n",
+     "", {}, 0},
+    // $SHLVL is one less once the shell becomes another program.
+    {{"-f", "-c", "exec /bin/sh -c 'echo $SHLVL'"}, {}, "", "2\n", "", {}, 0},
+  });
+}
+
+// $_ after a compound command, one behaviour per row: zsh's parser marks a
+// sublist "simple" (cmplx clear) when nothing in it, at any depth, is a
+// command word, a redirection, a subshell, select, `|`, `!` or `&`; such a
+// sublist runs by execsimple and leaves $_, any other empties it (zsh 5.9).
+TEST(StartupM8Review, UnderscoreFollowsZshsCmplx) {
+  vec<s::pair<str, str>> cases = {
+    {"case x in y) echo q;; esac", "[]"},
+    {"{ $empty; }", "[]"},
+    {"{ [[ -n x ]] || echo q; }", "[]"},
+    {"{ [[ -n x ]] } always { [[ -z x ]] && echo q }", "[]"},
+    {"if [[ -n x ]]; then fi", "[b]"},
+    {"while [[ -z x ]]; do done", "[b]"},
+    {"for i in x; do done", "[b]"},
+    {"for ((i=0;i<1;i++)); do (( 1 )); done", "[b]"},
+    {"repeat 1 [[ -n x ]]", "[b]"},
+    {"{ x=1 }", "[]"},
+    {"{ x=(1) }", "[]"},
+    {"{ } >/dev/null", "[]"},
+    {"! [[ a = a ]]", "[]"},
+    {"select i in; do :; done", "[]"},
+    {"{ (( 1 )) && [[ a = a ]] }", "[b]"},
+  };
+  vec<M8Row> rows;
+  for (const auto& [cmd, want] : cases)
+    rows.push_back({{"-f", "-c", "echo a b >/dev/null; " + cmd + "; echo \"[$_]\""}, {}, "",
+                    want + "\n", "", {}, 0});
+  m8_rows(rows);
+}
+
+// `exec` in an interactive shell that has read no line writes no history
+// file (zsh's savehistfile without a hist_ring).
+TEST(StartupM8Review, ExecWithoutHistoryWritesNoFile) {
+  TempDir home;
+  str dir = home.path.string();
+  home.file(".jfshenv", "", sf::perms::owner_all);
+  auto p = jfsh({"-d", "-l", "-i", "-c", "exec /bin/echo EXEC"},
+                {"HOME=" + dir, "ZDOTDIR=" + dir, "HISTFILE=" + dir + "/hf", "SAVEHIST=10"});
+  EXPECT_EQ(p.out, "EXEC\n");
+  EXPECT_FALSE(sf::exists(home.path / "hf"));
+}
+
+TEST(StartupM8Review, SchedAsZsh) {
+  str tail = " | sed -E 's/^( *[0-9]+) .{3} .{3} .. ..:..:.. /\\1 T /'";
+  m8_rows({
+    {{"-f", "-c", "sched +100 -- -x; sched -o +200 echo o; sched" + tail}, {}, "",
+     "  1 T -- -- -x\n  2 T -o echo o\n", "", {}, 0},
+    {{"-f", "-c", "sched -0; sched - 1 cmd; sched +1x a; sched +-5 a; sched | wc -l | tr -d ' '"},
+     {}, "", "1\n",
+     "jfsh: sched: usage for delete: sched -<item#>.\njfsh: sched: option expected\n"
+     "jfsh: sched: bad time specifier\n", {}, 0},
+    {{"-f", "-c",
+      "sched 100 a; sched 100 b; sched 50 c; sched 100 d; print -l $zsh_scheduled_events"},
+     {}, "", "50::c\n100::d\n100::a\n100::b\n", "", {}, 0},
+  });
 }
 
 }  // namespace

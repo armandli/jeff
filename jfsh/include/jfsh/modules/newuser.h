@@ -14,7 +14,8 @@ namespace jfsh {
 void register_newuser_module(ModuleManager& mm);
 
 // Whether a shell starting now would offer the new-user setup: none of
-// .jfshenv, .jfsh_profile, .jfshrc, .jfsh_login is in $ZDOTDIR (or $HOME).
+// .jfshenv, .jfsh_profile, .jfshrc, .jfsh_login is in $ZDOTDIR (or $HOME),
+// a directory that exists.
 bool newuser_needed(ExecContext& ctx);
 
 }  // namespace jfsh

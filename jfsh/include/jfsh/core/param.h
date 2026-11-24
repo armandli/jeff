@@ -55,6 +55,8 @@ using ParamValue = s::variant<
 
 struct ParamHandlers {
   func<str()>                     get_scalar;
+  // The value as a float, for a special made `typeset -F`/`-E` ($SECONDS).
+  func<double()>                  get_float;
   func<void(str)>                 set_scalar;
   func<vec<str>()>                get_array;
   func<void(vec<str>)>            set_array;

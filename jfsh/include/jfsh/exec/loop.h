@@ -36,10 +36,12 @@ struct StartupConfig {
   bool zsh_compat = false;             // also read ~/.zshenv, ~/.zshrc, …
 };
 
-// The parameters a new shell sets from its environment: $SHLVL one more
-// than it was, $PWD (kept from the environment when it names the current
-// directory) and $OLDPWD, all exported; the tied pairs ($PATH and $path,
-// $FPATH and $fpath, …), $fpath defaulting to the function library.
+// The parameters a new shell sets from its environment, as zsh's
+// setupvals: $SHLVL one more than it was, $PWD (the home directory or the
+// environment's $PWD when it names the current directory by an absolute
+// path without `.` or `..`, else the real path) and $OLDPWD the same, all
+// exported; $MAILCHECK 60; the tied pairs ($PATH and $path, $FPATH and
+// $fpath, …), $fpath defaulting to the function library.
 void init_shell_params(ExecContext& ctx);
 
 // Reads the startup files, in zsh's order:
@@ -71,8 +73,10 @@ bool run_hook(Executor& ex, strv name, const vec<str>& args = {});
 // $MAILCHECK seconds have passed.
 void before_prompt(Executor& ex, s::time_t now);
 
-// Before a command line runs: preexec with the line as $1, $2 and $3.
-void before_exec(Executor& ex, const str& line);
+// Before a command line runs: preexec with $1 the line as read (after
+// history expansion), $2 the parsed line on one line, $3 the parsed line
+// in full, as zsh's loop passes them.
+void before_exec(Executor& ex, const str& line, const CompiledProgram& prog);
 
 // Runs the `sched` events due at `now`, earliest first.
 void run_sched(Executor& ex, s::time_t now);
@@ -82,8 +86,8 @@ void run_sched(Executor& ex, s::time_t now);
 void check_mail(Executor& ex, s::time_t now);
 
 // The history settings as the options and $HISTSIZE, $SAVEHIST,
-// $HISTFILE and $histchars have them now.  $HISTSIZE defaults to 1000,
-// $SAVEHIST to $HISTSIZE.
+// $HISTFILE and $histchars have them now.  Unset, $HISTSIZE is 30 and
+// $SAVEHIST 0, zsh's defaults.
 HistOptions history_options(const ExecContext& ctx);
 
 }  // namespace jfsh

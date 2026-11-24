@@ -7,6 +7,7 @@
 
 #include <cstdio>
 
+#include <functional>
 #include <string>
 #include <utility>
 
@@ -22,11 +23,18 @@ struct StringInputSource : InputSource {
   int  next_char() override;
   void unget(int c) override;
   int  line() const noexcept override { return mLine; }
+  s::size_t pos() const noexcept override { return mPos; }
+
+  // Calls `fn` with each line (and its newline) as reading first reaches
+  // it, as zsh's inputline echoes input under VERBOSE.
+  void on_line(func<void(strv)> fn) { mOnLine = s::move(fn); }
 
 private:
-  str       mSrc;
-  s::size_t mPos;
-  int       mLine;
+  str               mSrc;
+  func<void(strv)>  mOnLine;
+  s::size_t         mPos;
+  s::size_t         mSeen = 0;   // where the lines passed to mOnLine end
+  int               mLine;
 };
 
 struct FileInputSource : InputSource {

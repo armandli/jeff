@@ -172,8 +172,9 @@ struct SignalManager {
   // and the dispositions an interactive shell needs (SIGINT, SIGHUP and
   // SIGWINCH acted on; SIGQUIT, SIGTERM and SIGTSTP caught and dropped;
   // SIGTTIN and SIGTTOU ignored).  Without a terminal job control stays
-  // off.
-  void init(bool interactive);
+  // off.  `tty` is the shell's own terminal fd (zsh's SHTTY, opened by the
+  // caller and kept open by it); -1 makes init look for one itself.
+  void init(bool interactive, int tty = -1);
 
   // True when the shell owns a terminal and runs jobs in process groups.
   bool job_control()   const noexcept { return mJobControl; }
@@ -305,6 +306,7 @@ private:
   bool           mHaveModes    = false;
   bool           mStartChecked = false;
   bool           mHaveKept     = false;   // mKeepBlocked isn't empty
+  bool           mBorrowedTty  = false;   // mTtyFd is the caller's, not closed here
 };
 
 extern SignalManager Signals;

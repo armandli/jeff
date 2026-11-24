@@ -8,6 +8,7 @@
 
 #include <jfsh/core/aliases.h>
 #include <jfsh/history/history.h>
+#include <jfsh/parser/parser.h>
 
 namespace jfsh {
 namespace {
@@ -63,12 +64,51 @@ TEST(History, IgnoreAllDupsMovesTheRepeatToTheEnd) {
   EXPECT_EQ(texts(h), (vec<str>{"pwd", "ls"}));
 }
 
+// zsh's histreduceblanks: the first character of each gap between words
+// stays; blanks inside words and a comment after the last stay as typed.
 TEST(History, ReduceBlanksCollapsesWhitespaceRuns) {
-  HistOptions opts;
-  opts.reduce_blanks = true;
-  HistoryManager h{opts};
-  h.add("ls    -la\t\t/tmp");
-  EXPECT_EQ(texts(h), vec<str>{"ls -la\t/tmp"});
+  auto reduce = [](strv line, bool keep_leading = false) {
+    HistOptions o;
+    o.reduce_blanks = true;
+    o.ignore_space  = keep_leading;
+    return HistoryManager::hend_text(line, word_spans(line, true), o);
+  };
+  EXPECT_EQ(reduce("ls    -la\t\t/tmp"), "ls -la\t/tmp");
+  EXPECT_EQ(reduce("echo $(  echo   a  )   b"), "echo $(  echo   a  ) b");
+  EXPECT_EQ(reduce("echo \"a  b\"   c   "), "echo \"a  b\" c");
+  EXPECT_EQ(reduce("echo a  # c   d"), "echo a  # c   d");
+  EXPECT_EQ(reduce("   echo  lead"), "echo lead");
+  EXPECT_EQ(reduce("   echo  lead", true), "   echo lead");
+  // `(( … ))` is one word; `for ((` has one per expression, blanks before
+  // its `;` kept.
+  EXPECT_EQ(reduce("(( 1 ))   ;   echo   a"), "(( 1 )) ; echo a");
+  EXPECT_EQ(reduce("if  ((  1  )) ; then  echo  y ;  fi"), "if ((  1  )) ; then echo y ; fi");
+  EXPECT_EQ(reduce("for ((  i=0  ;  i<1  ;  i++  ))  {  echo  $i  }"),
+            "for (( i=0  ; i<1  ; i++  )) { echo $i }");
+  EXPECT_EQ(reduce("[[   a  ==  a   ]]"), "[[ a == a ]]");
+  // An array assignment: `name=(`, each element and `)`.
+  EXPECT_EQ(reduce("a=(  1   2  )   ;  echo $a"), "a=( 1 2 ) ; echo $a");
+  EXPECT_EQ(reduce("a+=(  3  )"), "a+=( 3 )");
+  EXPECT_EQ(reduce("typeset  -a   b=(  1   2  )"), "typeset -a b=( 1 2 )");
+  EXPECT_EQ(reduce("x=(  $(echo  a)  )"), "x=( $(echo  a) )");
+  // A here-document or a parse error stops zsh's lexer before the end of
+  // the line: it stays as typed.
+  EXPECT_EQ(reduce("cat  <<E   >/dev/null\n  x    y\nE"), "cat  <<E   >/dev/null\n  x    y\nE");
+  EXPECT_EQ(reduce("echo  a  ;  cat <<E\nz\nE"), "echo  a  ;  cat <<E\nz\nE");
+  EXPECT_EQ(reduce("echo   a  )  b"), "echo   a  )  b");
+  EXPECT_EQ(reduce("echo a;;  "), "echo a;;  ");
+  // A line that parses through an alias: the alias's name is a word, its
+  // text adds none (zsh's ihwend).
+  AliasTable aliases;
+  aliases.regular["b"] = {"{"};
+  aliases.regular["x"] = {"if true; then"};
+  auto reduce_aliased = [&](strv line) {
+    HistOptions o;
+    o.reduce_blanks = true;
+    return HistoryManager::hend_text(line, word_spans(line, true, &aliases), o);
+  };
+  EXPECT_EQ(reduce_aliased("b   echo   a ;  }"), "b echo a ; }");
+  EXPECT_EQ(reduce_aliased("x   echo  a ;  fi"), "x echo a ; fi");
 }
 
 TEST(History, HistsizeKeepsNewestEntries) {

@@ -425,7 +425,7 @@ void SignalManager::install(int sig) noexcept {
   ::sigaction(sig, &sa, nullptr);
 }
 
-void SignalManager::init(bool interactive) {
+void SignalManager::init(bool interactive, int tty) {
   mInteractive = interactive;
   open_self_pipe();
   install(SIGCHLD);
@@ -448,15 +448,23 @@ void SignalManager::init(bool interactive) {
   }
   install(SIGHUP);
 
-  // The terminal: /dev/tty, or stdin when that is one, kept on a high
+  // The terminal: the shell's own (shared, as zsh's SHTTY serves both
+  // init_io and acquire_pgrp), else /dev/tty or stdin, kept on a high
   // close-on-exec fd.
-  int fd = ::open("/dev/tty", O_RDWR | O_CLOEXEC);
-  if (fd < 0 and ::isatty(STDIN_FILENO)) fd = ::dup(STDIN_FILENO);
-  if (fd < 0) return;
-  int high = ::fcntl(fd, F_DUPFD_CLOEXEC, 10);
-  ::close(fd);
-  if (high < 0) return;
-  if (not ::isatty(high)) { ::close(high); return; }
+  int high = tty;
+  mBorrowedTty = tty >= 0;
+  if (high < 0) {
+    int fd = ::open("/dev/tty", O_RDWR | O_CLOEXEC);
+    if (fd < 0 and ::isatty(STDIN_FILENO)) fd = ::dup(STDIN_FILENO);
+    if (fd < 0) return;
+    high = ::fcntl(fd, F_DUPFD_CLOEXEC, 10);
+    ::close(fd);
+    if (high < 0) return;
+  }
+  if (not ::isatty(high)) {
+    if (not mBorrowedTty) ::close(high);
+    return;
+  }
 
   // Started in the background (`jfsh &` from another shell): wait until
   // brought to the foreground.
@@ -478,7 +486,7 @@ void SignalManager::init(bool interactive) {
   if (::tcsetpgrp(mTtyFd, mShellPgid) != 0) {
     mJobControl = false;
     for (int sig : JOB_CONTROL_SIGNALS) install(sig);
-    ::close(mTtyFd);
+    if (not mBorrowedTty) ::close(mTtyFd);
     mTtyFd = -1;
     return;
   }
