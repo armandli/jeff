@@ -22,6 +22,10 @@ struct AliasTable {
   HashTable<str>      suffix;    // -s: file extension → command text
 };
 
+// The aliases every shell starts with (zsh's createaliastable): run-help
+// and which-command, which the widgets of those names run.
+AliasTable default_aliases();
+
 }  // namespace jfsh
 
 #endif  // JFSH_CORE_ALIAS_TABLE_H

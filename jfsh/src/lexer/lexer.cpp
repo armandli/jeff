@@ -759,15 +759,21 @@ LexToken Lexer::read_word(int first_char, str prefix) {
         if (n == '\'' and not in_double) {
           // $'…' — C-style escapes; `\'` does not end it.
           text += "$'";
+          bool closed = false;
           for (int q; (q = mSrc.next_char()) != -1;) {
             text += static_cast<char>(q);
-            if (q == '\'') break;
+            if (q == '\'') {
+              closed = true;
+              break;
+            }
             if (q == '\\') {
               int e = mSrc.next_char();
               if (e == -1) break;
               text += static_cast<char>(e);
             }
           }
+          // Unclosed, it goes on over the next line (zsh's `dquote>`).
+          if (not closed) mIncomplete = true;
           all_digits_so_far = false;
           c = mSrc.next_char();
           continue;

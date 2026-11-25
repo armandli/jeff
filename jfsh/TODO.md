@@ -1564,10 +1564,10 @@ with its `name "$@"` line. Neither autoload path touches `$0`'s script name any 
 trap.
 
 **Left**
-- Done elsewhere: `f() {}` and `< <(cmd)` (M14); `bindkey`/`zle`/`vared` (M9).
+- Done elsewhere: `f() {}` and `< <(cmd)` (M14); `bindkey`/`zle`/`vared` (M9); `fc -p/-P`
+  and the default aliases `run-help` and `which-command` (M9's review).
   Planned elsewhere (M17): `typeset -Z/-L/-R` padding and `-t` (and `functions -t/-T`);
-  `autoload -w`; `read -z -c -l -n -p`; `print -z`; `fc -p/-P`; `hash -d`; zsh's
-  default aliases `run-help` and `which-command`; special-builtin errors under
+  `autoload -w`; `read -z -c -l -n -p`; `print -z`; `hash -d`; special-builtin errors under
   POSIX_BUILTINS; a forked stage's HASH_CMDS; zsh's line numbers and `(eval)` in
   messages, and no `zsh:` prefix in an interactive shell. `emulate -l` (M12 chose a
   sourceable listing; zsh lists every option), `emulate nosuch` (zsh: zsh) and its
@@ -1890,18 +1890,14 @@ logout file, zshexit and HISTFILE in
   goes on); jfsh reads it from the terminal in cooked mode, so the `^C` is echoed and
   the loop goes on. Reason:
   select's reading is the executor's, not the line editor's (M2/M9).
-- After an `exit` in a trap at the prompt, jfsh draws the prompt line again before
-  the EXIT trap's output (`% EX`); zsh leaves the screen as it is. Reason: the
-  editor's display (M9) finishes the line it was reading.
-- `$TMOUT` isn't implemented: no SIGALRM at the prompt after `$TMOUT` seconds, so
-  `TMOUT=1; trap 'exit 3' ALRM` doesn't exit. Reason: zsh's zleread timeout is M9's.
+- (Done in M9's review: an `exit` in a trap at the prompt leaves the screen as it is;
+  `$TMOUT` is implemented.)
 - With HIST_REDUCE_BLANKS, a line jfsh can't parse is stored as typed (zsh's hend
   rule), so `time …`, `coproc …` and `$(case … esac)` lines keep their blanks where
   zsh reduces them. Reason: `time` and `coproc` are parse errors (M17); the lines
   don't run either.
-- vared and isearch redraw differently from zsh (vared draws the buffer again after a
-  key, the isearch prompt goes on a line of its own); the text read is the same.
-  Reason: the editor's display (M9).
+- (Checked again in M9's review: vared's and `^R`'s screens are zsh's; what is left of
+  the display after trap output is in M9's Left.)
 - `sched` events only run before a prompt; zsh also runs them while the line editor
   waits for input (a timed fd watch). `sched -o` is accepted but there is no line to
   clear. Planned in M16.
@@ -1945,35 +1941,59 @@ logout file, zshexit and HISTFILE in
 
 **Done.** Expected behaviour comes from zsh 5.9 (`zsh -f`, `zsh -f -i`), which could be
 run on the machine M9 was written on: default keymaps and `bindkey` listings, `print -P`
-output, bang expansions and xtrace lines were compared with it.
+output, bang expansions and xtrace lines were compared with it; the M9 review compared
+the rest again, screen by screen (see Review fixes).
 - **Keymaps and widgets** (`src/editor/keymap.cpp`, `include/jfsh/editor/zle.h`): keys
   are looked up in data-driven keymaps (`emacs`, `viins`, `vicmd`, `visual`, `viopp`,
   `isearch`, `command`, `.safe`; `main` is another name for emacs or viins) holding
-  zsh's default bindings, plus Home/End/Delete, Shift-Tab and Ctrl-X Ctrl-E. A
-  sequence that is a prefix of a longer binding waits `$KEYTIMEOUT`; unbound escape
-  sequences are swallowed, not inserted. `main` is viins when `$VISUAL`/`$EDITOR`
-  mentions vi, as in zsh. Keymaps live in the `Zle` object (one per shell, on
-  `ExecContext::zle`), so a .jfshrc can set them up before the first prompt.
-- **Emacs widgets** (`src/editor/editor.cpp`): movement by character, word (zsh's
-  `forward-word`, with `$WORDCHARS`) and line; deleting and killing with a kill ring
-  (kills in a row join, `yank`/`yank-pop`); transpose and case; mark and region;
-  undo/redo (typing is one step); numeric arguments (`Alt-digits`, `neg-argument`,
-  `universal-argument`); `quoted-insert`; overwrite mode; bracketed paste; history
-  (`up/down-line-or-history`, `history-search-*`, `history-beginning-search-*`,
-  incremental search with `^R`/`^S`/`^G`/backspace, `insert-last-word`,
-  `copy-prev-word`, `infer-next-history`); `push-line`/`get-line`, `accept-and-hold`,
-  `accept-line-and-down-history`; `expand-history`/`magic-space`;
-  `edit-command-line` (`$VISUAL`/`$EDITOR`); `execute-named-cmd`; `run-help` and
-  `which-command`; `clear-screen`. Ctrl-D on an empty line is EOF (IGNORE_EOF says
-  "use 'exit' to exit").
+  zsh's default bindings (bytes from 0x80 up are self-insert in emacs and viins, which
+  reads the rest of a UTF-8 character as zsh's getrestchar; `command` has `^G ^J ^M`;
+  `.safe` is zsh's immutable fallback), plus jfsh's own Home/End/Delete, Shift-Tab and
+  Ctrl-X Ctrl-E. A sequence that is a prefix of a longer binding waits `$KEYTIMEOUT`;
+  unbound escape sequences are swallowed, not inserted. `main` is viins when
+  `$VISUAL`/`$EDITOR` mentions vi, as in zsh; `$KEYMAP` is the name selected (`main` at
+  the prompt). Keymaps live in the `Zle` object (one per shell, on `ExecContext::zle`),
+  so a .jfshrc can set them up before the first prompt. Every widget zsh 5.9 has is
+  there (`zle -la` lists them and their `.names`).
+- **Emacs widgets** (`src/editor/editor.cpp`, ports of zsh's zle_move.c, zle_word.c,
+  zle_misc.c): movement by character, word (zsh's `forward-word`, with `$WORDCHARS`) and
+  line, a negative count going the other way; deleting and killing into zsh's cut
+  buffer and 8-entry kill ring (kills in a row join, `yank`/`yank-pop`), which also feed
+  the vi registers, one set for the whole shell (the prompt's editor and vared's share
+  them, as zsh's globals) and `$killring` in widgets; transpose
+  (`gosmacs-transpose-chars` too) and case; mark and region; undo/redo, one step per
+  widget as zsh's handleundo (each change kept as what it replaced, so a long line costs
+  little; a change remembers its history line, and text a read starts with, vared's or
+  push-line's, is a change); numeric arguments as zsh's tmult (`Alt-digits`,
+  `neg-argument`, `universal-argument` reading its digits, `argument-base`);
+  `quoted-insert`; overwrite mode; bracketed paste; history (`up/down-line-or-history`,
+  `…-or-search`, with counts and the column a run of line moves keeps to, as zsh's
+  upline/downline; `history-search-*`, `history-beginning-search-*`, incremental search
+  with `^R`/`^S`/`^G`/backspace, `insert-last-word`, `copy-prev-word`,
+  `copy-prev-shell-word`, `infer-next-history`, `beginning/end-of-line-hist`);
+  `push-line`/`get-line`, `accept-and-hold`, `accept-line-and-down-history`,
+  `accept-and-infer-next-history`; `expand-history`/`magic-space`; `edit-command-line`
+  (`$VISUAL`/`$EDITOR`); `execute-named-cmd` and `where-is` (zsh's executenamedcommand:
+  the name completed on Tab or space, listed on `^D`); `describe-key-briefly`,
+  `what-cursor-position`; `run-help` and `which-command` (zsh's processcmd: they run the
+  aliases of their names, `run-help=man` and `which-command=whence`, which every shell
+  now starts with); `clear-screen`, `reset-prompt`. Ctrl-D on an empty line is EOF
+  (IGNORE_EOF says "use 'exit' to exit"); Ctrl-C goes through `Zle::on_interrupt`.
+  With FLOW_CONTROL (the default) `^S`/`^Q` stay the terminal's, as in zsh.
 - **Vi mode** (`src/editor/vi.cpp`): insert/normal/visual (`v`, `V`)/replace (`R`);
   motions `h l w W b B e E ge gE 0 ^ $ | f F t T ; , %`, history `k j + - G / ? n N`;
   operators `d c y gu gU g~ > <` with a motion, doubled for lines, or a text object
-  (`iw aw iW aW i" a" i' a' i( a( i[ a[ i{ a{ i< a<`); `x X D C S s Y p P r ~ J o O i a
-  I A`; counts on both the operator and the motion (`2d3w`); registers `"a`–`"z`
-  (`"A` appends, `"_` discards); marks `m` `` ` `` `'`; `u` and `^R`; `.` repeats the
-  last change, an insert included. Leaving insert mode steps back a character, and the
-  cursor stays on the line's last character in vicmd.
+  (`iw aw iW aW`, and jfsh's own `i" a" i' a' i( a( i[ a[ i{ a{ i< a<`, which zsh has as
+  shell functions); `> <` need lines (a motion within one does nothing); `x X D C S s Y p
+  P r ~ J o O i a I A`; counts on both the operator and the motion (`2d3w`); registers
+  `"a`–`"z` (`"A` appends, `"_` discards), `"0` (the last yank) and `"1`–`"9` (the last
+  deletions, shifting); marks `m` `` ` `` `'`; `u` and `^R`; `.` repeats the last change,
+  an insert included, a count or register given to it replacing the change's and
+  `"1p..` stepping through `"2`… (zsh's virepeatchange). Leaving insert mode steps back a
+  character, and the cursor stays on the line's last character in vicmd. In insert mode
+  `^W`, `^U` and backspace stop where the insert began (zsh's viinsbegin). With main
+  linked to viins every read starts in an insert (zsh's viinsert_init), so what is typed
+  before the first Esc is one undo step, at the prompt and in vared.
 - **UTF-8** (`src/core/utf8.cpp`, B25): the cursor moves by character (a base
   character and its combining marks are one), widths come from `wcwidth()` with a
   built-in table for characters the locale doesn't know. `main` sets `LC_CTYPE` from
@@ -1981,23 +2001,37 @@ output, bang expansions and xtrace lines were compared with it.
 - **Rendering** (`src/editor/refresh.cpp`, B26, B27): the prompt is expanded once per
   line; each refresh draws prompt and buffer again from the prompt's first row,
   breaking rows itself (so it always knows where the cursor is): multi-line prompts and
-  buffers, wrapped lines, wide characters, control characters as `^X`, the region in
-  standout, `RPROMPT`/`RPS1` on the last prompt row when the line fits
-  (TRANSIENT_RPROMPT drops it on accept), messages and completion lists below the
-  line. The width is read on every refresh, so SIGWINCH means drawing again.
-  PROMPT_CR/PROMPT_SP mark output that didn't end in a newline with
-  `$PROMPT_EOL_MARK`, as zsh does. A job notice or trap output while typing clears the
-  line first and draws it again below (`Editor::trash`).
-- **`bindkey`** (`src/builtins/zle.cpp`): `-e -v -a -M -l -L -N -A -D -d -r -s -R -p`,
-  listing in zsh's format (ranges like `" "-"~" self-insert`, `bindkey -L` commands),
-  zsh's key notation (`^X`, `\e`, `\M-x`, `\C-x`, `\NNN`, `\xNN`).
-- **`zle`**: `-N` (user widgets, which may replace builtin ones; `.name` is always the
-  builtin), `-D`, `-A`, `-l [-L] [-a]`, `-M`, `-U`, `-K`, `-R`, `-I`, and `zle widget`
-  from inside a widget. A user widget's function sees `$BUFFER`, `$CURSOR`, `$LBUFFER`,
+  buffers, wrapped lines, wide characters, tabs as blanks to the next multiple of 8,
+  other control characters as `^X`, the region in standout, `RPROMPT`/`RPS1` on the
+  last prompt row when the line fits (TRANSIENT_RPROMPT drops it on accept), messages
+  and completion lists below the line, on the shell's terminal (`Zle::tty_out`). The
+  width is read on every refresh, so SIGWINCH means drawing again. PROMPT_CR/PROMPT_SP
+  mark output that didn't end in a newline with `$PROMPT_EOL_MARK`, as zsh does. A job
+  notice or a listing too tall for the screen goes below the line, which stays (zsh's
+  trashzle, `Editor::trash`), and the line is drawn again after it; a trap run at the
+  prompt writes where the cursor is, and an `exit` in it leaves the screen as it is.
+- **`bindkey`** (`src/builtins/zle.cpp`, zsh's bin_bindkey): `-e -v -a -M -l -L -N -A -D
+  -d -r -s -R -p -m`, the operation and keymap checks and messages in zsh's order,
+  listing in zsh's order and format (scankeymap, bindlistout: ranges like `" "-"~"
+  self-insert`, `bindkey -R -M km`, `-a` for vicmd, `-s` for strings, `--` before a key
+  starting with `-`), keys printed as printbind (bindztrdup in dquotedztrdup's quotes:
+  `"\\\\"` for a backslash) and read as getkeystring (`^X`, `\e`, `\M-x`, `\C-x`, `\NNN`,
+  `\xNN`, `\uNNNN`, the modifiers applying to the escaped character that follows).
+- **`zle`** (zsh's bin_zle): `-N` (user widgets, which may replace builtin ones; `.name`
+  is always the builtin), `-D` (a builtin's name too), `-A` (the widget the name has
+  now), `-C`, `-l [-L] [-a] [names]` (aliases of builtins are builtin), `-M`, `-U`,
+  `-K`, `-R`, `-I`, `-f yank|kill|…` and `zle widget [-n num] [-N] [-K keymap] [-w]
+  [-f nolast] args` from inside a widget; the argument counts and messages are zsh's.
+  A user widget's function (run without XTRACE) sees `$BUFFER`, `$CURSOR`, `$LBUFFER`,
   `$RBUFFER`, `$PREBUFFER`, `$WIDGET`, `$LASTWIDGET`, `$KEYS`, `$KEYMAP`, `$NUMERIC`,
   `$HISTNO`, `$MARK`, `$CUTBUFFER`, `$BUFFERLINES`, `$REGION_ACTIVE` as special
-  parameters bound to the editor, so assigning them edits the line at once.
-- **`vared [-p prompt] [-r rprompt] [-c] [-a|-A] [-h] [-M keymap] name`**.
+  parameters bound to the editor, so assigning them edits the line at once. A widget
+  without a function, or a name taken away, says so and runs the builtin of that name.
+- **`vared [-p prompt] [-r rprompt] [-c] [-a|-A] [-h] [-M keymap] [-m keymap] name`**,
+  with zsh's checks and messages (bin_vared); an array's elements are joined with
+  separators and backslashes quoted, and split back so; `-M` and `-m` link `main` and
+  `vicmd` to the keymaps named for the edit and back after it (zsh's savekeymap and
+  restorekeymap, with their warnings).
 - **Completion** (`src/editor/completion.cpp`, B28, B52): the word at the cursor is
   found by a small tokenizer (quotes, backslashes, separators, redirections, `$(`,
   precommand modifiers, assignments). Contexts: `$name` and `${name` → parameters (with
@@ -2006,46 +2040,78 @@ output, bang expansions and xtrace lines were compared with it.
   cached per directory mtime), or files when the word has a `/`; after `cd`, `pushd`,
   `rmdir` → directories; otherwise files, with `/` after directories, LIST_TYPES
   markers in lists, and quoting (backslashes, or inside an open `'`/`"`, closed on a
-  unique match). Tab inserts the longest common prefix; a Tab that adds nothing lists
+  unique match). Tab with only blanks before it on its line inserts itself (zsh's
+  usetab). Tab inserts the longest common prefix; a Tab that adds nothing lists
   (AUTO_LIST, LIST_AMBIGUOUS, LIST_ROWS_FIRST, columns, `$LISTMAX` with "do you wish to
-  see all N possibilities"); the next one starts menu completion (AUTO_MENU,
-  MENU_COMPLETE, Shift-Tab goes back). COMPLETE_IN_WORD is honoured.
-  `compdef fn cmd…` / `compdef -d` hand a command's arguments to a shell function,
-  which sees `$words`, `$CURRENT`, `$PREFIX` and adds matches with `compadd [-S suf] [-P
-  pre] [-d disp] [-a] [-U] -- words`, or `_files [-/] [-g pat]`, `_directories` and
-  `_command_names`. `compinit` is accepted and does nothing.
-- **Prompt** (`src/prompt/prompt.cpp`, B34–B37, B61): numeric arguments (`%2~`,
-  `%-1/`, `%3c`, `%2m`); `%~` replaces `$HOME` (from the shell's parameters) only at a
-  component boundary; `%B %b %U %u %S %s %E`, `%F{…}`/`%K{…}` with names, 0–255 and
-  `#rrggbb`, `%f %k` (with zsh's re-emission of colours after `%B`/`%b`); `%? %j %L %h
-  %! %i %I %N %x %e %y %l %n %m %M %# %v %d %/ %c %. %C`; `%D{fmt}` (with zsh's `%f %K
-  %L`), `%D %T %t %@ %* %w %W`; `%(x.true.false)` with every test zsh has; truncation
-  `%N<…<`, `%N>…>`, `%N[…]`, ended by `%<<` or the enclosing group; `%{…%}`; unknown
-  escapes expand to nothing. PROMPT_SUBST (parameter, command and arithmetic
-  expansion first; quotes kept), PROMPT_BANG and PROMPT_PERCENT. Zero-width parts are
-  marked so the editor knows the prompt's width. `print -P`, PS3 and PS4 use the same
-  expander; PS4 now defaults to zsh's `+%N:%i> ` (and an assignment's trace ends in a
-  space, as zsh's does).
-- **History** (`src/history/history.cpp`): bang expansion anywhere in the line: `!!`,
-  `!N`, `!-N`, `!str`, `!?str?`, `!#`, `!{…}`, `^old^new^`, word designators (`:0 ^ $ * %
-  x-y -y x* x-`, the colon optional before `^ $ * %`), modifiers (`:h :t :r :e :s :gs :&
-  :g& :q :x :u :l :a :A :p`), `$histchars`; nothing expands inside single quotes,
-  after a backslash, or before a blank, `=` or `(`. The interactive loop prints an
-  expanded line before running it; HIST_VERIFY puts it back in the editor; `:p` only
-  prints it. Errors are zsh's (`no such event: N`, `event not found: str`, `no such
-  word in event`, `substitution failed`, `illegal modifier: z`).
+  see all N possibilities", answered as zsh's getzlequery: typed-ahead keys are a no and
+  stay to be read, only `y` or Tab lists); the next one starts menu completion (AUTO_MENU,
+  MENU_COMPLETE, Shift-Tab goes back). `compdef fn cmd…` / `compdef -d` hand a
+  command's arguments to a shell function, which sees `$words`, `$CURRENT`, `$PREFIX`
+  and adds matches with `compadd` (every option, M15), or `_files [-/] [-g pat]`,
+  `_directories` and `_command_names`. `compinit` is accepted and does nothing.
+- **Prompt** (`src/prompt/prompt.cpp`, B34–B37, B61, structured as zsh's
+  putpromptchar and prompttrunc): numeric arguments (`%2~`, `%-1/`, `%3c`, `%2m`, `%-`
+  alone is -1); `%~` replaces `$HOME` (from the shell's parameters) only at a component
+  boundary; `%B %b %U %u %S %s %E`, sent every time, the attributes still on sent again
+  after `%B %b %s %u` (tsetcap's TSC_DIRTY); `%F{…}`/`%K{…}` (the name prompt-expanded)
+  with names, 0–255 and `#rrggbb`, else the number before the letter, `%f %k`; `%? %j %L
+  %h %! %i %I %N %x %e %y %l %n %m %M %# %v %d %/ %c %. %C` (`%e` the depth of
+  `$funcstack`, `%x` the file, `%m %M` `$HOST`); `%D{fmt}` through a port of zsh's
+  ztrftime (`%f %K %L`, `%.`/`%3.` fractions, `%N`), `%D %T %t %@ %* %w %W`;
+  `%(x.true.false)` with every test zsh has (a letter that isn't one shows neither
+  branch; a branch the string ends in ends it, shown as far as it got); truncation
+  `%N<…<`, `%N>…>`, `%N[x…]`, `%-N<…<` (N short of `$COLUMNS`), ended by `%<<` or the
+  enclosing group, zero-width parts kept after the truncation string; `%{…%}`; unknown
+  escapes and a `%` at the end expand to nothing. PROMPT_SUBST (parameter, command and
+  arithmetic expansion first; quotes kept), PROMPT_BANG and PROMPT_PERCENT. Zero-width
+  parts are marked so the editor knows the prompt's width. `print -P`, PS3 and PS4 use
+  the same expander; PS1 and PS2 start as zsh's setupvals sets them (`%m%# ` and `%_> `
+  in an interactive shell, `$ ` and `> ` under sh/ksh emulation, empty otherwise; unset,
+  a prompt is empty), PS3 as `?# `, PS4 as `+%N:%i> ` (`+ ` for sh/ksh) (and
+  an assignment's trace ends in a space, as zsh's does); `$PROMPT`, `$PROMPT2`,
+  `$PROMPT3`, `$PROMPT4` are other names for `$PS1`…`$PS4` (unsetting one empties the
+  prompt and unsets only that name); `$psvar` given a scalar is one element. A number
+  past 64 bits is cut with zstrtol's "number truncated" warning.
+- **History** (`src/history/history.cpp`, a port of zsh's histsubchar): bang expansion
+  on each line as it is read, a here-document's body left alone, the quoting going on
+  from one line of a command to the next: `!!`, `!N`, `!-N`, `!str`, `!?str?`, `!#`,
+  `!{…}`, `^old^new^` on any line read (with modifiers after it), word
+  designators (`:0 ^ $ * % x-y -y x* x-`, the colon optional before `^ $ * %`; the words
+  as they are in the event, its spacing kept), modifiers (`:h :t :r :e` with counts,
+  failing as zsh's, `:s :gs :& :g& :G :q :Q :x :u :l :a :A :P :p :c`), `$histchars` (one
+  parameter with `$HISTCHARS`; set empty, no expansion); an event
+  ends where zsh's does; nothing expands inside single quotes, after a backslash, after
+  `!"` (which goes, and ends expansion for the line), or before a blank, `=` or `(`. The
+  interactive loop prints an expanded line before running it; HIST_VERIFY puts it back
+  in the editor (without one the line is dropped, as zsh's); `:p` only prints it. Errors
+  are zsh's (`no such event: N`, `event not found: str`, `no such word in event`,
+  `modifier failed: h`, `% with no previous word matched`, `no previous substitution`,
+  `substitution failed`, `illegal modifier: z`).
 - **History file**: reads and writes zsh's format: EXTENDED_HISTORY lines (`: start:
   elapsed;cmd`), multi-line entries as `\` continuations, and zsh's metafied bytes.
   APPEND_HISTORY appends only entries not yet in the file (B5) and then cuts the file
   back to `$SAVEHIST`; without it the file is rewritten (HIST_SAVE_NO_DUPS honoured).
-  `fcntl` locks while reading and writing. INC_APPEND_HISTORY writes each line as it is
-  entered, INC_APPEND_HISTORY_TIME after it ran (with its time), SHARE_HISTORY also
-  reads what other shells wrote before each prompt. `fc -W` rewrites, `fc -A` appends.
-- **History options**, read from the options and `$HISTSIZE` (default 1000),
-  `$SAVEHIST` (default `$HISTSIZE`), `$HISTFILE` before each prompt: HIST_IGNORE_SPACE,
-  HIST_IGNORE_DUPS, HIST_IGNORE_ALL_DUPS (drops the older copy, B58), HIST_NO_STORE
-  (drops `history`/`fc -l` lines, B40), HIST_REDUCE_BLANKS, HIST_FIND_NO_DUPS (in the
-  editor's searches), HIST_VERIFY, BANG_HIST.
+  `fcntl` locks while reading and writing ("locking failed for FILE: …" when the file
+  can't be opened). INC_APPEND_HISTORY writes each line as it is entered,
+  INC_APPEND_HISTORY_TIME after it ran (with its time), SHARE_HISTORY also reads what
+  other shells wrote before each prompt (these only with `$SAVEHIST`, M8). `fc -W`
+  rewrites and `fc -A` appends the whole list (with `-I` only the entries not read or
+  written yet, as savehistfile's HFILE_SKIPOLD; `fc -RI` leaves out lines the list
+  already has), only in an interactive shell; `fc -p [-a] [file [size [savesize]]]`/`fc -P`
+  push and pop a history (zsh's pushhiststack; `-a` pops when the function returns, the
+  shell's exit saves and pops them all). `fc -l` writes a command as nicezputs (`\n` for a newline).
+- **History options**, read from the options and `$HISTSIZE` (default 30), `$SAVEHIST`
+  (default 0), `$HISTFILE` before each prompt (M8): HIST_IGNORE_SPACE and HIST_NO_STORE
+  keep their lines only until the next one comes (zsh's HIST_TMPSTORE, so `!!` still
+  finds them; B40), HIST_IGNORE_DUPS (the repeat takes the last entry's place),
+  HIST_IGNORE_ALL_DUPS (drops the older copy, B58), HIST_REDUCE_BLANKS (zsh's
+  histreduceblanks over the lexer's word spans, M8), HIST_FIND_NO_DUPS (in the editor's
+  searches), HIST_VERIFY, BANG_HIST, CSH_JUNKIE_HISTORY.
+- `$TMOUT`: armed around every read the line editor does on the terminal (PS1, PS2,
+  vared: zsh's zleread), not when an interactive shell reads without one; SIGALRM's trap
+  runs (and the alarm starts again), else the shell says "timeout" and exits with 14
+  unless the terminal was used within `$TMOUT` seconds (zsh's handler, which an
+  interactive shell has for any SIGALRM, and its subshells don't).
 - Without a terminal (`jfsh -i < file`) the prompt goes to stderr and the line is read
   unbuffered (B54).
 - Tests: `tests/editor_test.cpp` drives an `Editor` through a pty in process and feeds
@@ -2055,6 +2121,303 @@ output, bang expansions and xtrace lines were compared with it.
   `tests/interactive_test.cpp`; history file and prompts without a terminal in
   `tests/startup_test.cpp`.
 
+**Review fixes** (branch jfsh-m9-review), against zsh 5.9, comparing final screens
+through a terminal emulator (scratchpad m9/vt.py, m9/drv.py: pty probes, `-c` and
+standard-input runs) three ways (zsh, main, branch): 1,168 probes (scratchpad m9/p),
+with M7's 1,678-probe corpus (3,356 runs) and M8's pty, startup and history corpora
+run again.
+Keymaps and listings were the largest gap: `bindkey` and `zle` are now ports of
+bin_bindkey and bin_zle (operation tables, argument counts, messages, -lL, -rR, -m,
+.safe protected, the listing order and quoting), the default keymaps zsh's (meta keys,
+viins `^X` unbound, vicmd `ga`, `command`, `.safe`), and the 22 widgets zsh had that jfsh
+didn't are there. The emacs widgets are ports (negative counts everywhere, transposes,
+case, copy-prev-word with a count, what-cursor-position, execute-named-cmd with
+completion and listing, which-command/run-help as processcmd with zsh's two default
+aliases), the kill ring is zsh's cut buffer, ring and vi registers (`"0`, `"1`–`"9`
+were missing), undo is per widget (typing was one step) and stores changes rather than
+copies of the line (a 10,000-character line typed key by key had made 10,000 copies),
+the numeric argument is zsh's tmult (universal-argument reads its digits), self-insert
+is doinsert (a negative count, overwrite), `$KEYMAP` is the selected name, FLOW_CONTROL
+is honoured, tabs show as blanks. Vi: `V` with an operator works on the whole lines (it
+cut one character), `>`/`<` need lines, `3$` beyond the buffer fails in place, viins
+`^W ^U ^H` stop at the insert's start, `/`'s match leaves the cursor at the end. The
+prompt follows putpromptchar and prompttrunc (always-sent attributes and TSC_DIRTY,
+`%F` without braces, `%-`, `%(x` tests and unterminated branches, `%[`, negative
+truncation widths, the truncation string before kept escapes, the right truncation
+overshoot, a trailing `%`), `%t %@` pad the hour, `%D{%3.}`, `%e`, `%x`, `$psvar` as a
+scalar, `$PROMPT*` and the PS1/PS3/SPROMPT defaults. History expansion is a port of
+histsubchar (event and designator rules, `:h`/`:t`/`:e`/`:r` failures, `:G :Q :P`, `:q`
+and `:x` quoting, `\&`, `^a^b^:G`, `${!}`, `!"`, word spacing), runs per line so a
+here-document stays as typed, HIST_IGNORE_SPACE/HIST_NO_STORE lines stay until the next
+line, `fc -p`/`-P` exist, `fc -l` escapes newlines as nicezputs, and history-file errors
+are zsh's. `$TMOUT` (M8's Left) and the screen after an `exit` in a trap at the prompt
+(M8's Left) are zsh's; job notices keep the line above them (trashzle). `alias +g`,
+`+r`, `+s`, `+m` and a lone `+` list names only (exposed by the new default aliases).
+Performance was on a par with zsh (per key with a 10,000-character or 200-line buffer,
+a 10,000-character paste, `^R` and history-beginning-search over 100,000 entries,
+completion over 10,000 files and a 200-directory `$PATH`: within the 0.05–0.3 s
+settling time of the harness for both shells). Tests: `EditorM9Review.NegativeCountsRunTheOtherWay`,
+`EditorM9Review.UndoIsPerWidget`, `EditorM9Review.TransposeCopyAndDelete`,
+`EditorM9Review.KillRingAsZsh`, `EditorM9Review.MessagesAndNamedCommands`,
+`EditorM9Review.TabsShowAsBlanks`, `EditorM9Review.ViInsertStopsWhereTheInsertBegan`,
+`EditorM9Review.ViRegistersLinesAndIndent`, `EditorM9Review.BindkeyAsBinBindkey`,
+`EditorM9Review.ZleAsBinZle`, `PromptM9Review.AttributesAlwaysGoOut`,
+`PromptM9Review.ConditionalsAndTheirTests`, `PromptM9Review.TruncationAsPrompttrunc`,
+`PromptM9Review.TimeAndDepth`, `PromptM9Review.PromptParametersAreOneAnother`,
+`HistoryM9Review.EventsAsZshFindsThem`, `HistoryM9Review.WordsKeepTheirSpacing`,
+`HistoryM9Review.ModifiersCanFail`, `HistoryM9Review.LinesKeptUntilTheNext`,
+`HistoryM9Review.FcListingAndStacks`, `InteractiveM9Review.BangInAHereDocumentStays`,
+`InteractiveM9Review.ExitInATrapAtThePromptLeavesTheScreen`,
+`InteractiveM9Review.TmoutSendsAlrmAtThePrompt`,
+`InteractiveM9Review.WhichCommandRunsItsName`; tests updated to zsh's values:
+`Editor.UndoAndNumericArguments`, `Editor.HistorySearchAndLastWord`,
+`Bindkey.ListingMatchesZsh`, `Bindkey.KeyNotation`, `Zle.Builtin`,
+`Alias.ListingAndUnalias`, `History.IgnoreSpaceDropsLeadingSpaceLines`,
+`History.B40NoStoreDropsHistoryCommandsOnly`, `HistoryExpand.QuotingAndLiteralBangs`,
+`HistoryExpand.RangesAndErrors`. Ported from zsh, with its attribution and licence:
+`src/editor/editor.cpp`, `src/editor/keymap.cpp`, `src/builtins/zle.cpp`,
+`src/prompt/prompt.cpp`, `src/history/history.cpp`, `src/builtins/hist.cpp`.
+
+**Review fixes, round 1.** The round-0 driver counted a regression only where main
+matched zsh exactly, and zsh's `%_> ` continuation prompt never matched jfsh's `> `, so
+two line-reading regressions passed as "changed"; the driver now gives both shells
+PS2='> ', normalises zsh's `for>`-style prompts and the temporary directory's name, and
+every "changed" line is read as well. Three regressions were fixed: a fresh viins
+prompt (and vared) wasn't in an insert, so `abc` Esc `u` undid one key (zleread's
+viinsert_init); bang expansion forgot a quote opened on an earlier line (the quote
+state now goes from line to line, as zsh's lexer state does, and every line read may be
+`^old^new`, as zsh's inputline sets isfirstch); subshells of an interactive shell kept
+its SIGALRM handler and ignored the signal. `$TMOUT` is armed around every editor read
+on the terminal (PS2 and vared included; an unfinished command isn't reported as a parse
+error when it fires) and not without one. PS1/PS2/PS4 are assigned as setupvals does,
+with no fallback when unset; `unset PROMPT` empties PS1. vared `-M`/`-m` port
+savekeymap. The cut buffer, kill ring (kept newest first) and vi registers moved from the
+editor to `Zle`, so vared shares them, and `$killring` reads and sets the ring. Widgets
+fixed: copy-prev-shell-word (bufferwords' rule for the word at the cursor),
+accept-and-infer-next-history and infer-next-history (infernexthist: from two entries
+back, nothing accepted when nothing is inferred), argument-base (resets the count),
+describe-key-briefly and where-is (keys quoted as bindztrdup), end-of-list (keeps the
+listing on the screen), vi-caps-lock-panic (its message), up/down-line and the
+`…-or-history`/`…-or-search` widgets (counts, lastcol). ztrftime's `%E`/`%O` and the
+other flags after a plain start go to strftime with the next character (morefmt). Vi:
+`"1p..` steps the registers, a count given to `.` replaces the change's, a put repeats
+once, operators fail in an empty buffer (dd stored an empty line). Undo follows the
+history line each change was made in (unapplychange), and text a read starts with is a
+change. `fc -p` works in a shell that isn't interactive (every shell has an in-memory
+history now, as zsh's), applies its sizes to the file it reads at once, keeps the
+running line in the old history, and `fc -P` saves only when interactive (savehistfile).
+Older bugs fixed on the way: `histchars=''` turns bang history off (and `$histchars` is
+`$HISTCHARS`); a `bindkey -s` macro that calls itself no longer redraws on every key
+(zsh draws only with no key pushed back); prompt numbers past 64 bits warn as zstrtol;
+`$'…` unclosed at the end of a line goes on to the next (it ran as two commands); the
+`:c` modifier; zsh's option aliases (`histexpand`, `braceexpand`, `dotglob`, `log`, …);
+Tab with only blanks before it inserts a tab (usetab), and the "do you wish to see all"
+question is getzlequery's; traps run while the editor reads see `$BUFFER` and the others
+read-only (zlebeforetrap). vi.cpp and options.cpp carry zsh's licence for what they port.
+Counts (three ways): the reviewer's 440 probes 407 the same as zsh, 2 flagged (a zsh
+`$TMOUT` timing flake; a `.`-after-`cw` probe whose zsh run hadn't settled, matching
+with a longer wait); this round's 153 probes and the
+M9 corpus (1,176 probes) no regressions; M7's 3,304 runs 4, `fc -l -1` in a shell
+without a line being run (fixed); M8's corpora 3, all `$MAILCHECK` timing; history
+corpora (93 cases) none.
+Tests: `EditorM9Review.ViUndoAtAFreshPrompt`, `EditorM9Review.UndoFollowsHistoryLines`,
+`EditorM9Review.LineMovesTakeCountsAndKeepTheColumn`,
+`EditorM9Review.CopyPrevShellWordAsBufferwords`, `EditorM9Review.WidgetsAsZshHasThem`,
+`EditorM9Review.KillRingIsGlobal`, `EditorM9Review.ViRepeatStepsNumberedRegisters`,
+`PromptM9Review.TimeFlagsGoToStrftime`, `PromptM9Review.NumbersTruncatedWithAWarning`,
+`HistoryM9Review.QuotesAndCaretsAcrossLines`, `HistoryM9Review.CommandPathModifier`,
+`HistoryM9Review.HistcharsAndOptionAliases`, `HistoryM9Review.FcPushReadsWithItsSizes`,
+`InteractiveM9Review.SubshellsDieOfAlrm`, `InteractiveM9Review.TmoutAtEveryEditorRead`,
+`InteractiveM9Review.BangKeepsQuotesAcrossLines`,
+`InteractiveM9Review.VaredKeymapsAndViUndo`; updated to zsh's values:
+`Prompt.DefaultsFollowZsh`, `HistoryM9Review.FcListingAndStacks`.
+
+**Review fixes, round 2.** Bang expansion follows the lexer's three quoting states:
+`'…'` (a backslash is a plain character, nothing expands), `$'…'` (a backslash escapes,
+nothing expands) and `"…"` (a backslash escapes, history expands); `^old^new` isn't
+done inside `'…'` or `$'…'`. `fc` is a port of bin_fc and fcgetcomm with zsh's curline
+and curhist (a shell that isn't interactive has no current line: `-1` is event 0,
+re-running stops short of the newest event, the default re-run event is the first),
+addhistnum, and fclist's "can't be executed backwards"; `fc -W`/`-A` write nothing in a
+shell that isn't interactive (savehistfile). Vi command mode is the keymap selected by
+the name `vicmd` (invicmdmode), so under `vared -M vicmd` the cursor may sit on a
+newline. `unset killring` in a widget unsets it; `$WIDGET` between keys is the last
+widget a key ran, as a trap sees it; `histchars`/`HISTCHARS` are one value with a flag
+each (three ASCII characters at most, the defaults when unset); `PROMPT=x` doesn't set
+an unset PS1; `$prompt` is one more name for PS1, as in zsh. Tests:
+`HistoryM9Review.ThreeQuotingStates`,
+`HistoryM9Review.FcWithoutACurrentLine`, `EditorM9Review.VicmdModeIsTheName`,
+`InteractiveM9Review.TrapSeesTheLastWidget`; extended: `EditorM9Review.KillRingIsGlobal`,
+`HistoryM9Review.HistcharsAndOptionAliases`, `Prompt.DefaultsFollowZsh`; set up as an
+interactive shell's history: `History.ListsAndReruns`,
+`History.TheLineBeingRunIsLeftOut`, `HistoryFile.FcWriteAndAppend`,
+`HistoryM9Review.FcListingAndStacks`. Counts (three ways): the reviewer's 440 and 230
+probes, this branch's 180 and the M9 corpus (1,167) no regressions; M7's 3,304 runs
+none; M8's corpora 4, all timing (`$PERIOD` and `$MAILCHECK` compare whole seconds, and
+main misses the same way at another second's phase); history corpora (93) none.
+
+**Review fixes, round 3.** `fc` string events are found as hcomsearch finds them, from
+the entry before the newest, and the line being run keeps the number the loop gave it
+(`ExecContext::hist_line`, zsh's curline), so a function's `print -s` after it is listed.
+History expansion follows lex.c's STOPHIST rules with a stack of the lexer's contexts
+(`HistQuoting`, returned with each expansion): `$(…)` read as a command (its quotes,
+nesting and comments), `"…"`, `` `…` `` with a `'…'` inside, `${…}`, and with
+INTERACTIVE_COMMENTS a comment at a word's start read without history; the text an
+expansion brings is lexed too. `$WIDGET` and `$LASTWIDGET` follow bindk and lbindk:
+`zle name` sets `$WIDGET` only for a builtin widget or with `-w`, `-f nolast` keeps
+`$LASTWIDGET`, which goes on from the last line. `fc -W`/`-A` write the whole list and
+`-I` only what wasn't read or written; `fc -RI` skips lines already there; the time
+formats are fclist's (`-t fmt`, `-i`, `-E`, `-f`, `-d`). The prompt strings: PS1 shares
+its string with PROMPT and prompt, RPS1 with RPROMPT (RPS2 with RPROMPT2), each name with
+its own unset flag; the editor shows the string whatever the flags; assigning through
+another name leaves an exported PS1's environment entry alone (`ParamTable::pin_env`);
+PS1–PS4 and SPROMPT are special, and stay special when unset; a special scalar refuses
+an array (`histchars=(a b)`). hist.cpp carries zsh's licence for what it ports. The
+probe drivers now pass `--norouter` to every jfsh run. Tests:
+`HistoryM9Review.NestingAndComments`, `HistoryM9Review.FcWriteReadAndTimes`,
+`EditorM9Review.WidgetAndLastWidget`, `InteractiveM9Review.FcStringEventsAndTheCurrentLine`;
+extended: `HistoryM9Review.FcWithoutACurrentLine`, `Prompt.DefaultsFollowZsh`; updated:
+`History.ListsAndReruns` (the lines run as the loop runs them),
+`HistoryFile.FcWriteAndAppend` (`-A` appends the whole list),
+`HistoryFile.ShareHistoryReadsWhatOthersWrote`.
+
+**Review fixes, round 4.** History expansion now follows gettok's rule for where a
+comment starts: only at a token's start at command level, inside `$(…)` or an array
+assignment's `(…)`, never inside `${…}` or math (round 5 corrected the glob-group and
+`=(` rules this round had only in part).
+Math (`$((…))`, `((…))` at a command's start, `$[…]`) is read as dquote_parse reads it:
+no comments, `'` and `"` plain, its parentheses counted. Here-documents opened inside
+`$(…)` have their bodies read without history up to their end word (`<<-` strips
+tabs, quoted end words too). The names sharing a prompt string (PS1/PROMPT/prompt,
+PS2–PS4 with PROMPT2–PROMPT4, RPS1/RPROMPT, RPS2/RPROMPT2) keep each exported name's
+environment entry until that name itself is assigned (`ParamTable::share_string`,
+replacing pin_env); unsetting a name already unset changes nothing; RPS1 and RPS2
+exist from the start as unset specials (`typeset -p RPS1` prints nothing, `export RPS1`
+leaves it unset). A special scalar refuses an array from every writer
+(`ParamTable::set_array`: `set -A`, `read -A`, `name+=(…)`), `typeset name=(…)` says
+"can't assign array value to non-array special", `typeset -a`/`-A` and a new `local`
+array "can't change type of a special parameter"; PS1–PS4, SPROMPT, RPS1, RPS2 are
+such specials, and a string special ($PS1, `$histchars`) refuses `typeset -i`/`-F`/`-E`
+the same way (an integer one such as $SECONDS doesn't); a failed `set -A` ends the
+command line as an assignment does, with status 0 as bin_set's. `export PS1=a PROMPT=b`
+keeps PS1's entry: typeset notes the assignment before it writes.
+INC_APPEND_HISTORY, INC_APPEND_HISTORY_TIME and SHARE_HISTORY cut the file back to
+SAVEHIST once it has more than SAVEHIST and a fifth lines (zsh's histfile_linect;
+SHARE_HISTORY counts again after reading the rewritten file, the others go on
+counting; the rewrite is in EXTENDED_HISTORY's own format), at exit too only through
+that rule; a line that exits the shell is not finished (INC_APPEND_HISTORY_TIME
+doesn't write it). `$LASTWIDGET` is the isearch widget when a key ends the search
+and runs its widget, and the repeated widget after vi `.`. Tests:
+`PromptM9Review.SharedStringsAndTheEnvironment`,
+`PromptM9Review.SpecialScalarsRefuseArrays`; extended:
+`HistoryM9Review.NestingAndComments`, `HistoryM9Review.FcWriteReadAndTimes` (the trim),
+`EditorM9Review.WidgetAndLastWidget` (isearch), `EditorM9Review.ViRepeatStepsNumberedRegisters`
+(`.`).
+
+**Review fixes, round 5.** The history lexer keeps gettokstr's state for the word
+being read (`HistQuoting::Word`: its open glob-group parentheses, braces and
+brackets, whether it has an assignment's `=`): inside a glob group blanks, `|` and the
+newline belong to the word, so no comment starts there; `;`, `&` and a redirection end
+it. A `(` is a token (subshell) only in command position or in `[[ … ]]` (not as the
+third word of a test, which incond 2 lexes as a word); `((` is math there or after
+`for`; elsewhere it starts or continues a glob group. `=(` is an array assignment only
+after a name (digits, or an identifier with a subscript, either with `+`) in command
+position or after typeset and the like (intypeset); at a word's start it is a process
+substitution, read as a command like `<(…)` and `>(…)`. incmdpos follows ctxtlex and
+the parser more closely: precommand words (`builtin`, `command`, `exec`, `noglob`,
+`-`) are no reserved words; a redirection's word gives back the incmdpos before it
+(`echo 2>f (a #!!)` expands); for/foreach/select's name and list, repeat's count and
+function's names are tracked; a backslash before the line's end joins the lines
+before a token starts. Here-document operators are queued at every level (top level,
+`{…}`, if/for/while/case, functions, subshells, after `|` and `&&`), and their bodies
+are read without history up to the end word, which is read as any word is (history
+expanded, then unquoted: `cat <<!!` ends at `echo` after `echo hi`);
+`is_incomplete`'s `in_heredoc` and the lexer's flag behind it are gone.
+`ParamTable::set_array` checks read-only before the
+array refusal (`LINENO=(a)`, `readonly PS4; PS4=(a)` say "read-only variable"); a
+subscript on a special scalar that is unset picks characters of its getter's value
+(`RPS1[1]=z`, `unset PS1; PS1[2,3]=yz`, `unset histchars; histchars[1]=z` → `z^#`);
+`+=` takes the old value through the special's getter whether the name is set or
+not (`RPS1=x; RPROMPT+=y` → `xy` in both); a failed `read -A` ends the line with
+bin_read's own status. An isearch pushes back the key that ends it (ungetkeycmd) and
+returns, so the main loop runs that key with the search as `$LASTWIDGET`; the search
+reads its keys in the main keymap with the `isearch` keymap over it and puts back the
+keymap it found; Esc (vi-cmd-mode) switches the keymap the search reads with,
+clear-screen and redisplay run inside it, a string binding's keys go on into the
+search, magic-space adds a space, backward-kill-word and the like go back past
+repeated searches, the accept widgets end it and run (exitfn), accept-search only ends
+it; with no numeric argument a lower-case letter matches either case (zlinecmp). Also:
+an unbound key runs undefined-key (`$LASTWIDGET`); execute-named-cmd and
+execute-last-named-cmd leave the named widget as `$LASTWIDGET` (getkeycmd), and an
+aborted name runs undefined-key; accept-and-hold and push-line keep the cursor for the
+line taken back (stackcs), and push-line with a count pushes empty lines over it.
+Tests: `HistoryM9Review.HereDocumentBodies`, `PromptM9Review.AppendThroughASharedName`,
+`EditorM9Review.IsearchEndsByPushingItsKeyBack`; extended:
+`HistoryM9Review.NestingAndComments` (glob groups, `=(`, redirections, for/[[ … ]]),
+`PromptM9Review.SpecialScalarsRefuseArrays` (subscripts, read-only first, `read -A`).
+(Round 6: the here-document and comment rules here held only for lines read one at a
+time; a buffer of several lines went through as one line until round 6.)
+
+**Review fixes, round 6.** `HistoryManager::expand_line` reads text holding several
+lines (a bracketed paste, ^V^J, an entry recalled with Up) a line at a time, as the
+lexer reads it: each newline ends a comment and (outside a glob group, and unless a
+backslash escapes it) a command, queued here-document bodies are copied unexpanded
+to their end word, and only the first line may be `^old^new`. expand-history
+(`expand_buffer`, zsh's doexpandhist) lexes the buffer the same way but reads no
+here-document body. A local (or typeset in a function) of a special saves the
+getter's value to put back (copyparam), so a local of one name of a shared string
+leaves the string as it was (`RPS1=a; f(){ local RPROMPT=x }; f` keeps `a`; the bang
+characters after `local HISTCHARS`). The isearch has doisearch's other branches:
+bracketed-paste adds the pasted text to the search, quoted-insert and
+vi-quoted-insert (which shows `^`) add the next key read raw, vi-repeat-search and
+vi-rev-repeat-search search again the first way or the other, and the pattern
+widgets repeat as the plain ones; a repeat that changes direction starts from the
+match (skip_pos only for the same way), a forward match leaves the cursor at its end,
+and a line equal to the one a step starts on is passed over with or without
+HIST_FIND_NO_DUPS (last_line). exchange-point-and-mark is zsh's: a mark never set is
+0, a count of 0 only activates the region, a negative one swaps without it.
+undefined-key has its own widget, which beeps and fails. The history lexer follows
+par_case: after `case WORD in` and after `;;`, `;&` or `;|` a pattern is next, and its
+`)` (or a pattern in parentheses) puts a command next, also inside `$(…)`. Also: a
+control character in a message showed as `^X` (round 7 replaced this one rule with
+zsh's two). Tests: `PromptM9Review.LocalOfASharedName`,
+`EditorM9Review.IsearchPasteQuotedAndRepeats`,
+`EditorM9Review.ExchangePointAndMarkAndUndefinedKey`; extended:
+`HistoryM9Review.NestingAndComments` (case patterns, multi-line text, expand_buffer),
+`HistoryM9Review.HereDocumentBodies` (multi-line text).
+
+**Review fixes, round 7.** A character typed into an isearch goes in whole
+(getrestchar; getfullchar after quoted-insert), so each step of the search's undo
+holds a whole character and ^H takes one off; the isearch State is ordered to 40
+bytes. Messages are made printable where they are made, by zsh's two rules: zle -M
+through showmsg (`Editor::nice_message`: each character through wcs_nicechar, `\t`,
+`^X`, `^?`, `\M-…` for a byte that is no character or a C1 control, `\u…` for other
+unprintable ones, a newline kept as a line break), and the status line (isearch,
+execute-named-cmd and the other minibuffers, describe-key's prompt, zle -R: every
+control character, a newline too, as `^X`; `Editor::status_text`); refresh draws the
+message as it is. A failing widget rings the bell only when it is the key's own
+(zlecore's handlefeep): undefined-key just fails, and a widget run inside another
+(`zle w`, the one execute-named-cmd runs) doesn't ring. A builtin widget that changed
+the text ended an active region (round 8 narrowed this to inserts and deletes); a user
+widget's own assignments to BUFFER don't, and `$REGION_ACTIVE` can be assigned
+(set_region_active).
+`$MARK` counts characters, as `$CURSOR` does, clamped to the buffer. Tests:
+`EditorM9Review.IsearchWholeCharacters`, `EditorM9Review.MessageAsShowmsg`; extended:
+`EditorM9Review.ExchangePointAndMarkAndUndefinedKey` (region after edits, `$MARK`,
+bells counted in the raw output).
+
+**Review fixes, round 8.** The region ends where zsh's spaceinline and shiftchars
+run, not on any change of the text: `LineBuffer`'s insert, insert_at, erase and
+replace set `spaced`, which run_widget reads (after the auto-suffix is removed, and
+after the widget); the widgets that rewrite in place edit the text without them and
+keep the region (transpose-chars, transpose-words, gosmacs-transpose-chars, the
+case-word widgets, quote-line, vi's case operators, overwrite-mode self-insert over
+as many bytes as it writes, push-line, a history line). expand-history ends it, as
+doexpandhist does. describe-key-briefly reads a character that inserts itself, or one
+with no binding, whole (`"\M-f\M-^W\M-%" is self-insert`), and nothing goes into the
+line. Tests: extended `EditorM9Review.ExchangePointAndMarkAndUndefinedKey` (in-place
+widgets keep the region), the describe-key cases in the widget test.
+
 **Left**
 - Syntax highlighting and autosuggestions (optional in the plan) aren't done.
 - Completion: no `_arguments`/`_describe`-style specs, no option or `--long` completion,
@@ -2063,22 +2426,106 @@ output, bang expansions and xtrace lines were compared with it.
   (`compadd` has every option, `-M` matchers included: M15 phases 15a and
   15b.) `expand-word`,
   `list-expand` and `spell-word` only beep, so Tab doesn't expand globs or `$vars` in
-  place.
+  place. The builtin completer (before compinit) lists names unquoted and completes
+  directories after `cd`, as compsys does; `zsh -f` (compctl's default) lists them as
+  they would be inserted (`a\ b`) and completes files everywhere. COMPLETE_IN_WORD
+  completes from the cursor but doesn't match the part after it (zsh: no match for
+  `su|foo`), and Tab in a here-document's body completes where zsh inserts a tab.
+  Reason: the builtin completer's contexts and matching (B28).
 - `zle -F` (fd handlers) and `zle -T` say `not implemented`; `zle-line-init`,
   `zle-line-finish` and `zle-keymap-select` hooks aren't called; `$zle_highlight` and
-  `$region_highlight` are ignored; `vared -i/-f` (init/finish widgets) are accepted and
-  ignored; vared can't be used inside a widget.
-- Vi: no `:` ex commands beyond `execute-named-cmd`; `.` repeats with the original
-  count only; `aa`/`ia` (shell words) are treated as blank-delimited words.
+  `$region_highlight` are ignored; `vared -i/-f` (init/finish widgets), `-t`, `-e` and a
+  subscripted name are accepted and ignored; vared can't be used inside a
+  widget. `read-command` and `recursive-edit` fail, `split-undo` and `set-local-history`
+  do nothing, `history-incremental-pattern-search-*` search for the text, not a
+  pattern; a user widget's standard input isn't `/dev/null`.
+- Vi: no `:` ex commands beyond `execute-named-cmd`; `aa`/`ia` (shell words) are treated
+  as blank-delimited words; vi.cpp is jfsh's own (only the widgets the review found
+  wrong are ports).
 - Rendering redraws everything on every key: fine for normal lines, slow for a buffer
   of thousands of characters over a slow link. After SIGWINCH, a terminal that reflows
   the old lines can leave stale rows above a multi-row prompt. `%G` is ignored.
-- `sched -o` still has no line to clear (the events don't run while the editor waits).
+  Combining characters join their base character (B25); zsh, with COMBINING_CHARS
+  unset by default, shows them as `<0301>` and moves over them one by one. Reason: B25's
+  utf8.cpp stepping is shared by the whole shell.
+- After trap output at the prompt that doesn't exit, jfsh draws the prompt and line
+  again below it (`% abcTR` then `% abcd`); zsh redraws only what changed from where it
+  thinks the cursor is (`% abcTR` then `d`); the same after a widget writes to the
+  terminal. Trap output that doesn't end in a newline (`print -n TR`) is overwritten by
+  that redraw (`% abcd`; zsh: `% abcTRd`). An error printed while the editor reads (a
+  trap's, `zle w` recursing) comes after the line; zsh's zwarning moves below the line
+  first (trashzle). Reason: matching zsh's partial redraw would need its zrefresh;
+  errors are printed in many places.
+- With `$BAUD` set zsh skips redrawing while keys are typed ahead; jfsh redraws after
+  every key not pushed back by a macro.
+- Ctrl-C typed together with other keys: zsh's terminal (ISIG) flushes the keys before
+  it, jfsh reads them as keys first (`abc` ^W ^C in one write kills `def` into the ring
+  in jfsh). Reason: jfsh's raw mode reads VINTR as a key.
+- `%F{N}` for N from 8 up and `%F{#rrggbb}` don't look at the terminal's colour count;
+  zsh (terminfo `colors`) falls back to the default colour when the terminal has fewer.
+  Reason: jfsh doesn't read terminfo for prompts.
+- `%I` inside a function is the line in the function, not in the file (zsh adds the
+  function's start line, funcstack's flineno, which jfsh doesn't keep).
+- `sched -o` still has no line to clear (the events don't run while the editor waits;
+  M16).
 - History: HIST_EXPIRE_DUPS_FIRST, HIST_LEX_WORDS, HIST_SAVE_BY_COPY (the file is
-  rewritten in place, under the lock), HIST_NO_FUNCTIONS and CSH_JUNKIE_HISTORY aren't
-  honoured; `fc -p`/`-P` (history stacks) aren't implemented; HIST_IGNORE_SPACE drops
-  the line at once instead of keeping it until the next one.
-- `%_` (parser state) is always empty, so PS2's default `%_> ` is `> `.
+  rewritten in place, under the lock) and HIST_NO_FUNCTIONS aren't honoured; history
+  words are found by a blank/quote splitter, not zsh's lexer (chwords). A bang error on
+  a continuation line drops the whole command, where zsh's history keeps what was read
+  (`for i in 1; do\necho`); a line whose parse fails at its first word (`done`) is kept,
+  where zsh's hend drops it (chwordpos). Reason: zsh's history is filled by its lexer as
+  it reads. The comment character `$histchars[3]` is ignored (the
+  lexer's `#`). Read without a terminal, zsh drops a line's leading blanks from the
+  history; jfsh keeps them (M8's input path).
+- Kept on purpose: Home, End, Delete (`^[[H`, `^[[F`, `^[[3~` and their variants) and
+  `^X^E` (edit-command-line) are bound by default; zsh -f leaves them unbound.
+- Error messages from a builtin or a function keep jfsh's `jfsh: name:` prefix where
+  zsh writes `name:` (or `zsh:name:N:`): M7's message format.
+- History expansion follows the lexer's contexts, but jfsh's own lexer and parser
+  differ in places the history doesn't decide: a comment inside an array assignment
+  (`a=(x #c)`: zsh's comment eats the `)`), `echo a&&#c`, a `$(…)` holding
+  here-documents run in a word (`echo $(cat <<E …) x` fails with "no matches found"),
+  `case … a)` inside `"$(…)"`, glob qualifiers like `(#a)`, a quote left open at the
+  end of input (`echo a"b` runs; zsh says `unmatched "`, so `echo a!"b !!"` differs
+  though the history step matches), a glob group open at a line's end (zsh's word goes
+  on over the newline, `echo x(a⏎#!!)` expands there; jfsh's lexer ends the command),
+  here-documents in backquotes and two here-documents on one command (multios).
+  Reason: M2/M3.
+- isearch: a search starting with `^` isn't anchored, and the zle-isearch-update and
+  zle-isearch-exit hooks aren't called; ^C in a search leaves the found line drawn
+  before the new prompt (zsh puts the original line back first). An insert before the
+  mark doesn't move it (zsh's spaceinline does: `abc ^@ ^A d` gives MARK 4), and a
+  delete that has nothing to delete (delete-char at the end) leaves the region active
+  (zsh's foredel of nothing still ends it).
+- A function with locals of both names of a shared prompt string (`local PS1=x
+  PROMPT=y`) puts them back in jfsh's order; zsh's follows its hash table, so the
+  string after the call differs by group. ^C at a here-document's PS2 ends it in jfsh;
+  zsh's lexer still reads the next line as the here-document. `esac` as a case pattern
+  (`case esac in esac)`) is a parse error in zsh, which then expands nothing; jfsh's
+  history step reads it as a pattern. A `zle -M` message longer than the terminal is
+  cut at its width; zsh wraps it.
+- isearch: a search that stops matching doesn't ring the bell (zsh's doisearch
+  feeps). `zle w` returns 1 for any failing user widget; zsh passes the function's
+  status. zle -R text stays on screen after the widget returns; zsh's next refresh
+  clears it. `zle nosuchw` in a widget shows nothing under the message (zsh: "No
+  such widget"). Up at the oldest entry rings the bell (zsh doesn't). ^H after a base
+  character and a combining mark in an isearch leaves the base (zsh empties the
+  search). zle -M shows U+2028 as itself (zsh, not printable: a blank). forward-char
+  stops between a character and its combining mark. set-mark-command in vicmd isn't
+  a visual selection for x, ~, r, p, gU and the like; copy-region-as-kill ends the
+  region (zsh keeps it active).
+- Parameters outside M9 that zsh treats as specials or types differently: `$HOME` isn't
+  special (`typeset -i HOME` doesn't refuse; IFS, WORDCHARS, TERM, ZDOTDIR likewise),
+  `typeset -F SECONDS` keeps an integer, `typeset -l PS1=ABC` changes all the names of
+  the string (zsh's case flag is per name), `typeset -Z3 PS1` is refused as a bad
+  option, and `a=([1]=x)` (zsh 5.9's subscripted array assignment) isn't parsed.
+  Reason: M4/M5.
+- `"a\!b"` typed at the prompt runs as `a\!b`; zsh's lexer drops the backslash before
+  the bang character inside double quotes when BANG_HIST is on (`a!b`). Reason: the
+  lexer doesn't know about history (M2).
+- `%_` and `%^` (parser state) are always empty, so PS2's default `%_> ` is `> `.
+  Reason: zsh's cmdpush/cmdpop run all through its lexer and parser (M2/M3); jfsh's
+  parser keeps no such stack.
 
 ### M10. Modules framework and core modules [modules/*]
 
@@ -3725,8 +4172,8 @@ superseded: compsys is zsh's shell-function library, run as is.
 - A forked pipeline stage's `HASH_CMDS` hit flows back to the parent through
   the self-pipe, so a path hashed inside a `|` is visible after (M7 left
   item).
-- zsh's default aliases (`run-help`, `which-command`) and functions added by
-  `zsh -f` are defined (M7 left item; the function bodies are M18's problem).
+- Functions added by `zsh -f` are defined (M7 left item; the function bodies are
+  M18's problem; the default aliases `run-help` and `which-command` are M9's review's).
 - Error messages name the shell as `zsh:` under emulation; add zsh's line
   numbers and `(eval)` where it uses them (M7 left item).
 
@@ -3772,8 +4219,8 @@ superseded: compsys is zsh's shell-function library, run as is.
 - Install `share/jfsh/functions/` (CMake cache `JFSH_FUNCTIONS_DIR`) with a
   subset of zsh's shipped function library: `Base/`, `Completion/`, `Misc/`,
   `Prompts/`, `VCS_Info/`, `Zle/`, `Zftp/`, `Zutil/`, `Chpwd/`, `MIME/`.
-- Default aliases `run-help`, `which-command`, `history` (`fc -l 1`) and
-  whatever else `zsh -f` sets up (M7 left item).
+- Default aliases: `run-help` and `which-command` (all `zsh -f` sets up) are there since
+  M9's review (`default_aliases()`); `history` is a builtin.
 - `run-help` function dispatching to `man` or format-specific handlers;
   `run-help-git`, `run-help-sudo`, `run-help-svn`.
 - `promptinit`, `prompt -l`, `prompt theme [args]` and a handful of bundled

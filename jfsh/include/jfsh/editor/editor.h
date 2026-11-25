@@ -13,6 +13,7 @@
 
 #include <cstdint>
 
+#include <array>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -34,10 +35,28 @@ struct LineBuffer {
   str       text;
   s::size_t cursor    = 0;      // byte offset, always at a character start
   bool      overwrite = false;
+  // zsh's spaceinline and shiftchars (foredel, backdel) ran: text was
+  // inserted or deleted, which ends an active region.  A rewrite in place
+  // (transpose, a case change, quote-line, a history line) edits `text`
+  // without these.
+  bool      spaced    = false;
 
   void insert(strv s) {
     text.insert(cursor, s);
     cursor += s.size();
+    spaced = true;
+  }
+  void insert_at(s::size_t at, strv s) {
+    text.insert(at, s);
+    spaced = true;
+  }
+  void erase(s::size_t at, s::size_t n) {
+    text.erase(at, n);
+    spaced = true;
+  }
+  void replace(s::size_t at, s::size_t n, strv s) {   // foredel, then spaceinline
+    text.replace(at, n, s);
+    spaced = true;
   }
   void move_to(s::size_t pos) { cursor = s::min(pos, text.size()); }
   strv before_cursor() const noexcept { return strv(text).substr(0, cursor); }
@@ -75,7 +94,7 @@ struct Editor {
   // After a widget function ran a command (a pipeline, `$(…)`): the job
   // code put the shell's terminal modes back, so the editor's go on again.
   void resume_raw_mode();
-  void resume() {}
+  void resume() { if (mReading and not mRawModeActive) enter_raw_mode(); }
 
   // Reads from `in` and draws on `out` instead of the terminal on 0 and 1.
   void set_io(int in, int out) { mIn = in; mOut = out; }
@@ -92,10 +111,15 @@ struct Editor {
   // about to print calls trash() first.
   using WakeFn = func<bool(bool& quit)>;
   void set_wake(int fd, WakeFn hook) { mWakeFd = fd; mWake = s::move(hook); }
-  // Clears the prompt and line from the screen, leaving the cursor where
-  // the prompt started, so other output can go there; the next refresh
-  // draws them again.
+  // zsh's trashzle: leaves the prompt and line on the screen and moves
+  // below them, so other output can go there; the next refresh draws
+  // them again after it.
   void trash();
+  // Output went where the cursor was (a trap run at the interrupt key):
+  // the next refresh draws the prompt and line again from there.
+  void forget_display() { mDrawn = mTrashed = false; mCursorRow = 0; }
+  // An `exit` in such a trap: the read ends without drawing the line again.
+  void quit() { mQuit = true; }
 
   // The last read_line ended with Ctrl-C: the line (and, for a PS2 line,
   // the whole command) is to be dropped.
@@ -112,9 +136,16 @@ struct Editor {
   // Ends the line being edited as send-break does (an error in a widget).
   void abort_line() { mInterrupted = mDone = true; }
   // Runs widget `name` (`zle name`); false when it failed or is unknown.
-  bool call_widget(strv name);
+  bool call_widget(strv name, vec<str> args = {}, bool set_bindk = false, bool nolast = false);
+  void set_widget_flag(strv flag);   // zle -f
   void push_input(strv keys) { mPending.insert(0, keys); }   // zle -U
   void set_message(str msg)  { mMessage = s::move(msg); }    // zle -M
+  // Message text as zsh draws it: zle -M through showmsg (nicechar: `\t`,
+  // `^X`, `\M-…` for a byte that is no character, newlines kept); the
+  // status line (isearch, the minibuffers, zle -R) with every control
+  // character, a newline too, as `^X`.
+  static str nice_message(strv msg);
+  static str status_text(strv text);
   void reset_prompt();                                       // zle reset-prompt
   bool select_keymap(strv name);                             // zle -K
   str  keymap_name() const;
@@ -128,11 +159,12 @@ struct Editor {
   void       set_numeric(opt<int> n) { mArg = n; }
   int        hist_number() const;
   const str& prebuffer()   const noexcept { return mPrebuffer; }
-  str        cut_buffer()  const { return mKillRing.empty() ? str{} : mKillRing.front(); }
+  str        cut_buffer()  const { return mZle.cut_buf.text; }
   void       set_cut_buffer(str s);
   long       mark() const noexcept { return mMark ? static_cast<long>(*mMark) : 0; }
   void       set_mark(long m);
   bool       region_active() const noexcept { return mRegionActive; }
+  void       set_region_active(bool on) noexcept { mRegionActive = on; }
 
   static vec<str> builtin_widget_names();
 
@@ -157,6 +189,7 @@ struct Editor {
   static const umap<str, WidgetInfo>& widget_table();
 
 protected:
+  // A cut buffer: the kill ring's and the vi registers' entries.
   // An auto-removable suffix a completion left before the cursor.
   struct AutoSuffix {
     s::size_t end = 0;      // where the suffix ends in the line
@@ -192,20 +225,51 @@ protected:
 
   // ---- Helpers for widgets ------------------------------------------------
   int  count() const noexcept { return mArg ? *mArg : 1; }
+  void reset_modifiers() {
+    mArg.reset();
+    mTMult    = 1;
+    mArgBase  = 10;
+    mTMultSet = mArgNeg = false;
+    mViRegister = 0;
+  }
+  int  keytimeout() const;            // $KEYTIMEOUT in milliseconds
+  bool use_tab() const;               // zsh's usetab
+  void do_insert(strv s);
+  bool read_rest_char(str& keys);
+  str  last_full_char();
   bool is_word_char(char32_t c) const;
   s::size_t next_word_start(s::size_t pos) const;   // forward-word
   s::size_t prev_word_start(s::size_t pos) const;   // backward-word
+  s::size_t prev_word_start_n(s::size_t pos, int n) const;
   s::size_t word_end(s::size_t pos) const;          // kill-word's end
   s::size_t line_start(s::size_t pos) const;        // of the buffer line
   s::size_t line_end(s::size_t pos) const;
+  // zsh's cuttext: saves `text` in the vi register asked for, or "0 / "1,
+  // and in the cut buffer (the kill ring takes the old one unless the
+  // last widget killed too).
+  enum CutFlags : unsigned { CUT_FRONT = 1, CUT_REPLACE = 2, CUT_YANK = 4 };
+  void cut_text(strv text, unsigned flags, bool lines = false);
+  // zsh's forekill/backkill: cuts `n` bytes after / before the cursor.
+  void fore_kill(s::size_t n, unsigned flags);
+  void back_kill(s::size_t n, unsigned flags);
   void kill_text(s::size_t from, s::size_t to, bool backward);
-  void push_kill(str text, bool backward);
+  // The buffer yank and put use: the vi register given, else mCutBuf.
+  // nullptr when there is none (or it is empty).
+  const CutBuffer* put_buffer(int* index = nullptr);
   void set_history_line(int index);   // shows history entry `index`
+  int  up_line(int n);
+  int  down_line(int n);
+  void to_last_col();
+  bool line_or(bool up, bool (Editor::*hist)());
+  int  infer_next(int from) const;
   bool history_matches(int index, strv prefix) const;
   // The words of history entry `index` (insert-last-word, copy-prev-word).
   vec<str> history_words(int index) const;
   bool incremental_search(bool backward);
+  str  read_paste();
   opt<str> minibuffer(strv prompt);   // reads a line below the buffer
+  opt<str> read_command_name(strv prompt);
+  void list_names(const vec<str>& names);
 
   // ---- Completion (completion.cpp) ---------------------------------------
   // Completes the word at the cursor: with the builtin completers, or for
@@ -234,6 +298,7 @@ protected:
   bool w_accept_and_hold();
   bool w_accept_line_and_down_history();
   bool w_send_break();
+  bool w_undefined_key();
   bool w_self_insert();
   bool w_self_insert_unmeta();
   bool w_quoted_insert();
@@ -263,6 +328,10 @@ protected:
   bool w_yank_pop();
   bool w_transpose_chars();
   bool w_transpose_words();
+  bool w_gosmacs_transpose_chars();
+  bool case_words(int kind);   // 0 up, 1 down, 2 capitalize
+  void paste_buffer(const CutBuffer& buf, int n, int position);
+  static bool is_yank_widget(strv name);
   bool w_capitalize_word();
   bool w_up_case_word();
   bool w_down_case_word();
@@ -277,6 +346,7 @@ protected:
   bool w_digit_argument();
   bool w_neg_argument();
   bool w_universal_argument();
+  bool w_argument_base();
   bool w_up_line_or_history();
   bool w_down_line_or_history();
   bool w_up_line();
@@ -321,6 +391,28 @@ protected:
   bool w_expand_word();
   bool w_run_help();
   bool w_which_command();
+  bool w_reset_prompt();
+  bool w_delete_word();
+  bool w_backward_delete_word();
+  bool w_beginning_of_line_hist();
+  bool w_end_of_line_hist();
+  bool w_up_line_or_search();
+  bool w_down_line_or_search();
+  bool w_vi_yank_eol();
+  bool w_vi_undo_change();
+  bool w_vi_pound_insert();
+  bool w_vi_caps_lock_panic();
+  bool w_accept_and_infer_next_history();
+  bool w_describe_key_briefly();
+  bool w_where_is();
+  bool w_end_of_list();
+  bool w_set_local_history();
+  bool w_split_undo();
+  bool w_recursive_edit();
+  bool w_read_command();
+  bool w_expand_cmd_path();
+  bool w_copy_prev_shell_word();
+  bool process_cmd();
 
   // vi.cpp
   bool w_vi_insert();
@@ -409,7 +501,6 @@ protected:
   bool vi_select_word(bool around, bool blank);
   bool vi_select_quoted(bool around);
   bool vi_select_bracketed(bool around);
-  void vi_store_register(str text, bool linewise);
   str  vi_read_char();
   void vi_enter_insert();
   void vi_clamp_cursor();     // vicmd: not past the last character
@@ -429,54 +520,78 @@ private:
   LineBuffer               mBuf;
   sptr<Keymap>             mKeymap;           // the current keymap
   sptr<Keymap>             mLocalKeymap;      // visual mode's overlay
+  str                      mKeymapName;       // $KEYMAP: the name selected
+  vec<str>                 mWidgetArgs;       // `zle widget args…`
   str                      mPending;          // input to read before the terminal
   str                      mPrebuffer;
   str                      mWidget, mLastWidget, mKeys;
   str                      mWidgetStyle;
   opt<int>                 mArg;
-  bool                     mArgSet       = false;  // the widget set the argument
+  int                      mTMult        = 1;      // zsh's zmod.tmult
+  int                      mArgBase      = 10;     // argument-base
+  bool                     mTMultSet     = false;  // MOD_TMULT
+  bool                     mArgSet       = false;  // the widget was a prefix
   bool                     mArgNeg       = false;  // neg-argument, no digits yet
   bool                     mDone         = false;
   bool                     mReading      = false;
+  bool                     mVared        = false;   // vared is editing
+  bool                     mRegionActive = false;
+  bool                     mRegionLines  = false;
 
   // Prompts, expanded once per line (B26).
   str                      mPromptText, mRPromptText;
-  bool                     mVared        = false;
   strv                     mVaredPrompt, mVaredRPrompt;
 
   // History navigation: index into mHist.entries(), size() for the line
   // being typed.  Edits to history lines are kept until the line is done.
   int                      mHistIndex    = 0;
+  int                      mWakeFd       = -1;   // set_wake's descriptor
   umap<int, str>           mHistEdits;
   str                      mSearchPrefix;     // history-search-*
   int                      mLastWordIndex = 0;  // insert-last-word
   int                      mLastWordHist  = 0;
   s::size_t                mLastWordStart = 0, mLastWordEnd = 0;
 
-  // Kill ring (newest first) and the last yank, for yank-pop.
-  vec<str>                 mKillRing;
-  int                      mYankIndex    = 0;
-  s::size_t                mYankStart    = 0, mYankEnd = 0;
+  // The last yank, for yank-pop: where it went, which buffer it came from
+  // (-1 mCutBuf, else a vi register; -2 none) and its kill-ring place
+  // (zsh's kct, -1 the cut buffer itself).
+  s::size_t                mYankB = 0, mYankE = 0, mYankCs = 0;
   opt<s::size_t>           mMark;
-  bool                     mRegionActive = false;
-  bool                     mRegionLines  = false;
+  int                      mYankFrom     = -2;
+  int                      mKct          = -1;
 
-  // Undo: snapshots of (text, cursor); merged while typing.
-  struct Snapshot { str text; s::size_t cursor; };
-  vec<Snapshot>            mUndo, mRedo;
+  // Undo: each change is what was replaced at `at` (zsh's struct change), so
+  // the stack grows with what was typed, not with the buffer's size.
+  struct Change {
+    str       del, ins;
+    s::size_t at = 0, cursor = 0, cursor_after = 0;
+    long      hist = 0;   // the history line it was made in (zsh's ch->hist)
+  };
+  static Change diff_change(strv before, strv after, s::size_t cursor, s::size_t cursor_after);
+  vec<Change>              mUndo, mRedo;
+  str                      mUndoBase;           // the text a group started from
+  s::size_t                mUndoBaseCursor = 0;
   // Undo grouping: 0 none, 1 a group (vi insert) waiting for its first
   // change, 2 a group whose snapshot is taken.
   int                      mUndoGroup    = 0;
-  bool                     mKilledNow    = false;   // this widget killed text
-  bool                     mLastWasKill  = false;   // … and the one before did
-  str                      mLastIsearch;
-
-  // Display.
-  int                      mCursorRow    = 0;   // cursor row, from the prompt's first row
-  int                      mRowsDrawn    = 0;
-  int                      mCols         = 0;
+  int                      mLastCol      = -1;  // zsh's lastcol, for line moves
+  // zsh's lastcmd flags: the last widget (not counting prefixes like
+  // digit-argument) killed (ZLE_KILL) or yanked (ZLE_YANK, after the
+  // cursor for vi-put-after).
+  bool                     mLastWasKill  = false;
+  bool                     mLastWasYank  = false;
+  bool                     mLastYankAfter = false;
+  s::uint8_t               mWidgetFlags  = 0;  // zle -f: 1 kill, 2 yank, 4 yankbefore
+  // Display (and completion's, below).
   bool                     mDrawn        = false;
   bool                     mFinalDraw    = false;   // accept: cursor to the end
+  bool                     mMenuActive   = false;
+  bool                     mListed       = false;   // the last Tab listed
+  int                      mCursorRow    = 0;   // cursor row, from the prompt's first row
+  int                      mEndRow       = 0;   // the buffer's last row, likewise
+  int                      mRowsDrawn    = 0;
+  int                      mCols         = 0;
+  str                      mLastIsearch;
   str                      mMessage;            // zle -M, isearch, …
   str                      mListing;            // completion lists
 
@@ -486,25 +601,24 @@ private:
   s::size_t                mMenuIndex    = 0;
   s::size_t                mMenuStart    = 0, mMenuEnd = 0;
   str                      mMenuSuffixKind;
-  bool                     mMenuActive   = false;
-  bool                     mListed       = false;   // the last Tab listed
   str                      mCompleteLine;           // buffer the last Tab saw
   bool                     mLastCompleting = false; // the last widget completed
+  int                      mRunDepth       = 0;     // run_widget calls under way
   s::size_t                mNestedCalls    = 0;     // widgets run with `zle name`
   uptr<CompletionResult>   mLastResult;             // the last matches, for old_list
   opt<AutoSuffix>          mAutoSuffix;
   str                      mVaredName;              // the parameter vared edits
 
   // vi state.
+  s::size_t                mViInsBegin   = 0;   // zsh's viinsbegin
   char                     mViRegister   = 0;
-  umap<char, s::pair<str, bool>> mViRegisters;   // text, linewise
-  bool                     mViUnnamedLines = false; // the kill ring's top is lines
   bool                     mViOperating  = false;   // a motion is an operator's
   char32_t                 mViFindChar   = 0;
   int                      mViFindDir    = 0;
   bool                     mViFindSkip   = false;
   str                      mViSearch;
   int                      mViSearchDir  = -1;
+  int                      mStartCursor  = -1;   // read_line's Zle::stack_cs, for run
   str                      mViLastChange;
   str                      mViRecording;
   bool                     mViRecord     = false;
@@ -522,7 +636,8 @@ private:
   bool                     mEof           = false;  // input closed or hung up
   bool                     mEofIgnored    = false;  // Ctrl-D under IGNORE_EOF
   bool                     mSentBreak     = false;  // send-break ended the read
-  int                      mWakeFd        = -1;
+  bool                     mQuit          = false;  // a trap's exit ended the read
+  bool                     mTrashed       = false;  // trash() left the line
   WakeFn                   mWake;
 };
 

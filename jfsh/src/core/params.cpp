@@ -184,7 +184,11 @@ Result<void> ParamTable::set_scalar(
     if (p.is_readonly())
       return s::unexpected(ShellError{ErrorKind::ExecError,
           "read-only variable: " + str(name)});
-    if (append) value = p.scalar() + value;
+    // A special's value comes through its getter even while this name is
+    // unset: the names of a shared prompt string read one string.
+    if (append)
+      value = (p.handlers and p.handlers->get_scalar ? p.handlers->get_scalar() : p.scalar())
+            + value;
     if (p.handlers and p.handlers->set_scalar) {
       p.handlers->set_scalar(s::move(value));   // read back when next looked up
       return {};
@@ -224,12 +228,16 @@ Result<void> ParamTable::set_slice(
   if (first == 0 and last == 0) return bad_range();
   // A range may start at 0, which is 1.
   if (first == 0) first = 1;
-  bool scalar = p and p->get().is_set() and not p->get().is_array() and not p->get().is_hash();
+  // An unset special scalar ($RPS1, or $PS1 after unset) is still a
+  // string, empty or its getter's value: the subscript picks characters.
+  bool scalar = p and (p->get().is_set() or p->get().scalar_special())
+            and not p->get().is_array() and not p->get().is_hash();
   if (scalar and array) return error(str(name) + ": attempt to assign array value to non-array");
   str text;
   vec<str> arr;
   if (scalar) {
-    text = p->get().scalar();
+    const Param& sp = p->get();
+    text = sp.handlers and sp.handlers->get_scalar ? sp.handlers->get_scalar() : sp.scalar();
   } else if (p and p->get().is_array()) {
     // Moved out and set again below, so one element costs no copy.
     arr = p->get().handlers ? p->get().array() : p->get().take_array();
@@ -294,12 +302,18 @@ Result<void> ParamTable::set_slice(
 
 Result<void> ParamTable::set_array(
     strv name, vec<str> words, bool append) {
+  // As setarrvalue: read-only first, then the type.
+  if (auto existing = lookup(name)) {
+    if (existing->get().is_readonly())
+      return s::unexpected(ShellError{ErrorKind::ExecError,
+          "read-only variable: " + str(name)});
+    if (existing->get().scalar_special())
+      return s::unexpected(ShellError{ErrorKind::ExecError,
+          str(name) + ": attempt to assign array value to non-array"});
+  }
   note_assigned(name);
   if (auto existing = lookup(name)) {
     Param& p = existing->get();
-    if (p.is_readonly())
-      return s::unexpected(ShellError{ErrorKind::ExecError,
-          "read-only variable: " + str(name)});
     if (p.handlers and p.handlers->set_array) {
       if (append) {
         auto old = p.array();
@@ -391,8 +405,16 @@ Result<void> ParamTable::unset(strv name) {
       it->second.handlers->unset_fn();
       return {};
     }
-    if (i == 0) {
+    // A special stored as a plain value (the prompt strings) stays one,
+    // unset (zsh keeps the node of a special that isn't PM_REMOVABLE).
+    bool keep = (it->second.flags & PM_SPECIAL) and not it->second.handlers;
+    if (i == 0 and not keep) {
       scope.erase(it);
+    } else if (i == 0) {
+      // Unsetting it again changes nothing (the string it may share).
+      if (not it->second.is_set()) return {};
+      it->second.value = str{};
+      it->second.flags = (it->second.flags & ~(PM_ARRAY | PM_HASH)) | PM_UNSET;
     } else {
       // A local stays local, so the outer parameter doesn't show through.
       it->second.value = str{};
@@ -458,6 +480,25 @@ void ParamTable::pop_scope() {
   mScopes.pop_back();
 }
 
+void ParamTable::note_assigned(strv name) {
+  if (name == "PATH" or name == "path") ++mPathGen;
+  if (mShared.empty()) return;
+  mEnvPinned.erase(str(name));
+  auto group = mShared.find(str(name));
+  if (group == mShared.end()) return;
+  auto storage = lookup(group->second.second);
+  str value = storage ? storage->get().scalar() : str{};
+  for (const auto& other : group->second.first) {
+    if (other == name) continue;
+    auto p = lookup(other);
+    if (p and p->get().is_exported() and p->get().is_set()) mEnvPinned.try_emplace(other, value);
+  }
+}
+
+void ParamTable::share_string(vec<str> names, str storage) {
+  for (const auto& n : names) mShared[n] = {names, storage};
+}
+
 // The innermost definition of a name decides whether, and with which value,
 // it is exported; outer definitions it shadows are skipped.
 vec<str> ParamTable::make_envp() const {
@@ -466,7 +507,9 @@ vec<str> ParamTable::make_envp() const {
   // 25 ms.
   vec<str> env;
   for_each([&](const Param& p) {
-    if (p.is_scalar() or p.is_integer() or p.is_float())   // integers in their base
+    if (auto pin = mEnvPinned.find(p.name); pin != mEnvPinned.end())
+      env.push_back(p.name + "=" + pin->second);
+    else if (p.is_scalar() or p.is_integer() or p.is_float())   // integers in their base
       env.push_back(p.name + "=" + p.scalar());
   }, [](const Param& p) { return p.is_exported() and p.is_set(); });
   return env;

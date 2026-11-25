@@ -410,6 +410,9 @@ void SignalManager::install(int sig) noexcept {
       break; default:
         ;
     }
+  } else if (sig == SIGALRM and mInteractive) {
+    // $TMOUT's alarm at the prompt (zsh's handler).
+    catch_it = true;
   } else if (mIgnoredAtStart[static_cast<s::size_t>(sig)]) {
     sa.sa_handler = SIG_IGN;
   } else if (sig == SIGHUP) {
@@ -447,6 +450,7 @@ void SignalManager::init(bool interactive, int tty) {
     if (sig != SIGCHLD) ::signal(sig, SIG_DFL);   // SIGCHLD keeps its handler
   }
   install(SIGHUP);
+  install(SIGALRM);
 
   // The terminal: the shell's own (shared, as zsh's SHTTY serves both
   // init_io and acquire_pgrp), else /dev/tty or stdin, kept on a high
@@ -557,6 +561,9 @@ sigset_t SignalManager::child_reset(ChildKind kind, bool keep_ignored) noexcept 
     if (mTraps.get(sig).action != TrapAction::Default) redo[static_cast<s::size_t>(sig)] = true;
   if (mJobControl)
     for (int sig : JOB_CONTROL_SIGNALS) redo[static_cast<s::size_t>(sig)] = true;
+  // The interactive shell's own SIGALRM handler ($TMOUT) goes back to the
+  // default in a child (zsh's entersubsh: the handler is the parent's).
+  if (mInteractive) redo[SIGALRM] = true;
   if (kind == ChildKind::Subshell) {
     for (int sig = 1; sig <= MAX_SIG; ++sig) {
       auto i = static_cast<s::size_t>(sig);

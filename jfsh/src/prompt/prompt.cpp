@@ -1,3 +1,34 @@
+// The prompt expander in this file follows zsh 5.9's Src/prompt.c
+// (putpromptchar, prompttrunc, parsecolorchar, tsetcap's TSC_DIRTY) and
+// ports ztrftime from Src/utils.c.
+// zsh's copyright and licence:
+//
+// The Z Shell is copyright (c) 1992-2017 Paul Falstad, Richard Coleman,
+// Zoltán Hidvégi, Andrew Main, Peter Stephenson, Sven Wischnowsky, and
+// others.  All rights reserved.  Individual authors, whether or not
+// specifically named, retain copyright in all changes; in what follows, they
+// are referred to as `the Zsh Development Group'.  This is for convenience
+// only and this body has no legal status.  The Z shell is distributed under
+// the following licence; any provisions made in individual files take
+// precedence.
+//
+// Permission is hereby granted, without written agreement and without
+// licence or royalty fees, to use, copy, modify, and distribute this
+// software and to distribute modified versions of this software for any
+// purpose, provided that the above copyright notice and the following
+// two paragraphs appear in all copies of this software.
+//
+// In no event shall the Zsh Development Group be liable to any party for
+// direct, indirect, special, incidental, or consequential damages arising out
+// of the use of this software and its documentation, even if the Zsh
+// Development Group have been advised of the possibility of such damage.
+//
+// The Zsh Development Group specifically disclaim any warranties, including,
+// but not limited to, the implied warranties of merchantability and fitness
+// for a particular purpose.  The software provided hereunder is on an "as is"
+// basis, and the Zsh Development Group have no obligation to provide
+// maintenance, support, updates, enhancements, or modifications.
+
 #include <jfsh/prompt/prompt.h>
 
 #include <cstdio>
@@ -76,33 +107,140 @@ str path_components(const str& path, int n) {
   return out;
 }
 
-// strftime with zsh's additions: %f, %K and %L are %e, %k and %l without
-// the leading space.
-str format_time(strv fmt, const struct tm& tm) {
-  str f;
-  for (s::size_t i = 0; i < fmt.size(); ++i) {
-    if (fmt[i] != '%' or i + 1 >= fmt.size()) { f += fmt[i]; continue; }
-    char c = fmt[++i];
-    char num[8];
+// zsh's ztrftime: strftime with zsh's own %. (fractions of a second, %3.
+// for milliseconds), %N, %f, %K, %L and the padding of %e %k %l, the rest
+// left to strftime.
+str format_time(strv fmt, const struct tm& tm, long nsec) {
+  str out;
+  for (s::size_t i = 0; i < fmt.size();) {
+    if (fmt[i] != '%') {
+      out += fmt[i++];
+      continue;
+    }
+    s::size_t start = i++;
+    bool strip = false;
+    int digs = 3;
+    if (i < fmt.size() and fmt[i] == '-') {
+      strip = true;
+      ++i;
+    }
+    if (i < fmt.size() and s::isdigit(static_cast<unsigned char>(fmt[i]))) {
+      s::size_t dend = i + 1;
+      while (dend < fmt.size() and s::isdigit(static_cast<unsigned char>(fmt[dend]))) ++dend;
+      if (dend < fmt.size() and fmt[dend] == '.') {
+        digs = s::atoi(str(fmt.substr(i, dend - i)).c_str());
+        i = dend;
+      }
+    }
+    // GNU padding flags and the like: strftime's.
+    bool plain = i - start == 1 or (i - start == 2 and strip) or (i < fmt.size() and fmt[i] == '.');
+    if (not plain) {
+      while (i < fmt.size() and strv("OE^#_-0123456789").find(fmt[i]) != strv::npos) ++i;
+      if (i < fmt.size()) {
+        ++i;
+        char buf[256];
+        s::size_t n = s::strftime(buf, sizeof buf, str(fmt.substr(start, i - start)).c_str(), &tm);
+        out.append(buf, n);
+        continue;
+      }
+    }
+    if (i >= fmt.size()) {
+      out += '%';
+      break;
+    }
+    char c = fmt[i++];
+    auto two = [&](int v, bool pad_space, bool zero) {
+      if (v > 9)       out += static_cast<char>('0' + v / 10);
+      else if (not strip) {
+        if (zero)           out += '0';
+        else if (pad_space) out += ' ';
+      }
+      out += static_cast<char>('0' + v % 10);
+    };
     switch (c) {
-      case 'f': s::snprintf(num, sizeof num, "%d", tm.tm_mday); f += num; break;
-      case 'K': s::snprintf(num, sizeof num, "%d", tm.tm_hour); f += num; break;
-      case 'L': s::snprintf(num, sizeof num, "%d", tm.tm_hour % 12 ? tm.tm_hour % 12 : 12);
-                f += num; break;
-      default:  f += '%'; f += c;
+      case '.': {
+        long f = nsec;
+        if (digs < 0 or digs > 9) digs = 9;
+        if (digs < 9) {
+          long max = 100000000;
+          for (int t = 8 - digs; t; --t) {
+            max /= 10;
+            f /= 10;
+          }
+          max -= 1;
+          f = (f + 5) / 10;
+          if (f > max) f = max;
+        }
+        char buf[16];
+        s::snprintf(buf, sizeof buf, "%0*ld", digs, f);
+        out += buf;
+        break;
+      }
+      case 'f': strip = true; [[fallthrough]];
+      case 'e': two(tm.tm_mday, true, false); break;
+      case 'K': strip = true; [[fallthrough]];
+      case 'H': case 'k': two(tm.tm_hour, true, c == 'H'); break;
+      case 'L': strip = true; [[fallthrough]];
+      case 'l': {
+        int h = tm.tm_hour % 12;
+        if (h == 0) h = 12;
+        if (h > 9)          out += '1';
+        else if (not strip) out += ' ';
+        out += static_cast<char>('0' + h % 10);
+        break;
+      }
+      case 'd': two(tm.tm_mday, false, true); break;
+      case 'm': two(tm.tm_mon + 1, false, true); break;
+      case 'M': two(tm.tm_min, false, true); break;
+      case 'S': two(tm.tm_sec, false, true); break;
+      case 'y': {
+        int y = tm.tm_year;
+        if (y > 9 or not strip) out += static_cast<char>('0' + (y / 10) % 10);
+        out += static_cast<char>('0' + y % 10);
+        break;
+      }
+      case 'N': {
+        char buf[16];
+        s::snprintf(buf, sizeof buf, "%09ld", nsec);
+        out += buf;
+        break;
+      }
+      case 'E': case 'O': case '^': case '#': case '_': case '-':
+      case '0': case '1': case '2': case '3': case '4':
+      case '5': case '6': case '7': case '8': case '9':
+        // A flag after a plain start (`%E`, `%-O`): zsh's goto morefmt, the
+        // flags and the next character go to strftime.
+        // At the end of the format, a lone `%` (its case '\0').
+        while (i < fmt.size() and strv("OE^#_-0123456789").find(fmt[i]) != strv::npos) ++i;
+        if (i >= fmt.size()) {
+          out += '%';
+          break;
+        }
+        ++i;
+        [[fallthrough]];
+      default: {
+        char buf[256];
+        s::size_t n = s::strftime(buf, sizeof buf, str(fmt.substr(start, i - start)).c_str(), &tm);
+        out.append(buf, n);
+      }
     }
   }
-  if (f.empty()) return {};
-  char buf[256];
-  s::size_t n = s::strftime(buf, sizeof buf, f.c_str(), &tm);
-  return str(buf, n);
+  return out;
 }
 
-struct tm local_now() {
-  s::time_t t = s::time(nullptr);
+struct Now {
   struct tm tm{};
-  ::localtime_r(&t, &tm);
-  return tm;
+  long      nsec = 0;
+};
+
+Now local_now() {
+  struct timespec ts{};
+  ::clock_gettime(CLOCK_REALTIME, &ts);
+  Now now;
+  s::time_t t = ts.tv_sec;
+  ::localtime_r(&t, &now.tm);
+  now.nsec = ts.tv_nsec;
+  return now;
 }
 
 str tty_name(bool short_form) {
@@ -152,7 +290,23 @@ str color_seq(strv spec, bool fg) {
   return def;
 }
 
+// zsh's match_colour for a name in %F{…}: nullopt when it names no colour
+// (the escape then acts as %f / %k).
+opt<str> color_spec(strv name, bool fg) {
+  static constexpr strv names[] = {
+    "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"};
+  for (strv n : names)
+    if (name == n) return color_seq(name, fg);
+  if (not name.empty() and name[0] == '#') return color_seq(name, fg);
+  if (not name.empty() and name.find_first_not_of("0123456789") == strv::npos
+      and s::atoi(str(name).c_str()) < 256)
+    return color_seq(name, fg);
+  return s::nullopt;
+}
+
 }  // namespace
+
+str ztrftime(strv fmt, const struct tm& tm, long nsec) { return format_time(fmt, tm, nsec); }
 
 // One expansion of a prompt string.
 struct PromptExpander {
@@ -203,9 +357,29 @@ struct PromptExpander {
     return s;
   }
 
+  // zsh's tsetcap with TSC_DIRTY: after `cap`, the attributes still on
+  // are sent again.
+  str dirty(char cap) const {
+    str s;
+    if (attrs.bold and cap != 'B') s += "\x1b[1m";
+    if (attrs.standout)            s += "\x1b[7m";
+    if (attrs.underline)           s += "\x1b[4m";
+    s += attrs.fg;
+    s += attrs.bg;
+    return s;
+  }
+
+  int columns() const { return static_cast<int>(param_long(r.mParams, "COLUMNS")); }
+
+  // The width of what is on the prompt's current line so far.
+  int current_column(const str& out) const {
+    s::size_t nl = out.rfind('\n');
+    return PromptRenderer::visual_width(strv(out).substr(nl == str::npos ? 0 : nl + 1));
+  }
+
   // Renders until the unquoted character `stop` (left for the caller) or
   // the end; with stop_at_trunc, also until the next truncation, which is
-  // left in place.
+  // left in place (zsh's putpromptchar and its truncwidth check).
   void seq(str& out, char stop, bool stop_at_trunc) {
     while (pos < src.size()) {
       char c = src[pos];
@@ -221,31 +395,93 @@ struct PromptExpander {
         }
         continue;
       }
-      if (not percent or c != '%' or pos + 1 >= src.size()) {
+      if (not percent or c != '%') {
         text(out, strv(&src[pos], 1));
         ++pos;
         continue;
       }
       s::size_t start = pos++;
-      bool has_num = false, neg = false;
+      bool minus = false, has_num = false;
       int  num = 0;
-      if (src[pos] == '-') { neg = true; ++pos; }
-      while (pos < src.size() and src[pos] >= '0' and src[pos] <= '9') {
-        has_num = true;
-        num = num * 10 + (src[pos++] - '0');
+      if (pos < src.size() and src[pos] == '-') {
+        minus = true;
+        ++pos;
       }
-      if (neg) { has_num = true; num = -num; }
-      if (pos >= src.size()) break;
+      if (pos < src.size() and src[pos] >= '0' and src[pos] <= '9') {
+        has_num = true;
+        num = number();
+        if (minus) num = -num;
+      } else if (minus) {
+        has_num = true;
+        num = -1;
+      }
+      // A `%` at the end, with or without a number, is nothing.
+      if (pos >= src.size()) {
+        pos = src.size();
+        return;
+      }
       char e = src[pos++];
       if ((e == '<' or e == '>' or e == '[') and stop_at_trunc) {
         pos = start;
         return;
       }
-      escape(out, e, num, has_num, stop);
+      if (e == '(') {
+        conditional(out, num, minus);
+        continue;
+      }
+      escape(out, e, num, has_num, minus, stop);
     }
   }
 
-  void escape(str& out, char e, int num, bool has_num, char stop) {
+  // zsh's zstrtol on the digits at `pos`, into putpromptchar's int: past
+  // 64 bits the rest is dropped with a warning, the value wrapping as C's
+  // conversions do.
+  int number() {
+    s::size_t from = pos;
+    s::uint64_t calc = 0;
+    opt<s::size_t> trunc;
+    for (; pos < src.size() and src[pos] >= '0' and src[pos] <= '9'; ++pos) {
+      if (trunc) continue;
+      s::uint64_t next = calc * 10 + static_cast<s::uint64_t>(src[pos] - '0');
+      if (next < calc) {
+        trunc = pos;
+        continue;
+      }
+      calc = next;
+    }
+    if (not trunc and static_cast<s::int64_t>(calc) < 0) {
+      trunc = pos - 1;
+      calc /= 10;
+    }
+    if (trunc) {
+      s::fprintf(stderr, "jfsh: number truncated after %d digits: %.*s\n",
+                 static_cast<int>(*trunc - from), static_cast<int>(src.size() - from),
+                 src.data() + from);
+    }
+    return static_cast<int>(static_cast<s::int64_t>(calc));
+  }
+
+  // zsh's parsecolorchar: %F{name} (the name prompt-expanded first), else
+  // the number before the F; nullopt for one that isn't a colour.
+  opt<str> colour(bool fg, int num) {
+    if (pos < src.size() and src[pos] == '{') {
+      auto end = src.find('}', pos + 1);
+      if (end == strv::npos) {
+        pos = src.size();
+        return color_seq("0", fg);
+      }
+      strv inner = src.substr(pos + 1, end - pos - 1);
+      pos = end + 1;
+      PromptExpander sub(r, inner);
+      sub.percent = true;
+      sub.bang    = false;
+      str name = PromptRenderer::strip_markers(sub.run(), true);
+      return color_spec(name, fg);
+    }
+    return color_seq(s::to_string(num), fg);
+  }
+
+  void escape(str& out, char e, int num, bool has_num, bool minus, char stop) {
     const ParamTable& params = r.mParams;
     switch (e) {
       case '%': text(out, "%"); break;
@@ -257,10 +493,10 @@ struct PromptExpander {
         text(out, path_components(tilde_path(params, current_dir(params)), num));
         break;
       case 'c': case '.':
-        text(out, path_components(tilde_path(params, current_dir(params)), has_num ? num : 1));
+        text(out, path_components(tilde_path(params, current_dir(params)), num ? num : 1));
         break;
       case 'C':
-        text(out, path_components(current_dir(params), has_num ? num : 1));
+        text(out, path_components(current_dir(params), num ? num : 1));
         break;
       case 'n': {
         str user = param_str(params, "USERNAME");
@@ -271,29 +507,26 @@ struct PromptExpander {
         text(out, user);
         break;
       }
-      case 'm': case 'M': {
-        char host[256] = {};
-        ::gethostname(host, sizeof host - 1);
-        str h = host;
-        if (e == 'm') {
-          int n = has_num ? num : 1;
-          vec<str> parts;
-          s::size_t at = 0;
-          for (;;) {
-            auto dot = h.find('.', at);
-            parts.push_back(h.substr(at, dot == str::npos ? str::npos : dot - at));
-            if (dot == str::npos) break;
-            at = dot + 1;
-          }
-          s::size_t want = static_cast<s::size_t>(n < 0 ? -n : n);
-          if (n != 0 and want < parts.size()) {
-            str o;
-            s::size_t from = n > 0 ? 0 : parts.size() - want;
-            for (s::size_t i = from; i < from + want; ++i) o += (i > from ? "." : "") + parts[i];
-            h = o;
-          }
+      case 'M':
+        text(out, param_str(params, "HOST"));
+        break;
+      case 'm': {
+        // The first `num` parts of $HOST, or the last -num.
+        auto hp = params.lookup("HOST");
+        if (not hp or not hp->get().is_set()) break;
+        str h = hp->get().scalar();
+        int arg = num ? num : 1;
+        if (arg < 0) {
+          s::size_t i = h.size();
+          for (; i > 0; --i)
+            if (h[i - 1] == '.' and not ++arg) break;
+          text(out, strv(h).substr(i));
+        } else {
+          s::size_t i = 0;
+          for (; i < h.size(); ++i)
+            if (h[i] == '.' and not --arg) break;
+          text(out, strv(h).substr(0, i));
         }
-        text(out, h);
         break;
       }
       case 'y': text(out, tty_name(false)); break;
@@ -317,65 +550,74 @@ struct PromptExpander {
       case 'j': text(out, s::to_string(r.mHooks.job_count ? r.mHooks.job_count() : 0)); break;
       case 'L': text(out, s::to_string(param_long(params, "SHLVL"))); break;
       case 'e': text(out, s::to_string(r.mHooks.eval_depth ? r.mHooks.eval_depth() : 0)); break;
-      case 'N': case 'x':
-        text(out, r.mHooks.script_name ? r.mHooks.script_name() : str("jfsh"));
+      case 'N': case 'x': {
+        // %x: the file the code came from; else, as %N, the script or
+        // function name.
+        str name = e == 'x' and r.mHooks.file_name ? r.mHooks.file_name()
+                 : r.mHooks.script_name             ? r.mHooks.script_name()
+                                                    : str("jfsh");
+        text(out, path_components(name, num));
         break;
+      }
       case '_': case '^': break;   // the parser's state: jfsh doesn't track it
       case 'D':
         if (pos < src.size() and src[pos] == '{') {
-          auto end = src.find('}', pos + 1);
-          strv fmt = src.substr(pos + 1, end == strv::npos ? strv::npos : end - pos - 1);
-          pos = end == strv::npos ? src.size() : end + 1;
-          text(out, format_time(fmt, local_now()));
+          str fmt;
+          s::size_t i = pos + 1;
+          for (; i < src.size() and src[i] != '}'; ++i) {
+            if (src[i] == '\\' and i + 1 < src.size()) ++i;
+            fmt += src[i];
+          }
+          pos = i < src.size() ? i + 1 : src.size();
+          if (not fmt.empty()) text(out, time_text(fmt));
         } else {
-          text(out, format_time("%y-%m-%d", local_now()));
+          text(out, time_text("%y-%m-%d"));
         }
         break;
-      case 'T': text(out, format_time("%K:%M", local_now())); break;
-      case '*': text(out, format_time("%K:%M:%S", local_now())); break;
-      case 't': case '@': text(out, format_time("%L:%M%p", local_now())); break;
-      case 'w': text(out, format_time("%a %f", local_now())); break;
-      case 'W': text(out, format_time("%m/%d/%y", local_now())); break;
+      case 'T': text(out, time_text("%K:%M")); break;
+      case '*': text(out, time_text("%K:%M:%S")); break;
+      case 't': case '@': text(out, time_text("%l:%M%p")); break;
+      case 'w': text(out, time_text("%a %f")); break;
+      case 'W': text(out, time_text("%m/%d/%y")); break;
       case 'v': {
-        auto p = params.lookup("psvar");
-        vec<str> v = p ? p->get().array() : vec<str>{};
-        int n = has_num ? num : 1;
-        long idx = n > 0 ? n - 1 : static_cast<long>(v.size()) + n;
-        if (idx >= 0 and idx < static_cast<long>(v.size()))
-          text(out, v[static_cast<s::size_t>(idx)]);
+        vec<str> v = psvar();
+        long arg = num;
+        if (not arg) arg = 1;
+        else if (arg < 0) arg += static_cast<long>(v.size()) + 1;
+        if (arg > 0 and arg <= static_cast<long>(v.size()))
+          text(out, v[static_cast<s::size_t>(arg - 1)]);
         break;
       }
       case 'E': zero_width(out, "\x1b[K"); break;
       case 'B':
         attrs.bold = true;
-        zero_width(out, "\x1b[1m" + colors());
+        zero_width(out, "\x1b[1m" + dirty('B'));
         break;
       case 'b':
-        if (attrs.bold) {
-          attrs.bold = false;
-          str s = "\x1b[0m";
-          if (attrs.standout)  s += "\x1b[7m";
-          if (attrs.underline) s += "\x1b[4m";
-          zero_width(out, s + colors());
-        }
+        attrs.bold = false;
+        zero_width(out, "\x1b[0m" + dirty('b'));
         break;
       case 'U': attrs.underline = true;  zero_width(out, "\x1b[4m");  break;
-      case 'u': attrs.underline = false; zero_width(out, "\x1b[24m"); break;
+      case 'u':
+        attrs.underline = false;
+        zero_width(out, "\x1b[24m" + dirty('u'));
+        break;
       case 'S': attrs.standout = true;   zero_width(out, "\x1b[7m");  break;
-      case 's': attrs.standout = false;  zero_width(out, "\x1b[27m"); break;
+      case 's':
+        attrs.standout = false;
+        zero_width(out, "\x1b[27m" + dirty('s'));
+        break;
       case 'F': case 'K': {
         bool fg = e == 'F';
-        str spec;
-        if (pos < src.size() and src[pos] == '{') {
-          auto end = src.find('}', pos + 1);
-          spec = str(src.substr(pos + 1, end == strv::npos ? strv::npos : end - pos - 1));
-          pos = end == strv::npos ? src.size() : end + 1;
-        } else if (has_num) {
-          spec = s::to_string(num);
+        opt<str> seq_text = colour(fg, num);
+        if (seq_text) {
+          (fg ? attrs.fg : attrs.bg) = *seq_text;
+          zero_width(out, *seq_text);
+          break;
         }
-        str seq_text = color_seq(spec, fg);
-        (fg ? attrs.fg : attrs.bg) = seq_text;
-        zero_width(out, seq_text);
+        // Not a colour: %f / %k.
+        (fg ? attrs.fg : attrs.bg).clear();
+        zero_width(out, fg ? "\x1b[39m" : "\x1b[49m");
         break;
       }
       case 'f': attrs.fg.clear(); zero_width(out, "\x1b[39m"); break;
@@ -389,117 +631,163 @@ struct PromptExpander {
         in_literal = false;
         break;
       case 'G': break;
-      case '(': conditional(out, num, has_num); break;
-      case '<': case '>': case '[': truncation(out, e, num, has_num, stop); break;
+      case '[': {
+        int arg = num;
+        if (pos < src.size() and src[pos] >= '0' and src[pos] <= '9') {
+          arg = number();
+        }
+        truncation(out, ']', arg, stop);
+        break;
+      }
+      case '<': case '>': {
+        int arg = num;
+        // %-N<…<: N columns short of the right margin.
+        if (minus) {
+          arg = columns() - current_column(out) + arg;
+          if (arg <= 0) arg = 1;
+        }
+        --pos;   // prompttrunc starts on the < or >
+        truncation(out, e, arg, stop);
+        break;
+      }
       default: break;   // unknown escapes expand to nothing, as in zsh
     }
+    (void)has_num;
   }
 
-  bool test(char t, int n) {
+  str time_text(strv fmt) const {
+    auto now = local_now();
+    return format_time(fmt, now.tm, now.nsec);
+  }
+
+  vec<str> psvar() const {
+    auto p = r.mParams.lookup("psvar");
+    if (not p or not p->get().is_set()) return {};
+    if (p->get().is_array()) return p->get().array();
+    return {p->get().scalar()};
+  }
+
+  // zsh's %(x.true.false) tests: 1 true, 0 false, -1 not a test (neither
+  // branch is shown).
+  int test(char t, int arg, bool minus, const str& out) {
     const ParamTable& params = r.mParams;
-    auto tm = local_now();
-    auto dir_depth = [&](bool tilde) {
-      str d = current_dir(params);
-      if (tilde) d = tilde_path(params, d);
-      int count = 0;
-      bool in = false;
-      for (char c : d) {
-        if (c != '/' and not in) ++count;
-        in = c != '/';
-      }
-      return count;
-    };
+    auto tm = local_now().tm;
     switch (t) {
+      case 'c': case '.': case '~': case '/': case 'C': {
+        str d = current_dir(params);
+        if (t == 'c' or t == '.' or t == '~') {
+          str home = param_str(params, "HOME");
+          while (home.size() > 1 and home.back() == '/') home.pop_back();
+          if (not home.empty() and home != "/" and (d == home or d.starts_with(home + "/"))) {
+            --arg;
+            d = d.substr(home.size());
+          }
+        }
+        // `/' gives 0, `/any' gives 1, etc.
+        s::size_t i = 0;
+        if (i < d.size() and d[i++] == '/' and i < d.size()) --arg;
+        for (; i < d.size(); ++i)
+          if (d[i] == '/') --arg;
+        return arg <= 0;
+      }
+      case 't': return arg == tm.tm_min;
+      case 'T': return arg == tm.tm_hour;
+      case 'd': return arg == tm.tm_mday;
+      case 'D': return arg == tm.tm_mon;
+      case 'w': return arg == tm.tm_wday;
+      case '?': return s::atoi(param_str(params, "status").c_str()) == arg;
+      case '#': return static_cast<int>(::geteuid()) == arg;
+      case 'g': return static_cast<int>(::getegid()) == arg;
+      case 'j': return (r.mHooks.job_count ? r.mHooks.job_count() : 0) >= arg;
+      case 'l': {
+        int t0 = current_column(out);
+        if (minus) t0 = columns() - t0;
+        return t0 >= arg;
+      }
+      case 'e': return (r.mHooks.eval_depth ? r.mHooks.eval_depth() : 0) >= arg;
+      case 'L': return param_long(params, "SHLVL") >= arg;
+      case 'S': return param_long(params, "SECONDS") >= arg;
+      case 'v': return static_cast<int>(psvar().size()) >= arg;
+      case 'V': {
+        vec<str> v = psvar();
+        int i = arg ? arg : 1;
+        int size = static_cast<int>(v.size());
+        return not v.empty() and size >= arg and i <= size
+           and not v[static_cast<s::size_t>(i - 1)].empty();
+      }
+      case '_': return 0 >= arg;
       case '!': return ::geteuid() == 0;
-      case '#': return static_cast<int>(::geteuid()) == n;
-      case '?': {
-        str st = param_str(params, "status");
-        return s::atoi(st.c_str()) == n;
-      }
-      case '_': return n <= 0;
-      case '/': case 'C': return dir_depth(false) >= n;
-      case '~': case 'c': case '.': return dir_depth(true) >= n;
-      case 'D': return tm.tm_mon == n;
-      case 'd': return tm.tm_mday == n;
-      case 'e': return (r.mHooks.eval_depth ? r.mHooks.eval_depth() : 0) >= n;
-      case 'g': return static_cast<int>(::getgid()) == n;
-      case 'j': return (r.mHooks.job_count ? r.mHooks.job_count() : 0) >= n;
-      case 'L': return param_long(params, "SHLVL") >= n;
-      case 'l': return line_width >= n;
-      case 'S': return param_long(params, "SECONDS") >= n;
-      case 'T': return tm.tm_hour == n;
-      case 't': return tm.tm_min == n;
-      case 'u': return static_cast<int>(::getuid()) == n;
-      case 'w': return tm.tm_wday == n;
-      case 'v': case 'V': {
-        auto p = params.lookup("psvar");
-        vec<str> v = p ? p->get().array() : vec<str>{};
-        if (t == 'v') return static_cast<int>(v.size()) >= n;
-        return n >= 1 and n <= static_cast<int>(v.size())
-           and not v[static_cast<s::size_t>(n - 1)].empty();
-      }
-      default: return false;
+      default:  return -1;
     }
   }
 
   // %N(x.true.false): either branch may hold further escapes; the one not
   // taken leaves no trace, not even its attribute changes.
-  void conditional(str& out, int num, bool has_num) {
-    if (not has_num) {
-      while (pos < src.size() and src[pos] >= '0' and src[pos] <= '9')
-        num = num * 10 + (src[pos++] - '0');
+  void conditional(str& out, int arg, bool minus) {
+    if (pos < src.size() and src[pos] >= '0' and src[pos] <= '9') {
+      arg = 0;
+      arg = number();
+    } else if (arg < 0) {
+      arg = -arg;
     }
-    if (pos + 1 >= src.size()) { pos = src.size(); return; }
-    char t     = src[pos++];
+    if (pos + 1 >= src.size()) {
+      pos = src.size();
+      return;
+    }
+    int t = test(src[pos++], arg, minus, out);
     char delim = src[pos++];
-    static constexpr strv known = "!#?_/C~c.DdegjLlSTtuwvV";
-    bool valid = known.find(t) != strv::npos;
-    bool cond  = valid and test(t, num);
 
     Attrs saved = attrs;
     int   width = line_width;
     str yes, no;
     seq(yes, delim, false);
-    if (pos < src.size()) ++pos;
+    // A branch the string ends in ends the whole expansion, shown as far
+    // as it got if it was the one to show.
+    if (pos >= src.size()) {
+      if (t == 1) out += yes;
+      else        attrs = saved, line_width = width;
+      return;
+    }
+    ++pos;
     Attrs yes_attrs = attrs;
     int   yes_width = line_width;
     attrs      = saved;
     line_width = width;
     seq(no, ')', false);
     if (pos < src.size()) ++pos;
-    if (not valid) {
-      attrs      = saved;
-      line_width = width;
-    } else if (cond) {
+    if (t == 1) {
       out += yes;
       attrs      = yes_attrs;
       line_width = yes_width;
-    } else {
+    } else if (t == 0) {
       out += no;
+    } else {
+      attrs      = saved;
+      line_width = width;
     }
   }
 
-  // %N<str< and %N>str>: what follows, up to the next truncation or the
-  // end of the enclosing group, is cut to N columns, `str` marking where.
-  void truncation(str& out, char dir, int num, bool has_num, char stop) {
-    char close = dir;
-    if (dir == '[') {
-      close = ']';
-      dir = '>';
-      if (pos < src.size() and (src[pos] == '<' or src[pos] == '>')) dir = src[pos++];
-    }
+  // zsh's prompttrunc: %N<str<, %N>str> and %N[xstr] cut what follows, up
+  // to the next truncation or the end of the enclosing group, to N
+  // columns, `str` marking where.  `pos` is on the < or > (or after the
+  // [ and its number).
+  void truncation(str& out, char truncchar, int arg, char stop) {
+    char ch = pos < src.size() ? src[pos] : '\0';
+    bool left = ch == '<';
+    if (ch != ']') ++pos;
     str repl;
-    while (pos < src.size() and src[pos] != close) {
+    while (pos < src.size() and src[pos] != truncchar) {
       if (src[pos] == '\\' and pos + 1 < src.size()) ++pos;
       repl += src[pos++];
     }
-    if (pos < src.size()) ++pos;
-    if (not has_num or num == 0) return;   // %<< ends a truncation
-    int limit = num < 0 ? -num : num;
+    if (pos >= src.size()) return;
+    ++pos;
+    if (arg <= 0) return;   // %<< ends a truncation
+    if (repl.empty() and truncchar == ']') repl = "<";
     int width = line_width;
     str part;
     seq(part, stop, true);
-    str cut = truncate(part, limit, repl, dir == '<');
+    str cut = truncate(part, arg, repl, left);
     out += cut;
     line_width = width + PromptRenderer::visual_width(cut);
   }
@@ -524,33 +812,34 @@ struct PromptExpander {
       i += len;
     }
     if (total <= limit) return str(text);
-    int avail = s::max(0, limit - text_width(repl));
-    str kept, dropped;
-    int used = 0;
+    int twidth = text_width(repl);
+    if (twidth >= limit) return str(repl);
+    int maxwidth = limit - twidth;
+    str out;
     if (cut_left) {
-      s::size_t i = pieces.size();
-      while (i > 0) {
-        const Piece& p = pieces[i - 1];
-        if (p.width >= 0 and used + p.width > avail) break;
-        if (p.width > 0) used += p.width;
-        --i;
+      // The truncation string, then what is left once the width is no
+      // more than maxwidth; zero-width parts on the way are kept.
+      out = repl;
+      int remw = total;
+      s::size_t i = 0;
+      for (; i < pieces.size() and remw > maxwidth; ++i) {
+        if (pieces[i].width < 0) out += pieces[i].bytes;
+        else                     remw -= pieces[i].width;
       }
-      for (s::size_t k = 0; k < i; ++k)
-        if (pieces[k].width < 0) dropped += pieces[k].bytes;
-      for (s::size_t k = i; k < pieces.size(); ++k) kept += pieces[k].bytes;
-      return dropped + str(repl) + kept;
+      for (; i < pieces.size(); ++i) out += pieces[i].bytes;
+      return out;
     }
+    // At the right: characters until the width is reached (the last may
+    // go past it), the truncation string, then the zero-width parts left.
     s::size_t i = 0;
-    while (i < pieces.size()) {
-      const Piece& p = pieces[i];
-      if (p.width >= 0 and used + p.width > avail) break;
-      if (p.width > 0) used += p.width;
-      kept += p.bytes;
-      ++i;
+    for (; i < pieces.size() and maxwidth > 0; ++i) {
+      out += pieces[i].bytes;
+      if (pieces[i].width > 0) maxwidth -= pieces[i].width;
     }
-    for (s::size_t k = i; k < pieces.size(); ++k)
-      if (pieces[k].width < 0) dropped += pieces[k].bytes;
-    return kept + str(repl) + dropped;
+    out += repl;
+    for (; i < pieces.size(); ++i)
+      if (pieces[i].width < 0) out += pieces[i].bytes;
+    return out;
   }
 };
 
@@ -559,13 +848,20 @@ void PromptRenderer::reload() {
     auto p = mParams.lookup(name);
     return (p and p->get().is_set()) ? p->get().scalar() : def;
   };
-  mVars.PS1    = get("PROMPT",   get("PS1",   "%n@%m %1~ %# "));
-  mVars.PS2    = get("PROMPT2",  get("PS2",   "%_> "));
-  mVars.PS3    = get("PROMPT3",  get("PS3",   "?# "));
-  mVars.PS4    = get("PROMPT4",  get("PS4",   "+%N:%i> "));
-  mVars.RPS1   = get("RPROMPT",  get("RPS1",  ""));
-  mVars.RPS2   = get("RPROMPT2", get("RPS2",  ""));
-  mVars.SPROMPT= get("SPROMPT",  "jfsh: correct '%R' to '%r' [nyae]? ");
+  // The shell starts them (install_special_params, as zsh's setupvals).
+  // Each is the string its names share (PS1 with PROMPT and prompt, RPS1
+  // with RPROMPT, …), whichever name is unset: zsh's zle reads the string.
+  auto shared = [&](const char* name) -> str {
+    auto p = mParams.lookup(name);
+    return p ? p->get().scalar() : str{};
+  };
+  mVars.PS1    = shared("PS1");
+  mVars.PS2    = shared("PS2");
+  mVars.PS3    = shared("PS3");
+  mVars.PS4    = shared("PS4");
+  mVars.RPS1   = shared("RPS1");
+  mVars.RPS2   = shared("RPS2");
+  mVars.SPROMPT= get("SPROMPT",  "");
 }
 
 str PromptRenderer::expand(strv prompt_str) const {

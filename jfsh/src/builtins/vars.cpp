@@ -91,6 +91,15 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
     return 1;
   }
   Param* p = existing ? &existing->get() : nullptr;
+  // A special keeps its type (zsh's typeset_single): no special becomes an
+  // array, and a string one ($PS1, $histchars) no number either.
+  if (attrs.type) {
+    auto sp = existing ? existing : ctx.params.lookup(name);
+    bool string = sp and not sp->get().is_integer() and not sp->get().is_float();
+    if (sp and sp->get().scalar_special()
+        and (attrs.type == 'a' or attrs.type == 'A' or string))
+      return builtin_error(cmd, name + ": can't change type of a special parameter");
+  }
   if (not p) {
     // A new local is not exported (unless -x), even when the parameter it
     // hides is, as in zsh: children see the local's absence.
@@ -112,7 +121,11 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
         return 1;
       }
       bool settable = special and (special->handlers->set_scalar or special->handlers->set_array);
+      // The value to put back is the getter's (zsh's copyparam), even for
+      // a name that is unset: a name of a shared string reads the string.
       ParamValue saved = special ? special->value : ParamValue{};
+      if (special and special->is_scalar() and special->handlers->get_scalar)
+        saved = special->handlers->get_scalar();
       s::uint32_t kind = special ? special->flags & (PM_SCALAR | PM_INTEGER | PM_FLOAT | PM_ARRAY
                                                      | PM_HASH)
                                  : PM_SCALAR;
@@ -133,8 +146,9 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
     }
     if (attrs.type == 'i' and not has_value) p->set(s::int64_t{0});
     if (attrs.type == 'F' and not has_value) p->set(0.0);
-  } else if (not p->is_set() and not has_value) {
-    // `local x` after `unset x` sets it again, empty.
+  } else if (not p->is_set() and not has_value and not (p->flags & PM_SPECIAL)) {
+    // `local x` after `unset x` sets it again, empty (an unset special,
+    // RPS1 at the start, stays unset: `export RPS1`).
     p->set(str{});
   }
   s::uint32_t flags = (p->flags | attrs.on) & ~attrs.off;
@@ -151,6 +165,9 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
     }
     return *v;
   };
+  // Before the write, so the other exported names of a shared prompt
+  // string keep the environment value they had.
+  if (has_value) ctx.params.note_assigned(name);
   bool was_integer = p->is_integer(), was_float = p->is_float();
   switch (attrs.type) {
     case 'a':
@@ -210,7 +227,6 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
   // (`typeset -i x=16#ff` is 16#FF).
   if (has_value and p->is_integer() and p->base == 0 and last_base >= 2) p->base = last_base;
   if ((p->flags & PM_UNIQUE) and p->is_array()) p->set(unique(p->array()));
-  if (has_value) ctx.params.note_assigned(name);
   return 0;
 }
 

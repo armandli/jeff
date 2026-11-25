@@ -77,9 +77,9 @@ TEST(Editor, TransposeAndCase) {
 
 TEST(Editor, UndoAndNumericArguments) {
   Rig t;
-  EXPECT_EQ(t.line("abc\x1f\r"), "");          // typing is one undo step
+  EXPECT_EQ(t.line("abc\x1f\r"), "ab");        // each key typed is a step (zsh 5.9)
   EXPECT_EQ(t.line("abc def\x17\x1f\r"), "abc def");
-  EXPECT_EQ(t.line("ab\x18u\r"), "");          // ^Xu
+  EXPECT_EQ(t.line("ab\x18u\r"), "a");         // ^Xu
   EXPECT_EQ(t.line("\x1b" "3x\r"), "xxx");
   EXPECT_EQ(t.line("abcdef\x1b" "3\x08\r"), "abc");
   EXPECT_EQ(t.line("a b c\x1b" "2\x17\r"), "a ");
@@ -154,7 +154,7 @@ TEST(Editor, HistorySearchAndLastWord) {
   EXPECT_EQ(t.line("ls \x1b.\r"), "ls x");
   EXPECT_EQ(t.line("ls \x1b.\x1b.\r"), "ls bar");
   EXPECT_EQ(t.line("ls \x1b" "2\x1b.\r"), "ls -m");
-  EXPECT_EQ(t.line("cp a \x1b\x1f\r"), "cp a a");
+  EXPECT_EQ(t.line("cp a \x1b\x1f\r"), "cp a a ");   // zsh copies up to the cursor
 }
 
 TEST(Editor, BufferStack) {
@@ -273,7 +273,7 @@ TEST(Bindkey, ListingMatchesZsh) {
   EXPECT_EQ(sh.run("bindkey -M viins | head -2").out,
             "\"^A\"-\"^C\" self-insert\n\"^D\" list-choices\n");
   EXPECT_EQ(sh.run("bindkey -M emacs | grep -e ' self-insert$' -e '^\"\\^\\[\\[C'").out,
-            "\"^[[C\" forward-char\n\" \"-\"~\" self-insert\n");
+            "\"^[[C\" forward-char\n\" \"-\"~\" self-insert\n\"\\M-^@\"-\"\\M-^?\" self-insert\n");
   EXPECT_EQ(sh.run("bindkey -M vicmd | grep -e '^\"\\\\\\$' -e '^\"\\\\^'").out,
             "\"\\$\" vi-end-of-line\n\"\\^\" vi-first-non-blank\n");
   EXPECT_EQ(sh.run("bindkey -l").out,
@@ -305,7 +305,8 @@ TEST(Bindkey, EveryDefaultBindingNamesAWidget) {
 
 TEST(Bindkey, KeyNotation) {
   EXPECT_EQ(parse_key_notation("^A\\e\\M-x\\C-b^?\\n\\033\\x41"), "\x01\x1b\xf8\x02\x7f\n\x1b" "A");
-  EXPECT_EQ(format_key("\x01\x1b[A\x7f \"$\\"), "^A^[[A^? \\\"\\$\\\\");
+  // zsh's printbind: bindztrdup in dquotedztrdup's quotes.
+  EXPECT_EQ(format_key("\x01\x1b[A\x7f \"$\\"), "\"^A^[[A^? \\\"\\$\\\\\\\\\"");
 }
 
 TEST(Bindkey, MacrosAndCustomBindingsDriveTheEditor) {
@@ -337,7 +338,9 @@ TEST(Zle, Builtin) {
   Shell sh;
   EXPECT_EQ(sh.run("zle -N foo; zle -N bar baz; zle -l").out, "bar (baz)\nfoo\n");
   EXPECT_EQ(sh.run("zle -lL").out, "zle -N bar baz\nzle -N foo\n");
-  EXPECT_EQ(sh.run("zle -A beginning-of-line bol; zle -l bol && echo yes").out, "yes\n");
+  // An alias of a builtin widget is a builtin one: only -a lists it.
+  EXPECT_EQ(sh.run("zle -A beginning-of-line bol; zle -l bol || zle -la bol && echo yes").out,
+            "yes\n");
   EXPECT_EQ(sh.run("zle -D foo bar bol; zle -l").out, "");
   EXPECT_EQ(sh.run("zle -l -a | grep -c '^vi-'").out.empty(), false);
   auto r = sh.run("zle beginning-of-line");
@@ -537,6 +540,476 @@ TEST(CompletionEngine, B52CommandsAreExecutableAndUnique) {
   auto r = sh.ctx.zle->completion->complete("jfsh_to", 7);
   ASSERT_EQ(r.matches.size(), 1u);
   EXPECT_EQ(r.matches[0].word, "jfsh_tool");
+}
+
+// ---- M9 review: the widgets as zsh 5.9's ------------------------------------
+//
+// Expected values from zsh -f -i in a pty (scratchpad m9/p_tv.py).
+
+TEST(EditorM9Review, NegativeCountsRunTheOtherWay) {
+  Rig t;
+  EXPECT_EQ(t.line("abc\x01\x1b-\x02X\r"), "aXbc");
+  EXPECT_EQ(t.line("echo foo bar\x1b-\x1b" "d\r"), "echo foo ");
+  EXPECT_EQ(t.line("echo foo bar\x02\x02\x02\x1b-\x0b\r"), "bar");
+  // self-insert with a negative count inserts after the cursor.
+  EXPECT_EQ(t.line("ab\x01\x1b-xY\r"), "Yxab");
+  EXPECT_EQ(t.line("a\x1bxuniversal-argument\r3x\r"), "axxx");
+  EXPECT_EQ(t.line("a\x1bxuniversal-argument\rx\r"), "axxxx");
+}
+
+TEST(EditorM9Review, UndoIsPerWidget) {
+  Rig t;
+  EXPECT_EQ(t.line("abc\x1f\r"), "ab");
+  EXPECT_EQ(t.line("echo abc\x01\x1b" "d\x05 x\x1f\x1f\r"), " abc");
+  // Each step is what changed, so a long line typed costs little.
+  str many(300, 'x');
+  EXPECT_EQ(t.line(many + "\x1f\x1f\r"), str(298, 'x'));
+}
+
+TEST(EditorM9Review, TransposeCopyAndDelete) {
+  Rig t;
+  EXPECT_EQ(t.line("abc\x01\x14\r"), "bac");
+  EXPECT_EQ(t.line("a b c\x1b" "2\x1b\x1f\r"), "a b cb ");
+  EXPECT_EQ(t.line("cp a \x1b\x1f\r"), "cp a a ");
+  // delete-word doesn't go to the kill ring.
+  EXPECT_EQ(t.line("echo foo bar\x01\x1bxdelete-word\r\x19\r"), " foo bar");
+  EXPECT_EQ(t.line("abc\x1bxgosmacs-transpose-chars\r\r"), "acb");
+}
+
+TEST(EditorM9Review, KillRingAsZsh) {
+  Rig t;
+  EXPECT_EQ(t.line("one two three\x01\x1b" "d\x06\x1b" "d\x06\x1b" "d\x05\x19\x1by\x1by\r"),
+            "  one");
+}
+
+TEST(EditorM9Review, MessagesAndNamedCommands) {
+  Rig t;
+  t.type("echo foo\x01\x06\x18=");
+  EXPECT_EQ(t.screen.row(1), "Char: c (0143, 99, 0x63)  point 2 of 9(12%)  column 1");
+  t.send("\x03");
+  t.finish();
+  t.type("echo foo\x18=");
+  EXPECT_EQ(t.screen.row(1), "EOF  point 9 of 9(100%)  column 8");
+  t.send("\x03");
+  t.finish();
+  // execute-named-cmd completes the name.
+  EXPECT_EQ(t.line("abc\x1bxbackward-ch\t\rX\r"), "abXc");
+  t.sh.run("k() { zle -M \"$KEYMAP\" }; zle -N k; bindkey '^Xk' k");
+  t.type("\x18k");
+  EXPECT_EQ(t.screen.row(1), "main");
+  t.send("\x03");
+  t.finish();
+}
+
+TEST(EditorM9Review, TabsShowAsBlanks) {
+  Rig t;
+  t.type("echo \x16\tx");
+  EXPECT_EQ(t.screen.row(0), "> echo  x");
+  t.send("\x03");
+  t.finish();
+}
+
+TEST(EditorM9Review, ViInsertStopsWhereTheInsertBegan) {
+  ViRig t;
+  EXPECT_EQ(t.line("echo foo bar\x1b" "a\x17\r"), "echo foo bar");
+  EXPECT_EQ(t.line("echo foo bar\x1b" "A baz\x15\r"), "echo foo bar");
+}
+
+TEST(EditorM9Review, ViRegistersLinesAndIndent) {
+  ViRig t;
+  // "1 is the last deletion, "2 the one before, "0 the last yank.
+  EXPECT_EQ(t.line("one two three\x1b" "0dwdw\"2p\r"), "tone hree");
+  EXPECT_EQ(t.line("one two three\x1b" "0dwdw\"1p\r"), "ttwo hree");
+  EXPECT_EQ(t.line("one two three\x1b" "0ywdw\"0P\r"), "one two three");
+  EXPECT_EQ(t.line("echo a\x16\necho b\x1bkVd\r"), "echo b");
+  // Indenting needs lines: within a line it does nothing.
+  EXPECT_EQ(t.line("echo a b\x1b" "0w>w\r"), "echo a b");
+  EXPECT_EQ(t.line("echo a\x16\necho b\x1bk>j\r"), "\techo a\n\techo b");
+  EXPECT_EQ(t.line("echo a b\x1b" "03$x\r"), "cho a b");
+}
+
+TEST(EditorM9Review, BindkeyAsBinBindkey) {
+  Shell sh;
+  // printbind: bindztrdup inside dquotedztrdup's quotes.
+  EXPECT_EQ(sh.run("bindkey '\\\\' backward-char; bindkey -L '\\\\'; bindkey '^\\\\'").out,
+            "bindkey \"\\\\\\\\\" backward-char\n\"^\\\\\\\\\" undefined-key\n");
+  Shell fresh;
+  EXPECT_EQ(fresh.run("bindkey -M viins | grep '\"~\"'").out, "\"^\\\\\\\\\"-\"~\" self-insert\n");
+  EXPECT_EQ(fresh.run("bindkey -LM vicmd | grep -e ' \"a\" ' -e '\"gUU\"'").out,
+            "bindkey -a \"a\" vi-add-next\nbindkey -s -a \"gUU\" \"gUgU\"\n");
+  EXPECT_EQ(fresh.run("bindkey -LM emacs | grep -e '^bindkey -R'").out,
+            "bindkey -R -M emacs \" \"-\"~\" self-insert\n"
+            "bindkey -R -M emacs \"\\M-^@\"-\"\\M-^?\" self-insert\n");
+  EXPECT_EQ(sh.run("bindkey -lL | head -2").out, "bindkey -N command\nbindkey -N emacs\n");
+  EXPECT_EQ(sh.run("bindkey -M .safe '^A'").out, "\"^A\" .self-insert\n");
+  EXPECT_EQ(sh.run("bindkey -M .safe x y").err, "jfsh: bindkey: keymap `.safe' is protected\n");
+  EXPECT_EQ(sh.run("bindkey -e -v").err, "jfsh: bindkey: incompatible keymap selection options\n");
+  EXPECT_EQ(sh.run("bindkey -rR 'a-c'; bindkey a").out, "\"a\" undefined-key\n");
+  EXPECT_EQ(sh.run("bindkey a b c").err, "jfsh: bindkey: even number of arguments required\n");
+  EXPECT_EQ(sh.run("bindkey -M command").out,
+            "\"^G\" send-break\n\"^J\" accept-line\n\"^M\" accept-line\n");
+}
+
+TEST(EditorM9Review, ZleAsBinZle) {
+  Shell sh;
+  EXPECT_EQ(sh.run("zle -A forward-char fc2; zle -l fc2").rc, 1);   // a builtin one
+  EXPECT_EQ(sh.run("zle -D forward-char; zle -la | grep -c '^forward-char$'").out, "0\n");
+  EXPECT_EQ(sh.run("zle -la .forward-char").rc, 0);
+  auto r = sh.run("zle -M hi");
+  EXPECT_EQ(r.err, "jfsh: zle: can only be called from widget function\n");
+  EXPECT_EQ(r.rc, 1);
+  EXPECT_EQ(sh.run("zle -N").err, "jfsh: zle: not enough arguments for -N\n");
+  EXPECT_EQ(sh.run("zle -R").rc, 1);
+  EXPECT_EQ(sh.run("zle").rc, 1);
+  EXPECT_EQ(sh.run("zle -N .f g; zle -l").out, ".f (g)\n");
+}
+
+// ---- M9 review, round 1 ------------------------------------------------------
+//
+// Expected values from zsh -f -i in a pty (scratchpad m9rv1/p/r*.py and
+// m9rv1/p2_*.py).
+
+// zleread's viinsert_init: with main as viins, what is typed before the
+// first Esc is one undo step, at every prompt.
+TEST(EditorM9Review, ViUndoAtAFreshPrompt) {
+  ViRig t;
+  EXPECT_EQ(t.line("abc\x1bu\r"), "");
+  EXPECT_EQ(t.line("abc\x1buAqq\x1bu\r"), "");
+  EXPECT_EQ(t.line("日本é\x1bu\r"), "");
+  EXPECT_EQ(t.line("echo \"a\x16\nb\"\x1bu\r"), "");
+}
+
+// Undo knows the history line each change was made in (zsh's ch->hist):
+// moving between lines is no change, and text a read starts with is one.
+TEST(EditorM9Review, UndoFollowsHistoryLines) {
+  Rig t;
+  t.hist.add("echo one");
+  EXPECT_EQ(t.line("\x10Z\x0e\x10\x1f\r"), "echo one");
+  EXPECT_EQ(t.line("abc\x10\x1f\x1f\r"), "ab");
+  t.pending = s::async(s::launch::async, [&t] { return t.ed->edit("abc", "", ""); });
+  t.send("\x1f\x1f\x1fZ\r");
+  EXPECT_EQ(t.finish(), "Z");
+}
+
+// zsh's upline/downline: counts, and the column a run of moves keeps to.
+TEST(EditorM9Review, LineMovesTakeCountsAndKeepTheColumn) {
+  Rig t;
+  EXPECT_EQ(t.line("echo \"a\x16\nb\x16\nc\"\x1b<\x1b" "2\x0eX\r"), "echo \"a\nb\nXc\"");
+  EXPECT_EQ(t.line("echo \"ab\x16\ncdef\x16\ng\x16\nhijk\"\x1b<\x06\x06\x06\x0e\x0e\x0eX\r"),
+            "echo \"ab\ncdef\ng\nhijXk\"");
+  t.hist.add("echo one");
+  t.hist.add("echo two");
+  EXPECT_EQ(t.line("echo \"a\x16\nb\"\x1b" "3\x10X\r"), "echo oneX");
+}
+
+// copy-prev-shell-word takes the word bufferwords finds at the cursor.
+TEST(EditorM9Review, CopyPrevShellWordAsBufferwords) {
+  Rig t;
+  t.sh.run("bindkey '^T' copy-prev-shell-word");
+  EXPECT_EQ(t.line("echo \"a b\" \x14\r"), "echo \"a b\" \"a b\"");
+  EXPECT_EQ(t.line("echo a\x01\x14\r"), "echoecho a");
+  EXPECT_EQ(t.line("echo abc def\x01\x1b" "f\x1b" "f\x1b" "b\x14\r"), "echo echoabc def");
+  EXPECT_EQ(t.line("echo a b c\x1b" "3\x14\r"), "echo a b cecho");
+  EXPECT_EQ(t.line("echo a; ls \x14\r"), "echo a; ls ls");
+}
+
+// The other widgets the review found wrong.
+TEST(EditorM9Review, WidgetsAsZshHasThem) {
+  Rig t;
+  t.sh.run("bindkey '^T' argument-base");
+  EXPECT_EQ(t.line("\x1b" "1\x1b" "6\x14\x1b" "1\x1b" "0x\r"), str(16, 'x'));
+  t.sh.run("bindkey '^T' vi-caps-lock-panic");
+  t.type("ab\x14");
+  EXPECT_EQ(t.screen.row(1), "press a lowercase key to continue");
+  t.send("QÉa");
+  t.send("c\r");
+  EXPECT_EQ(t.finish(), "abc");
+  t.sh.run("bindkey '^T' describe-key-briefly");
+  t.type("\x14\x01");
+  EXPECT_EQ(t.screen.row(1), "\"^A\" is beginning-of-line");
+  t.send("\x03");
+  t.finish();
+  // A character that inserts itself is read whole (getrestchar) and
+  // nothing goes into the line.
+  t.type("\x14日");
+  EXPECT_EQ(t.screen.row(1), "\"\\M-f\\M-^W\\M-%\" is self-insert");
+  t.send("\r");
+  EXPECT_EQ(t.finish(), "");
+  t.type("\x14é");
+  EXPECT_EQ(t.screen.row(1), "\"\\M-C\\M-)\" is self-insert");
+  t.send("\r");
+  EXPECT_EQ(t.finish(), "");
+  t.sh.run("bindkey '^T' where-is");
+  t.type("\x14" "forward-char\r");
+  EXPECT_EQ(t.screen.row(1), "forward-char is on \"^F\" \"^[OC\" \"^[[C\"");
+  t.send("\x03");
+  t.finish();
+  // accept-and-infer-next-history: the entry after the one like the line.
+  t.hist.add("echo one");
+  t.hist.add("echo two");
+  t.sh.run("bindkey '^T' accept-and-infer-next-history");
+  EXPECT_EQ(t.line("\x10\x10\x14"), "echo one");
+  EXPECT_EQ(t.line("\r"), "echo two");
+  // Tab with only blanks before it on its line inserts itself (usetab).
+  EXPECT_EQ(t.line("\tx\r"), "\tx");
+  EXPECT_EQ(t.line("echo \"a\x16\n\tb\"\r"), "echo \"a\n\tb\"");
+}
+
+// The cut buffer, kill ring and vi registers are the shell's, not one
+// editor's (vared shares them); $killring shows the ring, newest first.
+TEST(EditorM9Review, KillRingIsGlobal) {
+  Rig t;
+  EXPECT_EQ(t.line("abc def\x17\r"), "abc ");
+  t.ed = s::make_unique<Editor>(t.sh.opts, t.hist, t.prompt, *t.sh.ctx.zle);
+  t.ed->set_io(t.slave, t.slave);
+  EXPECT_EQ(t.line("\x19\r"), "def");
+  t.sh.run("w(){ BUFFER=\"${(j:,:)killring}|$CUTBUFFER|${#killring}\" }; zle -N w; "
+           "bindkey '^T' w");
+  EXPECT_EQ(t.line("echo a1 a2\x17\x02\x17\x14\r"), "a2,def,,,,,,|a1|8");
+  t.sh.run("w(){ killring=(k1 k2); CUTBUFFER=c0 }; zle -N w");
+  EXPECT_EQ(t.line("\x14\x19\x1by\x1by\r"), "k2");
+  // unset killring empties the ring and unsets the name (stdunsetfn).
+  t.sh.run("w(){ unset killring; BUFFER=\"[${(t)killring}] ${#killring}\" }; zle -N w");
+  EXPECT_EQ(t.line("\x14\r"), "[] 0");
+}
+
+// $WIDGET is the key's widget (zsh's bindk); `zle name` changes it only
+// for a builtin widget or with -w, and -f nolast keeps $LASTWIDGET.
+// $LASTWIDGET goes on from the last line.
+TEST(EditorM9Review, WidgetAndLastWidget) {
+  Rig t;
+  t.sh.run("inr(){ X=$WIDGET }; out(){ zle inr; BUFFER=\"[$WIDGET|$X]\" }; "
+           "zle -N inr; zle -N out; bindkey '^T' out");
+  EXPECT_EQ(t.line("\x14\r"), "[out|out]");
+  t.sh.run("out(){ zle inr -w; BUFFER=\"[$WIDGET|$X]\" }");
+  EXPECT_EQ(t.line("\x14\r"), "[out|inr]");
+  t.sh.run("out(){ zle inr -f nolast; BUFFER=\"[$WIDGET|$LASTWIDGET]\" }");
+  EXPECT_EQ(t.line("ab\x14\r"), "[out|self-insert]");
+  t.sh.run("out(){ BUFFER=\"[$LASTWIDGET]\" }");
+  EXPECT_EQ(t.line("\x14\r"), "[accept-line]");
+  // A key that ends an isearch runs after it (zsh pushes it back).
+  t.hist.add("echo abc");
+  t.sh.run("out(){ BUFFER=\"[$WIDGET|$LASTWIDGET]\" }");
+  EXPECT_EQ(t.line("\x12" "abc\x14\r"), "[out|history-incremental-search-backward]");
+}
+
+// The key that ends an isearch is read again after it (ungetkeycmd), so
+// its widget runs from the main loop: $LASTWIDGET is the search's caller
+// and then the key's widget; the search's keys are read in the main
+// keymap with the isearch keymap over it.
+TEST(EditorM9Review, IsearchEndsByPushingItsKeyBack) {
+  Rig t;
+  t.hist.add("echo abc");
+  t.sh.run("out(){ BUFFER=\"[$WIDGET|$LASTWIDGET|$CURSOR|$KEYMAP|$BUFFER]\" }; zle -N out; "
+           "bindkey '^Y' out");
+  EXPECT_EQ(t.line("\x12" "ab\x02\x19\r"), "[out|backward-char|4|main|echo abc]");
+  EXPECT_EQ(t.line("\x12" "ab\x06\x19\r"), "[out|forward-char|6|main|echo abc]");
+  // A numeric argument goes to the search, not to the key after it.
+  EXPECT_EQ(t.line("\x1b" "2\x12" "ab\x02\x19\r"), "[out|backward-char|4|main|echo abc]");
+  // A string binding's keys go on into the search.
+  t.sh.run("bindkey -s '^T' c");
+  EXPECT_EQ(t.line("\x12" "ab\x14\x19\r"),
+            "[out|history-incremental-search-backward|5|main|echo abc]");
+  // An unbound key runs undefined-key.
+  t.sh.run("bindkey -r '^V'");
+  EXPECT_EQ(t.line("\x12" "ab\x16\x19\r"), "[out|undefined-key|5|main|echo abc]");
+  // Started from a user widget, the search leaves that one as lbindk.
+  t.sh.run("my(){ zle .history-incremental-search-backward }; zle -N my; bindkey '^R' my");
+  EXPECT_EQ(t.line("\x12" "ab\x19\r"), "[out|my|5|main|echo abc]");
+  t.sh.run("bindkey '^R' history-incremental-search-backward");
+  // A lower-case letter matches either case, unless a count is given.
+  t.hist.add("echo ABC");
+  EXPECT_EQ(t.line("\x12" "ab\x19\r"),
+            "[out|history-incremental-search-backward|5|main|echo ABC]");
+  EXPECT_EQ(t.line("\x1b" "2\x12" "ab\x19\r"),
+            "[out|history-incremental-search-backward|5|main|echo abc]");
+  // vi: Esc in the search switches the keymap it reads with; the keymap
+  // the search began in comes back after it.
+  t.sh.run("bindkey -v; bindkey -M viins '^Y' out; bindkey -M vicmd '^Y' out; "
+           "bindkey -M viins '^R' history-incremental-search-backward");
+  EXPECT_EQ(t.line("\x12" "ab\x1b\x19\r"),
+            "[out|history-incremental-search-backward|5|main|echo ABC]");
+  t.sh.run("bindkey -e");
+  // accept-and-hold leaves the cursor where it was for the next line.
+  t.sh.run("bindkey '^Y' out");
+  EXPECT_EQ(t.line("echo abc\x02\x02\x1b" "a"), "echo abc");
+  EXPECT_EQ(t.line("\x19\r"), "[out|accept-and-hold|6|main|echo abc]");
+  // execute-named-cmd: the widget named is the key's.
+  EXPECT_EQ(t.line("abc\x1bxbackward-char\r\x19\r"), "[out|backward-char|2|main|abc]");
+}
+
+// doisearch's other branches: a paste and a quoted key go into the
+// search, the vi repeats search again (the first way, or the other), the
+// pattern widgets repeat as the plain ones do; a line the same as the one
+// a step starts on is passed over.
+TEST(EditorM9Review, IsearchPasteQuotedAndRepeats) {
+  Rig t;
+  for (const char* l : {"echo xab", "echo abc", "echo abd"}) t.hist.add(l);
+  t.sh.run("out(){ BUFFER=\"[$LASTWIDGET|$BUFFER|$CURSOR]\" }; zle -N out; bindkey '^Y' out");
+  const str isearch = "history-incremental-search-backward";
+  EXPECT_EQ(t.line("\x12\x1b[200~bc\x1b[201~\x19\r"), "[" + isearch + "|echo abc|6]");
+  EXPECT_EQ(t.line("\x12\x1b[200~abc\x1b[201~\x08\x19\r"), "[" + isearch + "||0]");
+  EXPECT_EQ(t.line("\x12" "a\x16" "b\x19\r"), "[" + isearch + "|echo abd|5]");
+  t.sh.run("bindkey '^T' history-incremental-pattern-search-backward");
+  EXPECT_EQ(t.line("\x12" "ab\x14\x19\r"), "[" + isearch + "|echo abc|5]");
+  // The other way starts from the match, and a forward match leaves the
+  // cursor at its end.
+  t.sh.run("bindkey '^T' history-incremental-pattern-search-forward");
+  EXPECT_EQ(t.line("\x12" "ab\x12\x14\x19\r"), "[" + isearch + "|echo abc|7]");
+  t.sh.run("bindkey -v; bindkey -M viins '^Y' out; bindkey -M vicmd '^Y' out; "
+           "bindkey -M viins '^R' " + isearch);
+  EXPECT_EQ(t.line("\x12" "ab\x1bn\x19\r"), "[" + isearch + "|echo abc|5]");
+  EXPECT_EQ(t.line("\x12" "ab\x12\x12\x1bN\x19\r"), "[" + isearch + "|echo abc|7]");
+  t.sh.run("bindkey -e; bindkey '^Y' out");
+  Rig d;
+  for (const char* l : {"echo xab", "echo ab", "echo ab"}) d.hist.add(l);
+  d.sh.run("out(){ BUFFER=\"[$BUFFER|$CURSOR]\" }; zle -N out; bindkey '^Y' out");
+  EXPECT_EQ(d.line("\x12" "ab\x12\x19\r"), "[echo xab|6]");
+}
+
+// A character typed into the search goes in whole (getrestchar,
+// getfullchar), so a backspace takes off a whole character; the search's
+// text is drawn on the status line, its control characters as ^X.
+TEST(EditorM9Review, IsearchWholeCharacters) {
+  Rig t;
+  for (const char* l : {"echo aéb", "echo 日本語"}) t.hist.add(l);
+  t.sh.run("out(){ BUFFER=\"[$BUFFER|$CURSOR]\" }; zle -N out; bindkey '^Y' out");
+  EXPECT_EQ(t.line("\x12本語\x08\x19\r"), "[echo 日本語|6]");
+  EXPECT_EQ(t.line("\x12本\x08\x19\r"), "[|0]");
+  EXPECT_EQ(t.line("\x12本語\x08\x08\x19\r"), "[|0]");
+  EXPECT_EQ(t.line("\x12x本\x08\x19\r"), "[|0]");
+  EXPECT_EQ(t.line("\x12" "a\x16é\x19\r"), "[echo aéb|5]");
+  t.type("\x12本語\x08");
+  EXPECT_EQ(t.screen.row(1), "bck-i-search: 本_");
+  t.send("\x07\r");
+  t.finish();
+  t.type("\x12" "a\x16\x0a");
+  EXPECT_EQ(t.screen.row(1), "failing bck-i-search: a^J_");
+  t.send("\x07\r");
+  t.finish();
+  t.type("\x12" "a\x16\x09");
+  EXPECT_EQ(t.screen.row(1), "failing bck-i-search: a^I_");
+  t.send("\x07\r");
+  t.finish();
+  t.type("abc\x1bx\x16\x01");
+  EXPECT_EQ(t.screen.row(0), "> abc");
+  EXPECT_EQ(t.screen.row(1), "execute: ^A_");
+  t.send("\x07\r");
+  t.finish();
+  t.sh.run("bindkey -v; bindkey -M viins '^Y' out; "
+           "bindkey -M viins '^R' history-incremental-search-backward");
+  EXPECT_EQ(t.line("\x12本語\x08\x19\r"), "[echo 日本語|6]");
+}
+
+// zle -M is drawn as showmsg draws it (nicechar: `\t`, `^X`, `\M-…` for a
+// byte that is no character, newlines kept).
+TEST(EditorM9Review, MessageAsShowmsg) {
+  Rig t;
+  auto shown = [&](const char* msg) {
+    t.sh.run(str("m(){ zle -M $'") + msg + "' }; zle -N m; bindkey '^T' m");
+    t.type("\x14");
+    str rows = t.screen.row(1) + "|" + t.screen.row(2);
+    t.send("\r");
+    t.finish();
+    return rows;
+  };
+  EXPECT_EQ(shown("a\\tb"), "a\\tb|");
+  EXPECT_EQ(shown("a\\nb"), "a|b");
+  EXPECT_EQ(shown("a\\x01b\\x7fc"), "a^Ab^?c|");
+  EXPECT_EQ(shown("a\\x80b\\xffc"), "a\\M-^@b\\M-^?c|");
+  EXPECT_EQ(shown("a\\u0085b"), "a\\M-^Eb|");
+}
+
+// zsh's exchangepointandmark: a mark never set is 0, a count of 0 only
+// activates the region, a negative one swaps without it; undefined-key
+// fails.
+TEST(EditorM9Review, ExchangePointAndMarkAndUndefinedKey) {
+  Rig t;
+  t.sh.run("out(){ BUFFER=\"[$BUFFER|$CURSOR|$MARK|$REGION_ACTIVE]\" }; zle -N out; "
+           "bindkey '^Y' out");
+  EXPECT_EQ(t.line("abc\x18\x18\x19\r"), "[abc|0|3|1]");
+  EXPECT_EQ(t.line("abc\x18\x18\x18\x18\x19\r"), "[abc|3|0|1]");
+  EXPECT_EQ(t.line("abc\x1b" "0\x18\x18\x19\r"), "[abc|3|0|1]");
+  EXPECT_EQ(t.line("abc\x1b-\x18\x18\x19\r"), "[abc|0|3|0]");
+  t.sh.run("u(){ zle undefined-key; BUFFER=\"rc=$?\" }; zle -N u; bindkey '^T' u; "
+           "v(){ zle beep; BUFFER=\"rc=$?\" }; zle -N v; bindkey '^V' v");
+  EXPECT_EQ(t.line("\x14\r"), "rc=1");
+  EXPECT_EQ(t.line("\x16\r"), "rc=0");
+  // An edit ends an active region (spaceinline, foredel); a move doesn't,
+  // nor a user widget's own assignment.
+  EXPECT_EQ(t.line("abc\x1b" "0\x18\x18" "d\x19\r"), "[abcd|4|0|0]");
+  EXPECT_EQ(t.line("abc\x1b" "0\x18\x18\x08\x19\r"), "[ab|2|0|0]");
+  EXPECT_EQ(t.line("abc\x1b" "0\x18\x18\x02\x19\r"), "[abc|2|0|1]");
+  // A rewrite in place (no spaceinline, no shiftchars) keeps it.
+  auto marked = [](const char* before, const char* after) {
+    return str(before) + '\0' + after;
+  };
+  t.sh.run("bindkey '^T' transpose-chars");
+  EXPECT_EQ(t.line(marked("abcd\x02", "\x14\x19\r")), "[abdc|4|3|1]");
+  EXPECT_EQ(t.line(marked("abc def\x01", "\x1bu\x19\r")), "[ABC def|3|0|1]");
+  EXPECT_EQ(t.line(marked("abc def\x01", "\x1b" "c\x19\r")), "[Abc def|3|0|1]");
+  EXPECT_EQ(t.line(marked("ab cd\x01", "\x1b" "f\x1bt\x19\r")), "[cd ab|5|0|1]");
+  EXPECT_EQ(t.line(marked("abc", "\x1b'\x19\r")), "['abc'|5|3|1]");
+  t.sh.run("bindkey '^O' overwrite-mode");
+  EXPECT_EQ(t.line(marked("abcd\x01", "\x0fxy\x19\r")), "[xycd|2|0|1]");
+  t.sh.run("bindkey '^O' accept-line-and-down-history");
+  t.sh.run("w(){ BUFFER+=x; REGION_ACTIVE=1 }; zle -N w; bindkey '^T' w");
+  EXPECT_EQ(t.line("abc\x14\x19\r"), "[abcx|3|0|1]");
+  t.sh.run("w(){ REGION_ACTIVE=1; zle self-insert }; zle -N w");
+  EXPECT_EQ(t.line("abc\x14\x19\r"), "[abc\x14|4|0|0]");
+  // $MARK counts characters, as $CURSOR, within the buffer.
+  t.sh.run("w(){ MARK=-1 }; zle -N w");
+  EXPECT_EQ(t.line("abc\x14\x19\r"), "[abc|3|0|0]");
+  t.sh.run("w(){ MARK=100 }; zle -N w");
+  EXPECT_EQ(t.line("abc\x14\x19\r"), "[abc|3|3|0]");
+  t.sh.run("w(){ MARK=2 }; zle -N w");
+  EXPECT_EQ(t.line("日本語\x14\x18\x18\x19\r"), "[日本語|2|3|1]");
+  // (^@, set-mark-command, is a NUL: the keys can't be one C string.)
+  EXPECT_EQ(t.line(str("日本語\x01\x06") + '\0' + "\x05\x18\x18\x19\r"), "[日本語|1|3|1]");
+  // One bell for a key with no widget, and none for a widget's own
+  // `zle undefined-key` when the widget itself succeeds (handlefeep).
+  t.sh.run("bindkey -r '^V'; w(){ zle undefined-key; zle -M x }; zle -N w");
+  t.line("x\x16\r");
+  EXPECT_EQ(s::count(t.raw.begin(), t.raw.end(), '\a'), 1);
+  t.line("x\x14\r");
+  EXPECT_EQ(s::count(t.raw.begin(), t.raw.end(), '\a'), 0);
+  t.sh.run("w(){ zle undefined-key }");
+  t.line("x\x14\r");
+  EXPECT_EQ(s::count(t.raw.begin(), t.raw.end(), '\a'), 1);
+}
+
+// zsh's invicmdmode tests the keymap's name: under vared -M vicmd (the
+// name main) the cursor may sit on a newline or past the end.
+TEST(EditorM9Review, VicmdModeIsTheName) {
+  Rig t;
+  t.sh.ctx.zle->link("vicmd", "main");
+  t.pending = s::async(s::launch::async, [&t] { return t.ed->edit("ab\ncd", "", ""); });
+  t.send("kD\r");
+  EXPECT_EQ(t.finish(), "ab\ncd");
+  t.pending = s::async(s::launch::async, [&t] { return t.ed->edit("ab\ncd", "", ""); });
+  t.send("kkx\r");
+  EXPECT_EQ(t.finish(), "ab\ncd");
+  t.sh.ctx.zle->link("emacs", "main");
+}
+
+// vi: "1p.. puts "1, "2, … one after the other; dd in an empty buffer
+// stores nothing.
+TEST(EditorM9Review, ViRepeatStepsNumberedRegisters) {
+  ViRig t;
+  EXPECT_EQ(t.line("echo abc def ghi x\x1b" "0dwdw\"1p..\r"), "dabc echo ef ghi x");
+  ViRig empty;
+  EXPECT_EQ(empty.line("\x1b" "ddp\r"), "");
+  // `.` after `.` repeats the same put again (the change is the put's
+  // keys, not the `.`).
+  ViRig put;
+  str once = *put.line("abc def\x1b" "0\"ayw$\"ap\r");
+  str yanked = once.substr(7);
+  EXPECT_FALSE(yanked.empty());
+  EXPECT_EQ(put.line("abc def\x1b" "0\"ayw$\"ap..\r"), "abc def" + yanked + yanked + yanked);
+  // After `.` $LASTWIDGET is the widget it repeated.
+  ViRig dot;
+  dot.sh.run("b(){ BUFFER=\"[$WIDGET|$LASTWIDGET]\" }; zle -N b; bindkey -M vicmd '^T' b");
+  EXPECT_EQ(dot.line("abc\x1b" "0x.\x14\r"), "[b|vi-delete-char]");
 }
 
 }  // namespace

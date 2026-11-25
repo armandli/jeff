@@ -603,17 +603,20 @@ TEST(Alias, ParsedWholeForDashCLineByLineForScripts) {
 TEST(Alias, ListingAndUnalias) {
   Shell sh;
   sh.run("alias q=\"it's\" r='a b'; alias -g G=x; alias -s txt=cat");
-  EXPECT_EQ(out(sh, "alias"), "G=x\nq='it'\\''s'\nr='a b'\n");
+  // run-help and which-command are there from the start, as in zsh.
+  EXPECT_EQ(out(sh, "alias"), "G=x\nq='it'\\''s'\nr='a b'\nrun-help=man\nwhich-command=whence\n");
   EXPECT_EQ(out(sh, "alias -g; alias -s"), "G=x\ntxt=cat\n");
   // zsh's alias -L lists the regular and global aliases, not the suffix ones.
-  EXPECT_EQ(out(sh, "alias -L"), "alias -g G=x\nalias q='it'\\''s'\nalias r='a b'\n");
-  EXPECT_EQ(out(sh, "alias q; alias -m 'r*'"), "q='it'\\''s'\nr='a b'\n");
+  EXPECT_EQ(out(sh, "alias -L"), "alias -g G=x\nalias q='it'\\''s'\nalias r='a b'\n"
+                                 "alias run-help=man\nalias which-command=whence\n");
+  EXPECT_EQ(out(sh, "alias q; alias -m 'r*'"), "q='it'\\''s'\nr='a b'\nrun-help=man\n");
   EXPECT_EQ(sh.run("alias nosuch").rc, 1);
   // Quoted: a global alias expands anywhere, in unalias's arguments too.
   auto r = sh.run("unalias 'G' nosuch");
   EXPECT_EQ(r.err, "jfsh: unalias: no such hash table element: nosuch\n");
   EXPECT_EQ(r.rc, 1);
-  EXPECT_EQ(out(sh, "unalias -s txt; unalias -m 'q*'; alias; alias -s"), "r='a b'\n");
+  EXPECT_EQ(out(sh, "unalias -s txt; unalias -m 'q*'; alias; alias -s"),
+            "r='a b'\nrun-help=man\nwhich-command=whence\n");
   EXPECT_EQ(out(sh, "unalias -a; alias"), "");
 }
 
@@ -783,6 +786,8 @@ TEST(History, ListsAndReruns) {
   hist.add("echo b");
   hist.add("ls x");
   sh.ctx.history = &hist;
+  // An interactive shell's history, with a line being run (zsh's curline).
+  sh.opts.assign(OPT_INTERACTIVE, true);
   EXPECT_EQ(out(sh, "fc -l"), "    1  echo a\n    2  echo b\n    3  ls x\n");
   EXPECT_EQ(out(sh, "history -2"), "    2  echo b\n    3  ls x\n");
   EXPECT_EQ(out(sh, "fc -ln 1 2"), "echo a\necho b\n");
@@ -790,12 +795,20 @@ TEST(History, ListsAndReruns) {
   EXPECT_EQ(out(sh, "fc -l echo"), "    2  echo b\n    3  ls x\n");
   // The command run again is shown on stderr and added to the history
   // (zsh's stuff()); an `old=new` that applies nowhere stops it (fclist).
-  auto r = sh.run("fc -s a=Z 1");
+  // As the interactive loop runs them: each line is in the history first,
+  // and fc's string search starts below it (hcomsearch).
+  auto line = [&](const str& cmd) {
+    sh.ctx.hist_line = hist.add(cmd);
+    auto res = sh.run(cmd);
+    sh.ctx.hist_line = 0;
+    return res;
+  };
+  auto r = line("fc -s a=Z 1");
   EXPECT_EQ(r.out + r.err, "Z\necho Z\n");
   EXPECT_EQ(hist.entries().back().text, "echo Z");
-  EXPECT_EQ(sh.run("r b=B echo").err, "jfsh: fc: no substitutions performed\n");
-  EXPECT_EQ(out(sh, "r Z=Y echo"), "Y\n");
-  EXPECT_EQ(out(sh, "fc -e - 2"), "b\n");
+  EXPECT_EQ(line("r b=B echo").err, "jfsh: fc: no substitutions performed\n");
+  EXPECT_EQ(line("r Z=Y echo").out, "Y\n");
+  EXPECT_EQ(line("fc -e - 2").out, "b\n");
   EXPECT_EQ(sh.run("fc -l 99").err, "jfsh: fc: no such event: 99\n");
   sh.ctx.history = nullptr;
   // As zsh -c, whose history is empty.

@@ -382,10 +382,11 @@ int builtin_read(vec<str>& args, ExecContext& ctx) {
     for (const auto& f : fields) echo(f);
     if (echo_only) return eof ? 1 : 0;
     str name = names.empty() ? "reply" : names[0];
+    // A failed setaparam ends the line, but bin_read still returns its
+    // own status.
     if (auto r = ctx.params.set_array(name, fields); not r) {
       s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
       ctx.aborting = true;
-      return 1;
     }
     return eof ? 1 : 0;
   }

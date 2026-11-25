@@ -45,6 +45,7 @@ struct PromptHooks {
   func<str(strv)> subst;
   func<int()>     job_count;     // %j
   func<str()>     script_name;   // %N: the script, sourced file or function
+  func<str()>     file_name;     // %x: the script or sourced file
   func<int()>     eval_depth;    // %e
 };
 
@@ -90,6 +91,9 @@ private:
 
   friend struct PromptExpander;
 };
+
+// zsh's ztrftime, as %D{…} uses it (fc -t, -i, -E, -f too).
+str ztrftime(strv fmt, const struct tm& tm, long nsec = 0);
 
 // zsh/nearcolor (M11): while set, a `%F{#rrggbb}` / `%K{#rrggbb}` colour
 // is handed here for the SGR sequence to use instead of a 24-bit one, so a

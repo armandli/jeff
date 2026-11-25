@@ -22,12 +22,17 @@ void register_zleparameter_module(ModuleManager& mm) {
     pw.handlers->get_hash = [ctxp]() {
       umap<str, str> h;
       if (not ctxp->zle) return h;
-      for (const auto& name : Zle::builtin_widgets()) h[name] = "builtin";
-      for (const auto& [name, _] : ctxp->zle->module_widgets) h[name] = "builtin";
-      for (const auto& [name, fn] : ctxp->zle->user_widgets)
-        h[name] = "user:" + fn;
-      for (const auto& [name, target] : ctxp->zle->widget_aliases)
-        h[name] = "alias:" + target;
+      const Zle& zle = *ctxp->zle;
+      for (const auto& name : Zle::builtin_widgets()) {
+        h["." + name] = "builtin";
+        if (not zle.deleted_widgets.contains(name)) h[name] = "builtin";
+      }
+      for (const auto& [name, _] : zle.module_widgets) h[name] = "builtin";
+      for (const auto& [name, target] : zle.widget_aliases) h[name] = "builtin";
+      for (const auto& [name, fn] : zle.user_widgets) {
+        auto c = zle.comp_widgets.find(name);
+        h[name] = c == zle.comp_widgets.end() ? "user:" + fn : "completion:" + c->second + ":" + fn;
+      }
       return h;
     };
 

@@ -101,6 +101,8 @@ int builtin_float     (vec<str>&, ExecContext&);
 
 // History
 int builtin_fc        (vec<str>&, ExecContext&);
+// fc -P: saves the pushed history (fc -p) and brings the one before back.
+bool hist_stack_pop(ExecContext& ctx);
 int builtin_history   (vec<str>&, ExecContext&);
 int builtin_r         (vec<str>&, ExecContext&);
 
