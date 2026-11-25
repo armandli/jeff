@@ -494,20 +494,20 @@ TEST(History, TheLineBeingRunIsLeftOut) {
   hist.add("echo a");
   hist.add("echo b");
   sh.ctx.history = &hist;
+  // An interactive shell's history, with a line being run (zsh's curline).
+  sh.opts.assign(OPT_INTERACTIVE, true);
   // The interactive loop added `fc -l` before running it.
-  hist.add("fc -l");
-  sh.ctx.hist_current = true;
+  sh.ctx.hist_line = hist.add("fc -l");
   EXPECT_EQ(out(sh, "fc -l"), "    1  echo a\n    2  echo b\n");
   // Listed by number, the line being run is there (zsh's fclist).
   EXPECT_EQ(out(sh, "fc -l 2 3"), "    2  echo b\n    3  fc -l\n");
-  sh.ctx.hist_current = false;
+  sh.ctx.hist_line = 0;
   sh.ctx.history = nullptr;
   HistoryManager hist2{HistOptions{}};
   hist2.add("echo a");
   hist2.add("echo b");
-  hist2.add("r");
+  sh.ctx.hist_line = hist2.add("r");
   sh.ctx.history = &hist2;
-  sh.ctx.hist_current = true;
   auto r = sh.run("r");
   EXPECT_EQ(r.out, "b\n");
   EXPECT_EQ(r.err, "echo b\n");
@@ -515,9 +515,9 @@ TEST(History, TheLineBeingRunIsLeftOut) {
   EXPECT_EQ(hist2.entries()[2].text, "r");
   EXPECT_EQ(hist2.entries().back().text, "echo b");
   EXPECT_EQ(hist2.size(), 4u);
-  hist2.add("fc -s 2");
+  sh.ctx.hist_line = hist2.add("fc -s 2");
   EXPECT_EQ(sh.run("fc -s 2").err, "echo b\n");
-  sh.ctx.hist_current = false;
+  sh.ctx.hist_line = 0;
   sh.ctx.history = nullptr;
 }
 

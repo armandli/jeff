@@ -361,6 +361,7 @@ HistOptions history_options(const ExecContext& ctx) {
   h.inc_append    = o.get(OPT_INCAPPENDHISTORY) or o.get(OPT_INCAPPENDHISTORYTIME);
   h.share         = o.get(OPT_SHAREHISTORY);
   h.extended      = o.get(OPT_EXTENDEDHISTORY) or h.share;
+  h.extended_set  = o.get(OPT_EXTENDEDHISTORY);
   h.ignore_dups   = o.get(OPT_HISTIGNOREDUPS);
   h.ignore_all    = o.get(OPT_HISTIGNOREALLDUPS);
   h.ignore_space  = o.get(OPT_HISTIGNORESPACE);
@@ -371,10 +372,12 @@ HistOptions history_options(const ExecContext& ctx) {
   h.find_no_dups  = o.get(OPT_HISTFINDNODUPS);
   h.verify        = o.get(OPT_HISTVERIFY);
   h.bang          = o.get(OPT_BANGHIST);
+  h.csh_junkie    = o.get(OPT_CSHJUNKIEHISTORY);
+  h.comments      = o.get(OPT_INTERACTIVECOMMENTS);
   h.fcntl_lock    = true;
-  str chars = param("histchars");
-  if (chars.empty()) chars = param("HISTCHARS");
-  if (not chars.empty()) h.histchars = chars;
+  // zsh's histcharssetfn: set (even empty) they are the characters, at
+  // most 3, a missing one none; unset, the defaults.
+  if (auto p = ctx.params.lookup("histchars")) h.histchars = p->get().scalar().substr(0, 3);
   return h;
 }
 

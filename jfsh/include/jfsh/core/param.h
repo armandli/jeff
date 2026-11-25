@@ -93,6 +93,11 @@ struct Param {
   bool is_readonly() const noexcept { return flags & PM_READONLY; }
   bool is_array()    const noexcept { return flags & PM_ARRAY; }
   bool is_hash()     const noexcept { return flags & PM_HASH; }
+  // A special that holds no array (zsh refuses an array for it).
+  bool scalar_special() const noexcept {
+    return (flags & PM_SPECIAL) and not (flags & (PM_ARRAY | PM_HASH))
+       and not (handlers and (handlers->set_array or handlers->set_hash));
+  }
   bool is_integer()  const noexcept { return flags & PM_INTEGER; }
   bool is_float()    const noexcept { return flags & PM_FLOAT; }
   bool is_scalar()   const noexcept { return flags & PM_SCALAR; }
@@ -247,15 +252,21 @@ struct ParamTable {
   s::uint64_t path_generation() const noexcept { return mPathGen; }
   // For a caller that stores into a Param itself (typeset): counts the
   // assignment to `name`.
-  void note_assigned(strv name) noexcept {
-    if (name == "PATH" or name == "path") ++mPathGen;
-  }
+  void note_assigned(strv name);
+  // Names that share one string (PS1, PROMPT and prompt; RPS1 and
+  // RPROMPT; …), kept in `storage`'s value.  zsh's environment entry of an
+  // exported name changes only when that name itself is assigned (addenv
+  // per parameter): assigning (or unsetting) one keeps the others' entries
+  // as they were.
+  void share_string(vec<str> names, str storage);
 
 private:
 
   // mScopes[0] = global; mScopes.back() = innermost local
   vec<HashTable<Param>> mScopes;
   vec<int>              mPrefixScopes;   // indexes of prefix scopes, ascending
+  umap<str, str>        mEnvPinned;   // environment entries kept as they were
+  umap<str, s::pair<vec<str>, str>> mShared;   // share_string: name → (group, storage)
   s::uint64_t           mPathGen = 0;
 };
 

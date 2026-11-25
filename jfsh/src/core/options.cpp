@@ -1,3 +1,33 @@
+// The option aliases in this file (OPTION_ALIASES) are taken from zsh
+// 5.9's Src/options.c (its OPT_ALIAS entries).
+// zsh's copyright and licence:
+//
+// The Z Shell is copyright (c) 1992-2017 Paul Falstad, Richard Coleman,
+// Zoltán Hidvégi, Andrew Main, Peter Stephenson, Sven Wischnowsky, and
+// others.  All rights reserved.  Individual authors, whether or not
+// specifically named, retain copyright in all changes; in what follows, they
+// are referred to as `the Zsh Development Group'.  This is for convenience
+// only and this body has no legal status.  The Z shell is distributed under
+// the following licence; any provisions made in individual files take
+// precedence.
+//
+// Permission is hereby granted, without written agreement and without
+// licence or royalty fees, to use, copy, modify, and distribute this
+// software and to distribute modified versions of this software for any
+// purpose, provided that the above copyright notice and the following
+// two paragraphs appear in all copies of this software.
+//
+// In no event shall the Zsh Development Group be liable to any party for
+// direct, indirect, special, incidental, or consequential damages arising out
+// of the use of this software and its documentation, even if the Zsh
+// Development Group have been advised of the possibility of such damage.
+//
+// The Zsh Development Group specifically disclaim any warranties, including,
+// but not limited to, the implied warranties of merchantability and fitness
+// for a particular purpose.  The software provided hereunder is on an "as is"
+// basis, and the Zsh Development Group have no obligation to provide
+// maintenance, support, updates, enhancements, or modifications.
+
 #include <jfsh/core/options.h>
 
 #include <cctype>
@@ -219,20 +249,58 @@ static str normalize_option_name(strv name) {
   return s;
 }
 
+namespace {
+
+// Other shells' names for zsh's options (zsh's OPT_ALIAS entries): never
+// listed, and `negated` for one that means the option off.
+struct OptionAlias {
+  const char* name;
+  const char* target;
+  bool        negated;
+};
+
+constexpr OptionAlias OPTION_ALIASES[] = {
+  {"braceexpand", "ignorebraces",     true},
+  {"dotglob",     "globdots",         false},
+  {"hashall",     "hashcmds",         false},
+  {"histappend",  "appendhistory",    false},
+  {"histexpand",  "banghist",         false},
+  {"log",         "histnofunctions",  true},
+  {"mailwarn",    "mailwarning",      false},
+  {"onecmd",      "singlecommand",    false},
+  {"physical",    "chaselinks",       false},
+  {"promptvars",  "promptsubst",      false},
+  {"stdin",       "shinstdin",        false},
+  {"trackall",    "hashcmds",         false},
+};
+
+}  // namespace
+
 optref<const OptionInfo> OptionState::find(strv name, bool* negated) noexcept {
-  str norm = normalize_option_name(name);
-  if (negated) *negated = false;
-  for (const auto& info : OPTION_INFO)
-    if (normalize_option_name(info.name) == norm) return info;
-  if (norm.size() <= 2 or not norm.starts_with("no")) return s::nullopt;
-  norm = norm.substr(2);
-  for (const auto& info : OPTION_INFO) {
-    if (normalize_option_name(info.name) == norm) {
-      if (negated) *negated = true;
-      return info;
+  // An option or an alias by its normalized name; `neg` when it means the
+  // option off.
+  auto match = [](const str& norm, bool& neg) -> optref<const OptionInfo> {
+    for (const auto& info : OPTION_INFO)
+      if (normalize_option_name(info.name) == norm) return info;
+    for (const auto& a : OPTION_ALIASES) {
+      if (norm != a.name) continue;
+      for (const auto& info : OPTION_INFO)
+        if (normalize_option_name(info.name) == a.target) {
+          neg = neg != a.negated;
+          return info;
+        }
     }
+    return s::nullopt;
+  };
+  str norm = normalize_option_name(name);
+  bool neg = false;
+  auto r = match(norm, neg);
+  if (not r and norm.size() > 2 and norm.starts_with("no")) {
+    neg = true;
+    r   = match(norm.substr(2), neg);
   }
-  return s::nullopt;
+  if (negated) *negated = r and neg;
+  return r;
 }
 
 bool OptionState::default_of(const OptionInfo& info) const noexcept {

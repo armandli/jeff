@@ -250,8 +250,12 @@ int builtin_set(vec<str>& args, ExecContext& ctx) {
       }
       rest = s::move(old);
     }
-    if (auto r = ctx.params.set_array(*array_name, s::move(rest)); not r)
-      return builtin_error(cmd, r.error().message);
+    // zsh's setaparam fails as an assignment does: no builtin's name, and
+    // the command line ends, but bin_set still returns 0.
+    if (auto r = ctx.params.set_array(*array_name, s::move(rest)); not r) {
+      s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
+      ctx.aborting = true;
+    }
     return 0;
   }
   ctx.positional = s::move(rest);

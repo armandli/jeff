@@ -10,6 +10,7 @@
 // a SIGWINCH just means drawing again (B27).
 
 #include <cstdio>
+#include <cwctype>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
@@ -37,6 +38,23 @@ int Editor::terminal_height() const noexcept {
 }
 
 namespace {
+
+// zsh's nicechar_sel for one byte: `\M-` for the high bit, `^X` for a
+// control character, `\t` and `\n`.
+str nice_byte(unsigned char c) {
+  str out;
+  auto printable = [](unsigned char b) { return b >= 0x20 and b < 0x7f; };
+  if (not printable(c) and (c & 0x80)) {
+    out += "\\M-";
+    c &= 0x7f;
+  }
+  if (printable(c))   out += static_cast<char>(c);
+  else if (c == 0x7f) out += "^?";
+  else if (c == '\n') out += "\\n";
+  else if (c == '\t') out += "\\t";
+  else                out += {'^', static_cast<char>(c + 0x40)};
+  return out;
+}
 
 // Lays text out in rows of `cols` columns.
 struct Layout {
@@ -108,7 +126,8 @@ void Editor::refresh() {
   lay_out_prompt(lay, mPromptText);
   int prompt_row = lay.row;
 
-  // The buffer; control characters show as ^X, the region in standout.
+  // The buffer; tabs as blanks, other control characters as ^X, the
+  // region in standout.
   int cur_row = -1, cur_col = 0;
   s::size_t region_from = 0, region_to = 0;
   if (mRegionActive and mMark) {
@@ -139,6 +158,9 @@ void Editor::refresh() {
     char32_t c = utf8_decode(t, i, len);
     if (c == '\n') {
       lay.newline();
+    } else if (c == '\t') {
+      // A tab: blanks to the next multiple of 8 columns (zsh's zrefresh).
+      for (int n = 8 - lay.col % 8; n > 0; --n) lay.put(" ", 1);
     } else if (c < 0x20 or c == 0x7f) {
       char caret[3] = {'^', static_cast<char>(c == 0x7f ? '?' : (c | 0x40)), 0};
       lay.put(caret, 2);
@@ -155,6 +177,7 @@ void Editor::refresh() {
     cur_col = lay.col;
   }
   int end_row = lay.row, end_col = lay.col;
+  mEndRow = end_row;
 
   // RPROMPT on the prompt's last row, when the line fits beside it.
   bool final_draw = mFinalDraw;
@@ -172,7 +195,8 @@ void Editor::refresh() {
     cur_col = end_col;
   }
 
-  // Below the line: the message, then the listing, cut to the width.
+  // Below the line: the message (made printable where it was made), then
+  // the listing, cut to the width.
   str below = mMessage;
   if (not mListing.empty() and not final_draw) {
     if (not below.empty()) below += '\n';
@@ -219,6 +243,7 @@ void Editor::refresh() {
   if (cur_col > 0) seq += "\x1b[" + s::to_string(cur_col) + "C";
   mCursorRow = cur_row;
   mDrawn     = true;
+  mTrashed   = false;
   write_out(seq);
 }
 
@@ -233,14 +258,62 @@ void Editor::finish_display() {
   mCursorRow = 0;
 }
 
+// zsh's trashzle: the line stays on the screen; the cursor goes to the
+// start of the row below it, and what was below (a message, a listing)
+// goes.
 void Editor::trash() {
   if (not mDrawn) return;
-  str seq;
-  if (mCursorRow > 0) seq += "\x1b[" + s::to_string(mCursorRow) + "A";
-  seq += "\r\x1b[J";
+  str seq = "\r";
+  for (int row = mCursorRow; row <= mEndRow; ++row) seq += '\n';
+  seq += "\x1b[J";
   write_out(seq);
   mDrawn     = false;
+  mTrashed   = true;
   mCursorRow = 0;
+}
+
+
+// showmsg: each character through wcs_nicechar, a newline kept as one.
+str Editor::nice_message(strv msg) {
+  str out;
+  for (s::size_t i = 0, len = 1; i < msg.size(); i += len) {
+    char32_t c = utf8_decode(msg, i, len);
+    auto byte = static_cast<unsigned char>(msg[i]);
+    if (c == '\n') {
+      out += '\n';
+    } else if (len == 1 and byte >= 0x80) {
+      out += nice_byte(byte);   // no character: MB_INVALID
+    } else if (s::iswprint(static_cast<wint_t>(c))) {
+      out.append(msg.substr(i, len));
+    } else if (c < 0x100) {
+      out += nice_byte(static_cast<unsigned char>(c));
+    } else {
+      char code[16];
+      s::snprintf(code, sizeof code, c >= 0x10000 ? "\\U%.8x" : "\\u%.4x",
+                  static_cast<unsigned>(c));
+      out += code;
+    }
+  }
+  return out;
+}
+
+// The status line (zle_refresh.c): a control character, newline too, as
+// `^` and the character 64 on (`?` for DEL and the like).
+str Editor::status_text(strv text) {
+  str out;
+  for (s::size_t i = 0, len = 1; i < text.size(); i += len) {
+    char32_t c = utf8_decode(text, i, len);
+    auto byte = static_cast<unsigned char>(text[i]);
+    if (len == 1 and byte >= 0x80) {
+      out += nice_byte(byte);
+    } else if (c < 0x20 or c == 0x7f or (c >= 0x80 and c < 0xa0)) {
+      out += '^';
+      utf8_append(out, (c & ~char32_t{0x80}) > 31 ? char32_t{'?'} : (c | char32_t{'@'}));
+    } else {
+      out.append(text.substr(i, len));
+    }
+  }
+  return out;
 }
 
 }  // namespace jfsh

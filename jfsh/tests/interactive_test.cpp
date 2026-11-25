@@ -1166,3 +1166,172 @@ TEST(InteractiveM8Review, LinenoAtEofAndReducedBlanks) {
 }
 
 }  // namespace
+
+// ---- M9 review --------------------------------------------------------------
+//
+// Expected values from zsh -f -i in a pty (scratchpad m9/p/p_m8h.py and
+// p_bang.py).
+
+// zsh's history expansion leaves a here-document's body alone.
+TEST(InteractiveM9Review, BangInAHereDocumentStays) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("echo a1");
+  ASSERT_TRUE(sh.expect("a1\r\n")) << sh.out;
+  sh.line("cat <<E");
+  sh.line("x !! y");
+  sh.line("E");
+  EXPECT_TRUE(sh.expect("\r\nx !! y\r\n")) << sh.out;
+}
+
+// A trap run at the interrupt key writes where the cursor is, and an
+// `exit` there leaves the screen as it is (zsh's handler doesn't redraw).
+TEST(InteractiveM9Review, ExitInATrapAtThePromptLeavesTheScreen) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("trap 'echo TR; exit 3' INT; trap 'echo EX' EXIT");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  sh.send("abc");
+  ASSERT_TRUE(sh.expect("abc")) << sh.out;
+  sh.send("\x03");
+  EXPECT_TRUE(sh.expect("\r\x1b[5CTR\r\n\r\nEX\r\n")) << sh.out;
+  int st = 0;
+  ASSERT_TRUE(sh.exits(st)) << sh.out;
+  EXPECT_EQ(WEXITSTATUS(st), 3);
+}
+
+// $TMOUT: SIGALRM when no line comes in time; its trap can exit.
+TEST(InteractiveM9Review, TmoutSendsAlrmAtThePrompt) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("TMOUT=1; trap 'echo AL; exit 4' ALRM");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  EXPECT_TRUE(sh.expect("AL\r\n", 4000ms)) << sh.out;
+  int st = 0;
+  ASSERT_TRUE(sh.exits(st)) << sh.out;
+  EXPECT_EQ(WEXITSTATUS(st), 4);
+}
+
+// which-command and run-help run the alias of their own name (zsh's
+// processcmd), with the line pushed for the next prompt.
+TEST(InteractiveM9Review, WhichCommandRunsItsName) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("alias which-command='echo WC'");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  sh.send("ls -l");
+  sh.send("\x1b?");
+  EXPECT_TRUE(sh.expect("WC ls\r\n")) << sh.out;
+  EXPECT_TRUE(sh.expect("% ls -l")) << sh.out;
+}
+
+// ---- M9 review, round 1 ------------------------------------------------------
+//
+// Expected values from zsh -f -i in a pty (scratchpad m9rv1/p/r1.py, r2.py,
+// r8.py and m9rv1/p2_*.py).
+
+// A subshell of an interactive shell takes SIGALRM's default action: the
+// interactive shell's $TMOUT handler isn't its.
+TEST(InteractiveM9Review, SubshellsDieOfAlrm) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("(sh -c 'kill -ALRM $PPID'; echo sub $?); echo after $?");
+  EXPECT_TRUE(sh.expect("after 142\r\n")) << sh.out;
+  EXPECT_EQ(sh.out.find("sub 0"), std::string::npos) << sh.out;
+  sh.line("x=$(sh -c 'kill -ALRM $PPID'; echo in); echo \"cs [$x] $?\"");
+  EXPECT_TRUE(sh.expect("cs [] 142\r\n")) << sh.out;
+}
+
+// $TMOUT counts for every read the editor does: at PS2 the shell times out
+// (no parse error for the unfinished command), and in vared.
+TEST(InteractiveM9Review, TmoutAtEveryEditorRead) {
+  {
+    Pty sh;
+    ASSERT_TRUE(sh.expect("% "));
+    sh.line("TMOUT=1");
+    ASSERT_TRUE(sh.expect("% ")) << sh.out;
+    sh.line("if true");
+    EXPECT_TRUE(sh.expect("jfsh: timeout\r\n", 5000ms)) << sh.out;
+    int st = 0;
+    ASSERT_TRUE(sh.exits(st)) << sh.out;
+    EXPECT_EQ(WEXITSTATUS(st), 14);
+    EXPECT_EQ(sh.out.find("parse error"), std::string::npos) << sh.out;
+  }
+  {
+    Pty sh;
+    ASSERT_TRUE(sh.expect("% "));
+    sh.line("TMOUT=1; x=a; vared x");
+    EXPECT_TRUE(sh.expect("jfsh: timeout\r\n", 5000ms)) << sh.out;
+    int st = 0;
+    ASSERT_TRUE(sh.exits(st)) << sh.out;
+    EXPECT_EQ(WEXITSTATUS(st), 14);
+  }
+}
+
+// Bang history keeps the quoting of the lines before (zsh's lexer state).
+TEST(InteractiveM9Review, BangKeepsQuotesAcrossLines) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("echo a");
+  ASSERT_TRUE(sh.expect("a\r\n")) << sh.out;
+  sh.line("echo 'x");
+  sh.line("!! y'");
+  EXPECT_TRUE(sh.expect("x\r\n!! y\r\n")) << sh.out;
+  sh.line("echo b \\");
+  sh.line("^y^Y");
+  EXPECT_TRUE(sh.expect("b echo x\r\n!! Y\r\n")) << sh.out;
+}
+
+// vared -M and -m link main and vicmd for the edit (zsh's savekeymap), and
+// a vi insert at its start is one undo step.
+TEST(InteractiveM9Review, VaredKeymapsAndViUndo) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("x=ab; vared -M vicmd x; echo \"[$x]\"");
+  std::this_thread::sleep_for(200ms);
+  sh.send("0x\r");
+  EXPECT_TRUE(sh.expect("[b]\r\n")) << sh.out;
+  sh.line("bindkey -lL main");
+  EXPECT_TRUE(sh.expect("bindkey -A emacs main\r\n")) << sh.out;
+  sh.line("x=ab; vared -M nosuch x; echo \"[$x]\"");
+  EXPECT_TRUE(sh.expect("vared: no such keymap: nosuch")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  sh.send("Q\r");
+  EXPECT_TRUE(sh.expect("[abQ]\r\n")) << sh.out;
+  sh.line("bindkey -v; KEYTIMEOUT=1");
+  sh.line("x=ab; vared x; echo \"[$x]\"");
+  std::this_thread::sleep_for(200ms);
+  sh.send("cd\x1b");
+  std::this_thread::sleep_for(200ms);
+  sh.send("u\r");
+  EXPECT_TRUE(sh.expect("[ab]\r\n")) << sh.out;
+}
+
+// A trap run while the editor reads sees the last widget a key ran
+// (zsh's bindk) in $WIDGET, and the line in $BUFFER.
+TEST(InteractiveM9Review, TrapSeesTheLastWidget) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("trap 'print -r -- \"<$WIDGET|$BUFFER>\"' USR1");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  sh.line("(sleep 1; kill -USR1 $$) &!");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  std::this_thread::sleep_for(200ms);
+  sh.send("abc\x02");
+  EXPECT_TRUE(sh.expect("<backward-char|abc>", 4000ms)) << sh.out;
+}
+
+// fc's string events start below the newest entry (hcomsearch) and the
+// line being run keeps its number (curline): in a function that adds an
+// entry with print -s, the listing runs to that entry.
+TEST(InteractiveM9Review, FcStringEventsAndTheCurrentLine) {
+  Pty sh;
+  ASSERT_TRUE(sh.expect("% "));
+  sh.line("echo a");
+  sh.line("echo b");
+  sh.line("f() { print -s 'echo z'; fc -l echo; }; f");
+  EXPECT_TRUE(sh.expect("    2  echo b\r\n    3  f() { print -s 'echo z'; fc -l echo; }; f\r\n"
+                        "    4  echo z\r\n")) << sh.out;
+}

@@ -22,6 +22,13 @@
 
 namespace jfsh {
 
+AliasTable default_aliases() {
+  AliasTable t;
+  t.regular["run-help"]      = AliasDef{"man", false};
+  t.regular["which-command"] = AliasDef{"whence", false};
+  return t;
+}
+
 namespace {
 
 namespace chr = s::chrono;
@@ -326,8 +333,116 @@ void install_special_params(ExecContext& ctx) {
       params.assign("VENDOR", str(sys == "darwin" ? "apple" : sys == "linux" ? "pc" : "unknown"));
   }
 
-  // xtrace's prefix starts as zsh's; unset, there is none.
-  if (not params.lookup("PS4")) params.assign("PS4", str("+%N:%i> "));
+  // The prompts as zsh's setupvals starts them (the environment's win):
+  // none for a shell that isn't interactive; sh's and ksh's `$ ` (`# `
+  // for root); else zsh's own.  xtrace's prefix, PS4, likewise; unset,
+  // a prompt is empty.
+  auto emu = ctx.opts.emulation();
+  bool sh_like = emu == OptionState::Emulation::SH or emu == OptionState::Emulation::KSH;
+  str ps1 = "%m%# ", ps2 = "%_> ";
+  if (not ctx.opts.get(OPT_INTERACTIVE)) ps1 = ps2 = "";
+  else if (sh_like) ps1 = ::geteuid() == 0 ? "# " : "$ ", ps2 = "> ";
+  if (not params.lookup("PS1")) params.assign("PS1", ps1);
+  if (not params.lookup("PS2")) params.assign("PS2", ps2);
+  if (not params.lookup("PS4")) params.assign("PS4", str(sh_like ? "+ " : "+%N:%i> "));
+  // select's prompt and the spelling correction's, as zsh's setupvals.
+  if (not params.lookup("PS3"))     params.assign("PS3", str("?# "));
+  if (not params.lookup("SPROMPT"))
+    params.assign("SPROMPT", str("jfsh: correct '%R' to '%r' [nyae]? "));
+  // zsh's prompt strings are special parameters ($parameters says so);
+  // the right prompts exist from the start, unset.
+  for (const char* name : {"RPS1", "RPS2"})
+    if (not params.lookup(name)) params.assign(name, str{}, PM_SCALAR | PM_UNSET);
+  for (const char* name : {"PS1", "PS2", "PS3", "PS4", "SPROMPT", "RPS1", "RPS2"})
+    if (auto p = params.lookup(name)) p->get().flags |= PM_SPECIAL;
+  // $PROMPT, $PROMPT2, … are other names for $PS1, $PS2, …
+  for (auto [alias, name] : {s::pair{"PROMPT", "PS1"}, s::pair{"prompt", "PS1"},
+                             s::pair{"PROMPT2", "PS2"}, s::pair{"PROMPT3", "PS3"},
+                             s::pair{"PROMPT4", "PS4"}, s::pair{"RPROMPT", "RPS1"},
+                             s::pair{"RPROMPT2", "RPS2"}}) {
+    str target = name;
+    // The names share one string (zsh's IPDEF7), each with its own unset
+    // flag: writing through PROMPT leaves an unset PS1 unset.  (The other
+    // names' environment entries: ParamTable::share_string.)
+    auto write = [&params, target](str v) {
+      auto p = params.lookup(target);
+      if (not p) {
+        params.assign(target, s::move(v), PM_SCALAR | PM_SPECIAL).flags |= PM_UNSET;
+        return;
+      }
+      p->get().value = s::move(v);
+    };
+    special(params, alias, str{}, PM_SCALAR, {
+      .get_scalar = [&params, target] {
+        auto p = params.lookup(target);
+        return p ? p->get().scalar() : str{};
+      },
+      .set_scalar = [&params, write, alias](str v) {
+        write(s::move(v));
+        if (auto p = params.lookup(alias)) p->get().flags &= ~PM_UNSET;
+      },
+    });
+    // Set as the string is at the start (RPROMPT, like RPS1, is unset).
+    // (A value the environment gave the name has set it.)
+    auto t = params.lookup(target);
+    auto self = params.lookup(alias);
+    if ((not t or not t->get().is_set()) and not (self->get().flags & PM_EXPORTED))
+      self->get().flags |= PM_UNSET;
+    // Unsetting it empties the string, and only this name is unset; a
+    // name already unset is left alone.
+    params.lookup(alias)->get().handlers->unset_fn = [&params, write, alias] {
+      auto p = params.lookup(alias);
+      if (not p or not p->get().is_set()) return;
+      write(str{});
+      p->get().flags |= PM_UNSET;
+    };
+  }
+  params.share_string({"PS1", "PROMPT", "prompt"}, "PS1");
+  params.share_string({"PS2", "PROMPT2"}, "PS2");
+  params.share_string({"PS3", "PROMPT3"}, "PS3");
+  params.share_string({"PS4", "PROMPT4"}, "PS4");
+  params.share_string({"RPS1", "RPROMPT"}, "RPS1");
+  params.share_string({"RPS2", "RPROMPT2"}, "RPS2");
+  // The history characters, under either name (zsh's histchars and
+  // HISTCHARS): one value, kept in histchars' own, each name with its own
+  // unset flag.  Setting takes at most three ASCII characters (else a
+  // warning and no change); unsetting brings back the defaults.
+  {
+    str initial = "!^#";
+    auto env = [&params](strv name) -> opt<str> {
+      auto e = params.lookup(name);
+      return e and e->get().is_set() ? opt<str>(e->get().scalar()) : s::nullopt;
+    };
+    if (auto v = env("histchars"))      initial = *v;
+    else if (auto w = env("HISTCHARS")) initial = *w;
+    auto store = [&params](str v) {
+      for (char c : v)
+        if (static_cast<unsigned char>(c) >= 0x80) {
+          s::fprintf(stderr, "jfsh: HISTCHARS can only contain ASCII characters\n");
+          return;
+        }
+      if (auto q = params.lookup("histchars")) q->get().value = v.substr(0, 3);
+    };
+    auto value = [&params] {
+      auto q = params.lookup("histchars");
+      return q ? q->get().scalar() : str("!^#");
+    };
+    for (const char* name : {"histchars", "HISTCHARS"}) {
+      str self = name;
+      special(params, self, str(name == strv("histchars") ? initial : str{}), PM_SCALAR, {
+        .get_scalar = value,
+        .set_scalar = [&params, store, self](str v) {
+          store(s::move(v));
+          if (auto q = params.lookup(self)) q->get().flags &= ~PM_UNSET;
+        },
+      }, false);
+      params.lookup(self)->get().handlers->unset_fn = [&params, self] {
+        if (auto q = params.lookup("histchars")) q->get().value = str("!^#");
+        if (auto q = params.lookup(self)) q->get().flags |= PM_UNSET;
+      };
+    }
+    store(initial);
+  }
   // What a command of nothing but redirections runs, and where `=(…)`
   // puts its files, as zsh starts them.
   if (not params.lookup("NULLCMD"))     params.assign("NULLCMD", str("cat"));

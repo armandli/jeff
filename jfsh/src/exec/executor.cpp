@@ -29,9 +29,11 @@
 #include <jfsh/core/read_file.h>
 #include <jfsh/core/stack.h>
 #include <jfsh/editor/completion.h>
+#include <jfsh/editor/editor.h>
 #include <jfsh/editor/zle.h>
 #include <jfsh/exec/subst.h>
 #include <jfsh/glob/glob.h>
+#include <jfsh/history/history.h>
 #include <jfsh/lexer/input.h>
 #include <jfsh/parser/parser.h>
 
@@ -449,6 +451,17 @@ int Executor::exec_simple(vec<str> args,
       auto at = args.begin()
               + static_cast<s::ptrdiff_t>(s::min(a.position + placed++, args.size()));
       if (a.array) {
+        // A special scalar can't take an array: a new local of the name
+        // would change its type (zsh's typeset_single).
+        if (auto p = mCtx.params.lookup(a.name); p and p->get().scalar_special() and not a.append) {
+          bool local = mCtx.func_depth > 0 and not args.empty()
+                   and (args[0] == "local" or not mCtx.params.lookup_local(a.name));
+          s::fprintf(stderr, "jfsh: %s: %s: %s\n", args.empty() ? "typeset" : args[0].c_str(),
+                     a.name.c_str(), local ? "can't change type of a special parameter"
+                                           : "can't assign array value to non-array special");
+          mCtx.aborting = true;
+          return false;
+        }
         // `typeset a+=(…)` is refused by typeset (`a+` is no name), as in zsh.
         args.insert(at, a.append ? a.name + "+" : a.name);
         typeset_arrays.push_back(s::move(a));
@@ -3153,6 +3166,7 @@ static Result<void> assign_one(ExecContext& ctx, const Assignment& a) {
     return {};
   }
   if (a.subscript) return assign_element(ctx, a);
+  // (A special scalar refuses an array: ParamTable::set_array.)
   if (a.array) return ctx.params.set_array(a.name, a.elements, a.append);
   if (auto p = ctx.params.lookup(a.name); p and p->get().is_set()) {
     Param& old = p->get();
@@ -3476,6 +3490,11 @@ int Executor::call_function(const ProgRef& body,
     }
   }
   for (const auto& [_, hook] : mCtx.hooks.function) hook(args[0], false);
+  // History pushed with fc -p -a goes when the function does (zsh's
+  // endparamscope and saveandpophiststack).
+  while (mCtx.history and mCtx.history->stack_depth() > 0
+         and mCtx.history->stack_level() >= mCtx.func_depth)
+    if (not hist_stack_pop(mCtx)) break;
   mCtx.params.pop_scope();
   --mCtx.func_depth;
   // An `exit` that has unwound the functions leaves at once from here, as
@@ -4073,7 +4092,9 @@ PromptHooks Executor::prompt_hooks() {
     return n;
   };
   h.script_name = [this] { return mCtx.script_name.empty() ? mCtx.arg0 : mCtx.script_name; };
-  h.eval_depth  = [this] { return s::max(0, mStringDepth - 1); };
+  h.file_name   = [this] { return mCtx.source_name.empty() ? mCtx.arg0 : mCtx.source_name; };
+  // zsh's %e: the depth of $funcstack (functions, sourced files, evals).
+  h.eval_depth  = [this] { return static_cast<int>(mCtx.funcstack.size()); };
   return h;
 }
 
@@ -4089,6 +4110,12 @@ void Executor::update_window_size() {
   if (::ioctl(fd, TIOCGWINSZ, &ws) != 0 or ws.ws_col == 0) return;
   (void)mCtx.params.set_scalar("COLUMNS", s::to_string(ws.ws_col));
   (void)mCtx.params.set_scalar("LINES", s::to_string(ws.ws_row));
+}
+
+long Executor::tmout_seconds() const {
+  auto p = mCtx.params.lookup("TMOUT");
+  if (not p or not p->get().is_set()) return 0;
+  return s::max(0L, s::strtol(p->get().scalar().c_str(), nullptr, 10));
 }
 
 void Executor::handle_signals() {
@@ -4120,6 +4147,9 @@ void Executor::handle_signals() {
       // `wait`) are lost there (drop_trap_signals).
       mBacklog[static_cast<s::size_t>(sig)] = static_cast<s::uint16_t>(n - 1);
       run_trap(sig);
+      // zsh's handletrap: the $TMOUT alarm starts again once its trap ran.
+      if (sig == SIGALRM)
+        if (auto t = tmout_seconds(); t > 0) ::alarm(static_cast<unsigned>(t));
     } else if (mCtx.signals.shell_handles(sig)) {
       untrapped_signal(sig);
     }
@@ -4143,6 +4173,24 @@ void Executor::untrapped_signal(int sig) {
     mCtx.aborting = mCtx.interrupt = true;
     mCtx.last_exit = 128 + SIGINT;
     if (not mCtx.signals.running_trap(sig)) mCtx.intr_echoed = true;
+  } else if (sig == SIGALRM) {
+    // $TMOUT ran out, or a SIGALRM came anyway (zsh's handler): unless the
+    // terminal was used within $TMOUT seconds (its access time), the shell
+    // says so and exits with the signal's number.
+    long tmout = tmout_seconds();
+    struct stat st{};
+    int tty = mCtx.zle and mCtx.zle->tty_out >= 0 ? mCtx.zle->tty_out : STDIN_FILENO;
+    long idle = ::fstat(tty, &st) == 0 ? static_cast<long>(s::time(nullptr) - st.st_atime) : -1;
+    if (idle >= 0 and idle < tmout) {
+      ::alarm(static_cast<unsigned>(tmout - idle));
+    } else {
+      if (mCtx.zle and mCtx.zle->active) mCtx.zle->active->trash();
+      s::fprintf(stderr, "jfsh: timeout\n");
+      s::fflush(stderr);
+      mCtx.exiting  = true;
+      mCtx.exit_now = false;
+      mCtx.exit_val = SIGALRM;
+    }
   } else if (sig == SIGHUP) {
     // zsh's zexit(SIGHUP, …): the status is the signal's number, 1.
     mCtx.hangup   = true;

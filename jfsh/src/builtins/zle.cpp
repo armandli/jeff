@@ -1,3 +1,34 @@
+// bindkey, zle and vared in this file are derived from zsh 5.9's
+// Src/Zle/zle_keymap.c (bin_bindkey), zle_thingy.c (bin_zle) and
+// zle_main.c (bin_vared).
+// zsh's copyright and licence:
+//
+// The Z Shell is copyright (c) 1992-2017 Paul Falstad, Richard Coleman,
+// Zoltán Hidvégi, Andrew Main, Peter Stephenson, Sven Wischnowsky, and
+// others.  All rights reserved.  Individual authors, whether or not
+// specifically named, retain copyright in all changes; in what follows, they
+// are referred to as `the Zsh Development Group'.  This is for convenience
+// only and this body has no legal status.  The Z shell is distributed under
+// the following licence; any provisions made in individual files take
+// precedence.
+//
+// Permission is hereby granted, without written agreement and without
+// licence or royalty fees, to use, copy, modify, and distribute this
+// software and to distribute modified versions of this software for any
+// purpose, provided that the above copyright notice and the following
+// two paragraphs appear in all copies of this software.
+//
+// In no event shall the Zsh Development Group be liable to any party for
+// direct, indirect, special, incidental, or consequential damages arising out
+// of the use of this software and its documentation, even if the Zsh
+// Development Group have been advised of the possibility of such damage.
+//
+// The Zsh Development Group specifically disclaim any warranties, including,
+// but not limited to, the implied warranties of merchantability and fitness
+// for a particular purpose.  The software provided hereunder is on an "as is"
+// basis, and the Zsh Development Group have no obligation to provide
+// maintenance, support, updates, enhancements, or modifications.
+
 // Line-editor builtins: bindkey, zle, vared, and the completion ones,
 // compdef and the _files/_directories/_command_names helpers (compadd,
 // compset and compquote are in complete.cpp).  These completion ones are
@@ -20,6 +51,7 @@
 #include <jfsh/builtins/builtins.h>
 #include <jfsh/builtins/util.h>
 #include <jfsh/core/aliases.h>
+#include <jfsh/core/signals.h>
 #include <jfsh/core/utf8.h>
 #include <jfsh/editor/completion.h>
 #include <jfsh/editor/editor.h>
@@ -108,11 +140,44 @@ void bind_editor_params(ExecContext& ctx, Editor& ed, bool readonly = false) {
     return s::to_string(1 + s::count(b.text.begin(), b.text.end(), '\n'));
   });
   bound(p, "PENDING", PM_INTEGER, [] { return str("0"); });
-  bound(p, "REGION_ACTIVE", PM_INTEGER, [&ed] { return str(ed.region_active() ? "1" : "0"); });
-  bound(p, "MARK", PM_INTEGER, [&ed] { return s::to_string(ed.mark()); },
-        [&ed](str v) { ed.set_mark(s::strtol(v.c_str(), nullptr, 10)); });
+  bound(p, "REGION_ACTIVE", PM_INTEGER, [&ed] { return str(ed.region_active() ? "1" : "0"); },
+        [&ed](str v) { ed.set_region_active(s::strtol(v.c_str(), nullptr, 10) != 0); });
+  // In characters, as $CURSOR (zsh's mark counts ZLE characters).
+  bound(p, "MARK", PM_INTEGER,
+        [&b, &ed] {
+          auto at = s::min(static_cast<s::size_t>(ed.mark()), b.text.size());
+          return s::to_string(byte_to_char(b.text, at));
+        },
+        [&b, &ed](str v) {
+          long n = s::strtol(v.c_str(), nullptr, 10);
+          ed.set_mark(static_cast<long>(char_to_byte(b.text, s::max(0L, n))));
+        });
   bound(p, "CUTBUFFER", PM_SCALAR, [&ed] { return ed.cut_buffer(); },
         [&ed](str v) { ed.set_cut_buffer(s::move(v)); });
+  // $killring: the kill ring, newest first; zsh's get_killring makes 8
+  // empty entries when there are none yet.  Assigning replaces the ring.
+  {
+    Zle& z = *ctx.zle;
+    Param& k = p.assign("killring", ParamValue{vec<str>{}}, PM_ARRAY | PM_SPECIAL | PM_LOCAL);
+    k.handlers = s::make_unique<ParamHandlers>();
+    k.handlers->get_array = [&z] {
+      if (z.kring.empty()) z.kring.resize(8);
+      vec<str> v;
+      for (const auto& c : z.kring) v.push_back(c.text);
+      return v;
+    };
+    k.handlers->set_array = [&z, &p](vec<str> v) {
+      z.kring.clear();
+      for (auto& x : v) z.kring.push_back({s::move(x), true, false});
+      if (auto q = p.lookup("killring")) q->get().flags &= ~PM_UNSET;
+    };
+    // zsh's unset_killring: the ring goes, and the parameter is unset
+    // (stdunsetfn) for the rest of the widget.
+    k.handlers->unset_fn = [&z, &p] {
+      z.kring.clear();
+      if (auto q = p.lookup("killring")) q->get().flags |= PM_UNSET;
+    };
+  }
   bound(p, "WIDGETSTYLE", PM_SCALAR, [&ed] { return ed.widget_style(); });
   if (auto n = ed.numeric())
     bound(p, "NUMERIC", PM_INTEGER, [&ed] { return s::to_string(ed.numeric().value_or(1)); },
@@ -174,7 +239,11 @@ void install_zle_hooks(Executor& ex) {
     bind_editor_params(ctx, ed);
     ctx.abort_line = false;
     ++*depth;
+    // Without XTRACE, as zsh runs widget functions.
+    bool xtrace = ctx.opts.get(OPT_XTRACE);
+    ctx.opts.unset(OPT_XTRACE);
     int rc = call_shell_function(ctx, fn, args);
+    ctx.opts.assign(OPT_XTRACE, xtrace);
     ed.resume_raw_mode();
     // An error throws the line away, as zsh does.
     if (ctx.aborting) ed.abort_line();
@@ -185,12 +254,20 @@ void install_zle_hooks(Executor& ex) {
     ctx.params.pop_scope();
     if (rc < 0) {
       ed.set_message("No such shell function `" + fn + "'");
-      return 1;
+      return -1;
     }
     (void)widget;
     return rc;
   };
   zle.hooks.run_command = [&ex](const str& cmd) { return ex.exec_string(cmd); };
+  zle.hooks.trap_scope = [&ctx](Editor& ed, bool begin) {
+    if (not begin) {
+      ctx.params.pop_scope();
+      return;
+    }
+    ctx.params.push_scope();
+    bind_editor_params(ctx, ed, true);
+  };
   if (not zle.completion) return;
   CompletionSources src;
   src.command_names = [&ctx, &ex] {
@@ -230,308 +307,581 @@ void install_zle_hooks(Executor& ex) {
 }
 
 // ---- bindkey ---------------------------------------------------------------
+//
+// bin_bindkey and its helpers from zsh's Zle/zle_keymap.c.
 
 namespace {
 
-// Prints `km`'s bindings as zsh does: runs of single keys bound to the
-// same widget as a range, then the sequences.
-void list_bindings(const Keymap& km, strv km_name, bool as_commands, bool is_main,
-                   const opt<str>& prefix) {
-  auto quoted = [](strv seq) { return "\"" + format_key(seq) + "\""; };
-  const auto& b = km.bindings;
-  for (auto it = b.begin(); it != b.end(); ++it) {
-    const str& key = it->first;
-    if (prefix and not (strv(key).starts_with(*prefix) and key.size() > prefix->size())) continue;
-    const KeyBinding& kb = it->second;
-    // A range: single bytes in a row, bound alike.
-    auto last = it;
-    if (key.size() == 1 and not kb.is_macro) {
-      auto next = s::next(it);
-      while (next != b.end() and next->first.size() == 1 and not next->second.is_macro
-             and next->second.widget == kb.widget
-             and static_cast<unsigned char>(next->first[0])
-                 == static_cast<unsigned char>(last->first[0]) + 1) {
-        last = next;
-        ++next;
-      }
-    }
-    str keys = quoted(key);
-    if (last != it) keys += "-" + quoted(last->first);
-    str value = kb.is_macro ? quoted(kb.macro) : kb.widget;
+bool undefined_key(const KeyBinding* b) {
+  return not b
+      or (not b->is_macro and (b->widget == "undefined-key" or b->widget == ".undefined-key"));
+}
+
+// zsh's bindstate and bindlistout.
+struct BindList {
+  strv              kmname;
+  bool              as_commands = false;
+  bool              all         = false;   // BS_ALL: show undefined-key too
+  str               first, last;
+  const KeyBinding* bind = nullptr;
+
+  void out() const {
+    if (undefined_key(bind) and not all) return;
+    bool range = first != last;
+    str line;
     if (as_commands) {
-      str cmd = "bindkey";
-      if (not is_main) cmd += " -M " + str(km_name);
-      if (last != it) cmd += " -R";
-      if (kb.is_macro) cmd += " -s";
-      s::printf("%s %s %s\n", cmd.c_str(), keys.c_str(), value.c_str());
-    } else {
-      s::printf("%s %s\n", keys.c_str(), value.c_str());
+      bool nodash = true;
+      line = "bindkey ";
+      if (range) line += "-R ";
+      if (bind and bind->is_macro) line += "-s ";
+      if (kmname == "main") {
+      } else if (kmname == "vicmd") {
+        line += "-a ";
+      } else {
+        line += "-M " + shell_quote(kmname) + " ";
+        nodash = false;
+      }
+      if (nodash and not first.empty() and first[0] == '-') line += "-- ";
     }
-    it = last;
+    line += format_key(first);
+    if (range) line += "-" + format_key(last);
+    line += ' ';
+    if (not bind)              line += "undefined-key";
+    else if (bind->is_macro)   line += format_key(bind->macro);
+    else if (as_commands)      line += shell_quote(bind->widget);
+    else                       line += bind->widget;
+    s::printf("%s\n", line.c_str());
   }
+};
+
+bool same_binding(const KeyBinding* a, const KeyBinding* b) {
+  if (undefined_key(a) or undefined_key(b)) return undefined_key(a) and undefined_key(b);
+  if (a->is_macro != b->is_macro) return false;
+  return a->is_macro ? a->macro == b->macro : a->widget == b->widget;
+}
+
+void list_keymap(const Keymap& km, strv kmname, bool as_commands, const opt<str>& prefix) {
+  BindList bs{kmname, as_commands, false, {}, {}, nullptr};
+  for (const auto* kv : km.scan()) {
+    const str& seq = kv->first;
+    if (prefix and not prefix->empty()
+        and (not strv(seq).starts_with(*prefix) or seq.size() == prefix->size()))
+      continue;
+    const KeyBinding* b = &kv->second;
+    if (same_binding(b, bs.bind) and seq.size() == 1 and bs.last.size() == 1
+        and static_cast<unsigned char>(seq[0]) == static_cast<unsigned char>(bs.last[0]) + 1) {
+      bs.last = seq;
+      continue;
+    }
+    bs.out();
+    bs.first = bs.last = seq;
+    bs.bind = b;
+  }
+  bs.out();
+}
+
+// zsh's metabind table: the meta key bindings bindkey -m adds.
+str meta_binding(int c) {
+  static const Keymap emacs = [] {
+    Zle defaults;
+    return *defaults.keymap("emacs");
+  }();
+  const KeyBinding* b = emacs.lookup(str("\x1b") + static_cast<char>(c & 0x7f));
+  return b and not b->is_macro and c != 0x9b ? b->widget : str{};
 }
 
 }  // namespace
 
 int builtin_bindkey(vec<str>& args, ExecContext& ctx) {
-  strv cmd = args[0];
+  strv name = args[0];
   Zle& zle = zle_of(ctx);
   OptParse o;
-  if (not parse_options(args, "ldevaAMNDrsRLmpu", "M", o)) return 1;
-  vec<str> rest(args.begin() + static_cast<s::ptrdiff_t>(o.next), args.end());
+  if (not parse_options(args, "evaldDANmrsLRp", "M", o)) return 1;
+  vec<str> argv(args.begin() + static_cast<s::ptrdiff_t>(o.next), args.end());
 
-  if (o.has('d')) {
-    zle.reset();
-    return 0;
-  }
-  if (o.has('l')) {
-    vec<str> names;
-    for (const auto& [name, km] : zle.keymaps) names.push_back(name);
-    s::sort(names.begin(), names.end());
-    if (not rest.empty()) names = rest;
-    for (const auto& n : names) {
-      auto km = zle.keymap(n);
-      if (not km) return builtin_error(cmd, "no such keymap `" + n + "'");
-      if (o.has('L')) {
-        str primary = zle.keymap_name(km);
-        if (primary != n) s::printf("bindkey -A %s %s\n", primary.c_str(), n.c_str());
-        else              s::printf("bindkey -N %s\n", n.c_str());
-      } else {
-        s::printf("%s\n", n.c_str());
-      }
-    }
-    return 0;
-  }
-  if (o.has('D')) {
-    int rc = 0;
-    for (const auto& n : rest) {
-      if (not zle.keymaps.erase(n)) rc = builtin_error(cmd, "no such keymap `" + n + "'");
-    }
-    return rc;
-  }
-  if (o.has('A')) {
-    if (rest.size() != 2) return builtin_error(cmd, "-A needs two keymap names");
-    if (not zle.link(rest[0], rest[1]))
-      return builtin_error(cmd, "no such keymap `" + rest[0] + "'");
-    return 0;
-  }
-  if (o.has('N')) {
-    if (rest.empty() or rest.size() > 2) return builtin_error(cmd, "-N needs one or two keymap names");
-    if (not zle.create(rest[0], rest.size() > 1 ? rest[1] : str{}))
-      return builtin_error(cmd, "no such keymap `" + rest[1] + "'");
-    return 0;
+  // The operation, as zsh's opns table: the first of these flags given.
+  struct Op { char o; bool selp; int min, max; };
+  static constexpr Op ops[] = {
+    {'l', false, 0, -1}, {'d', false, 0, 0}, {'D', false, 1, -1}, {'A', false, 2, 2},
+    {'N', false, 1, 2}, {'m', true, 0, 0}, {'r', true, 1, -1}, {'s', true, 2, -1},
+    {0, true, 0, -1},
+  };
+  const Op* op = ops;
+  while (op->o and not o.has(op->o)) ++op;
+  if (op->o)
+    for (const Op* opp = op + 1; opp->o; ++opp)
+      if (o.has(opp->o)) return builtin_error(name, "incompatible operation selection options");
+  int n = o.has('e') + o.has('v') + o.has('a') + (o.arg('M') != nullptr);
+  if (not op->selp and n)
+    return builtin_error(name, str("keymap cannot be selected with -") + op->o);
+  if (n > 1) return builtin_error(name, "incompatible keymap selection options");
+
+  str kmname;
+  sptr<Keymap> km;
+  if (op->selp) {
+    if (o.has('e'))       kmname = "emacs";
+    else if (o.has('v'))  kmname = "viins";
+    else if (o.has('a'))  kmname = "vicmd";
+    else if (o.arg('M'))  kmname = *o.arg('M');
+    else                  kmname = "main";
+    km = zle.keymap(kmname);
+    if (not km) return builtin_error(name, "no such keymap `" + kmname + "'");
+    if (o.has('e') or o.has('v')) zle.link_keymap(km, "main");
   }
 
-  // The keymap the rest works on.
-  str km_name = "main";
-  if (o.has('e')) { zle.link("emacs", "main"); km_name = "emacs"; }
-  if (o.has('v')) { zle.link("viins", "main"); km_name = "viins"; }
-  if (o.has('a')) km_name = "vicmd";
-  if (auto* m = o.arg('M')) km_name = *m;
-  auto km = zle.keymap(km_name);
-  if (not km) return builtin_error(cmd, "no such keymap `" + km_name + "'");
-  bool is_main = km_name == "main";
-
-  if (o.has('r')) {
-    int rc = 0;
-    for (const auto& k : rest) {
-      str seq = parse_key_notation(k);
-      if (o.has('p')) {
-        for (auto it = km->bindings.begin(); it != km->bindings.end();) {
-          if (strv(it->first).starts_with(seq) and it->first.size() > seq.size()) it = km->bindings.erase(it);
-          else ++it;
-        }
-      } else if (not km->bindings.erase(seq)) {
-        rc = 1;
-      }
-    }
-    return rc;
-  }
-  if (rest.empty()) {
-    if (o.has('e') or o.has('v')) return 0;   // just selecting
-    list_bindings(*km, km_name, o.has('L'), is_main, s::nullopt);
-    return 0;
-  }
-  if (rest.size() == 1 and not o.has('s')) {
-    str seq = parse_key_notation(rest[0]);
-    if (o.has('p')) {
-      list_bindings(*km, km_name, o.has('L'), is_main, seq);
+  // Listing.
+  if (not op->o and (argv.empty() or argv.size() == 1)) {
+    if (o.has('e') or o.has('v')) return 0;
+    if (not argv.empty() and not o.has('p')) {
+      str seq = parse_key_notation(argv[0]);
+      BindList bs{kmname, o.has('L'), true, seq, seq, km->lookup(seq)};
+      bs.out();
       return 0;
     }
-    const KeyBinding* b = km->lookup(seq);
-    str value = not b ? str("undefined-key")
-              : b->is_macro ? "\"" + format_key(b->macro) + "\"" : b->widget;
-    if (o.has('L')) {
-      if (not b) return 0;
-      s::printf("bindkey%s%s \"%s\" %s\n", is_main ? "" : " -M ", is_main ? "" : km_name.c_str(),
-                format_key(seq).c_str(), value.c_str());
-    } else {
-      s::printf("\"%s\" %s\n", format_key(seq).c_str(), value.c_str());
+    opt<str> prefix;
+    if (o.has('p')) {
+      if (argv.empty()) return builtin_error(name, "option -p requires a prefix string");
+      prefix = parse_key_notation(argv[0]);
+    }
+    list_keymap(*km, kmname, o.has('L'), prefix);
+    return 0;
+  }
+
+  int argc = static_cast<int>(argv.size());
+  if (argc < op->min) return builtin_error(name, str("not enough arguments for -") + op->o);
+  if (op->max != -1 and argc > op->max)
+    return builtin_error(name, str("too many arguments for -") + op->o);
+
+  switch (op->o) {
+    case 'l': {
+      // bin_bindkey_lsmaps
+      int ret = 0;
+      vec<str> names;
+      if (argv.empty()) {
+        for (const auto& [kn, k] : zle.keymaps) names.push_back(kn);
+        s::sort(names.begin(), names.end());
+      } else {
+        names = argv;
+      }
+      for (const auto& kn : names) {
+        auto k = zle.keymap(kn);
+        if (not k) {
+          ret = builtin_error(name, "no such keymap: `" + kn + "'");
+          continue;
+        }
+        if (not o.has('L')) {
+          s::printf("%s\n", kn.c_str());
+          continue;
+        }
+        if (kn == ".safe") continue;
+        str line = "bindkey -";
+        if (not k->primary.empty() and k->primary != kn) {
+          line += "A ";
+          if (k->primary[0] == '-') line += "-- ";
+          line += shell_quote(k->primary) + " ";
+        } else {
+          line += "N ";
+          if (kn[0] == '-') line += "-- ";
+        }
+        line += shell_quote(kn);
+        s::printf("%s\n", line.c_str());
+      }
+      return ret;
+    }
+    case 'd':
+      zle.reset();
+      return 0;
+    case 'D': {
+      int ret = 0;
+      for (const auto& kn : argv) {
+        if (kn == ".safe")
+          ret = builtin_error(name, "keymap name `" + kn + "' is protected");
+        else if (not zle.unlink(kn)) ret = builtin_error(name, "no such keymap `" + kn + "'");
+      }
+      return ret;
+    }
+    case 'A':
+      if (not zle.keymap(argv[0])) return builtin_error(name, "no such keymap `" + argv[0] + "'");
+      if (not zle.link(argv[0], argv[1]))
+        return builtin_error(name, "keymap name `" + argv[1] + "' is protected");
+      return 0;
+    case 'N':
+      if (argv[0] == ".safe")
+        return builtin_error(name, "keymap name `" + argv[0] + "' is protected");
+      if (argc > 1 and not zle.keymap(argv[1]))
+        return builtin_error(name, "no such keymap `" + argv[1] + "'");
+      zle.create(argv[0], argc > 1 ? argv[1] : str{});
+      return 0;
+    case 'm':
+      if (km->primary == ".safe")
+        return builtin_error(name, "keymap `" + kmname + "' is protected");
+      builtin_error(name, "warning: `bindkey -m' disables multibyte support");
+      for (int c = 128; c < 256; ++c) {
+        str w = meta_binding(c);
+        if (w.empty()) continue;
+        str seq(1, static_cast<char>(c));
+        const KeyBinding* b = km->lookup(seq);
+        bool self_insert = b and not b->is_macro
+                       and (b->widget == "self-insert" or b->widget == ".self-insert");
+        if (undefined_key(b) or self_insert)
+          km->bind(seq, w);
+      }
+      return 0;
+    default:
+      break;
+  }
+
+  // bin_bindkey_bind: -r, -s or plain, with -R for ranges.
+  char func = op->o;
+  if (not func or func == 's')
+    for (s::size_t i = 2; i < argv.size(); i += 2)
+      if (i + 1 >= argv.size()) return builtin_error(name, "even number of arguments required");
+  if (km->primary == ".safe") return builtin_error(name, "keymap `" + kmname + "' is protected");
+  if (func == 'r' and o.has('p')) {
+    for (const auto& useq : argv) {
+      str prefix = parse_key_notation(useq);
+      for (auto it = km->bindings.begin(); it != km->bindings.end();) {
+        if (strv(it->first).starts_with(prefix) and it->first.size() > prefix.size())
+          it = km->bindings.erase(it);
+        else ++it;
+      }
     }
     return 0;
   }
-  if (rest.size() % 2 != 0) return builtin_error(cmd, "odd number of arguments");
-  for (s::size_t i = 0; i + 1 < rest.size(); i += 2) {
-    if (o.has('R')) {
-      // "a-z": every key in the range.
-      str spec = parse_key_notation(rest[i]);
-      if (spec.size() != 3 or spec[1] != '-') return builtin_error(cmd, "malformed key range `" + rest[i] + "'");
-      for (int c = static_cast<unsigned char>(spec[0]); c <= static_cast<unsigned char>(spec[2]); ++c)
-        km->bind(str(1, static_cast<char>(c)), rest[i + 1]);
-      continue;
+  int ret = 0;
+  for (s::size_t i = 0; i < argv.size(); ++i) {
+    const str& useq = argv[i];
+    KeyBinding kb;
+    if (func == 's') {
+      kb.is_macro = true;
+      kb.macro = parse_key_notation(argv[++i]);
+    } else if (func != 'r') {
+      kb.widget = argv[++i];
     }
-    str seq = parse_key_notation(rest[i]);
-    if (seq.empty()) return builtin_error(cmd, "cannot bind to an empty key sequence");
-    if (o.has('s')) km->bind_macro(seq, parse_key_notation(rest[i + 1]));
-    else            km->bind(seq, rest[i + 1]);
+    str seq = parse_key_notation(useq);
+    auto bind = [&](const str& k) {
+      if (func == 'r' or (not kb.is_macro and kb.widget == "undefined-key")) km->unbind(k);
+      else if (kb.is_macro) km->bind_macro(k, kb.macro);
+      else                  km->bind(k, kb.widget);
+    };
+    if (o.has('R')) {
+      int first, last;
+      if (seq.size() < 2 or seq.size() > 2 + (seq[1] == '-')
+          or (first = static_cast<unsigned char>(seq[0]))
+             > (last = static_cast<unsigned char>(seq.back()))) {
+        ret = builtin_error(name, "malformed key range `" + useq + "'");
+      } else {
+        for (; first <= last; ++first) bind(str(1, static_cast<char>(first)));
+      }
+    } else if (seq.empty()) {
+      ret = builtin_error(name, "cannot bind to an empty key sequence");
+    } else {
+      bind(seq);
+    }
   }
-  return 0;
+  return ret;
 }
 
 // ---- zle ------------------------------------------------------------------
+//
+// bin_zle and its operations from zsh's Zle/zle_thingy.c.
+
+namespace {
+
+// Whether `name` is a widget's name the user may not rebind (zsh's
+// TH_IMMORTAL: the `.name` of a builtin widget).
+bool protected_widget(strv name) {
+  return name.starts_with('.') and Zle::is_builtin_widget(name.substr(1));
+}
+
+// Binds widget name `name` to what `src` names now (zsh's bindwidget):
+// a user or completion widget's function, or the builtin.
+void bind_widget(Zle& zle, const str& name, const str& src) {
+  str target = zle.resolve_widget(src);
+  zle.deleted_widgets.erase(name);
+  zle.user_widgets.erase(name);
+  zle.comp_widgets.erase(name);
+  zle.widget_aliases.erase(name);
+  if (auto u = zle.user_widgets.find(target); u != zle.user_widgets.end()) {
+    str fn = u->second;
+    if (auto c = zle.comp_widgets.find(target); c != zle.comp_widgets.end())
+      zle.comp_widgets[name] = c->second;
+    zle.user_widgets[name] = fn;
+  } else if (target != name) {
+    zle.widget_aliases[name] = target.starts_with('.') or zle.module_widgets.contains(target)
+                             ? target : "." + target;
+  }
+}
+
+// zsh's scanlistwidgets: -1 names only, 0 `name (fn)`, 1 as commands.
+void list_widget(const Zle& zle, const str& w, int list) {
+  if (list < 0) {
+    s::printf("%s\n", w.c_str());
+    return;
+  }
+  auto u = zle.user_widgets.find(w);
+  if (u == zle.user_widgets.end()) return;   // builtin (WIDGET_INT)
+  auto c = zle.comp_widgets.find(w);
+  str line;
+  if (list) {
+    line = c != zle.comp_widgets.end() ? "zle -C " : "zle -N ";
+    if (w[0] == '-') line += "-- ";
+    line += shell_quote(w);
+    if (c != zle.comp_widgets.end())
+      line += " " + shell_quote(c->second) + " " + shell_quote(u->second);
+    else if (u->second != w)         line += " " + shell_quote(u->second);
+  } else {
+    line = w;
+    if (c != zle.comp_widgets.end()) line += " -C " + c->second + " " + u->second;
+    else if (u->second != w)         line += " (" + u->second + ")";
+  }
+  s::printf("%s\n", line.c_str());
+}
+
+}  // namespace
 
 int builtin_zle(vec<str>& args, ExecContext& ctx) {
-  strv cmd = args[0];
+  strv name = args[0];
   Zle& zle = zle_of(ctx);
   Editor* ed = zle.active;
-  // `zle widget args…`: run a widget, only while a line is being edited.
+  bool active = ed and ed->active();
+  // `zle widget [-n num] [-Nw] [-K keymap] [-f nolast] args`: bin_zle_call
+  // reads the options after the widget's name itself.
   if (args.size() >= 2 and not args[1].starts_with('-')) {
-    if (not ed or not ed->active())
-      return builtin_error(cmd, "widgets can only be called when ZLE is active");
-    if (not zle.is_widget(args[1])) return builtin_error(cmd, "no such widget `" + args[1] + "'");
-    if (args[1] == "reset-prompt") {
-      ed->reset_prompt();
+    if (not active) return builtin_error(name, "widgets can only be called when ZLE is active");
+    str wname = args[1];
+    s::size_t i = 2;
+    opt<opt<int>> numeric;
+    opt<str> keymap_restore;
+    bool set_bindk = false, nolast = false;
+    for (; i < args.size() and args[i].starts_with('-'); ++i) {
+      const str& a = args[i];
+      if (a.size() == 1 or a[1] == '-') {
+        ++i;
+        break;
+      }
+      for (s::size_t k = 1; k < a.size(); ++k) {
+        char c = a[k];
+        auto value = [&]() -> opt<str> {
+          if (k + 1 < a.size()) {
+            str v = a.substr(k + 1);
+            k = a.size();
+            return v;
+          }
+          if (i + 1 < args.size()) return args[++i];
+          return s::nullopt;
+        };
+        if (c == 'f') {
+          auto f = value();
+          if (not f or *f != "nolast") {
+            if (keymap_restore) ed->select_keymap(*keymap_restore);
+            return builtin_error(name, "'nolast' expected after -f");
+          }
+          nolast = true;
+        } else if (c == 'n') {
+          auto num = value();
+          if (not num) return builtin_error(name, "number expected after -n");
+          numeric = opt<int>(s::atoi(num->c_str()));
+        } else if (c == 'N') {
+          numeric = opt<int>{};
+        } else if (c == 'K') {
+          auto km = value();
+          if (not km) return builtin_error(name, "keymap expected after -K");
+          keymap_restore = ed->keymap_name();
+          if (not ed->select_keymap(*km)) {
+            ed->set_message("No such keymap `" + *km + "'");
+            return 1;
+          }
+        } else if (c == 'w') {
+          set_bindk = true;
+        } else {
+          if (keymap_restore) ed->select_keymap(*keymap_restore);
+          return builtin_error(name, "unknown option: " + a);
+        }
+      }
+    }
+    vec<str> wargs(args.begin() + static_cast<s::ptrdiff_t>(s::min(i, args.size())), args.end());
+    opt<int> saved_numeric = ed->numeric();
+    if (numeric) ed->set_numeric(*numeric);
+    bool ok = ed->call_widget(wname, wargs, set_bindk, nolast);
+    if (numeric) ed->set_numeric(saved_numeric);
+    if (keymap_restore) ed->select_keymap(*keymap_restore);
+    return ok ? 0 : 1;
+  }
+
+  OptParse o;
+  if (not parse_options(args, "aAcCDfFgGIKlLmMNrRTUw", "", o)) return 1;
+  vec<str> argv(args.begin() + static_cast<s::ptrdiff_t>(o.next), args.end());
+  struct Op { char o; int min, max; };
+  static constexpr Op ops[] = {
+    {'l', 0, -1}, {'D', 1, -1}, {'A', 2, 2}, {'N', 1, 2}, {'C', 3, 3}, {'R', 0, -1},
+    {'M', 1, 1}, {'U', 1, 1}, {'K', 1, 1}, {'I', 0, 0}, {'f', 1, -1}, {'F', 0, 2},
+    {'T', 0, 2}, {0, 0, -1},
+  };
+  const Op* op = ops;
+  while (op->o and not o.has(op->o)) ++op;
+  if (op->o)
+    for (const Op* opp = op + 1; opp->o; ++opp)
+      if (o.has(opp->o)) return builtin_error(name, "incompatible operation selection options");
+  int argc = static_cast<int>(argv.size());
+  if (argc < op->min) return builtin_error(name, str("not enough arguments for -") + op->o);
+  if (op->max != -1 and argc > op->max)
+    return builtin_error(name, str("too many arguments for -") + op->o);
+
+  switch (op->o) {
+    case 'l': {
+      if (argv.empty()) {
+        for (const auto& w : zle.widget_names()) list_widget(zle, w, o.has('a') ? -1 : o.has('L'));
+        return 0;
+      }
+      for (const auto& w : argv) {
+        // A builtin's name taken away with -D is still found (getnode2).
+        bool known = zle.is_widget(w) or zle.deleted_widgets.contains(w);
+        if (not known or (not o.has('a') and not zle.user_widgets.contains(w))) return 1;
+        if (o.has('L')) list_widget(zle, w, 1);
+      }
       return 0;
     }
-    return ed->call_widget(args[1]) ? 0 : 1;
-  }
-  OptParse o;
-  if (not parse_options(args, "lLaNDARMUKIcCFT", "", o)) return 1;
-  vec<str> rest(args.begin() + static_cast<s::ptrdiff_t>(o.next), args.end());
-  if (o.has('C')) {
-    // zle -C widget completion-widget function
-    if (rest.size() < 3) return builtin_error(cmd, "not enough arguments for -C");
-    static const uset<str> styles = {
-      "complete-word", "expand-or-complete", "expand-or-complete-prefix", "menu-complete",
-      "menu-expand-or-complete", "reverse-menu-complete", "list-choices", "delete-char-or-list"};
-    strv style = strv(rest[1]).starts_with('.') ? strv(rest[1]).substr(1) : strv(rest[1]);
-    if (not styles.contains(str(style)))
-      return builtin_error(cmd, "invalid widget `" + rest[1] + "'");
-    zle.user_widgets[rest[0]] = rest[2];
-    zle.comp_widgets[rest[0]] = rest[1];
-    zle.widget_aliases.erase(rest[0]);
-    return 0;
-  }
-  if (o.has('N')) {
-    if (rest.empty() or rest.size() > 2)
-      return builtin_error(cmd, "-N needs a widget name and at most one function");
-    str fn = rest.size() > 1 ? rest.back() : rest[0];
-    if (rest[0].starts_with('.')) return builtin_error(cmd, "widget name `" + rest[0] + "' is protected");
-    zle.user_widgets[rest[0]] = fn;
-    zle.comp_widgets.erase(rest[0]);
-    zle.widget_aliases.erase(rest[0]);
-    return 0;
-  }
-  if (o.has('D')) {
-    int rc = 0;
-    for (const auto& w : rest) {
-      zle.comp_widgets.erase(w);
-      if (zle.user_widgets.erase(w) == 0 and zle.widget_aliases.erase(w) == 0)
-        rc = builtin_error(cmd, "no such widget `" + w + "'");
+    case 'D': {
+      int ret = 0;
+      for (const auto& w : argv) {
+        if (not zle.is_widget(w) or zle.deleted_widgets.contains(w)) {
+          ret = builtin_error(name, "no such widget `" + w + "'");
+        } else if (protected_widget(w)) {
+          ret = builtin_error(name, "widget name `" + w + "' is protected");
+        } else {
+          bool known = zle.user_widgets.erase(w) + zle.widget_aliases.erase(w) > 0;
+          zle.comp_widgets.erase(w);
+          if (not known and Zle::is_builtin_widget(w)) zle.deleted_widgets.insert(w);
+        }
+      }
+      return ret;
     }
-    return rc;
-  }
-  if (o.has('A')) {
-    if (rest.size() != 2) return builtin_error(cmd, "-A needs two widget names");
-    if (not zle.is_widget(rest[0])) return builtin_error(cmd, "no such widget `" + rest[0] + "'");
-    zle.widget_aliases[rest[1]] = rest[0];
-    zle.user_widgets.erase(rest[1]);
-    zle.comp_widgets.erase(rest[1]);
-    return 0;
-  }
-  if (o.has('M')) {
-    if (rest.size() != 1) return builtin_error(cmd, "-M needs one message");
-    if (ed and ed->active()) ed->set_message(rest[0]);
-    else                     s::fprintf(stderr, "%s\n", rest[0].c_str());
-    return 0;
-  }
-  if (o.has('U')) {
-    if (not ed or not ed->active()) return builtin_error(cmd, "can only be called from widget function");
-    for (auto it = rest.rbegin(); it != rest.rend(); ++it) ed->push_input(*it);
-    return 0;
-  }
-  if (o.has('K')) {
-    if (not ed or not ed->active()) return builtin_error(cmd, "can only be called from widget function");
-    if (rest.size() != 1 or not ed->select_keymap(rest[0]))
-      return builtin_error(cmd, "no such keymap `" + (rest.empty() ? str{} : rest[0]) + "'");
-    return 0;
-  }
-  if (o.has('R') or o.has('I')) {
-    if (ed and ed->active()) {
-      if (not rest.empty()) ed->set_message(rest[0]);
-      if (o.has('I')) ed->trash();
-      else            ed->redraw();
+    case 'A':
+      if (not zle.is_widget(argv[0]))
+        return builtin_error(name, "no such widget `" + argv[0] + "'");
+      if (protected_widget(argv[1]))
+        return builtin_error(name, "widget name `" + argv[1] + "' is protected");
+      bind_widget(zle, argv[1], argv[0]);
+      return 0;
+    case 'N':
+      if (protected_widget(argv[0]))
+        return builtin_error(name, "widget name `" + argv[0] + "' is protected");
+      zle.deleted_widgets.erase(argv[0]);
+      zle.widget_aliases.erase(argv[0]);
+      zle.comp_widgets.erase(argv[0]);
+      zle.user_widgets[argv[0]] = argc > 1 ? argv[1] : argv[0];
+      return 0;
+    case 'C': {
+      static const uset<str> styles = {
+        "complete-word", "expand-or-complete", "expand-or-complete-prefix", "menu-complete",
+        "menu-expand-or-complete", "reverse-menu-complete", "list-choices", "delete-char-or-list",
+        "accept-and-menu-complete", "menu-select"};
+      strv style = strv(argv[1]).starts_with('.') ? strv(argv[1]).substr(1) : strv(argv[1]);
+      if (not styles.contains(str(style)))
+        return builtin_error(name, "invalid widget `" + argv[1] + "'");
+      if (protected_widget(argv[0]))
+        return builtin_error(name, "widget name `" + argv[0] + "' is protected");
+      zle.deleted_widgets.erase(argv[0]);
+      zle.widget_aliases.erase(argv[0]);
+      zle.user_widgets[argv[0]] = argv[2];
+      zle.comp_widgets[argv[0]] = argv[1];
+      return 0;
     }
-    return 0;
-  }
-  if (o.has('F') or o.has('T'))
-    return builtin_error(cmd, str("-") + (o.has('F') ? 'F' : 'T') + ": not implemented");
-  // zle, zle -l [-L] [-a] [names]: the widgets.
-  bool all = o.has('a');
-  if (not rest.empty() and o.has('l')) {
-    int rc = 0;
-    for (const auto& w : rest) if (not zle.is_widget(w)) rc = 1;
-    return rc;
-  }
-  vec<str> names;
-  if (all)
-    for (const auto& w : Zle::builtin_widgets()) names.push_back(w);
-  for (const auto& [w, fn] : zle.user_widgets) names.push_back(w);
-  for (const auto& [w, to] : zle.widget_aliases) names.push_back(w);
-  s::sort(names.begin(), names.end());
-  names.erase(s::unique(names.begin(), names.end()), names.end());
-  for (const auto& w : names) {
-    if (auto c = zle.comp_widgets.find(w); c != zle.comp_widgets.end()) {
-      const str& fn = zle.user_widgets.at(w);
-      if (o.has('L')) s::printf("zle -C %s %s %s\n", w.c_str(), c->second.c_str(), fn.c_str());
-      else            s::printf("%s -C %s %s\n", w.c_str(), c->second.c_str(), fn.c_str());
-    } else if (auto u = zle.user_widgets.find(w); u != zle.user_widgets.end()) {
-      if (o.has('L')) s::printf("zle -N %s%s%s\n", w.c_str(), u->second == w ? "" : " ", u->second == w ? "" : u->second.c_str());
-      else if (u->second == w) s::printf("%s\n", w.c_str());
-      else s::printf("%s (%s)\n", w.c_str(), u->second.c_str());
-    } else if (auto a = zle.widget_aliases.find(w); a != zle.widget_aliases.end()) {
-      if (o.has('L')) s::printf("zle -A %s %s\n", a->second.c_str(), w.c_str());
-      else            s::printf("%s (%s)\n", w.c_str(), a->second.c_str());
-    } else if (not o.has('L')) {
-      s::printf("%s\n", w.c_str());
+    case 'R':
+      if (not active) return 1;
+      if (not argv.empty() and not argv[0].empty())
+        ed->set_message(Editor::status_text(argv[0]));
+      ed->redraw();
+      return 0;
+    case 'M':
+      if (not active) return builtin_error(name, "can only be called from widget function");
+      ed->set_message(Editor::nice_message(argv[0]));
+      return 0;
+    case 'U':
+      if (not active) return builtin_error(name, "can only be called from widget function");
+      ed->push_input(argv[0]);
+      return 0;
+    case 'K':
+      if (not active) return builtin_error(name, "can only be called from widget function");
+      if (not ed->select_keymap(argv[0])) {
+        ed->set_message("No such keymap `" + argv[0] + "'");
+        return 1;
+      }
+      return 0;
+    case 'I':
+      if (not active) return 1;
+      ed->trash();
+      return 0;
+    case 'f': {
+      if (not active) return builtin_error(name, "can only set flags from a widget");
+      int ret = 0;
+      for (const auto& f : argv) {
+        if (f == "yank" or f == "yankbefore" or f == "kill" or f == "vichange")
+          ed->set_widget_flag(f);
+        else ret = builtin_error(name, "invalid flag `" + f + "' given to zle -f");
+      }
+      return ret;
     }
+    case 'F': case 'T':
+      return builtin_error(name, str("-") + op->o + ": not implemented");
+    default:
+      // bin_zle_call without a widget: whether a widget could be called.
+      return active ? 0 : 1;
   }
-  return 0;
 }
 
 // ---- vared ------------------------------------------------------------------
 
+// vared, as zsh's bin_vared: the checks in its order, an array's elements
+// joined with their separators and backslashes quoted, split back the
+// same way.
 int builtin_vared(vec<str>& args, ExecContext& ctx) {
   strv cmd = args[0];
   OptParse o;
   if (not parse_options(args, "AacghepriMmftI", "prMmfitI", o)) return 1;
-  if (o.next + 1 != args.size()) return builtin_error(cmd, "one parameter name expected");
+  if (o.next >= args.size()) return builtin_error(cmd, "not enough arguments");
+  if (o.next + 1 < args.size()) return builtin_error(cmd, "too many arguments");
   const str& name = args[o.next];
-  if (not is_identifier(name)) return builtin_error(cmd, "not an identifier: " + name);
+  auto term = ctx.params.lookup("TERM");
+  bool emacs = term and term->get().is_set() and term->get().scalar() == "emacs";
+  if ((ctx.opts.get(OPT_INTERACTIVE) and not ctx.opts.get(OPT_ZLE)) or emacs)
+    return builtin_error(cmd, "ZLE not enabled");
+  if (zle_of(ctx).active and zle_of(ctx).active->active())
+    return builtin_error(cmd, "ZLE cannot be used recursively (yet)");
+  if (o.has('A') and o.has('a')) return builtin_error(cmd, "specify only one of -a and -A");
+  if ((o.has('a') or o.has('A')) and not o.has('c'))
+    builtin_error(cmd, o.has('a') ? "-a ignored" : "-A ignored");
   auto p = ctx.params.lookup(name);
-  bool array = o.has('a') or o.has('A') or (p and p->get().is_array());
+  bool array = (o.has('c') and (o.has('a') or o.has('A'))) or (p and p->get().is_array());
   str initial;
   if (p and p->get().is_set()) {
+    if (not is_identifier(name)) return builtin_error(cmd, "not an identifier: `" + name + "'");
     if (array) {
-      for (const auto& w : p->get().array()) initial += (initial.empty() ? "" : " ") + w;
+      // A separator or backslash in an element is quoted with a backslash.
+      for (const auto& w : p->get().array()) {
+        if (not initial.empty()) initial += ' ';
+        for (char c : w) {
+          if (c == '\\' or c == ' ' or c == '\t' or c == '\n') initial += '\\';
+          initial += c;
+        }
+      }
     } else {
       initial = p->get().scalar();
     }
   } else if (not o.has('c')) {
     return builtin_error(cmd, "no such variable: " + name);
+  } else if (not is_identifier(name)) {
+    // zsh's fetchvalue takes a leading number as a positional parameter.
+    if (s::isdigit(static_cast<unsigned char>(name[0])))
+      return builtin_error(cmd, "not an identifier: `" + name + "'");
+    return builtin_error(cmd, "invalid parameter name: " + name);
   }
-  if (not ctx.opts.get(OPT_ZLE) or not ::isatty(STDIN_FILENO))
-    return builtin_error(cmd, "ZLE not enabled");
+  if (zle_of(ctx).tty_out < 0 and not ::isatty(STDIN_FILENO)) {
+    int t = ::open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (t < 0) return builtin_error(cmd, "can't access terminal");
+    ::close(t);
+  }
   Zle& zle = zle_of(ctx);
   if (zle.active and zle.active->active()) return builtin_error(cmd, "ZLE cannot be used recursively (yet)");
 
@@ -540,8 +890,42 @@ int builtin_vared(vec<str>& args, ExecContext& ctx) {
   PromptRenderer prompt(ctx.params, ctx.opts);
   prompt.set_hooks(ctx.executor->prompt_hooks());
   Editor ed(ctx.opts, hist, prompt, zle);
+  if (zle.on_wake)
+    ed.set_wake(Signals.wake_fd(), [&zle, &ed](bool& quit) { return zle.on_wake(ed, quit); });
   ed.set_vared_name(name);
-  if (auto* km = o.arg('M')) ed.select_keymap(*km);
+  // zsh's savekeymap: -M links `main`, -m `vicmd`, to the keymap named
+  // for the edit (a warning, and nothing, for one that doesn't exist);
+  // restorekeymap links the old ones back after it.
+  struct SavedKeymap {
+    Zle&         zle;
+    strv         link;
+    sptr<Keymap> old;
+    bool         given = false;
+    SavedKeymap(Zle& z, strv l) : zle(z), link(l) {}
+    ~SavedKeymap() {
+      if (old)        zle.link_keymap(old, link);
+      else if (given) s::fprintf(stderr, "vared: keymap %.*s was not defined, not restored\n",
+                                 static_cast<int>(link.size()), link.data());
+    }
+    SavedKeymap(const SavedKeymap&) = delete;
+    SavedKeymap& operator=(const SavedKeymap&) = delete;
+  };
+  auto save_keymap = [&](SavedKeymap& sk, const str* to) {
+    if (not to) return;
+    auto km = zle.keymap(*to);
+    if (not km) {
+      (void)builtin_error(cmd, "no such keymap: " + *to);
+      return;
+    }
+    sk.given = true;
+    if (auto cur = zle.keymap(sk.link); cur != km) {
+      sk.old = cur;
+      zle.link_keymap(km, sk.link);
+    }
+  };
+  SavedKeymap main_save{zle, "main"}, vicmd_save{zle, "vicmd"};
+  save_keymap(main_save, o.arg('M'));
+  save_keymap(vicmd_save, o.arg('m'));
   str ps  = o.arg('p') ? *o.arg('p') : str{};
   str rps = o.arg('r') ? *o.arg('r') : str{};
   auto result = ed.edit(initial, ps, rps);
@@ -566,8 +950,26 @@ int builtin_vared(vec<str>& args, ExecContext& ctx) {
   if (not result or ed.interrupted()) return 1;
   Result<void> set;
   if (array) {
+    // zsh's spacesplit with quoting: blanks separate the words, a
+    // backslash keeps the next character.
     vec<str> words;
-    for (const auto& w : HistoryManager::split_words(*result)) words.push_back(w);
+    str cur;
+    bool any = false;
+    for (s::size_t i = 0; i < result->size(); ++i) {
+      char c = (*result)[i];
+      if (c == '\\' and i + 1 < result->size()) {
+        cur += (*result)[++i];
+        any = true;
+      } else if (c == ' ' or c == '\t' or c == '\n') {
+        if (any) words.push_back(s::move(cur));
+        cur.clear();
+        any = false;
+      } else {
+        cur += c;
+        any = true;
+      }
+    }
+    if (any) words.push_back(s::move(cur));
     set = ctx.params.set_array(name, s::move(words));
   } else {
     set = ctx.params.set_scalar(name, *result);

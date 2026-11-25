@@ -1,3 +1,36 @@
+// The vi widgets in this file ported in the M9 review (vi-end-of-line,
+// vi-backward-delete-char, vi-kill-line, vi-backward-kill-word,
+// put-replace-selection, vi-repeat-change's registers and the up/down line
+// moves) are derived from zsh 5.9's Src/Zle/zle_vi.c, zle_move.c and
+// zle_hist.c.
+// zsh's copyright and licence:
+//
+// The Z Shell is copyright (c) 1992-2017 Paul Falstad, Richard Coleman,
+// Zoltán Hidvégi, Andrew Main, Peter Stephenson, Sven Wischnowsky, and
+// others.  All rights reserved.  Individual authors, whether or not
+// specifically named, retain copyright in all changes; in what follows, they
+// are referred to as `the Zsh Development Group'.  This is for convenience
+// only and this body has no legal status.  The Z shell is distributed under
+// the following licence; any provisions made in individual files take
+// precedence.
+//
+// Permission is hereby granted, without written agreement and without
+// licence or royalty fees, to use, copy, modify, and distribute this
+// software and to distribute modified versions of this software for any
+// purpose, provided that the above copyright notice and the following
+// two paragraphs appear in all copies of this software.
+//
+// In no event shall the Zsh Development Group be liable to any party for
+// direct, indirect, special, incidental, or consequential damages arising out
+// of the use of this software and its documentation, even if the Zsh
+// Development Group have been advised of the possibility of such damage.
+//
+// The Zsh Development Group specifically disclaim any warranties, including,
+// but not limited to, the implied warranties of merchantability and fitness
+// for a particular purpose.  The software provided hereunder is on an "as is"
+// basis, and the Zsh Development Group have no obligation to provide
+// maintenance, support, updates, enhancements, or modifications.
+
 #include <jfsh/editor/editor.h>
 
 // Vi mode: the vicmd widgets (motions, operators, text objects, registers,
@@ -38,9 +71,9 @@ int vi_class(char32_t c, bool big) {
 
 }  // namespace
 
-bool Editor::in_vicmd() const {
-  return mKeymap and mKeymap == mZle.keymap("vicmd");
-}
+// zsh's invicmdmode: the keymap selected by the name vicmd (main linked
+// to vicmd, as under vared -M vicmd, isn't).
+bool Editor::in_vicmd() const { return mKeymapName == "vicmd"; }
 
 void Editor::vi_clamp_cursor() {
   if (mBuf.cursor > mBuf.text.size()) mBuf.cursor = mBuf.text.size();
@@ -50,7 +83,8 @@ void Editor::vi_clamp_cursor() {
 }
 
 void Editor::vi_enter_insert() {
-  select_keymap("viins");
+  select_keymap("main");
+  mViInsBegin = mBuf.cursor;
   if (mUndoGroup == 0) mUndoGroup = 1;
 }
 
@@ -66,22 +100,6 @@ str Editor::vi_read_char() {
     ch += static_cast<char>(more);
   }
   return ch;
-}
-
-void Editor::vi_store_register(str text, bool linewise) {
-  char r = mViRegister;
-  mViRegister = 0;
-  if (r >= 'A' and r <= 'Z') {
-    auto& slot = mViRegisters[static_cast<char>(r - 'A' + 'a')];
-    slot.first += text;
-    slot.second = slot.second or linewise;
-  } else if ((r >= 'a' and r <= 'z') or (r >= '0' and r <= '9')) {
-    mViRegisters[r] = {text, linewise};
-  }
-  if (r == '_') return;   // the black hole
-  mKillRing.insert(mKillRing.begin(), s::move(text));
-  if (mKillRing.size() > 8) mKillRing.pop_back();
-  mViUnnamedLines = linewise;
 }
 
 // ---- Entering insert mode ----------------------------------------------------
@@ -118,7 +136,7 @@ bool Editor::w_vi_open_line_below() {
 
 bool Editor::w_vi_open_line_above() {
   mBuf.cursor = line_start(mBuf.cursor);
-  mBuf.text.insert(mBuf.cursor, "\n");
+  mBuf.insert_at(mBuf.cursor, "\n");
   vi_enter_insert();
   return true;
 }
@@ -257,13 +275,21 @@ bool Editor::w_vi_beginning_of_line() {
   return true;
 }
 
+// zsh's viendofline: the end of the count-th line from here; with fewer
+// lines than that the cursor stays and the widget fails.
 bool Editor::w_vi_end_of_line() {
-  for (int n = count(); n > 1; --n) {
-    s::size_t end = line_end(mBuf.cursor);
-    if (end >= mBuf.text.size()) break;
-    mBuf.cursor = end + 1;
+  s::size_t oldcs = mBuf.cursor;
+  int n = count();
+  if (n < 1) return false;
+  s::size_t cs = mBuf.cursor;
+  while (n-- > 0) {
+    if (cs > mBuf.text.size()) {
+      mBuf.cursor = oldcs;
+      return false;
+    }
+    cs = line_end(cs) + 1;
   }
-  s::size_t end = line_end(mBuf.cursor);
+  s::size_t end = cs - 1;
   mBuf.cursor = end;
   if (not mViOperating and in_vicmd() and end > line_start(end)) mBuf.cursor = prev_char(mBuf.text, end);
   return true;
@@ -277,8 +303,7 @@ bool Editor::w_vi_first_non_blank() {
 }
 
 bool Editor::w_vi_digit_or_beginning_of_line() {
-  bool counting = mLastWidget == "digit-argument" or mLastWidget == "vi-digit-or-beginning-of-line";
-  if (mArg and counting) return w_digit_argument();
+  if (mTMultSet) return w_digit_argument();
   return w_vi_beginning_of_line();
 }
 
@@ -380,8 +405,14 @@ bool Editor::vi_operator(ViOp op) {
   // Visual mode: the region, at once.
   if (mRegionActive and mLocalKeymap and mMark) {
     s::size_t from = s::min(*mMark, mBuf.cursor), to = s::max(*mMark, mBuf.cursor);
-    if (to < mBuf.text.size()) to = next_char(mBuf.text, to);
-    bool lines = mRegionLines;
+    // Indenting works on whole lines in visual mode too.
+    bool lines = mRegionLines or op == ViOp::Indent or op == ViOp::Unindent;
+    if (lines) {   // visual-line mode: the whole lines
+      from = line_start(from);
+      to   = line_end(to);
+    } else if (to < mBuf.text.size()) {
+      to = next_char(mBuf.text, to);
+    }
     mRegionActive = false;
     mRegionLines  = false;
     mLocalKeymap.reset();
@@ -413,6 +444,9 @@ bool Editor::vi_operator(ViOp op) {
   mLocalKeymap = saved_local;
   mKeymap = saved_keymap;
   if (not b or b->is_macro or w.empty() or w == "vi-cmd-mode" or w == "beep") return false;
+  // zsh's getvirange: no range at all in an empty buffer (dd stores
+  // nothing, cc stays in vicmd).
+  if (mBuf.text.empty()) return false;
   int n = n1 * (n2 ? *n2 : 1);
 
   s::size_t start = mBuf.cursor;
@@ -492,6 +526,11 @@ bool Editor::vi_operator(ViOp op) {
       to   = line_end(to);
     }
   }
+  // zsh's viindent / viunindent: a motion within a line does nothing.
+  if ((op == ViOp::Indent or op == ViOp::Unindent) and not lines) {
+    mBuf.cursor = start;
+    return false;
+  }
   vi_apply(op, from, to, lines);
   return true;
 }
@@ -501,17 +540,17 @@ void Editor::vi_apply(ViOp op, s::size_t from, s::size_t to, bool linewise) {
   str& t = mBuf.text;
   switch (op) {
     case ViOp::Yank:
-      vi_store_register(t.substr(from, to - from), linewise);
+      cut_text(strv(t).substr(from, to - from), CUT_YANK, linewise);
       mBuf.cursor = from;
       break;
     case ViOp::Delete: {
-      vi_store_register(t.substr(from, to - from), linewise);
+      cut_text(strv(t).substr(from, to - from), 0, linewise);
       s::size_t a = from, b = to;
       if (linewise) {   // the line break goes too
         if (b < t.size()) ++b;
         else if (a > 0) --a;
       }
-      t.erase(a, b - a);
+      mBuf.erase(a, b - a);
       mBuf.cursor = s::min(a, t.size());
       if (linewise) {
         if (mBuf.cursor > 0 and mBuf.cursor >= t.size()) mBuf.cursor = line_start(mBuf.cursor);
@@ -520,8 +559,8 @@ void Editor::vi_apply(ViOp op, s::size_t from, s::size_t to, bool linewise) {
       break;
     }
     case ViOp::Change:
-      vi_store_register(t.substr(from, to - from), linewise);
-      t.erase(from, to - from);
+      cut_text(strv(t).substr(from, to - from), 0, linewise);
+      mBuf.erase(from, to - from);
       mBuf.cursor = from;
       vi_enter_insert();
       break;
@@ -546,11 +585,11 @@ void Editor::vi_apply(ViOp op, s::size_t from, s::size_t to, bool linewise) {
       for (;;) {
         if (op == ViOp::Indent) {
           if (p < t.size() and t[p] != '\n') {
-            t.insert(p, "\t");
+            mBuf.insert_at(p, "\t");
             to += 1;
           }
         } else if (p < t.size() and t[p] == '\t') {
-          t.erase(p, 1);
+          mBuf.erase(p, 1);
           to -= 1;
         }
         s::size_t e = line_end(p);
@@ -583,17 +622,27 @@ bool Editor::w_vi_delete_char() {
   return true;
 }
 
+// zsh's vibackwarddeletechar: not past the line's start, nor in insert
+// mode past where the insert began.
 bool Editor::w_vi_backward_delete_char() {
-  s::size_t start = in_vicmd() ? line_start(mBuf.cursor) : 0;
-  if (mBuf.cursor <= start) return false;
-  s::size_t from = mBuf.cursor;
-  for (int n = count(); n > 0 and from > start; --n) from = prev_char(mBuf.text, from);
-  if (in_vicmd()) {
-    vi_apply(ViOp::Delete, from, mBuf.cursor, false);
-  } else {
-    mBuf.text.erase(from, mBuf.cursor - from);
-    mBuf.cursor = from;
+  int n = count();
+  if (n < 0) {
+    opt<int> saved = mArg;
+    mArg = -n;
+    bool ok = w_vi_delete_char();
+    mArg = saved;
+    return ok;
   }
+  s::size_t bol = line_start(mBuf.cursor);
+  if (not in_vicmd()) {
+    if (mViInsBegin > mBuf.cursor) return false;
+    s::size_t avail = char_count(strv(mBuf.text).substr(mViInsBegin, mBuf.cursor - mViInsBegin));
+    if (avail < static_cast<s::size_t>(n)) return false;
+  }
+  if (mBuf.cursor == bol) return false;
+  s::size_t from = mBuf.cursor;
+  for (int k = n; k > 0 and from > bol; --k) from = prev_char(mBuf.text, from);
+  back_kill(mBuf.cursor - from, CUT_FRONT);
   return true;
 }
 
@@ -635,80 +684,60 @@ bool Editor::w_vi_yank_whole_line() {
 }
 
 bool Editor::w_vi_put_after() {
-  str text;
-  bool lines;
-  if (mViRegister and mViRegister != '"') {
-    char r = static_cast<char>(s::tolower(mViRegister));
-    auto it = mViRegisters.find(r);
+  int n = count();
+  if (n < 0) return false;
+  if (mViRegister == '_') {
     mViRegister = 0;
-    if (it == mViRegisters.end()) return false;
-    text  = it->second.first;
-    lines = it->second.second;
-  } else {
-    mViRegister = 0;
-    if (mKillRing.empty()) return false;
-    text  = mKillRing.front();
-    lines = mViUnnamedLines;
+    return true;
   }
-  str all;
-  for (int n = count(); n > 0; --n) all += (lines and not all.empty() ? "\n" : "") + text;
-  if (lines) {
-    s::size_t end = line_end(mBuf.cursor);
-    mBuf.text.insert(end, "\n" + all);
-    mBuf.cursor = end + 1;
-    w_vi_first_non_blank();
-  } else {
-    if (mBuf.cursor < line_end(mBuf.cursor)) mBuf.cursor = next_char(mBuf.text, mBuf.cursor);
-    mBuf.text.insert(mBuf.cursor, all);
-    mBuf.cursor += all.size();
-    if (mBuf.cursor > 0) mBuf.cursor = prev_char(mBuf.text, mBuf.cursor);
+  const CutBuffer* b = put_buffer(&mYankFrom);
+  if (not b) {
+    mYankFrom = -2;
+    return false;
   }
+  CutBuffer buf = *b;
+  mKct = -1;
+  mYankCs = mBuf.cursor;
+  paste_buffer(buf, n, 1);
   return true;
 }
 
 bool Editor::w_vi_put_before() {
-  str text;
-  bool lines;
-  if (mViRegister and mViRegister != '"') {
-    char r = static_cast<char>(s::tolower(mViRegister));
-    auto it = mViRegisters.find(r);
+  int n = count();
+  if (n < 0) return false;
+  if (mViRegister == '_') {
     mViRegister = 0;
-    if (it == mViRegisters.end()) return false;
-    text  = it->second.first;
-    lines = it->second.second;
-  } else {
-    mViRegister = 0;
-    if (mKillRing.empty()) return false;
-    text  = mKillRing.front();
-    lines = mViUnnamedLines;
+    return true;
   }
-  str all;
-  for (int n = count(); n > 0; --n) all += (lines and not all.empty() ? "\n" : "") + text;
-  if (lines) {
-    s::size_t start = line_start(mBuf.cursor);
-    mBuf.text.insert(start, all + "\n");
-    mBuf.cursor = start;
-    w_vi_first_non_blank();
-  } else {
-    mBuf.text.insert(mBuf.cursor, all);
-    mBuf.cursor += all.size();
-    if (mBuf.cursor > 0) mBuf.cursor = prev_char(mBuf.text, mBuf.cursor);
+  const CutBuffer* b = put_buffer(&mYankFrom);
+  if (not b) {
+    mYankFrom = -2;
+    return false;
   }
+  CutBuffer buf = *b;
+  mKct = -1;
+  mYankCs = mBuf.cursor;
+  paste_buffer(buf, n, 0);
   return true;
 }
 
+// zsh's putreplaceselection: the region goes (as kill-region would cut
+// it) and the buffer comes in its place.
 bool Editor::w_put_replace_selection() {
-  if (not (mRegionActive and mMark) or mKillRing.empty()) return false;
-  str text = mKillRing.front();
-  s::size_t from = s::min(*mMark, mBuf.cursor), to = s::max(*mMark, mBuf.cursor);
-  if (to < mBuf.text.size()) to = next_char(mBuf.text, to);
-  str old = mBuf.text.substr(from, to - from);
-  mBuf.text.replace(from, to - from, text);
-  mBuf.cursor = from + text.size();
-  if (mBuf.cursor > from) mBuf.cursor = prev_char(mBuf.text, mBuf.cursor);
-  mRegionActive = false;
+  int n = count();
+  if (n < 0 or mViRegister == '_' or not (mRegionActive and mMark)) {
+    mViRegister = 0;
+    return false;
+  }
+  const CutBuffer* b = put_buffer();
+  if (not b) return false;
+  CutBuffer prev = *b;
+  int pos = 2;
+  if (mRegionLines and prev.lines)
+    pos = line_end(s::max(*mMark, mBuf.cursor)) == mBuf.text.size() ? 1 : 0;
   mLocalKeymap.reset();
-  vi_store_register(old, false);
+  w_kill_region();
+  paste_buffer(prev, n, pos);
   return true;
 }
 
@@ -724,7 +753,7 @@ bool Editor::w_vi_replace_chars() {
   }
   str rep;
   for (int k = 0; k < n; ++k) rep += ch;
-  mBuf.text.replace(mBuf.cursor, to - mBuf.cursor, rep);
+  mBuf.replace(mBuf.cursor, to - mBuf.cursor, rep);
   mBuf.cursor += rep.size();
   mBuf.cursor = prev_char(mBuf.text, mBuf.cursor);
   return true;
@@ -747,7 +776,7 @@ bool Editor::w_vi_set_buffer() {
   char r = ch[0];
   if (not (s::isalnum(static_cast<unsigned char>(r)) or r == '"' or r == '_')) return false;
   mViRegister = r;
-  mArgSet = mArg.has_value();   // a count before the register carries on
+  mArgSet = true;   // a prefix: a count before the register carries on
   return true;
 }
 
@@ -774,18 +803,39 @@ bool Editor::w_vi_goto_mark_line() {
 
 // ---- Insert-mode extras --------------------------------------------------------
 
+// zsh's vikillline: back to where the insert began, without the kill ring.
 bool Editor::w_vi_kill_line() {
-  s::size_t start = line_start(mBuf.cursor);
-  if (start == mBuf.cursor) return false;
-  kill_text(start, mBuf.cursor, true);
+  if (mViInsBegin > mBuf.cursor) return false;
+  mBuf.erase(mViInsBegin, mBuf.cursor - mViInsBegin);
+  mBuf.cursor = mViInsBegin;
   return true;
 }
 
+// zsh's vibackwardkillword: words back, but not past where the insert
+// began or the line's start.
 bool Editor::w_vi_backward_kill_word() {
-  s::size_t start = mBuf.cursor;
-  for (int n = count(); n > 0; --n) start = vi_word_backward(start, false);
-  if (start == mBuf.cursor) return false;
-  kill_text(start, mBuf.cursor, true);
+  strv t = mBuf.text;
+  s::size_t x = mBuf.cursor, lim = s::max(mViInsBegin, line_start(mBuf.cursor));
+  int n = count();
+  if (n < 0) return false;
+  while (n-- > 0) {
+    while (x > lim) {
+      s::size_t pos = prev_char(t, x);
+      if (not blank(char_at(t, pos))) break;
+      x = pos;
+    }
+    if (x > lim) {
+      s::size_t pos = prev_char(t, x);
+      int cc = vi_class(char_at(t, pos), false);
+      for (;;) {
+        x = pos;
+        if (x <= lim) break;
+        pos = prev_char(t, x);
+        if (vi_class(char_at(t, pos), false) != cc) break;
+      }
+    }
+  }
+  back_kill(mBuf.cursor - x, CUT_FRONT);
   return true;
 }
 
@@ -793,13 +843,19 @@ bool Editor::w_vi_quoted_insert() { return w_quoted_insert(); }
 
 // ---- History -----------------------------------------------------------------
 
+// zsh's viuplineorhistory: the line move, then the first non-blank
+// (whether the move worked or not).
 bool Editor::w_vi_up_line_or_history() {
-  if (not w_up_line_or_history()) return false;
+  int col = mLastCol;
+  (void)w_up_line_or_history();
+  mLastCol = col;
   return w_vi_first_non_blank();
 }
 
 bool Editor::w_vi_down_line_or_history() {
-  if (not w_down_line_or_history()) return false;
+  int col = mLastCol;
+  (void)w_down_line_or_history();
+  mLastCol = col;
   return w_vi_first_non_blank();
 }
 
@@ -831,8 +887,7 @@ bool Editor::vi_history_search(int dir, bool ask) {
   for (int i = mHistIndex + dir; i >= 0 and i < size; i += dir) {
     if (e[static_cast<s::size_t>(i)].text.find(mViSearch) != str::npos
         and e[static_cast<s::size_t>(i)].text != mBuf.text) {
-      set_history_line(i);
-      mBuf.cursor = 0;
+      set_history_line(i);   // the cursor at the end, as zle_setline leaves it
       return true;
     }
   }
@@ -848,8 +903,40 @@ bool Editor::w_vi_rev_repeat_search() { return vi_history_search(-mViSearchDir, 
 
 bool Editor::w_vi_repeat_change() {
   if (mViLastChange.empty() or mViReplaying) return false;
+  // zsh's virepeatchange keeps a change's count and register apart from
+  // its keys (lastvichg.mod): split them off the recorded keys.  A count
+  // given to `.` replaces the change's, a register too (both stay with
+  // it); else a change from "1 to "8 goes on to the next register, so
+  // "1p.. puts the deletions one after the other.
+  str count, rest;
+  char reg = 0;
+  s::size_t p = 0;
+  for (; p < mViLastChange.size(); ++p) {
+    char c = mViLastChange[p];
+    if ((c >= '1' and c <= '9') or (c == '0' and not count.empty())) {
+      count += c;
+    } else if (c == '"' and p + 1 < mViLastChange.size()) {
+      reg = mViLastChange[++p];
+    } else {
+      break;
+    }
+  }
+  rest = mViLastChange.substr(p);
+  if (mArg) count = s::to_string(*mArg);
+  if (mViRegister)                    reg = mViRegister;
+  else if (reg >= '1' and reg <= '8') ++reg;
+  mViLastChange = (reg ? str{'"', reg} : str{}) + count + rest;
+  // A put reads its count before the change's comes back (viputafter
+  // takes zmult first, and `.` has ended its own): it puts once.
+  str keys = mViLastChange;
+  if (not rest.empty() and (rest[0] == 'p' or rest[0] == 'P'))
+    keys = (reg ? str{'"', reg} : str{}) + rest;
+  mArg.reset();
+  mTMult      = 1;
+  mTMultSet   = false;
+  mViRegister = 0;
   str saved = s::move(mPending);
-  mPending = mViLastChange;
+  mPending = s::move(keys);
   mViReplaying = true;
   bool saved_record = mViRecord;
   mViRecord = false;
@@ -859,8 +946,10 @@ bool Editor::w_vi_repeat_change() {
     if (seq.empty()) break;
     mKeys = seq;
     if (b and b->is_macro) push_input(b->macro);
-    else if (b) run_widget(b->widget);
-    else if (mKeymap->insert_unbound) run_widget("self-insert");
+    else if (b) {
+      mWidget = b->widget;
+      run_widget(b->widget);
+    }
   }
   mViReplaying = false;
   mViRecord = saved_record;

@@ -99,6 +99,14 @@ struct ShellHooks {
   }
 };
 
+// fc -p's saved parameters (zsh's struct histsave).
+struct HistStackParams {
+  opt<str> histfile, histsize, savehist;
+  bool     had_file = false;   // a file was given: $HISTFILE goes back too
+  // The line running's number in the history below (not in the pushed one).
+  s::uint32_t hist_line = 0;
+};
+
 struct ExecContext {
   // Clears trap_failed and trap_status (below); wherever `aborting` is
   // cleared.
@@ -194,7 +202,7 @@ struct ExecContext {
   // `disable name`, `disable -f name`: skipped when commands are looked up.
   uset<str>          disabled_builtins{};
   uset<str>          disabled_functions{};
-  AliasTable         aliases{};
+  AliasTable         aliases = default_aliases();
   vec<str>           dirstack{};   // pushd/popd, without $PWD ($dirstack)
   int                source_depth = 0;   // `.`/`source` files being read
   str                source_name{};      // the file being read, if any
@@ -211,6 +219,9 @@ struct ExecContext {
   Executor*       executor = nullptr;
   // The interactive shell's history, for fc/history/r; null without one.
   HistoryManager* history  = nullptr;
+  // What fc -p saved of $HISTFILE, $HISTSIZE and $SAVEHIST, one per
+  // pushed history.
+  vec<HistStackParams> hist_stack_params{};
   // The line editor's keymaps, widgets and completion (bindkey, zle,
   // vared, compdef); the Executor makes one when none is given.
   Zle*            zle      = nullptr;
@@ -233,9 +244,9 @@ struct ExecContext {
   s::size_t   optcind = 0;
   str         optarg{};
   s::uint32_t lineno = 0;      // $LINENO: line of the command being run
-  // The interactive loop added the line being run to the history before
-  // running it, so `fc` and `r` leave that entry out.
-  bool        hist_current = false;
+  // The number the interactive loop gave the line being run when it put
+  // it in the history before running it (zsh's curline), 0 for none.
+  s::uint32_t hist_line = 0;
   LoopState   loop{};
 };
 
@@ -409,6 +420,8 @@ struct Executor {
   // FileNotFound (exit 127) or PermissionDenied (exit 126).
   Result<str> find_command(strv name);
 
+  // $TMOUT in seconds, 0 when unset or not positive.
+  long tmout_seconds() const;
   // Acts on signals that arrived since the last call: reaps children into
   // the job table, runs traps, turns an untrapped Ctrl-C into `aborting`
   // and SIGHUP into an exit, and follows SIGWINCH into $COLUMNS/$LINES.

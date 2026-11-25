@@ -244,7 +244,8 @@ struct SignalManager {
   // SIGHUP (it exits through its own path) and, in an interactive shell,
   // SIGINT.
   bool shell_handles(int sig) const noexcept {
-    return sig == SIGHUP or (sig == SIGINT and (mJobControl or mInteractive));
+    return sig == SIGHUP or (sig == SIGINT and (mJobControl or mInteractive))
+        or (sig == SIGALRM and mInteractive);   // $TMOUT
   }
 
   // The handler: marks `sig` pending and wakes the self-pipe.

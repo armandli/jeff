@@ -368,10 +368,17 @@ int builtin_alias(vec<str>& args, ExecContext& ctx) {
   strv cmd = args[0];
   OptParse o;
   if (not parse_options(args, "gLmrs", "", o, true)) return 1;
-  bool global = o.has('g'), suffix = o.has('s'), regular_only = o.has('r');
+  // +g, +r, +s, +m and a lone + list the names only (zsh's PRINT_NAMEONLY).
+  bool names_only = o.has_plus('g') or o.has_plus('r') or o.has_plus('s') or o.has_plus('m');
+  if (o.next < args.size() and args[o.next] == "+") {
+    names_only = true;
+    ++o.next;
+  }
+  bool global = o.has('g') or o.has_plus('g'), suffix = o.has('s') or o.has_plus('s');
+  bool regular_only = o.has('r') or o.has_plus('r');
   if (static_cast<int>(global) + static_cast<int>(suffix) + static_cast<int>(regular_only) > 1)
     return builtin_error(cmd, "illegal combination of options");
-  bool as_command = o.has('L');
+  bool as_command = o.has('L') or o.has_plus('L');
   auto& regular = ctx.aliases.regular;
   auto& suffixes = ctx.aliases.suffix;
   auto list = [&](const func<bool(const str&)>& want) {
@@ -380,7 +387,10 @@ int builtin_alias(vec<str>& args, ExecContext& ctx) {
       for (const auto& [n, _] : suffixes)
         if (want(n)) names.push_back(n);
       s::sort(names.begin(), names.end());
-      for (const auto& n : names) print_alias(n, suffixes[n], 's', as_command);
+      for (const auto& n : names) {
+        if (names_only) s::printf("%s\n", n.c_str());
+        else            print_alias(n, suffixes[n], 's', as_command);
+      }
       return;
     }
     vec<str> names;
@@ -390,14 +400,16 @@ int builtin_alias(vec<str>& args, ExecContext& ctx) {
       if (want(n)) names.push_back(n);
     }
     s::sort(names.begin(), names.end());
-    for (const auto& n : names)
-      print_alias(n, regular[n].text, regular[n].global ? 'g' : 0, as_command);
+    for (const auto& n : names) {
+      if (names_only) s::printf("%s\n", n.c_str());
+      else            print_alias(n, regular[n].text, regular[n].global ? 'g' : 0, as_command);
+    }
   };
   if (o.next >= args.size()) {
     list([](const str&) { return true; });
     return 0;
   }
-  if (o.has('m')) {
+  if (o.has('m') or o.has_plus('m')) {
     for (s::size_t i = o.next; i < args.size(); ++i) {
       auto pat = CompiledPattern::compile(args[i]);
       list([&](const str& n) { return pat.matches(n); });

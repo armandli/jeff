@@ -1,8 +1,10 @@
 #include <jfsh/editor/completion.h>
 
 #include <cstring>
+#include <cwctype>
 #include <dirent.h>
 #include <pwd.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -1120,7 +1122,7 @@ bool Editor::w_auto_suffix_remove() {
     return true;
   }
   if (not removes_suffix(sfx->chars, {})) return true;
-  mBuf.text.erase(sfx->end - sfx->len, sfx->len);
+  mBuf.erase(sfx->end - sfx->len, sfx->len);
   mBuf.cursor = sfx->end - sfx->len;
   return true;
 }
@@ -1144,7 +1146,7 @@ void Editor::insert_match(const CompletionResult& r, s::size_t index, bool final
     text += m.suffix;
     if (r.quote and end < mBuf.text.size() and mBuf.text[end] == r.quote and m.suffix != "/") ++end;
   }
-  mBuf.text.replace(r.start, end - r.start, text);
+  mBuf.replace(r.start, end - r.start, text);
   mBuf.cursor = r.start + text.size();
   mAutoSuffix = auto_suffix(m, final);
   if (mAutoSuffix and mAutoSuffix->len <= mBuf.cursor) mAutoSuffix->end = mBuf.cursor;
@@ -1198,7 +1200,7 @@ void Editor::remove_suffix(strv widget) {
   str key = inserts ? mKeys : str{};
   if (key.size() > 1 and key[0] == '\x1b') key.erase(0, 1);
   if (not removes_suffix(sfx->chars, key)) return;
-  mBuf.text.erase(sfx->end - sfx->len, sfx->len);
+  mBuf.erase(sfx->end - sfx->len, sfx->len);
   mBuf.cursor = sfx->end - sfx->len;
 }
 
@@ -1392,12 +1394,45 @@ void Editor::list_matches(const CompletionResult& r, strv mode) {
   bool ask = (listmax > 0 and n > listmax) or (listmax == 0 and nrows + 1 >= height)
           or (listmax < 0 and nrows > -listmax);
   if (ask) {
+    // zsh's getzlequery, the cursor after the question: keys typed ahead
+    // are a no (`n` is shown, they stay to be read); else Tab is a yes,
+    // a control character a no, and the answer is shown; only y lists.
     mMessage = "jfsh: do you wish to see all " + s::to_string(n) + " possibilities ("
              + s::to_string(nrows) + " lines)? ";
     refresh();
-    int c = read_byte(-1);
+    int down = mEndRow + 1 - mCursorRow;
+    int col  = s::min(static_cast<int>(char_count(mMessage)), terminal_width() - 1);
+    write_out("\x1b[" + s::to_string(down) + "B\r\x1b[" + s::to_string(col) + "C");
+    int waiting = 0;
+    bool yes = false;
+    if (mPending.empty() and ::ioctl(mIn, FIONREAD, &waiting) == 0 and waiting > 0) {
+      write_out("n");
+    } else {
+      str k;
+      int c = read_byte(-1);
+      if (c >= 0) {
+        k += static_cast<char>(c);
+        (void)read_rest_char(k);
+      }
+      s::size_t len = 0;
+      char32_t wc = k.empty() ? 0 : utf8_decode(k, 0, len);
+      if (wc == '\t')
+        wc = 'y';
+      else if (k.empty() or s::iswcntrl(static_cast<wint_t>(wc)))
+        wc = 'n';
+      else
+        wc = static_cast<char32_t>(s::towlower(static_cast<wint_t>(wc)));
+      if (wc != '\n') {
+        str echo;
+        utf8_append(echo, wc);
+        write_out(echo);
+      }
+      yes = wc == 'y';
+    }
+    // Back to the line, where refresh expects the cursor.
+    write_out("\x1b[" + s::to_string(down) + "A");
     mMessage.clear();
-    if (c != 'y' and c != 'Y' and c != ' ' and c != '\t') {
+    if (not yes) {
       refresh();
       return;
     }
@@ -1456,7 +1491,7 @@ bool Editor::do_complete(bool list_only, bool menu, bool reverse, const str& fn)
     s::size_t n = mMenu.size();
     mMenuIndex = reverse ? (mMenuIndex + n - 1) % n : (mMenuIndex + 1) % n;
     const str& text = mMenu[mMenuIndex].first;
-    mBuf.text.replace(mMenuStart, mMenuEnd - mMenuStart, text);
+    mBuf.replace(mMenuStart, mMenuEnd - mMenuStart, text);
     mMenuEnd = mMenuStart + text.size();
     mBuf.cursor = mMenuEnd;
     mAutoSuffix.reset();
@@ -1562,7 +1597,7 @@ bool Editor::apply_completion(CompletionResult& r, bool reverse) {
       if (r.matches[i].all) continue;
       text += menu_text(r, r.matches[i]) + " ";
     }
-    mBuf.text.replace(r.start, r.end - r.start, text);
+    mBuf.replace(r.start, r.end - r.start, text);
     mBuf.cursor = r.start + text.size();
     inserted = true;
   } else if (numeric) {
@@ -1598,7 +1633,7 @@ bool Editor::apply_completion(CompletionResult& r, bool reverse) {
     mMenuActive = true;
     started_menu = true;
   } else if (r.unambiguous != before and not r.keep_word) {
-    mBuf.text.replace(r.start, r.end - r.start, r.unambiguous);
+    mBuf.replace(r.start, r.end - r.start, r.unambiguous);
     mBuf.cursor = r.start + s::min(r.unambiguous_cursor, r.unambiguous.size());
     inserted = true;
   } else if (r.function and r.unambiguous == before and not r.keep_word) {
@@ -1635,9 +1670,22 @@ bool Editor::complete_widget(strv builtin, const str& fn) {
   return ok;
 }
 
-bool Editor::w_expand_or_complete()     { return do_complete(false, false); }
-bool Editor::w_complete_word()          { return do_complete(false, false); }
-bool Editor::w_menu_complete()          { return do_complete(false, true); }
+// zsh's usetab: Tab alone, with nothing but blanks before the cursor on
+// its line, inserts itself instead of completing (not in a zle -C
+// widget, where compfunc decides).
+bool Editor::use_tab() const {
+  if (mKeys != "\t" or mZle.comp_widgets.contains(mWidget)) return false;
+  s::size_t b = line_start(mBuf.cursor);
+  return strv(mBuf.text).substr(b, mBuf.cursor - b).find_first_not_of(" \t") == strv::npos;
+}
+
+bool Editor::w_expand_or_complete() {
+  return use_tab() ? w_self_insert() : do_complete(false, false);
+}
+
+bool Editor::w_complete_word() { return use_tab() ? w_self_insert() : do_complete(false, false); }
+
+bool Editor::w_menu_complete() { return use_tab() ? w_self_insert() : do_complete(false, true); }
 bool Editor::w_reverse_menu_complete()  { return do_complete(false, true, true); }
 bool Editor::w_list_choices()           { return do_complete(true, false); }
 
