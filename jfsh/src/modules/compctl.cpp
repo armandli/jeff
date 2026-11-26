@@ -223,7 +223,6 @@ void register_compctl_module(ModuleManager& mm) {
       auto specs = state().specs;
       for (const auto& [cmd, _] : specs) remove(*ctxp, cmd);
     };
-    out.feature_names = {"b:compctl"};
   });
 }
 

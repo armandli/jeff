@@ -93,6 +93,7 @@ add_library(jfsh_builtins STATIC
   # jfsh_modules, to keep the static-lib graph acyclic: these need
   # BuiltinDef (from jfsh_builtins) and ModuleManager (from jfsh_modules),
   # so putting them here and depending on jfsh_modules PUBLIC-ly works.
+  src/modules/module.cpp
   src/modules/datetime.cpp
   src/modules/mathfunc.cpp
   src/modules/parameter.cpp
@@ -167,6 +168,7 @@ add_library(jfsh_exec STATIC
   src/builtins/setopt.cpp
   src/builtins/vars.cpp
   src/builtins/zle.cpp
+  src/modules/shipped.cpp
 )
 target_include_directories(jfsh_exec PUBLIC include)
 # Where the system-wide startup files (jfshenv, jfshrc, …) are read from.
@@ -239,19 +241,16 @@ target_link_libraries(jfsh_editor PUBLIC
   jfsh_dep_curses jfsh_compiler_options)
 
 # ---------------------------------------------------------------------------
-# jfsh_modules — loadable and compiled-in module framework (M10).
-#                Mirrors zsh Src/{module,modentry}.c.  The shipped modules
-#                (zsh/datetime, zsh/mathfunc) live in jfsh_builtins below
-#                because they define BuiltinDefs and so need the builtin
-#                layer; keeping them there avoids a static-lib cycle.
-#                Phase 2 adds: zsh/parameter, zsh/zutil, zsh/system,
-#                zsh/files, zsh/stat, zsh/pcre (see TODO.md M10 "Left").
+# jfsh_modules — the module interface (M10).  The framework, a port of zsh
+#                Src/module.c (src/modules/module.cpp), and the shipped
+#                modules live in jfsh_builtins, since they define BuiltinDefs
+#                and use the builtins' helpers; src/modules/shipped.cpp,
+#                which registers them with the core builtins zsh keeps in
+#                modules (bindkey, sched, …), lives in jfsh_exec.
 # ---------------------------------------------------------------------------
-add_library(jfsh_modules STATIC
-  src/modules/module.cpp
-)
-target_include_directories(jfsh_modules PUBLIC include)
-target_link_libraries(jfsh_modules PUBLIC jfsh_core ${CMAKE_DL_LIBS} jfsh_compiler_options)
+add_library(jfsh_modules INTERFACE)
+target_include_directories(jfsh_modules INTERFACE include)
+target_link_libraries(jfsh_modules INTERFACE jfsh_core ${CMAKE_DL_LIBS})
 
 # ---------------------------------------------------------------------------
 # jfsh_router — System 1 RUN/AGENT classifier.

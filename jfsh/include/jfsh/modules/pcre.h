@@ -1,17 +1,16 @@
 #ifndef JFSH_MODULES_PCRE_H
 #define JFSH_MODULES_PCRE_H
-// jfsh/modules/pcre.h — the `zsh/pcre` module (M10 Phase 2c).
+// jfsh/modules/pcre.h — the `zsh/pcre` module (a port of zsh's
+// Src/Modules/pcre.c to PCRE2).
 //
-// Contributes zsh's PCRE2 bindings:
+//   pcre_compile [-aimxs] pattern
+//   pcre_study
+//   pcre_match   [-b] [-v var] [-a arr] [-n offset] string
 //
-//   pcre_compile [-aimsx] pattern
-//   pcre_study                           — no-op on PCRE2 (jit is cheap)
-//   pcre_match   [-v var] [-a arr] [-n offset] string
-//   $PCRE_MATCH   — whole-match text after a successful pcre_match
-//   $pcre_match   — array of captured groups (1-based)
-//
-// Also arms `[[ string -pcre-match pattern ]]` as a module condition,
-// which `[[ s =~ re ]]` uses under REMATCH_PCRE (loading the module).
+// The match goes to $MATCH and $match (or -v and -a), with -b its byte
+// offsets to $ZPCRE_OP.  Also `[[ string -pcre-match re ]]`, which `=~`
+// uses under RE_MATCH_PCRE (the module comes in for it).  Without PCRE2 at
+// build time the builtins say "not available on this system".
 
 #include <jfsh/modules/module.h>
 

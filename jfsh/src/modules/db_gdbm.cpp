@@ -201,7 +201,6 @@ void register_db_gdbm_module(ModuleManager& mm) {
     out.builtins.push_back(BuiltinDef{"ztie",      builtin_ztie,      BINF_NONE, 0});
     out.builtins.push_back(BuiltinDef{"zuntie",    builtin_zuntie,    BINF_NONE, 0});
     out.builtins.push_back(BuiltinDef{"zgdbmpath", builtin_zgdbmpath, BINF_NONE, 0});
-    out.feature_names = {"b:ztie", "b:zuntie", "b:zgdbmpath"};
 #if defined(JFSH_HAVE_GDBM) || defined(JFSH_HAVE_NDBM)
     ExecContext* ctxp = &ctx;
     out.on_unload = [ctxp] {

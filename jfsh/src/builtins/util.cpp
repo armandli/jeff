@@ -32,6 +32,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cwctype>
 
 #include <algorithm>
@@ -197,6 +198,78 @@ bool parse_options(const vec<str>& args, strv letters, strv with_arg,
   return true;
 }
 
+int zsh_options(const vec<str>& args, const char* optstr, int minargs, int maxargs,
+                ZOps& ops, s::uint32_t flags) {
+  const str& name = args[0];
+  s::size_t i = 1;
+  if (optstr) {
+    while (i < args.size()) {
+      const str& word = args[i];
+      bool sense = not word.empty() and word[0] == '-';
+      if (not sense and not ((flags & ZOPS_PLUSOPTS) and not word.empty() and word[0] == '+'))
+        break;
+      // Digits aren't options unless the command says they are.
+      if (not (flags & ZOPS_KEEPNUM) and word.size() > 1
+          and s::isdigit(static_cast<unsigned char>(word[1])))
+        break;
+      if ((flags & ZOPS_SKIPDASH) and word.size() == 1) break;
+      if ((flags & ZOPS_DASHDASH) and word == "--") {
+        ++i;
+        break;
+      }
+      // `--` or `-` ends the options (ops.ind['-']), `+` too with ind['+'].
+      s::size_t k = word.size() > 1 and word[1] == '-' ? 1 : 0;
+      if (k + 1 >= word.size()) {
+        ops.ind['-'] = 1;
+        if (not sense) ops.ind['+'] = 1;
+      }
+      while (++k < word.size()) {
+        char c = word[k];
+        const char* at = c ? s::strchr(optstr, c) : nullptr;
+        if (not at) break;
+        ops.ind[static_cast<unsigned char>(c) & 127u] = sense ? 1 : 2;
+        if (at[1] != ':') continue;
+        opt<str> optarg;
+        if (at[2] == ':') {
+          // An optional argument in the same word.
+          if (k + 1 < word.size()) optarg = word.substr(k + 1);
+        } else if (k + 1 < word.size()) {
+          optarg = word.substr(k + 1);
+        } else if (i + 1 < args.size()) {
+          optarg = args[++i];
+        } else {
+          s::fprintf(stderr, "jfsh: %s: argument expected: -%c\n", name.c_str(), c);
+          return -1;
+        }
+        if (optarg) {
+          ops.args.push_back(s::move(*optarg));
+          ops.ind[static_cast<unsigned char>(c) & 127u] |=
+              static_cast<s::uint16_t>(ops.args.size() << 2);
+          k = args[i].size();
+          break;
+        }
+      }
+      if (k < args[i].size()) {
+        s::fprintf(stderr, "jfsh: %s: bad option: %c%c\n", name.c_str(), sense ? '-' : '+',
+                   args[i][k]);
+        return -1;
+      }
+      ++i;
+      if (ops.ind['-']) break;
+    }
+  } else if (i < args.size() and args[i] == "--") {
+    ops.ind['-'] = 1;
+    ++i;
+  }
+  auto argc = static_cast<int>(args.size() - i);
+  if (argc < minargs or (maxargs != -1 and argc > maxargs)) {
+    s::fprintf(stderr, "jfsh: %s: %s\n", name.c_str(),
+               argc < minargs ? "not enough arguments" : "too many arguments");
+    return -1;
+  }
+  return static_cast<int>(i);
+}
+
 str param_value_text(const Param& p) {
   if (p.is_array()) {
     // zsh's printparamvalue: `( a b )`, and `(  )` when empty.
@@ -221,8 +294,13 @@ str param_value_text(const Param& p) {
 vec<const Param*> sorted_params(const ParamTable& params,
                                 const func<bool(const Param&)>& pred) {
   vec<const Param*> out;
-  params.for_each([&](const Param& p) {
-    if (pred(p)) out.push_back(&p);
+  // A parameter whose value listings hide (zsh/parameter's $commands …), or
+  // a module's mark, isn't made: it is listed by name.
+  params.for_each([&](const Param& p) { out.push_back(&p); }, [&](const Param& p) {
+    if (not pred(p)) return false;
+    if (not (p.flags & (PM_HIDEVAL | PM_AUTOLOAD))) return true;
+    out.push_back(&p);
+    return false;
   });
   s::sort(out.begin(), out.end(),
           [](const Param* a, const Param* b) { return a->name < b->name; });

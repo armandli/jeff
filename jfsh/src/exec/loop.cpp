@@ -110,6 +110,7 @@ bool is_pwd(const str& path) {
 constexpr s::pair<strv, strv> TIED_SPECIALS[] = {
   {"PATH", "path"}, {"FPATH", "fpath"}, {"CDPATH", "cdpath"}, {"MANPATH", "manpath"},
   {"MAILPATH", "mailpath"}, {"FIGNORE", "fignore"}, {"PSVAR", "psvar"},
+  {"MODULE_PATH", "module_path"},
 };
 
 s::int64_t int_param(ExecContext& ctx, strv name, s::int64_t def) {
@@ -208,10 +209,12 @@ void init_shell_params(ExecContext& ctx) {
   if (auto m = params.lookup("MAILCHECK"); not m or not m->get().is_set())
     params.assign("MAILCHECK", s::int64_t{60}, PM_INTEGER);
 
-  // zsh's tied specials; an environment value goes into the array.
+  // zsh's tied specials; an environment value goes into the array, except
+  // for $MODULE_PATH (zsh's PM_DONTIMPORT), which starts as jfsh's module
+  // directory.
   for (auto [scalar, array] : TIED_SPECIALS) {
     auto p = params.lookup(scalar);
-    bool set = p and p->get().is_set();
+    bool set = p and p->get().is_set() and scalar != "MODULE_PATH";
     str text = set ? p->get().scalar() : str{};
     s::uint32_t flags = set ? p->get().flags & PM_EXPORTED : 0;
     params.assign(str(array), vec<str>{}, PM_ARRAY | PM_SPECIAL);
@@ -219,6 +222,7 @@ void init_shell_params(ExecContext& ctx) {
     params.tie(sp, str(array), ':');
     if (set) sp.handlers->set_scalar(text);
   }
+  if (*JFSH_MODULE_DIR) (void)params.set_array("module_path", {JFSH_MODULE_DIR});
   if (param(ctx, "FPATH").empty()) {
     vec<str> fpath;
     if (*JFSH_SITE_FUNCTIONS_DIR) fpath.emplace_back(JFSH_SITE_FUNCTIONS_DIR);

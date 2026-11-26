@@ -27,6 +27,7 @@ void BuiltinTable::register_all() {
   add({"exec",     builtin_exec,       BINF_SPECIAL});
   add({"exit",     builtin_exit,       BINF_SPECIAL});
   add({"logout",   builtin_logout,     BINF_NONE});
+  add({"bye",      builtin_exit,       BINF_NONE});
   add({"export",   builtin_export,     BINF_SPECIAL | BINF_ASSIGN});
   add({"readonly", builtin_readonly,   BINF_SPECIAL | BINF_ASSIGN});
   add({"return",   builtin_return,     BINF_SPECIAL});
@@ -71,6 +72,7 @@ void BuiltinTable::register_all() {
 
   add({"alias",    builtin_alias,      BINF_NONE});
   add({"unalias",  builtin_unalias,    BINF_NONE});
+  add({"unhash",   builtin_unhash,     BINF_NONE});
   add({"builtin",  builtin_builtin,    BINF_NONE});
   add({"command",  builtin_command,    BINF_NONE});
   add({"source",   builtin_source,     BINF_NONE, 1});
@@ -80,28 +82,22 @@ void BuiltinTable::register_all() {
   add({"false",    builtin_false,      BINF_NONE});
   add({"[",        builtin_test,       BINF_NONE});
   add({"test",     builtin_test,       BINF_NONE});
-  add({"ulimit",   builtin_ulimit,     BINF_NONE});
   add({"umask",    builtin_umask,      BINF_NONE});
   add({"zmodload", builtin_zmodload,   BINF_NONE});
   add({"autoload", builtin_autoload,   BINF_NONE});
   add({"functions",builtin_functions,  BINF_NONE});
   add({"whence",   builtin_whence,     BINF_NONE});
+  add({"where",    builtin_where,      BINF_NONE});
+  add({"ttyctl",   builtin_ttyctl,     BINF_NONE});
   add({"which",    builtin_which,      BINF_NONE});
   add({"type",     builtin_type,       BINF_NONE});
   add({"compdef",  builtin_compdef,    BINF_NONE});
-  add({"compadd",  builtin_compadd,    BINF_NONE});
-  add({"compset",  builtin_compset,    BINF_NONE});
-  add({"compquote", builtin_compquote, BINF_NONE});
   add({"_files",   builtin__files,     BINF_NONE});
   add({"_directories", builtin__directories, BINF_NONE});
   add({"_command_names", builtin__command_names, BINF_NONE});
   add({"setopt",   builtin_setopt,     BINF_NONE});
   add({"unsetopt", builtin_unsetopt,   BINF_NONE});
-  add({"bindkey",  builtin_bindkey,    BINF_NONE});
-  add({"vared",    builtin_vared,      BINF_NONE});
-  add({"zle",      builtin_zle,        BINF_NONE});
   add({"let",      builtin_let,        BINF_NONE});
-  add({"sched",    builtin_sched,      BINF_NONE});
   add({"emulate",  builtin_emulate,    BINF_NONE});
   add({"noglob",   builtin_noglob,     BINF_NONE});
   add({"-",        builtin_dash,       BINF_NONE});
@@ -176,207 +172,6 @@ int builtin_noglob(vec<str>& args, ExecContext& ctx) { return run_words(args, ct
 int builtin_dash(vec<str>& args, ExecContext& ctx)   { return run_words(args, ctx, "-"); }
 
 
-// `zmodload` (M10): loads, unloads, lists, and aliases modules.  Flags
-// accepted:
-//   -L           list in a sourceable form (used by `zmodload` alone too)
-//   -l           list as `zmodload -L` does, long form
-//   -i           ignore "already loaded" / "not loaded" errors
-//   -u           unload the module
-//   -A alias=target  alias chain (`zmodload -A new=zsh/old`)
-//   -R alias     remove an alias
-//   -a NAME [BLTN]  autoload: the first use of BLTN loads NAME
-//   -d           show module dependencies (treated as "list", none kept)
-//   -e NAME…     exit status 0 iff every NAME is loaded
-//   -F NAME ±ft  features (accepted; no fine-grained toggles yet)
-// Unsupported combinations print `jfsh: zmodload: …` and return 1.
-int builtin_zmodload(vec<str>& args, ExecContext& ctx) {
-  bool list_short = false;    // -L
-  bool list_long  = false;    // -l
-  bool ignore     = false;    // -i
-  bool unload     = false;    // -u
-  bool alias_set  = false;    // -A
-  bool alias_del  = false;    // -R
-  bool autoload   = false;    // -a
-  bool check      = false;    // -e
-  bool features   = false;    // -F
-
-  s::size_t i = 1;
-  for (; i < args.size(); ++i) {
-    const str& a = args[i];
-    if (a.size() < 2 or a[0] != '-' or a == "--") { if (a == "--") ++i; break; }
-    for (s::size_t k = 1; k < a.size(); ++k) {
-      switch (a[k]) {
-        case 'L': list_short = true; break;
-        case 'l': list_long  = true; break;
-        case 'i': ignore     = true; break;
-        case 'u': unload     = true; break;
-        case 'A': alias_set  = true; break;
-        case 'R': alias_del  = true; break;
-        case 'a': autoload   = true; break;
-        case 'e': check      = true; break;
-        case 'F': features   = true; break;
-        case 'd': /* dependency listing: tracked but unused */ break;
-        case 'b': case 'c': case 'p': case 'f':
-          // -b/-c/-p/-f fine-grained autoload categories: parsed, treated
-          // the same as -a.
-          autoload = true; break;
-        case 'm': case 'U': case 'I':
-          // -m pattern matching, -U unloadable, -I ignore if listed:
-          // accepted, no-op.
-          break;
-        default:
-          s::fprintf(stderr, "jfsh: zmodload: bad option: -%c\n", a[k]);
-          return 1;
-      }
-    }
-  }
-
-  // Alias set: zmodload -A alias=target …
-  if (alias_set) {
-    bool any = false;
-    for (; i < args.size(); ++i) {
-      auto eq = args[i].find('=');
-      if (eq == str::npos) {
-        if (not any) {
-          // zmodload -A alone lists aliases.
-          for (const auto& [k, v] : ctx.modules.aliases())
-            s::printf("%s -> %s\n", k.c_str(), v.c_str());
-          return 0;
-        }
-        s::fprintf(stderr, "jfsh: zmodload: -A arguments must be of the form name=module\n");
-        return 1;
-      }
-      ctx.modules.add_alias(args[i].substr(0, eq), args[i].substr(eq + 1));
-      any = true;
-    }
-    if (not any) {
-      for (const auto& [k, v] : ctx.modules.aliases())
-        s::printf("%s -> %s\n", k.c_str(), v.c_str());
-    }
-    return 0;
-  }
-
-  if (alias_del) {
-    if (i >= args.size()) {
-      s::fprintf(stderr, "jfsh: zmodload: -R requires an alias name\n");
-      return 1;
-    }
-    for (; i < args.size(); ++i) ctx.modules.remove_alias(args[i]);
-    return 0;
-  }
-
-  if (check) {
-    for (; i < args.size(); ++i)
-      if (not ctx.modules.is_loaded(args[i])) return 1;
-    return 0;
-  }
-
-  if (autoload) {
-    if (i >= args.size()) {
-      s::fprintf(stderr, "jfsh: zmodload: -a requires a module name\n");
-      return 1;
-    }
-    str mod = args[i++];
-    if (i >= args.size()) {
-      ctx.modules.mark_autoload(mod);
-    } else {
-      for (; i < args.size(); ++i) ctx.modules.mark_autoload(mod, args[i]);
-    }
-    return 0;
-  }
-
-  // No module arguments → list.  zsh's `-L` is a sourceable form that
-  // includes autoloads and aliases; `-l` lists loaded modules only; no
-  // flag lists loaded modules by name.
-  if (i >= args.size()) {
-    auto entries = list_short ? ctx.modules.list_all() : ctx.modules.list();
-    for (const auto& e : entries) {
-      if (list_short or list_long) {
-        if (e.loaded)       s::printf("zmodload %s\n", e.name.c_str());
-        else if (e.auto_)   s::printf("zmodload -a %s\n", e.name.c_str());
-      } else {
-        s::printf("%s\n", e.name.c_str());
-      }
-    }
-    if (list_short) {
-      for (const auto& [a, t] : ctx.modules.aliases())
-        s::printf("zmodload -A %s=%s\n", a.c_str(), t.c_str());
-    }
-    return 0;
-  }
-
-  // Unload one or more modules.
-  if (unload) {
-    int rc = 0;
-    for (; i < args.size(); ++i) {
-      if (not ctx.modules.is_loaded(args[i])) {
-        if (not ignore) {
-          s::fprintf(stderr, "jfsh: zmodload: no such module: %s\n", args[i].c_str());
-          rc = 1;
-        }
-        continue;
-      }
-      auto r = ctx.modules.unload(args[i]);
-      if (not r) {
-        s::fprintf(stderr, "jfsh: zmodload: %s\n", r.error().message.c_str());
-        rc = 1;
-      }
-    }
-    return rc;
-  }
-
-  // Load one or more modules.  `-F NAME +feat / -feat / feat`: a leading
-  // `+feat` or bare `feat` is a no-op (the feature is on by default); a
-  // leading `-feat` records the feature as disabled, so the module's
-  // next load leaves it out.  Matches zsh's behaviour when combined with
-  // the re-register path below.
-  int rc = 0;
-  if (features) {
-    if (i >= args.size()) {
-      s::fprintf(stderr, "jfsh: zmodload: -F requires a module name\n");
-      return 1;
-    }
-    str mod = args[i++];
-    uset<str> off;
-    // Preserve any previously-disabled features so successive -F calls
-    // add to the set rather than replacing it.
-    if (auto* prev = ctx.modules.disabled_features(mod)) off = *prev;
-    for (; i < args.size(); ++i) {
-      const str& a = args[i];
-      if (a.empty()) continue;
-      if (a[0] == '-')       off.insert(a.substr(1));
-      else if (a[0] == '+')  off.erase (a.substr(1));
-      else                   off.erase (a);      // bare feature = enable
-    }
-    bool was_loaded = ctx.modules.is_loaded(mod);
-    if (was_loaded) (void)ctx.modules.unload(mod);
-    ctx.modules.set_disabled_features(mod, s::move(off));
-    if (was_loaded) {
-      auto r = ctx.modules.load(mod, &ctx);
-      if (not r) {
-        s::fprintf(stderr, "jfsh: zmodload: %s\n", r.error().message.c_str());
-        return 1;
-      }
-    }
-    return 0;
-  }
-
-  for (; i < args.size(); ++i) {
-    if (ctx.modules.is_loaded(args[i])) {
-      if (not ignore) {
-        // zsh is silent on re-load; stay silent too.
-      }
-      continue;
-    }
-    auto r = ctx.modules.load(args[i], &ctx);
-    if (not r) {
-      s::fprintf(stderr, "jfsh: zmodload: %s\n", r.error().message.c_str());
-      rc = 1;
-    }
-  }
-  return rc;
-}
-
 // `let expr…`: evaluates each expression; the status is 0 when the last
 // one is non-zero, 1 when it is zero.  As in zsh an error is not fatal: it
 // ends the evaluation with the value 0, and the message has no `let:`.
@@ -386,6 +181,9 @@ int builtin_let(vec<str>& args, ExecContext& ctx) {
   for (s::size_t i = 1; i < args.size(); ++i) {
     auto v = math_eval(args[i], ctx.params, math_options(ctx),
                        &ctx.modules.math_funcs());
+    // An autoloaded parameter that wasn't defined: status 1, and the line
+    // goes on (zsh's bin_let clears errflag).
+    if (ctx.take_lookup_error()) return 1;
     if (not v) {
       s::fprintf(stderr, "jfsh: %s\n", v.error().message.c_str());
       return 1;

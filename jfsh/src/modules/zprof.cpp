@@ -141,7 +141,6 @@ void register_zprof_module(ModuleManager& mm) {
       ctxp->hooks.remove("zsh/zprof");
       prof() = Profile{};
     };
-    out.feature_names = {"b:zprof"};
   });
 }
 

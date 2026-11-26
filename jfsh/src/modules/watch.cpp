@@ -209,7 +209,6 @@ void register_watch_module(ModuleManager& mm) {
     ctx.hooks.before_prompt.emplace_back("zsh/watch", [ctxp] { check(*ctxp); });
     out.builtins.push_back(BuiltinDef{"log", builtin_log, BINF_NONE, 0, 0});
     out.on_unload = [ctxp] { ctxp->hooks.remove("zsh/watch"); };
-    out.feature_names = {"b:log", "p:watch", "p:WATCHFMT", "p:LOGCHECK"};
   });
 }
 

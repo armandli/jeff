@@ -1,10 +1,11 @@
 #ifndef JFSH_MODULES_REGEX_H
 #define JFSH_MODULES_REGEX_H
-// jfsh/modules/regex.h — the `zsh/regex` module (M10 polish).
+// jfsh/modules/regex.h — the `zsh/regex` module (a port of zsh's
+// Src/Modules/regex.c).
 //
-// Contributes the `-regex-match` binary condition for `[[ ]]` using POSIX
-// Extended Regular Expressions (via `<regex.h>`).  On a match it sets
-// `$MATCH` / `$match` the same way `=~` and `zsh/pcre` do.
+// `[[ string -regex-match re ]]`, a POSIX extended regex (case blind
+// without CASE_MATCH), which is what `=~` runs: $MATCH, $MBEGIN, $MEND,
+// $match, $mbegin and $mend, or $BASH_REMATCH with BASH_REMATCH.
 
 #include <jfsh/modules/module.h>
 

@@ -456,6 +456,9 @@ struct Arith {
   int                                  noeval = 0;     // > 0: parse, don't evaluate
   Tok                                  mtok   = T_EOI;
   bool                                 unary  = true;  // an operand comes next
+  // A variable brought in a module that didn't define it: zsh's errflag
+  // is set, and no binary operator after it assigns (see op()).
+  bool                                 halted = false;
 };
 
 MathNum Arith::eval_text(strv text) {
@@ -637,7 +640,9 @@ opt<str> Arith::param_text(Entry& e) {
 MathNum Arith::getmathparam(Entry& e) {
   MathNum r;
   strv name = lval_name(e.lval);
+  auto failures = params.lookup_failures;
   auto p = params.lookup(name);
+  if (params.lookup_failures != failures) halted = true;
   // A number has no elements: `i[2]` is all of i, as in zsh (the subscript
   // is still worked out, once).
   bool number = p and p->get().is_set() and (p->get().is_integer() or p->get().is_float());
@@ -1086,6 +1091,9 @@ void Arith::bop(Tok tk) {
 
 void Arith::op(Tok what) {
   if (failed()) return;
+  // zsh's op() after errflag: a binary operator stops before it assigns;
+  // `x++` whose own fetch failed still stores (its unary path doesn't look).
+  bool held = halted;
   if (sp < 0) {
     bad("stack empty");
     return;
@@ -1188,7 +1196,7 @@ void Arith::op(Tok what) {
     }
     if (tp & (OP_E2 | OP_E2IO)) {
       Entry& lv = stack.v[static_cast<s::size_t>(sp + 1)];
-      c = setmathvar(lv, c, what == T_EQ);
+      if (not halted) c = setmathvar(lv, c, what == T_EQ);
       // The result is still the lvalue, which keeps what it resolved to.
       Entry kept = lv;
       push(c, kept.lval, false);
@@ -1216,7 +1224,7 @@ void Arith::op(Tok what) {
     break; case T_POSTPLUS: case T_POSTMINUS: {
       int step = what == T_POSTPLUS ? 1 : -1;
       MathNum n = v.is_float ? MathNum::of(v.d + step) : MathNum::of(wadd(v.i, step));
-      (void)setmathvar(e, n);
+      if (not held) (void)setmathvar(e, n);
     }
 
     break; case T_UPLUS:
@@ -1244,7 +1252,7 @@ void Arith::op(Tok what) {
     break; case T_PREPLUS: case T_PREMINUS: {
       int step = what == T_PREPLUS ? 1 : -1;
       v = v.is_float ? MathNum::of(v.d + step) : MathNum::of(wadd(v.i, step));
-      (void)setmathvar(e, v);
+      if (not held) (void)setmathvar(e, v);
     }
 
     break; default:
@@ -1262,10 +1270,25 @@ MathNum Arith::callmathfunc(strv text) {
   strv args = text.substr(paren + 1);
   // zsh drops the last character, taking it to be the `)`.
   if (not args.empty()) args.remove_suffix(1);
-  const MathFuncDef* def = funcs ? funcs->find(name) : nullptr;
+  Result<const MathFuncDef*> found = funcs ? funcs->find(name) : nullptr;
+  // A mark whose module didn't define it: zsh's zerr, not "unknown".
+  if (not found) {
+    fail(found.error().message);
+    return {};
+  }
+  const MathFuncDef* def = *found;
   if (not def) {
     fail("unknown function: " + str(name));
     return {};
+  }
+  // A string function takes the text as it is (zsh's MFF_STR).
+  if (def->str_fn) {
+    auto r = def->str_fn(args);
+    if (not r) {
+      fail(r.error().message);
+      return {};
+    }
+    return *r;
   }
   vec<MathNum> argv;
   s::size_t a = 0;

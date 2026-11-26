@@ -43,12 +43,13 @@ static BuiltinTable Builtins;
 
 Executor::Executor(ExecContext& ctx) : mCtx(ctx) {
   mCtx.executor = this;
-  install_special_params(mCtx);
   static bool initialized = false;
   if (not initialized) {
     Builtins.register_all();
     initialized = true;
   }
+  mCtx.modules.attach(mCtx, [](strv name) { return Builtins.find(name).has_value(); });
+  install_special_params(mCtx);
   if (not mCtx.zle) {
     mOwnZle        = s::make_unique<Zle>();
     mOwnCompletion = s::make_unique<CompletionEngine>(mCtx.params);
@@ -301,6 +302,8 @@ static void note_shell_fd(int fd) {
 
 static void forget_shell_fd(int fd) { ShellFds.erase(fd); }
 
+void Executor::note_user_fd(int fd) { forget_shell_fd(fd); }
+
 static bool is_shell_fd(int fd) {
   auto it = ShellFds.find(fd);
   struct stat st{};
@@ -388,8 +391,11 @@ int Executor::exec_simple(vec<str> args,
   bool fatal = true;
   auto substs_before = mProcSubsts;
   bool had_words = not args.empty();
+  ForkKind kind = ForkKind::Shell;
   bool expanded = expand_command(args, redirs, subst_status, fatal,
-                                 typeset_args.empty() ? nullptr : &counts);
+                                 typeset_args.empty() ? nullptr : &counts,
+                                 had_words or assigns.empty(), noglob, not assigns.empty(),
+                                 &kind);
   for (auto& a : typeset_args) {
     s::size_t n = 0;
     for (s::size_t k = 0; k < a.position and k < counts.size(); ++k) n += counts[k];
@@ -413,6 +419,8 @@ int Executor::exec_simple(vec<str> args,
   // in `$( … )`): the command doesn't run, as zsh's errflag.
   if (mCtx.aborting) {
     if (mCtx.trap_status >= 0) mCtx.last_exit = 1;
+    // A failed autoload in a word: zsh's execcmd_exec makes a 0 status 1.
+    if (mCtx.lookup_failing() and mCtx.last_exit == 0) mCtx.last_exit = 1;
     return mCtx.last_exit;
   }
   // The prefix scope of a builtin or function, popped when the command is
@@ -474,94 +482,21 @@ int Executor::exec_simple(vec<str> args,
     return true;
   };
 
-  // Precommand modifiers: `builtin` and `command` pick what the name may
-  // be; `exec` replaces the shell (or, alone, makes the redirections
-  // permanent); `-` changes nothing here (`nocorrect` is the parser's).
-  enum class Only { Any, Builtin, External } only = Only::Any;
-  bool prefixed = noglob;   // after a precommand modifier other than exec
-  bool bare_prefix = false; // `builtin` or `command` with nothing after it
-  bool replace = false;
-  bool clear_env = false;
-  bool command_p = false;
-  bool via_command = false;   // run through `command`: no longer special
-  str  argv0;
-  while (not args.empty()) {
-    const str& w = args[0];
-    if (w == "builtin" and only == Only::Any) {
-      args.erase(args.begin());
-      prefixed = true;
-      bare_prefix = args.empty();
-      if (bare_prefix) break;
-      only = Only::Builtin;
-      break;
-    }
-    if (w == "command" and only == Only::Any) {
-      via_command = true;
-      prefixed = true;
-      s::size_t i = 1;
-      bool lookup = false;
-      bool default_path = false;
-      for (; i < args.size() and args[i].size() > 1 and args[i][0] == '-'; ++i) {
-        if (args[i] == "--") { ++i; break; }
-        // A word with another letter is the command, as in zsh.
-        if (args[i].find_first_not_of("pvV", 1) != str::npos) break;
-        for (char f : strv(args[i]).substr(1)) {
-          if (f == 'p') default_path = true;
-          else          lookup = true;
-        }
-      }
-      // `command -v name`: describe it, as whence does.
-      if (lookup) break;
-      args.erase(args.begin(), args.begin() + static_cast<s::ptrdiff_t>(i));
-      bare_prefix = args.empty();
-      if (bare_prefix) break;
-      command_p = default_path;
-      only = mCtx.opts.get(OPT_POSIXBUILTINS) ? Only::Any : Only::External;
-      continue;
-    }
-    // After `command` (but under POSIX_BUILTINS), `exec` is a command
-    // name, as in zsh.
-    if (w == "exec" and not replace and only != Only::External) {
-      s::size_t i = 1;
-      for (; i < args.size() and args[i].size() > 1 and args[i][0] == '-'; ++i) {
-        if (args[i] == "--") { ++i; break; }
-        strv letters = strv(args[i]).substr(1);
-        for (s::size_t k = 0; k < letters.size(); ++k) {
-          char f = letters[k];
-          if (f == 'c') {
-            clear_env = true;
-          } else if (f == 'l') {
-            argv0 = "-";
-          } else if (f == 'a') {
-            if (k + 1 < letters.size()) {
-              argv0 = str(letters.substr(k + 1));
-            } else if (i + 1 < args.size()) {
-              argv0 = args[++i];
-            } else {
-              s::fprintf(stderr, "jfsh: exec: argument expected: -a\n");
-              return 1;
-            }
-            break;
-          } else {
-            s::fprintf(stderr, "jfsh: exec: bad option: -%c\n", f);
-            return 1;
-          }
-        }
-      }
-      args.erase(args.begin(), args.begin() + static_cast<s::ptrdiff_t>(i));
-      replace = true;
-      continue;
-    }
-    // `-` not after `command` either (but under POSIX_BUILTINS).
-    // (`nocorrect` is a reserved word the parser takes.)
-    if (w == "-" and only != Only::External) {
-      argv0 = "-";
-      args.erase(args.begin());
-      prefixed = true;
-      continue;
-    }
-    break;
+  Precommands pc = parse_precommands(args, noglob);
+  args.erase(args.begin(), args.begin() + static_cast<s::ptrdiff_t>(pc.first));
+  if (not pc.error.empty()) {
+    s::fprintf(stderr, "jfsh: %s\n", pc.error.c_str());
+    return 1;
   }
+  using Only = Precommands::Only;
+  Only  only        = pc.only;
+  bool  prefixed    = pc.prefixed;
+  bool  bare_prefix = pc.bare_prefix;
+  bool  replace     = pc.replace;
+  bool  clear_env   = pc.clear_env;
+  bool  command_p   = pc.command_p;
+  bool  via_command = pc.via_command;
+  str   argv0       = s::move(pc.argv0);
   // A command of nothing but redirections runs $NULLCMD (cat) with them,
   // or $READNULLCMD (more) for a lone `<file`; under SH_NULLCMD it is `:`.
   // With CSH_NULLCMD, an empty $NULLCMD or after a precommand modifier it
@@ -571,24 +506,25 @@ int Executor::exec_simple(vec<str> args,
   // it, and `exec` with only redirections empties it.
   if (not args.empty())                          mCtx.underscore = args.back();
   else if (replace and not redirs.empty())        mCtx.underscore.clear();
+  // (fork_kind decided it, with the same null_command, before the
+  // redirections were expanded: they weren't.)
+  if (kind == ForkKind::NoCommand) {
+    s::fprintf(stderr, "jfsh: redirection with no command\n");
+    mCtx.aborting = true;
+    return 1;
+  }
+  if (kind == ForkKind::NoBuiltin) {   // its redirections weren't expanded
+    s::fprintf(stderr, "jfsh: no such builtin: %s\n", args[0].c_str());
+    return 1;
+  }
   if (args.empty() and not redirs.empty() and assigns.empty() and not replace) {
-    auto param = [&](strv name) {
-      auto p = mCtx.params.lookup(name);
-      return p and p->get().is_set() ? p->get().scalar() : str{};
-    };
-    str nullcmd = param("NULLCMD");
-    str readnullcmd = param("READNULLCMD");
-    if (prefixed or mCtx.opts.get(OPT_CSHNULLCMD) or nullcmd.empty()) {
+    auto cmd = null_command(redirs, prefixed);
+    if (not cmd) {   // (fork_kind said so already; kept for safety)
       s::fprintf(stderr, "jfsh: redirection with no command\n");
       mCtx.aborting = true;
       return 1;
     }
-    if (mCtx.opts.get(OPT_SHNULLCMD))
-      args.emplace_back(":");
-    else if (not readnullcmd.empty() and redirs.size() == 1 and redirs[0].type == REDIR_READ)
-      args.push_back(s::move(readnullcmd));
-    else
-      args.push_back(s::move(nullcmd));
+    args.push_back(s::move(*cmd));
     mCtx.underscore = args.back();
   }
   if (bare_prefix) return 0;
@@ -661,6 +597,10 @@ int Executor::exec_simple(vec<str> args,
     s::fflush(nullptr);
     // A failed expansion or a readonly name ends the command line.
     if (rc != 0) mCtx.aborting = true;
+    // An error that ended the line while the values were expanded (zsh's
+    // `lastval = errflag ? errflag : cmdoutval`: an autoloaded parameter
+    // its module didn't define) is 1, before `x=$(cmd)`'s status.
+    if (rc == 0 and mCtx.lookup_failing()) rc = 1;
     // `x=$(cmd)` has cmd's status.
     if (rc == 0 and subst_status) rc = *subst_status;
     return rc;
@@ -697,13 +637,10 @@ int Executor::exec_simple(vec<str> args,
   // before trying an external command.
   const BuiltinDef* mod_def = nullptr;
   if (not def and fn == mCtx.functions.end() and not disabled) {
-    mod_def = mCtx.modules.find_builtin(args[0]);
-    // An autoloaded builtin: its module comes in now.
-    if (auto mod = mod_def ? s::nullopt : mCtx.modules.autoload_for_builtin(args[0])) {
-      if (auto r = mCtx.modules.load(*mod, &mCtx, true); not r)
-        s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
-      mod_def = mCtx.modules.find_builtin(args[0]);
-    }
+    // An autoloaded builtin: its module comes in now (zsh's resolvebuiltin).
+    bool marked = false;
+    mod_def = mCtx.modules.resolve_builtin(args[0], &marked);
+    if (not mod_def and marked) return 1;
   }
   const BuiltinDef* defp = def ? &def->get() : mod_def;
   if (only == Only::Builtin and not defp) {
@@ -742,6 +679,8 @@ int Executor::exec_simple(vec<str> args,
     rc = apply_assigns(assigns,
         global ? AssignTo::Shell : is_fn ? AssignTo::Exported : AssignTo::Prefix,
         assign_status);
+    // A failed autoload in them: the builtin or function doesn't run, 1.
+    if (rc == 0 and mCtx.lookup_failing()) rc = 1;
     // A readonly name in front of a builtin or function ends the command
     // line, as zsh's errflag does.
     if (rc != 0) {
@@ -778,7 +717,13 @@ int Executor::exec_simple(vec<str> args,
       mTrapAbort.reset();
       mCtx.signal_in_builtin = false;
       bool was_aborting = mCtx.aborting;
-      rc = defp->fn(args, mCtx);
+      // A module's builtin may unload its own module (`zmodload -u` from a
+      // `zstyle -e` value): a copy keeps its state until it returns.
+      auto failures = mCtx.params.lookup_failures;
+      rc = mod_def ? BuiltinFn(defp->fn)(args, mCtx) : defp->fn(args, mCtx);
+      // A failed autoload of a parameter it set (`read exnosuch`): the
+      // assignment failed, so the builtin did (zsh's setsparam returns NULL).
+      if (rc == 0 and mCtx.params.lookup_failures != failures and mCtx.lookup_failing()) rc = 1;
       // The trap ran inside the builtin: one `read` handled, a signal that
       // cut `wait` short, or one `kill` sent the shell itself.
       bool own    = s::exchange(mCtx.signal_in_builtin, false);
@@ -1032,6 +977,9 @@ void Executor::on_command_error(int rc) {
 int Executor::exec_sublist(ExecState& es, ExecFlags flags) {
   int  rc   = 0;
   bool skip = false;
+  // A failed autoload's mark lasts as long as the error it came with: a
+  // command run with no error pending starts without it.
+  if (not mCtx.aborting) mCtx.lookup_error = false;
   for (;;) {
     WordCode  w    = es.fetch();  // WC_SUBLIST
     WordCode  f    = wc_sublist_flags(w);
@@ -1052,7 +1000,9 @@ int Executor::exec_sublist(ExecState& es, ExecFlags flags) {
       // $?: what an enclosing { }, if, loop or function returns doesn't
       // replace it, as zsh's lastval.
       if (mCtx.aborting and mCtx.trap_status >= 0) rc = mCtx.last_exit;
-      if (f & WC_SUBLIST_NOT) rc = (rc == 0) ? 1 : 0;
+      // zsh inverts only without an error pending (`! [[ -n $x ]]` after a
+      // failed autoload is 1).
+      if ((f & WC_SUBLIST_NOT) and not mCtx.lookup_failing()) rc = (rc == 0) ? 1 : 0;
       // zsh 5.9 forgets the `!` of `! f` once the function (or eval, or
       // sourced file) has run commands of its own.
       if (type == WC_SUBLIST_END and mCtx.code_runs != runs) exempt = false;
@@ -1064,6 +1014,11 @@ int Executor::exec_sublist(ExecState& es, ExecFlags flags) {
     es.pc = end;
     if (mCtx.signals.has_pending()) handle_signals();
     if (mCtx.aborting and mCtx.trap_status >= 0) rc = mCtx.last_exit;   // as above
+    // The next pipeline of a && / || chain with a failed autoload pending:
+    // zsh's execcmd_exec for it makes a 0 status 1, and the line ends.
+    if (type != WC_SUBLIST_END and mCtx.lookup_failing()
+        and ((type == WC_SUBLIST_AND) == (rc == 0)))
+      return mCtx.last_exit = rc ? rc : 1;
     if (interrupted()) return rc;
     if (type == WC_SUBLIST_END) return rc;
     skip = (type == WC_SUBLIST_AND) ? rc != 0 : rc == 0;
@@ -1342,6 +1297,9 @@ int Executor::exec_cmd(ExecState& es, ExecFlags flags) {
   opt<int>        subst_status;
   bool fatal = true;
   if (not expand_command(no_args, redirs, subst_status, fatal)) return 1;
+  // An error that ended the line in a redirection (an autoloaded parameter
+  // its module didn't define): the command doesn't run, status 1.
+  if (mCtx.aborting) return mCtx.last_exit = 1;
   SavedFds saved;
   s::fflush(nullptr);
   if (not apply_redirects(redirs, saved, flags)) return 1;
@@ -1471,11 +1429,11 @@ int Executor::exec_while(ExecState& es, WordCode head) {
     int status = exec_list(es, EF_NONE);
     --mCtx.noerrexit;
     --mCtx.noerrreturn;
-    // As zsh's execwhile: an error in the condition leaves the last body's
-    // status for `while`, but `until` goes on into the body, which the
-    // error skips, and so ends with 1 as an error in the body does.
+    // As zsh's execwhile: an error in the condition, when the condition's
+    // status says stop, leaves the last body's status (0 on the first
+    // pass); when it says go on, the body the error skips ends with 1.
     if (mCtx.aborting and not mCtx.interrupt) {
-      rc = mCtx.trap_status >= 0 ? mCtx.last_exit : until ? 1 : rc;
+      rc = mCtx.trap_status >= 0 ? mCtx.last_exit : ((status == 0) == until) ? rc : 1;
       break;
     }
     if (interrupted()) {
@@ -1636,6 +1594,12 @@ int Executor::exec_case(ExecState& es, WordCode head) {
     es.pc = end;
     return mCtx.last_exit = 0;
   }
+  // An autoloaded parameter its module didn't define ends the line with 0
+  // (zsh's execcase: no pattern matches under errflag, so lastval is 0).
+  if (mCtx.lookup_failing()) {
+    es.pc = end;
+    return mCtx.last_exit = 0;
+  }
   int  rc   = 0;
   bool fall = false;
   while (es.pc < end) {
@@ -1700,6 +1664,11 @@ int Executor::exec_select(ExecState& es, WordCode head) {
   if (not loop_values(es, head, names, values)) {
     es.pc = end;
     return 1;
+  }
+  // A failed autoload in the words: 1, the line ends (zsh's execselect).
+  if (mCtx.lookup_failing()) {
+    es.pc = end;
+    return mCtx.last_exit = 1;
   }
   // A trap's `return` in the words: zsh still runs the menu, and the
   // function returns 0 after it.
@@ -2043,13 +2012,15 @@ int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
       }
       note(op);
       for (const auto& a : args) note(" " + trace_quote(a));
-      int rc = cond_completion(op, args, mCtx);
-      if (rc < 0) {
+      // A module's prefix condition (zsh's COND_MOD), its module autoloaded.
+      const CondDef* cd = op.size() > 1 and op[0] == '-'
+                              ? mCtx.modules.find_cond(strv(op).substr(1), false) : nullptr;
+      auto argc = static_cast<int>(args.size());
+      if (not cd or argc < cd->min_args or (cd->max_args >= 0 and argc > cd->max_args)) {
         s::fprintf(stderr, "jfsh: unknown condition: %s\n", op.c_str());
-        rc = 2;
+        return finish(2);
       }
-      if (rc > 1) mCtx.aborting = mCtx.abort_line = true;
-      return finish(rc);
+      return finish(cd->prefix_fn(args, mCtx));
     }
     default: break;
   }
@@ -2117,8 +2088,9 @@ int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
   // `-pcre-match` / `-regex-match` as binary ops whether or not the owning
   // module is loaded; this dispatch runs the function if the module is
   // loaded and reports a clear error otherwise.
-  if (auto* cd = mCtx.modules.find_cond(op))
-    return finish(cd->fn(*lhs, *rhs, mCtx));
+  if (op.size() > 1 and op[0] == '-')
+    if (auto* cd = mCtx.modules.find_cond(strv(op).substr(1), true))
+      return finish(cd->fn(*lhs, *rhs, mCtx));
   s::fprintf(stderr, "jfsh: unknown condition: %s\n", op.c_str());
   return finish(2);
 }
@@ -2126,65 +2098,18 @@ int Executor::exec_cond_leaf(ExecState& es, WordCode head) {
 // arith := WC_ARITH(0, 1) WC_STRING(expr).  Status 0 when the value is
 // non-zero, 1 when it is zero, 2 on an error.
 int Executor::cond_rematch(const str& lhs, const str& re) {
-  static constexpr const char* MATCH_PARAMS[] = {
-    "MATCH", "MBEGIN", "MEND", "match", "mbegin", "mend",
-  };
-  bool bash = mCtx.opts.get(OPT_BASHREMATCH);
-  // With BASH_REMATCH the matchers' $MATCH / $match are put back after.
-  struct Saved {
-    bool     set = false, array = false, integer = false;
-    str      scalar;
-    vec<str> arr;
-  };
-  vec<Saved> saved;
-  if (bash)
-    for (const char* name : MATCH_PARAMS) {
-      Saved sv;
-      if (auto p = mCtx.params.lookup(name); p and p->get().is_set()) {
-        const Param& prm = p->get();
-        sv.set     = true;
-        sv.array   = prm.is_array();
-        sv.integer = prm.is_integer();
-        if (sv.array) sv.arr = prm.array();
-        else          sv.scalar = prm.scalar();
-      }
-      saved.push_back(s::move(sv));
-    }
-  int rc;
-  const CondDef* pcre = nullptr;
-  if (mCtx.opts.get(OPT_REMATCHPCRE)) {
-    pcre = mCtx.modules.find_cond("-pcre-match");
-    if (not pcre and mCtx.modules.load("zsh/pcre", &mCtx))
-      pcre = mCtx.modules.find_cond("-pcre-match");
+  // zsh's COND_REGEX: the condition of zsh/regex, or with RE_MATCH_PCRE of
+  // zsh/pcre, which comes in for it (and sets $MATCH or $BASH_REMATCH).
+  bool pcre = mCtx.opts.get(OPT_REMATCHPCRE);
+  str name = pcre ? "pcre-match" : "regex-match";
+  (void)mCtx.modules.ensure_feature(pcre ? "zsh/pcre" : "zsh/regex", "C:", &name);
+  const CondDef* cd = mCtx.modules.find_cond(name, true);
+  if (not cd) {
+    s::fprintf(stderr, "jfsh: -%s not available for regex\n", name.c_str());
+    mCtx.aborting = mCtx.abort_line = true;
+    return 2;
   }
-  if (pcre) {
-    rc = pcre->fn(lhs, re, mCtx);
-    if (rc == 2) rc = 1;   // a bad pattern is a false test, as for an ERE
-  } else {
-    rc = cond_regex(lhs, re, mCtx, "");
-  }
-  if (not bash) return rc;
-  if (rc == 0) {
-    vec<str> all;
-    if (auto m = mCtx.params.lookup("MATCH")) all.push_back(m->get().scalar());
-    if (auto m = mCtx.params.lookup("match"); m and m->get().is_array())
-      for (auto& e : m->get().array()) all.push_back(e);
-    (void)mCtx.params.set_array("BASH_REMATCH", s::move(all));
-  }
-  for (s::size_t k = 0; k < saved.size(); ++k) {
-    const char* name = MATCH_PARAMS[k];
-    auto& sv = saved[k];
-    if (not sv.set) {
-      (void)mCtx.params.unset(name);
-    } else if (sv.array) {
-      (void)mCtx.params.set_array(name, s::move(sv.arr));
-    } else {
-      (void)mCtx.params.set_scalar(name, sv.scalar);
-      if (sv.integer)
-        mCtx.params.lookup(name)->get().set(s::strtoll(sv.scalar.c_str(), nullptr, 10));
-    }
-  }
-  return rc;
+  return cd->fn(lhs, re, mCtx) == 0 ? 0 : 1;
 }
 
 int Executor::exec_arith(ExecState& es, WordCode) {
@@ -2199,6 +2124,9 @@ int Executor::exec_arith(ExecState& es, WordCode) {
     expr = traced;
   }
   auto v = ex.math(expr);
+  // An autoloaded parameter that wasn't defined: the message, then the
+  // status 2 and the line goes on (zsh's execarith clears errflag).
+  if (mCtx.take_lookup_error()) return mCtx.last_exit = 2;
   // A TRAPxxx that failed during the expansion: 2.  zsh's execarith clears
   // the error but not the trap's retflag, so the function returns 2, and
   // at the top just the line ends (the EXIT trap still runs).
@@ -2914,11 +2842,27 @@ bool Executor::expand_command(vec<str>& args,
                               vec<Redirection>& redirs,
                               opt<int>&         subst_status,
                               bool&             fatal,
-                              vec<s::size_t>*   counts) {
+                              vec<s::size_t>*   counts,
+                              bool              may_fork,
+                              bool              noglob,
+                              bool              has_assigns,
+                              ForkKind*         kind_out) {
   Expander ex{*this, mCtx};
+  // zsh forks for an external command (and for redirections alone, run
+  // through $NULLCMD) before it expands the redirections, so an error there
+  // (`> ${x?}`, a failed autoload) fails just that command, with 1, in the
+  // child: the shell's line goes on.
+  bool forked = false;
   auto fail = [&](const ShellError& e) {
     s::fprintf(stderr, "jfsh: %s\n", e.message.c_str());
     subst_status = ex.subst_status();
+    if (forked) {
+      fatal = false;
+      mCtx.aborting = mCtx.abort_line = mCtx.hard_error = mCtx.lookup_error = false;
+      mCtx.exiting = mCtx.exit_now = false;
+      if (not args.empty()) mCtx.underscore = args.back();   // zsh forked after setunderscore
+      return false;
+    }
     // In a here-document or here-string even ${x?} fails just the command
     // (zsh 5.9), so the shell doesn't exit for it.
     if (not fatal and mCtx.exit_now) mCtx.exiting = mCtx.exit_now = false;
@@ -2942,6 +2886,19 @@ bool Executor::expand_command(vec<str>& args,
     args = s::move(*words);
   }
 
+  // (Without redirections nothing here depends on it: exec_simple reports
+  // a missing builtin itself.)
+  if (may_fork and not mCtx.aborting and not redirs.empty()) {
+    ForkKind kind = fork_kind(args, redirs, noglob);
+    // (Assignments make an empty command zsh's nullexec instead.)
+    if (kind == ForkKind::NoCommand and has_assigns) kind = ForkKind::Shell;
+    if (kind_out) *kind_out = kind;
+    // No command to run, or no such builtin: exec_simple reports it, and
+    // no redirection is expanded, as in zsh's execcmd_exec.
+    if (kind == ForkKind::NoCommand or kind == ForkKind::NoBuiltin) return true;
+    forked = kind == ForkKind::Forks;
+  }
+  bool failing_before = mCtx.lookup_failing();
   vec<Redirection> out;
   out.reserve(redirs.size());
   for (auto& r : redirs) {
@@ -2986,7 +2943,168 @@ bool Executor::expand_command(vec<str>& args,
   }
   redirs = s::move(out);
   subst_status = ex.subst_status();
+  if (forked and mCtx.take_lookup_error()) {
+    fatal = false;
+    if (not args.empty()) mCtx.underscore = args.back();
+    return false;
+  }
+  // In a redirection of a command run in the shell: zsh's execcmd_exec
+  // sets lastval to 1 at that stage, whatever it was.
+  if (not failing_before and mCtx.lookup_failing()) mCtx.last_exit = 1;
   return true;
+}
+
+// The precommand modifiers in front of `args` (expanded); `first` is the
+// index of the word after them:
+// `builtin` and `command` pick what the name may be; `exec` replaces the
+// shell (or, alone, makes the redirections permanent); `-` and `noglob`
+// change nothing here.  One parser for expand_command's
+// fork_kind and exec_simple, so both see the same command.
+Executor::Precommands Executor::parse_precommands(const vec<str>& args, bool noglob) const {
+  Precommands pc;
+  pc.prefixed = noglob;
+  using Only = Precommands::Only;
+  s::size_t& at = pc.first;   // the word being read
+  while (at < args.size()) {
+    const str& w = args[at];
+    if (w == "builtin" and pc.only == Only::Any) {
+      ++at;
+      pc.prefixed = true;
+      pc.bare_prefix = at == args.size();
+      if (pc.bare_prefix) break;
+      pc.only = Only::Builtin;
+      break;
+    }
+    if (w == "command" and pc.only == Only::Any) {
+      pc.via_command = true;
+      pc.prefixed = true;
+      s::size_t i = at + 1;
+      bool lookup = false;
+      bool default_path = false;
+      for (; i < args.size() and args[i].size() > 1 and args[i][0] == '-'; ++i) {
+        if (args[i] == "--") { ++i; break; }
+        // A word with another letter is the command, as in zsh.
+        if (args[i].find_first_not_of("pvV", 1) != str::npos) break;
+        for (char f : strv(args[i]).substr(1)) {
+          if (f == 'p') default_path = true;
+          else          lookup = true;
+        }
+      }
+      // `command -v name`: describe it, as whence does.
+      if (lookup) break;
+      at = i;
+      pc.bare_prefix = at == args.size();
+      if (pc.bare_prefix) break;
+      pc.command_p = default_path;
+      pc.only = mCtx.opts.get(OPT_POSIXBUILTINS) ? Only::Any : Only::External;
+      continue;
+    }
+    // After `command` (but under POSIX_BUILTINS), `exec` is a command
+    // name, as in zsh.
+    if (w == "exec" and not pc.replace and pc.only != Only::External) {
+      s::size_t i = at + 1;
+      for (; i < args.size() and args[i].size() > 1 and args[i][0] == '-'; ++i) {
+        if (args[i] == "--") { ++i; break; }
+        strv letters = strv(args[i]).substr(1);
+        for (s::size_t k = 0; k < letters.size(); ++k) {
+          char f = letters[k];
+          if (f == 'c') {
+            pc.clear_env = true;
+          } else if (f == 'l') {
+            pc.argv0 = "-";
+          } else if (f == 'a') {
+            if (k + 1 < letters.size()) {
+              pc.argv0 = str(letters.substr(k + 1));
+            } else if (i + 1 < args.size()) {
+              pc.argv0 = args[++i];
+            } else {
+              pc.error = "exec: argument expected: -a";
+              return pc;
+            }
+            break;
+          } else {
+            pc.error = str("exec: bad option: -") + f;
+            return pc;
+          }
+        }
+      }
+      at = i;
+      pc.replace = true;
+      continue;
+    }
+    // `noglob` and `-` not after `command` either (but under
+    // POSIX_BUILTINS).  (`nocorrect` is a reserved word only where the
+    // parser takes it.)
+    if (w == "noglob" and pc.only != Only::External) {
+      ++at;
+      pc.prefixed = true;
+      continue;
+    }
+    if (w == "-" and pc.only != Only::External) {
+      pc.argv0 = "-";
+      ++at;
+      pc.prefixed = true;
+      continue;
+    }
+    break;
+  }
+  return pc;
+}
+
+// What a command of only `redirs` runs, as zsh's execcmd_exec: nothing
+// after a precommand modifier, under CSH_NULLCMD or with $NULLCMD empty
+// ("redirection with no command"); `:` under SH_NULLCMD; $READNULLCMD for
+// a lone `<`; else $NULLCMD.
+opt<str> Executor::null_command(const vec<Redirection>& redirs, bool prefixed) const {
+  auto value = [&](strv name) {
+    auto p = mCtx.params.lookup_raw(name);
+    return p and p->get().is_set() ? p->get().scalar() : str{};
+  };
+  str nullcmd = value("NULLCMD");
+  if (prefixed or mCtx.opts.get(OPT_CSHNULLCMD) or nullcmd.empty()) return s::nullopt;
+  if (mCtx.opts.get(OPT_SHNULLCMD)) return str(":");
+  str readnullcmd = value("READNULLCMD");
+  if (not readnullcmd.empty() and redirs.size() == 1 and redirs[0].type == REDIR_READ)
+    return readnullcmd;
+  return nullcmd;
+}
+
+// Where zsh's execcmd_exec runs `args` (expanded) with `redirs`, which it
+// expands only after this is decided: in the shell, in a forked child (an
+// external command, or $NULLCMD/$READNULLCMD naming one for redirections
+// alone), or nowhere: "redirection with no command", or `builtin` with a
+// name that isn't one ("no such builtin").  The precommand modifiers are
+// read by parse_precommands, as exec_simple reads them.
+Executor::ForkKind Executor::fork_kind(const vec<str>& all, const vec<Redirection>& redirs,
+                                       bool noglob) const {
+  Precommands pc = parse_precommands(all, noglob);
+  if (not pc.error.empty()) return ForkKind::Shell;
+  auto args = s::span<const str>(all).subspan(pc.first);
+  using Only = Precommands::Only;
+  auto in_shell = [&](const str& name, Only only) {
+    bool builtin = is_builtin(name) and not mCtx.disabled_builtins.contains(name);
+    if (only == Only::External) return false;
+    if (only == Only::Builtin)  return builtin;
+    return builtin or (not mCtx.disabled_functions.contains(name)
+                       and (mCtx.functions.contains(name) or mCtx.autoloads.contains(name)));
+  };
+  if (args.empty()) {
+    if (redirs.empty() or pc.replace) return ForkKind::Shell;
+    auto cmd = null_command(redirs, pc.prefixed);
+    if (not cmd) return ForkKind::NoCommand;
+    return in_shell(*cmd, Only::Any) ? ForkKind::Shell : ForkKind::Forks;
+  }
+  // `command -v`, exec: in the shell.
+  if (pc.replace or (pc.via_command and pc.only == Only::Any and args[0] == "command"))
+    return ForkKind::Shell;
+  if (pc.only == Only::Builtin)   // also after `command` (POSIX_BUILTINS)
+    return in_shell(args[0], Only::Builtin) ? ForkKind::Shell : ForkKind::NoBuiltin;
+  // After `command` a function isn't looked for: under POSIX_BUILTINS a
+  // builtin runs in the shell, anything else is external.
+  if (pc.via_command)
+    return in_shell(args[0], pc.only == Only::Any ? Only::Builtin : Only::External)
+           ? ForkKind::Shell : ForkKind::Forks;
+  return in_shell(args[0], pc.only) ? ForkKind::Shell : ForkKind::Forks;
 }
 
 // `name=value` on an integer or float parameter keeps its type: the value
@@ -3026,7 +3144,11 @@ static Result<void> set_numeric(ExecContext& ctx, Param& p, const Assignment& a)
 // subscript picks a character.
 static Result<void> assign_element(ExecContext& ctx, const Assignment& a) {
   const str& key = *a.subscript;
-  auto raw = ctx.params.lookup_raw(a.name);
+  auto failures = ctx.params.lookup_failures;
+  auto raw = ctx.params.lookup_noget(a.name);
+  // A module that came without the parameter: the message, and the element
+  // is set on a new one (zsh's getindex clears errflag).
+  if (ctx.params.lookup_failures != failures) (void)ctx.take_lookup_error();
   if (raw and raw->get().is_hash()) {
     Param& p = raw->get();
     if (a.array or a.subscript_whole)
@@ -3168,6 +3290,20 @@ static Result<void> assign_one(ExecContext& ctx, const Assignment& a) {
   if (a.subscript) return assign_element(ctx, a);
   // (A special scalar refuses an array: ParamTable::set_array.)
   if (a.array) return ctx.params.set_array(a.name, a.elements, a.append);
+  // A module's mark: the module comes in once (zsh's assignsparam).  One
+  // that came without the parameter is the error, and nothing is assigned;
+  // a mark whose module didn't load takes the value itself, as zsh's does
+  // (and names the module it will try next).
+  if (auto raw = ctx.params.lookup_raw(a.name); raw and (raw->get().flags & PM_AUTOLOAD)) {
+    auto failures = ctx.params.lookup_failures;
+    (void)ctx.params.lookup_noget(a.name);
+    if (ctx.params.lookup_failures != failures) return {};
+    if (auto mark = ctx.params.lookup_raw(a.name); mark and (mark->get().flags & PM_AUTOLOAD)) {
+      Param& m = mark->get();
+      m.value = a.append ? m.scalar() + a.value : a.value;
+      return {};
+    }
+  }
   if (auto p = ctx.params.lookup(a.name); p and p->get().is_set()) {
     Param& old = p->get();
     if (old.is_integer() or old.is_float()) return set_numeric(ctx, old, a);
@@ -3340,27 +3476,26 @@ static void write_trace(str line, int fd) {
 vec<str> Executor::builtin_names() const {
   vec<str> names;
   Builtins.for_each([&](const BuiltinDef& d) { names.emplace_back(d.name); });
-  // And those of the loaded modules (zpty, ztcp, …).
-  for (const BuiltinDef* d : mCtx.modules.all_builtins()) names.emplace_back(d->name);
+  // And those of the modules, autoloadable ones too (zpty, zstyle, …).
+  for (auto& n : mCtx.modules.builtin_names()) names.push_back(s::move(n));
   s::sort(names.begin(), names.end());
   names.erase(s::unique(names.begin(), names.end()), names.end());
   return names;
 }
 
 bool Executor::is_builtin(strv name) const noexcept {
-  return Builtins.find(name).has_value() or mCtx.modules.find_builtin(name) != nullptr
-      or mCtx.modules.autoload_for_builtin(name).has_value();
+  return Builtins.find(name).has_value() or mCtx.modules.has_builtin(name);
 }
 
 int Executor::call_builtin(strv name,
                            vec<str>& args,
                            ExecContext& ctx) {
   if (auto def = Builtins.find(name)) return def->get().fn(args, ctx);
-  if (auto mod = ctx.modules.find_builtin(name) ? s::nullopt
-                                                : ctx.modules.autoload_for_builtin(name))
-    (void)ctx.modules.load(*mod, &ctx, true);
-  if (const BuiltinDef* def = ctx.modules.find_builtin(name)) return def->fn(args, ctx);
-  return 127;
+  bool marked = false;
+  // A copy of a module's builtin, as in dispatch: it may unload its module.
+  if (const BuiltinDef* def = ctx.modules.resolve_builtin(name, &marked))
+    return BuiltinFn(def->fn)(args, ctx);
+  return marked ? 1 : 127;
 }
 
 // zsh's default limit on nested function calls, used when $FUNCNEST is
@@ -3390,7 +3525,9 @@ int Executor::call_function(const ProgRef& body,
     return 1;
   }
 
-  FuncFrame frame{mCtx, args[0]};
+  str file;
+  if (auto f = mCtx.function_files.find(args[0]); f != mCtx.function_files.end()) file = f->second;
+  FuncFrame frame{mCtx, args[0], FuncFrame::Frame::Function, s::move(file), body->line_base};
   auto saved_positional = s::exchange(
       mCtx.positional, vec<str>(args.begin() + 1, args.end()));
   str saved_arg0 = mCtx.arg0;
@@ -3466,6 +3603,9 @@ int Executor::call_function(const ProgRef& body,
     auto exit = s::tuple{mCtx.exiting, mCtx.exit_val, mCtx.exit_now};
     if (mCtx.exiting) mCtx.last_exit = 0;
     mCtx.exiting = mCtx.exit_now = false;
+    // A failed autoload in it makes the function's status 1 (zsh's
+    // lastval after the trap's errflag); the caller's line goes on.
+    bool erred = false;
     {
       TrapErrorScope scope{mCtx};
       ++mTrapDepth;   // a function it calls runs no EXIT trap of its own
@@ -3483,10 +3623,12 @@ int Executor::call_function(const ProgRef& body,
         }
       }
       --mTrapDepth;
+      erred = mCtx.lookup_failing();
     }
     if (not mCtx.exiting) {
       s::tie(mCtx.exiting, mCtx.exit_val, mCtx.exit_now) = exit;
-      if (not mCtx.exiting) mCtx.last_exit = saved;
+      if (not mCtx.exiting) mCtx.last_exit = erred ? 1 : saved;
+      if (erred) rc = 1;
     }
   }
   for (const auto& [_, hook] : mCtx.hooks.function) hook(args[0], false);
@@ -3757,6 +3899,9 @@ void Executor::exec_external_child(const vec<str>&         args,
     str ps4 = traced ? trace_prompt() : str{};
     opt<int> subst_status;
     int rc = apply_assigns(assigns, AssignTo::Exported, subst_status);
+    // A failed autoload in them: zsh's child exits 1 without running it,
+    // before any trace.
+    if (mCtx.lookup_failing()) _exit(1);
     if (traced) write_trace(ps4 + trace_assigns(assigns) + *traced, trace_fd(saved));
     if (rc != 0) _exit(rc);
   }
@@ -3836,7 +3981,7 @@ int Executor::source_file(const str& path, const vec<str>& args, const str& name
   vec<str> saved_positional;
   bool     set_args = not args.empty();
   if (set_args) saved_positional = s::exchange(mCtx.positional, args);
-  FuncFrame frame{mCtx, name};
+  FuncFrame frame{mCtx, name, FuncFrame::Frame::Source, name, 0};
   // `.` names $0 after the file under FUNCTION_ARGZERO and puts it back
   // after (zsh's bin_dot); otherwise, and for a startup file, $0 is left
   // alone, also when the file assigns it.
@@ -3977,9 +4122,9 @@ HashTable<str>& Executor::command_hash() {
   return mCmdHash;
 }
 
-void Executor::fill_command_hash() {
+void Executor::fill_command_hash(bool keep) {
   auto& hash = command_hash();
-  hash.clear();
+  if (not keep) hash.clear();
   // The first directory in $PATH with a name wins, as for a search.
   for (const auto& dir : path_dirs(mCtx.params)) {
     if (dir.empty() or dir[0] != '/') continue;   // relative ones aren't hashed
@@ -4394,6 +4539,7 @@ int Executor::run_exit_trap(int status, bool ran_off) {
   Trap trap = mCtx.signals.traps().get(SIGEXIT);
   mCtx.signals.set_trap(SIGEXIT, TrapAction::Default);
   bool was_exiting = mCtx.exiting;
+  bool ended       = was_exiting or mTopReturn;   // `exit N`, a top `return N`
   int  was_val     = mCtx.exit_val;
   mCtx.exiting = mCtx.returning = mCtx.aborting = mCtx.exit_now = false;
   mCtx.return_line = false;
@@ -4406,6 +4552,7 @@ int Executor::run_exit_trap(int status, bool ran_off) {
   mExitEndsExitTrap = false;
   mExitFromTrap = -1;
   mExitTrapFuncDepth = mCtx.func_depth;
+  mCtx.lookup_error = false;
   if (trap.action == TrapAction::Command) {
     run_trap_command(trap);
     // `return N` in it gives the shell's exit status.
@@ -4423,6 +4570,10 @@ int Executor::run_exit_trap(int status, bool ran_off) {
   mExitEndsExitTrap = false;
   if (mCtx.exiting) return mCtx.exit_val;   // the trap called `exit`
   if (mExitFromTrap >= 0) return mExitFromTrap;
+  // An autoloaded parameter its module didn't define stopped the trap: the
+  // shell that ran off its end exits 1 (zsh's errflag), one that called
+  // `exit N` with N.
+  if (s::exchange(mCtx.lookup_error, false) and not ended) status = 1;
   mCtx.exiting  = was_exiting;
   mCtx.exit_val = was_val;
   return status;

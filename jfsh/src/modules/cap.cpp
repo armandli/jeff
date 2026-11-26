@@ -77,7 +77,6 @@ void register_cap_module(ModuleManager& mm) {
     out.builtins.push_back(BuiltinDef{"cap",    builtin_cap,    BINF_NONE, 0});
     out.builtins.push_back(BuiltinDef{"getcap", builtin_getcap, BINF_NONE, 1});
     out.builtins.push_back(BuiltinDef{"setcap", builtin_setcap, BINF_NONE, 2});
-    out.feature_names = {"b:cap", "b:getcap", "b:setcap"};
   });
 }
 

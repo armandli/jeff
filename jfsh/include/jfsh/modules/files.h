@@ -1,24 +1,12 @@
 #ifndef JFSH_MODULES_FILES_H
 #define JFSH_MODULES_FILES_H
-// jfsh/modules/files.h — the `zsh/files` module (M10 Phase 2b).
+// jfsh/modules/files.h — the `zsh/files` module (a port of zsh's
+// Src/Modules/files.c).
 //
-// Contributes zsh's shell-builtin implementations of the common
-// file-system utilities:
-//
-//   chmod MODE file…
-//   chown OWNER[:GROUP] file…
-//   chgrp GROUP file…
-//   ln [-fs] src dst
-//   mkdir [-pm MODE] dir…
-//   mv src dst
-//   rm [-rf] file…
-//   rmdir dir…
-//   sync
-//
-// Loading the module replaces the usual external-command lookup for these
-// names so scripts avoid a fork+exec for every file touch.  The external
-// still runs if the user invokes it as `=rm`, `command rm`, or the module
-// isn't loaded.
+// chgrp, chmod (octal modes), chown, ln, mkdir, mv, rm, rmdir and sync as
+// builtins, and the same as zf_chgrp … zf_sync, which don't hide the
+// commands of those names.  Loading the module (or `zmodload -F zsh/files
+// b:zf_rm …`) brings them in.
 
 #include <jfsh/modules/module.h>
 

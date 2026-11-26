@@ -51,7 +51,6 @@ int builtin_clone(vec<str>& args, ExecContext& ctx) {
 void register_clone_module(ModuleManager& mm) {
   mm.register_builtin_module("zsh/clone", [](ModuleFeatures& out, ExecContext&) {
     out.builtins.push_back(BuiltinDef{"clone", builtin_clone, BINF_NONE, 1, 1});
-    out.feature_names = {"b:clone"};
   });
 }
 

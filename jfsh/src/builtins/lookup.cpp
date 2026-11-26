@@ -156,8 +156,11 @@ bool whence_one(const str& name, const WhenceOpts& w, ExecContext& ctx) {
       say(name, name + " is a reserved word", name + ": shell reserved word", "reserved");
       if (not w.all) return true;
     }
+    // A disabled function or builtin isn't there for whence (zsh's
+    // getnode skips DISABLED nodes).
     auto fn = ctx.functions.find(name);
-    if ((w.kinds & K_FUNCTION) and (fn != ctx.functions.end() or ctx.autoloads.contains(name))) {
+    if ((w.kinds & K_FUNCTION) and not ctx.disabled_functions.contains(name)
+        and (fn != ctx.functions.end() or ctx.autoloads.contains(name))) {
       str file;
       if (auto f = ctx.function_files.find(name); f != ctx.function_files.end()) file = f->second;
       str def = fn != ctx.functions.end() ? function_text(name, *fn->second)
@@ -171,7 +174,8 @@ bool whence_one(const str& name, const WhenceOpts& w, ExecContext& ctx) {
       say(w.func_body ? def : name, verbose, def, "function");
       if (not w.all) return true;
     }
-    if ((w.kinds & K_BUILTIN) and ctx.executor->is_builtin(name)) {
+    if ((w.kinds & K_BUILTIN) and not ctx.disabled_builtins.contains(name)
+        and ctx.executor->is_builtin(name)) {
       say(name, name + " is a shell builtin", name + ": shell built-in command", "builtin");
       if (not w.all) return true;
     }
@@ -256,6 +260,24 @@ void print_alias(const str& name, const str& text, char kind, bool as_command) {
 }  // namespace
 
 int builtin_whence(vec<str>& args, ExecContext& ctx) { return whence_common(args, ctx, {}); }
+
+// where: whence -ca, as zsh's table entry has it.
+int builtin_where(vec<str>& args, ExecContext& ctx) {
+  args.insert(args.begin() + 1, "-ca");
+  return builtin_whence(args, ctx);
+}
+
+// ttyctl [-fu]: zsh freezes the terminal's settings with -f and lets them
+// go with -u (-f wins), and says which without options.  jfsh's line editor
+// sets the terminal up for each line itself, so only the flag is kept.
+int builtin_ttyctl(vec<str>& args, ExecContext& ctx) {
+  ZOps ops;
+  if (zsh_options(args, "fu", 0, 0, ops) < 0) return 1;
+  if (ops.isset('f'))      ctx.tty_frozen = true;
+  else if (ops.isset('u')) ctx.tty_frozen = false;
+  else                     s::printf("tty is %sfrozen\n", ctx.tty_frozen ? "" : "not ");
+  return 0;
+}
 
 int builtin_type(vec<str>& args, ExecContext& ctx) {
   WhenceOpts w;
@@ -463,12 +485,14 @@ int builtin_unalias(vec<str>& args, ExecContext& ctx) {
   }
   if (o.next >= args.size()) return builtin_error(cmd, "not enough arguments");
   int rc = 0;
+  bool matched = false;   // -m: by any of the patterns (none is status 1)
   for (s::size_t i = o.next; i < args.size(); ++i) {
     const str& name = args[i];
     if (o.has('m')) {
       auto pat = CompiledPattern::compile(name);
-      if (suffix) s::erase_if(ctx.aliases.suffix, [&](const auto& kv) { return pat.matches(kv.first); });
-      else        s::erase_if(ctx.aliases.regular, [&](const auto& kv) { return pat.matches(kv.first); });
+      auto hit = [&](const auto& kv) { return pat.matches(kv.first); };
+      matched = (suffix ? s::erase_if(ctx.aliases.suffix, hit)
+                        : s::erase_if(ctx.aliases.regular, hit)) != 0 or matched;
       continue;
     }
     bool erased = suffix ? ctx.aliases.suffix.erase(name) : ctx.aliases.regular.erase(name);
@@ -476,6 +500,51 @@ int builtin_unalias(vec<str>& args, ExecContext& ctx) {
       builtin_error(cmd, "no such hash table element: " + name);
       rc = 1;
     }
+  }
+  if (o.has('m') and not matched) rc = 1;
+  return rc;
+}
+
+// unhash [-adfms] name …: zsh's bin_unhash.  -a aliases and -s suffix
+// aliases (unalias's), -f functions (unfunction's), -d named directories
+// (jfsh keeps none), and the command hash otherwise; -m takes patterns,
+// and matching nothing is status 1.
+int builtin_unhash(vec<str>& args, ExecContext& ctx) {
+  ZOps ops;
+  int first = zsh_options(args, "adfms", 1, -1, ops);
+  if (first < 0) return 1;
+  vec<str> rest(args.begin() + first, args.end());
+  bool pattern = ops.isset('m');
+  auto forward = [&](int (*fn)(vec<str>&, ExecContext&), const char* flag) {
+    vec<str> a{args[0]};
+    if (flag) a.emplace_back(flag);
+    if (pattern) a.emplace_back("-m");
+    a.emplace_back("--");
+    a.insert(a.end(), rest.begin(), rest.end());
+    return fn(a, ctx);
+  };
+  if (ops.isset('d')) {
+    if (pattern) return 1;
+    for (const auto& n : rest) builtin_error(args[0], "no such hash table element: " + n);
+    return 1;
+  }
+  if (ops.isset('f')) return forward(builtin_unset, "-f");
+  if (ops.isset('s')) return forward(builtin_unalias, "-s");
+  if (ops.isset('a')) return forward(builtin_unalias, nullptr);
+  auto& hash = ctx.executor->command_hash();
+  int rc = 0;
+  if (pattern) {
+    bool any = false;
+    for (const auto& n : rest) {
+      auto pat = CompiledPattern::compile(n);
+      any = s::erase_if(hash, [&](const auto& kv) { return pat.matches(kv.first); }) or any;
+    }
+    return any ? 0 : 1;
+  }
+  for (const auto& n : rest) {
+    if (hash.erase(n)) continue;
+    builtin_error(args[0], "no such hash table element: " + n);
+    rc = 1;
   }
   return rc;
 }

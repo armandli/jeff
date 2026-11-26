@@ -96,10 +96,7 @@ int builtin_zsocket(vec<str>& args, ExecContext& ctx) {
 void register_net_socket_module(ModuleManager& mm) {
   mm.register_builtin_module("zsh/net/socket", [](ModuleFeatures& out, ExecContext&) {
     out.builtins.push_back(BuiltinDef{"zsocket", builtin_zsocket, BINF_NONE, 1});
-    out.feature_names = {"b:zsocket"};
   });
-  // zsh's historical name (`zmodload zsh/socket`) → same module.
-  mm.add_alias("zsh/socket", "zsh/net/socket");
 }
 
 }  // namespace jfsh

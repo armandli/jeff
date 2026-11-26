@@ -24,28 +24,30 @@ namespace jfsh::test {
 
 TEST(Modules, ZmodloadListsLoadedModulesByDefault) {
   Shell sh;
+  // As zsh -f: only zsh/main is loaded; the rest come when used or loaded.
   auto r = sh.run("zmodload");
   EXPECT_EQ(r.rc, 0);
-  EXPECT_NE(r.out.find("zsh/datetime"),  std::string::npos);
-  EXPECT_NE(r.out.find("zsh/mathfunc"),  std::string::npos);
+  EXPECT_EQ(r.out, "zsh/main\n");
 }
 
 TEST(Modules, ZmodloadDashLShowsSourceableForm) {
   Shell sh;
-  auto r = sh.run("zmodload -L");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_NE(r.out.find("zmodload zsh/datetime"), std::string::npos);
-  EXPECT_NE(r.out.find("zmodload zsh/mathfunc"), std::string::npos);
+  EXPECT_EQ(sh.run("zmodload -L").out, "zmodload zsh/main\n");
+  EXPECT_EQ(sh.run("zmodload zsh/datetime; zmodload -L").out,
+            "zmodload zsh/datetime\nzmodload zsh/main\n");
 }
 
 TEST(Modules, ZmodloadDashERetursSuccessWhenLoaded) {
   Shell sh;
-  EXPECT_EQ(sh.run("zmodload -e zsh/datetime").rc, 0);
+  EXPECT_EQ(sh.run("zmodload -e zsh/main").rc, 0);
+  EXPECT_EQ(sh.run("zmodload -e zsh/datetime").rc, 1);
+  EXPECT_EQ(sh.run("zmodload zsh/datetime; zmodload -e zsh/datetime").rc, 0);
   EXPECT_EQ(sh.run("zmodload -e zsh/not-a-real-module").rc, 1);
 }
 
 TEST(Modules, ZmodloadUnloadMarksModuleAbsent) {
   Shell sh;
+  EXPECT_EQ(sh.run("zmodload zsh/mathfunc").rc, 0);
   EXPECT_EQ(sh.run("zmodload -e zsh/mathfunc").rc, 0);
   EXPECT_EQ(sh.run("zmodload -u zsh/mathfunc").rc, 0);
   EXPECT_EQ(sh.run("zmodload -e zsh/mathfunc").rc, 1);
@@ -57,9 +59,10 @@ TEST(Modules, ZmodloadUnloadMarksModuleAbsent) {
 TEST(Modules, ZmodloadDashAAddsAliases) {
   Shell sh;
   EXPECT_EQ(sh.run("zmodload -A date=zsh/datetime").rc, 0);
-  // Loading through the alias finds the real module.
-  auto r = sh.run("zmodload -e date");
-  EXPECT_EQ(r.rc, 0);
+  // The alias names the module, which isn't loaded until asked for.
+  EXPECT_EQ(sh.run("zmodload -e date").rc, 1);
+  EXPECT_EQ(sh.run("zmodload date; zmodload -e date").rc, 0);
+  EXPECT_EQ(sh.run("zmodload -e zsh/datetime").rc, 0);
 }
 
 TEST(Modules, ZmodloadBadFlagReportsAndFails) {
@@ -71,9 +74,13 @@ TEST(Modules, ZmodloadBadFlagReportsAndFails) {
 
 TEST(Modules, ZmodloadLoadUnknownModuleFails) {
   Shell sh;
-  auto r = sh.run("zmodload zsh/not-a-real-thing");
-  EXPECT_NE(r.rc, 0);
-  EXPECT_NE(r.err.find("failed to load module"), std::string::npos);
+  auto r = sh.run("zmodload zsh/no_such_thing");
+  EXPECT_EQ(r.rc, 1);
+  EXPECT_NE(r.err.find("failed to load module `zsh/no_such_thing': "), std::string::npos);
+  // A `-` isn't in a module name.
+  r = sh.run("zmodload zsh/not-a-real-thing");
+  EXPECT_EQ(r.rc, 1);
+  EXPECT_EQ(r.err, "jfsh: invalid module name `zsh/not-a-real-thing'\n");
 }
 
 TEST(Modules, ZmodloadUnloadUnknownModuleFails) {
@@ -94,6 +101,7 @@ TEST(Modules, ZmodloadUnloadWithDashIgnoresMissing) {
 
 TEST(Modules, MathfuncSqrtOfFour) {
   Shell sh;
+  sh.run("zmodload zsh/mathfunc");
   auto r = sh.run("echo $((sqrt(4)))");
   EXPECT_EQ(r.rc, 0);
   // zsh renders a float with 17 sig figs; 2.0 round-trips as "2.".
@@ -102,36 +110,41 @@ TEST(Modules, MathfuncSqrtOfFour) {
 
 TEST(Modules, MathfuncSinZero) {
   Shell sh;
+  sh.run("zmodload zsh/mathfunc");
   EXPECT_EQ(sh.run("echo $((sin(0)))").out, "0.\n");
 }
 
 TEST(Modules, MathfuncIntTruncatesTowardZero) {
   Shell sh;
+  sh.run("zmodload zsh/mathfunc");
   EXPECT_EQ(sh.run("echo $((int(3.7)))").out, "3\n");
   EXPECT_EQ(sh.run("echo $((int(-3.7)))").out, "-3\n");
 }
 
 TEST(Modules, MathfuncFloatPromotes) {
   Shell sh;
+  sh.run("zmodload zsh/mathfunc");
   // float(3) → 3.0, which prints as "3."
   EXPECT_EQ(sh.run("echo $((float(3)))").out, "3.\n");
 }
 
-TEST(Modules, MathfuncAtan2OfOneOne) {
+TEST(Modules, MathfuncAtanOfOneOne) {
   Shell sh;
-  auto r = sh.run("echo $((atan2(1, 1)))");
-  EXPECT_EQ(r.rc, 0);
-  // atan2(1,1) = π/4 ≈ 0.78539816339744828
-  EXPECT_NE(r.out.find("0.78539816339"), std::string::npos);
+  sh.run("zmodload zsh/mathfunc");
+  // zsh's two-argument atan is atan2; there is no atan2 function.
+  EXPECT_EQ(sh.run("echo $((atan(1, 1)))").out, "0.78539816339744828\n");
+  EXPECT_NE(sh.run("echo $((atan2(1, 1)))").err.find("unknown function: atan2"), str::npos);
 }
 
 TEST(Modules, MathfuncHypotOfThreeFour) {
   Shell sh;
+  sh.run("zmodload zsh/mathfunc");
   EXPECT_EQ(sh.run("echo $((hypot(3,4)))").out, "5.\n");
 }
 
 TEST(Modules, MathfuncAbsHandlesIntAndFloat) {
   Shell sh;
+  sh.run("zmodload zsh/mathfunc");
   EXPECT_EQ(sh.run("echo $((abs(-5)))").out,    "5\n");
   EXPECT_EQ(sh.run("echo $((abs(-2.5)))").out,  "2.5\n");
 }
@@ -151,6 +164,7 @@ TEST(Modules, MathfuncWrongArityIsAnError) {
 
 TEST(Modules, MathfuncCombinesWithOperatorsAndParams) {
   Shell sh;
+  sh.run("zmodload zsh/mathfunc");
   auto r = sh.run("x=9; echo $((sqrt(x) + 1))");
   EXPECT_EQ(r.rc, 0);
   EXPECT_EQ(r.out, "4.\n");
@@ -158,6 +172,7 @@ TEST(Modules, MathfuncCombinesWithOperatorsAndParams) {
 
 TEST(Modules, MathfuncUnloadRemovesFunctions) {
   Shell sh;
+  sh.run("zmodload zsh/mathfunc");
   EXPECT_EQ(sh.run("zmodload -u zsh/mathfunc").rc, 0);
   auto r = sh.run("echo $((sqrt(4)))");
   EXPECT_NE(r.rc, 0);
@@ -166,6 +181,7 @@ TEST(Modules, MathfuncUnloadRemovesFunctions) {
 
 TEST(Modules, LetUsesMathfunc) {
   Shell sh;
+  sh.run("zmodload zsh/mathfunc");
   // `let x = sqrt(16)` assigns a float to x; jfsh prints floats in
   // typeset -F form (10 decimals) when read back as a scalar.
   auto r = sh.run("let 'x = sqrt(16)'; echo $x");
@@ -179,6 +195,7 @@ TEST(Modules, LetUsesMathfunc) {
 
 TEST(Modules, StrftimeFormatsEpoch) {
   Shell sh;
+  sh.run("zmodload zsh/datetime");
   // Pass a fixed epoch time (midnight 1970-01-01 UTC) — but result depends
   // on local TZ, so just check the shape with %s (which is the input).
   auto r = sh.run("strftime '%s' 1700000000");
@@ -188,6 +205,7 @@ TEST(Modules, StrftimeFormatsEpoch) {
 
 TEST(Modules, StrftimeDashSStoresInVariable) {
   Shell sh;
+  sh.run("zmodload zsh/datetime");
   auto r = sh.run("strftime -s t '%s' 1700000000; echo $t");
   EXPECT_EQ(r.rc, 0);
   EXPECT_EQ(r.out, "1700000000\n");
@@ -201,6 +219,7 @@ TEST(Modules, StrftimeNeedsAFormat) {
 
 TEST(Modules, StrftimeBadOption) {
   Shell sh;
+  sh.run("zmodload zsh/datetime");
   auto r = sh.run("strftime -Q '%s'");
   EXPECT_NE(r.rc, 0);
   EXPECT_NE(r.err.find("bad option"), std::string::npos);
@@ -208,6 +227,7 @@ TEST(Modules, StrftimeBadOption) {
 
 TEST(Modules, EpochSecondsIsIntegerWithPositiveValue) {
   Shell sh;
+  sh.run("zmodload zsh/datetime");
   // $EPOCHSECONDS is installed as a special by install_special_params;
   // the datetime module records it in features.  Either way, it should
   // read as a positive integer.
@@ -223,9 +243,9 @@ TEST(Modules, EpochSecondsIsIntegerWithPositiveValue) {
 TEST(Modules, ZmodloadDashAMarksAutoload) {
   Shell sh;
   EXPECT_EQ(sh.run("zmodload -a zsh/pcre pcre_match").rc, 0);
-  auto r = sh.run("zmodload -L");
-  // After marking, zmodload -L lists zsh/pcre in autoload form.
-  EXPECT_NE(r.out.find("zmodload -a zsh/pcre"), std::string::npos);
+  // The mark is a builtin's, listed by -Lab; -L lists loaded modules.
+  EXPECT_EQ(sh.run("zmodload -L").out, "zmodload zsh/main\n");
+  EXPECT_NE(sh.run("zmodload -Lab").out.find("zmodload -ab zsh/pcre pcre_match\n"), str::npos);
 }
 
 // ---------------------------------------------------------------------------
@@ -287,11 +307,12 @@ TEST(Modules, ParameterBuiltinsContainsCore) {
 
 TEST(Modules, ParameterBuiltinsIncludesModuleContributed) {
   Shell sh;
-  // strftime is contributed by zsh/datetime.
-  auto r = sh.run("echo ${builtins[strftime]}");
-  EXPECT_EQ(r.rc, 0);
-  // Value is the contributing module's name.
-  EXPECT_EQ(r.out, "zsh/datetime\n");
+  // strftime comes with zsh/datetime, which isn't autoloadable; zstyle's
+  // module is, so it reads "undefined" until loaded.
+  EXPECT_EQ(sh.run("echo \"[${builtins[strftime]}]\" $builtins[zstyle]").out, "[] undefined\n");
+  EXPECT_EQ(sh.run("zmodload zsh/datetime zsh/zutil; "
+                   "echo $builtins[strftime] $builtins[zstyle]").out,
+            "defined defined\n");
 }
 
 TEST(Modules, ParameterOptionsHasExpectedKeys) {
@@ -310,9 +331,9 @@ TEST(Modules, ParameterOptionsReflectsSetopt) {
 
 TEST(Modules, ParameterModulesIncludesAutoloaded) {
   Shell sh;
-  auto r = sh.run("echo ${modules[zsh/datetime]} ${modules[zsh/mathfunc]}");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "loaded loaded\n");
+  EXPECT_EQ(sh.run("echo \"[${modules[zsh/datetime]}]\" ${modules[zsh/zutil]}").out,
+            "[] autoloaded\n");
+  EXPECT_EQ(sh.run("zmodload zsh/datetime; echo ${modules[zsh/datetime]}").out, "loaded\n");
 }
 
 TEST(Modules, ParameterReswordsIncludesIf) {
@@ -427,19 +448,12 @@ TEST(Modules, ZparseoptsFailOnUnknown) {
   EXPECT_NE(r.err.find("bad option"), std::string::npos);
 }
 
-TEST(Modules, IsAtLeastExactVersion) {
+TEST(Modules, IsAtLeastIsAFunctionNotABuiltin) {
   Shell sh;
-  auto r = sh.run("ZSH_VERSION=5.9; is-at-least 5.9 && echo ok");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "ok\n");
+  // zsh's is-at-least is a shell function in $fpath, not zsh/zutil's.
+  EXPECT_EQ(sh.run("whence -w is-at-least").out, "is-at-least: none\n");
 }
 
-TEST(Modules, IsAtLeastGreater) {
-  Shell sh;
-  auto r = sh.run("is-at-least 4.0 5.9 && echo yes");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "yes\n");
-}
 
 TEST(Modules, IsAtLeastLess) {
   Shell sh;
@@ -448,13 +462,6 @@ TEST(Modules, IsAtLeastLess) {
   EXPECT_EQ(r.out, "too-old\n");
 }
 
-TEST(Modules, IsAtLeastNumericComponents) {
-  Shell sh;
-  // 5.10 > 5.9 when components compared as integers.
-  auto r = sh.run("is-at-least 5.9 5.10 && echo yes");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "yes\n");
-}
 
 TEST(Modules, ZformatSubstitutesKeys) {
   Shell sh;
@@ -496,17 +503,16 @@ TEST(Modules, ZformatMissingKeyStays) {
 // zsh/system (Phase 2b).
 // ---------------------------------------------------------------------------
 
-TEST(Modules, ErrnosHashHasCommonEntries) {
+TEST(Modules, ErrnosArrayByNumber) {
   Shell sh;
-  auto r = sh.run("echo $errnos[EACCES] $errnos[ENOENT]");
-  EXPECT_EQ(r.rc, 0);
-  // The actual numbers vary by platform; just sanity-check both present.
-  EXPECT_NE(r.out, " \n");
-  EXPECT_NE(r.out.find(' '), std::string::npos);
+  sh.run("zmodload zsh/system");
+  EXPECT_EQ(sh.run("echo ${errnos[(i)ENOENT]} $errnos[13] ${(t)errnos}").out,
+            "2 EACCES array-readonly-hide-hideval-special\n");
 }
 
 TEST(Modules, SyserrorPrintsMessageForErrnoName) {
   Shell sh;
+  sh.run("zmodload zsh/system");
   auto r = sh.run("syserror ENOENT 2>&1");
   EXPECT_EQ(r.rc, 0);
   // strerror text varies by libc but always contains "file" or "directory".
@@ -515,6 +521,7 @@ TEST(Modules, SyserrorPrintsMessageForErrnoName) {
 
 TEST(Modules, SyserrorDashEStoresMessage) {
   Shell sh;
+  sh.run("zmodload zsh/system");
   auto r = sh.run("syserror -e msg ENOENT; echo $msg");
   EXPECT_EQ(r.rc, 0);
   // Something non-empty was stored.
@@ -523,34 +530,34 @@ TEST(Modules, SyserrorDashEStoresMessage) {
 
 TEST(Modules, SyserrorUnknownErrnoFails) {
   Shell sh;
+  sh.run("zmodload zsh/system");
   auto r = sh.run("syserror FAKEERRNO");
-  EXPECT_NE(r.rc, 0);
-  EXPECT_NE(r.err.find("unknown errno"), std::string::npos);
+  EXPECT_EQ(r.rc, 2);
+  EXPECT_EQ(r.err, "");
 }
 
 TEST(Modules, SysopenSysreadSyswriteSysseekRoundTrip) {
   Shell sh;
-  char path[] = "/tmp/jfsh_sysioXXXXXX";
-  int fd = ::mkstemp(path);
-  ASSERT_GE(fd, 0);
-  ASSERT_EQ(::write(fd, "hello world", 11), 11);
-  ::close(fd);
-
-  // Open the file, read 5 bytes, then seek back to 6 and read "world".
-  str cmd = str("sysopen -o read -u fd ") + path + "\n"
+  sh.run("zmodload zsh/system");
+  TempDir td;
+  str path = td.path.string() + "/f";
+  std::ofstream{path} << "hello world";
+  // Open the file, read 5 bytes, then seek to 6 and read "world".
+  str cmd = "sysopen -r -u fd " + path + "\n"
             "sysread -i $fd -s 5 part\n"
             "echo \"[$part]\"\n"
             "sysseek -u $fd -w start 6\n"
             "sysread -i $fd -s 5 part2\n"
-            "echo \"[$part2]\"\n"
-            "exec {fd}>&- 2>/dev/null; true\n";
+            "echo \"[$part2]\" $(( systell(fd) ))\n"
+            "exec {fd}<&-\n";
   auto r = sh.run(cmd);
-  ::unlink(path);
-  EXPECT_EQ(r.out, "[hello]\n[world]\n");
+  EXPECT_EQ(r.out, "[hello]\n[world] 11\n");
+  EXPECT_EQ(r.err, "");
 }
 
 TEST(Modules, SyswriteWritesToStdout) {
   Shell sh;
+  sh.run("zmodload zsh/system");
   auto r = sh.run("syswrite 'hi'");
   EXPECT_EQ(r.rc, 0);
   EXPECT_EQ(r.out, "hi");
@@ -558,6 +565,7 @@ TEST(Modules, SyswriteWritesToStdout) {
 
 TEST(Modules, ZsystemSupportsFlock) {
   Shell sh;
+  sh.run("zmodload zsh/system");
   EXPECT_EQ(sh.run("zsystem supports flock").rc, 0);
   EXPECT_NE(sh.run("zsystem supports no-such-feature").rc, 0);
 }
@@ -577,16 +585,17 @@ TEST(Modules, ZsystemFlockTakesAndReleasesLock) {
   EXPECT_EQ(r.out, "done\n");
 }
 
-TEST(Modules, SysreadTimeoutZeroReturnsTwoOnEmpty) {
+TEST(Modules, SysreadTimeoutZeroOnEmptyPipe) {
   Shell sh;
+  sh.run("zmodload zsh/system");
   int pipefd[2];
   ASSERT_EQ(::pipe(pipefd), 0);
   str cmd = "sysread -t 0 -i " + std::to_string(pipefd[0]) + "; echo $?";
   auto r = sh.run(cmd);
   ::close(pipefd[0]);
   ::close(pipefd[1]);
-  // Status printed is 2 when the read would block.
-  EXPECT_EQ(r.out, "2\n");
+  // A read that would block times out: status 4.
+  EXPECT_EQ(r.out, "4\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -609,8 +618,7 @@ TEST(Modules, FilesAfterZmodloadBuiltinsExist) {
       "zmodload zsh/files\n"
       "echo ${builtins[mkdir]} ${builtins[rm]} ${builtins[chmod]}");
   EXPECT_EQ(r.rc, 0);
-  // Each is now a module-contributed builtin → value is "zsh/files".
-  EXPECT_EQ(r.out, "zsh/files zsh/files zsh/files\n");
+  EXPECT_EQ(r.out, "defined defined defined\n");
 }
 
 TEST(Modules, FilesMkdirCreatesDirectory) {
@@ -735,19 +743,18 @@ TEST(Modules, StatNotLoadedByDefault) {
 
 TEST(Modules, StatAfterZmodloadBuiltinExists) {
   Shell sh;
-  auto r = sh.run("zmodload zsh/stat; echo ${builtins[zstat]}");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "zsh/stat\n");
+  EXPECT_EQ(sh.run("zmodload zsh/stat; echo ${builtins[zstat]} ${builtins[stat]}").out,
+            "defined defined\n");
 }
 
 TEST(Modules, StatListsElementsWithDashL) {
   Shell sh;
-  auto r = sh.run("zmodload zsh/stat; zstat -l");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_NE(r.out.find("size"),  std::string::npos);
-  EXPECT_NE(r.out.find("mode"),  std::string::npos);
-  EXPECT_NE(r.out.find("mtime"), std::string::npos);
-  EXPECT_NE(r.out.find("type"),  std::string::npos);
+  sh.run("zmodload zsh/stat");
+  EXPECT_EQ(sh.run("zstat -l").out,
+            "device inode mode nlink uid gid rdev size atime mtime ctime blksize blocks link\n");
+  auto r = sh.run("zstat +type /");
+  EXPECT_EQ(r.rc, 1);
+  EXPECT_EQ(r.err, "jfsh: zstat: type: no such stat element\n");
 }
 
 TEST(Modules, StatHashOutput) {
@@ -762,12 +769,12 @@ TEST(Modules, StatHashOutput) {
 
 TEST(Modules, StatArrayOutput) {
   Shell sh;
+  sh.run("zmodload zsh/stat");
   TempDir td;
   str path = td.path.string() + "/f";
   std::ofstream{path} << "abc";
-  auto r = sh.run("zmodload zsh/stat; zstat -A a +size +type " + path + "; echo $a[1] $a[2]");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "3 regular\n");
+  EXPECT_EQ(sh.run("zstat -A a +size " + path + "; echo $a").out, "3\n");
+  EXPECT_EQ(sh.run("zstat -H h " + path + "; echo $h[size] ${#h}").out, "3 14\n");
 }
 
 TEST(Modules, StatSingleElementToStdout) {
@@ -780,43 +787,43 @@ TEST(Modules, StatSingleElementToStdout) {
   EXPECT_EQ(r.out, "0\n");
 }
 
-TEST(Modules, StatDirectoryTypeIsDirectory) {
+TEST(Modules, StatDirectoryModeString) {
   Shell sh;
+  sh.run("zmodload zsh/stat");
   TempDir td;
-  auto r = sh.run("zmodload zsh/stat; zstat -H s +type " + td.path.string() + "; echo $s[type]");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "directory\n");
+  EXPECT_EQ(sh.run("chmod 755 " + td.path.string() + "; zstat -s +mode " + td.path.string()).out,
+            "drwxr-xr-x\n");
 }
 
 TEST(Modules, StatSymlinkFollowedByDefault) {
   Shell sh;
+  sh.run("zmodload zsh/stat");
   TempDir td;
   str target = td.path.string() + "/real";
   str link   = td.path.string() + "/sym";
   std::ofstream{target} << "x";
   ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
-  auto r = sh.run("zmodload zsh/stat; zstat -H s +type " + link + "; echo $s[type]");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "regular\n");
+  EXPECT_EQ(sh.run("zstat -s +mode " + link + " | cut -c1").out, "-\n");
 }
 
 TEST(Modules, StatDashLDoesNotFollowSymlink) {
   Shell sh;
+  sh.run("zmodload zsh/stat");
   TempDir td;
   str target = td.path.string() + "/real";
   str link   = td.path.string() + "/sym";
   std::ofstream{target} << "x";
   ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
-  auto r = sh.run("zmodload zsh/stat; zstat -L -H s +type " + link + "; echo $s[type]");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "link\n");
+  EXPECT_EQ(sh.run("zstat -L -s +mode " + link + " | cut -c1").out, "l\n");
+  EXPECT_EQ(sh.run("zstat +link " + link).out, target + "\n");
 }
 
 TEST(Modules, StatMissingFileFails) {
   Shell sh;
-  auto r = sh.run("zmodload zsh/stat; zstat +size /no/such/path");
-  EXPECT_NE(r.rc, 0);
-  EXPECT_NE(r.err.find("No such"), std::string::npos);
+  sh.run("zmodload zsh/stat");
+  auto r = sh.run("zstat +size /no/such/path");
+  EXPECT_EQ(r.rc, 1);
+  EXPECT_EQ(r.err, "jfsh: zstat: /no/such/path: no such file or directory\n");
 }
 
 TEST(Modules, StatOctalModeFlag) {
@@ -854,15 +861,13 @@ TEST(Modules, PcreCompileAndMatchSimple) {
   EXPECT_EQ(r.rc, 0);
 }
 
-TEST(Modules, PcreMatchSetsPcreMatch) {
+TEST(Modules, PcreMatchSetsMatch) {
   Shell sh;
-  auto r = sh.run(
-      "zmodload zsh/pcre\n"
-      "pcre_compile 'he(l+)o'\n"
-      "pcre_match 'say hello now'\n"
-      "echo $PCRE_MATCH ${pcre_match[1]}");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "hello ll\n");
+  sh.run("zmodload zsh/pcre");
+  EXPECT_EQ(sh.run("pcre_compile 'he(l+)o'; pcre_match 'say hello now'; echo $MATCH $match[1]").out,
+            "hello ll\n");
+  EXPECT_EQ(sh.run("pcre_match -v m -a a -b 'say hello'; echo $m $a $ZPCRE_OP").out,
+            "hello ll 4 9\n");
 }
 
 TEST(Modules, PcreMatchNonMatchReturnsOne) {
@@ -876,11 +881,10 @@ TEST(Modules, PcreMatchNonMatchReturnsOne) {
 
 TEST(Modules, PcreCompileRejectsBadPattern) {
   Shell sh;
-  auto r = sh.run(
-      "zmodload zsh/pcre\n"
-      "pcre_compile '[unclosed'");
-  EXPECT_NE(r.rc, 0);
-  EXPECT_NE(r.err.find("failed to compile"), std::string::npos);
+  sh.run("zmodload zsh/pcre");
+  auto r = sh.run("pcre_compile '[unclosed'");
+  EXPECT_EQ(r.rc, 1);
+  EXPECT_NE(r.err.find("pcre_compile: error in regex: "), str::npos);
 }
 
 TEST(Modules, PcreCompileDashICaseInsensitive) {
@@ -894,22 +898,18 @@ TEST(Modules, PcreCompileDashICaseInsensitive) {
 
 TEST(Modules, PcreMatchWithoutCompileFails) {
   Shell sh;
-  auto r = sh.run(
-      "zmodload zsh/pcre\n"
-      "pcre_match 'x'");
-  EXPECT_NE(r.rc, 0);
-  EXPECT_NE(r.err.find("no pattern compiled"), std::string::npos);
+  sh.run("zmodload zsh/pcre");
+  auto r = sh.run("pcre_match 'x'");
+  EXPECT_EQ(r.rc, 1);
+  EXPECT_EQ(r.err, "jfsh: pcre_match: no pattern has been compiled\n");
 }
 
 TEST(Modules, PcreMultipleCaptures) {
   Shell sh;
-  auto r = sh.run(
-      "zmodload zsh/pcre\n"
-      "pcre_compile '(\\w+)=(\\d+)'\n"
-      "pcre_match 'name=42'\n"
-      "echo \"${pcre_match[1]}/${pcre_match[2]}\"");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "name/42\n");
+  sh.run("zmodload zsh/pcre");
+  EXPECT_EQ(sh.run("pcre_compile '(\\w+)=(\\d+)'; pcre_match 'name=42'; "
+                   "echo \"$match[1]/$match[2]\"").out,
+            "name/42\n");
 }
 
 TEST(Modules, PcreMatchDashVNames) {
@@ -995,28 +995,23 @@ TEST(Modules, CondRegexMatchFalse) {
 
 TEST(Modules, ZmodloadDashFDisablesABuiltin) {
   Shell sh;
-  // Load zsh/example, then disable the builtin named `example`.  The
-  // module reloads with the builtin filtered out, so the next call
-  // fails with "command not found".
   auto r = sh.run(
       "zmodload zsh/example\n"
-      "example\n"
-      "zmodload -F zsh/example -example\n"
-      "example 2>&1 || echo gone");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_NE(r.out.find("jfsh zsh/example"), std::string::npos);
-  EXPECT_NE(r.out.find("gone"), std::string::npos);
+      "zmodload -F zsh/example -b:example\n"
+      "example; echo $?");
+  EXPECT_EQ(r.out, "The example module has now been set up.\n127\n");
+  EXPECT_EQ(r.err, "jfsh: command not found: example\n");
 }
 
 TEST(Modules, ZmodloadDashFReenablesFeature) {
   Shell sh;
   auto r = sh.run(
       "zmodload zsh/example\n"
-      "zmodload -F zsh/example -example\n"      // disable builtin
-      "zmodload -F zsh/example +example\n"      // re-enable
-      "example");
+      "zmodload -F zsh/example -b:example\n"
+      "zmodload -F zsh/example +b:example\n"
+      "example a | head -2");
   EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "jfsh zsh/example\n");
+  EXPECT_EQ(r.out, "The example module has now been set up.\nOptions: \nArguments: a\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,35 +1020,37 @@ TEST(Modules, ZmodloadDashFReenablesFeature) {
 
 TEST(Modules, ExampleModuleBuiltinPrintsGreeting) {
   Shell sh;
-  auto r = sh.run("zmodload zsh/example; example");
+  auto r = sh.run("zmodload zsh/example; example -fl a b; echo $exint $exstr $exarr");
   EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "jfsh zsh/example\n");
+  EXPECT_EQ(r.out, "The example module has now been set up.\nOptions: fl\nArguments: a b\n"
+                   "Name: example\n\nInteger Parameter: 42\nString Parameter: example\n"
+                   "Array Parameter: example array\n2 a a b\n");
+  EXPECT_EQ(sh.run("zmodload -u zsh/example").out,
+            "Thank you for using the example module.  Have a nice day.\n");
 }
 
 TEST(Modules, ExampleModuleMathFunc) {
   Shell sh;
-  auto r = sh.run("zmodload zsh/example; echo $((example(100)))");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "142\n");
+  sh.run("zmodload zsh/example");
+  // sum() promotes to a float; length() takes its text as it is.
+  EXPECT_EQ(sh.run("echo $(( sum(1,2,3.5) )) $(( sum(1) )) "
+                   "$(( length(abcd) )) $(( length( ab ) ))").out,
+            "6.5 1 4 4\n");
 }
 
 TEST(Modules, ExampleModuleCondition) {
   Shell sh;
-  auto r = sh.run(
-      "zmodload zsh/example\n"
-      "[[ 'hello world' -example-match 'world' ]] && echo yes");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "yes\n");
+  sh.run("zmodload zsh/example");
+  EXPECT_EQ(sh.run("[[ -len abc 3 ]] && echo y; [[ -len '' ]] && echo e; [[ -len abc ]] || echo n; "
+                   "[[ ex -ex ample ]] && echo x; [[ a -ex b ]] || echo nx").out,
+            "y\ne\nn\nx\nnx\n");
 }
 
-TEST(Modules, ExampleModuleDashMChecksMathFuncExists) {
+TEST(Modules, ExampleModuleFeatures) {
   Shell sh;
-  auto r = sh.run(
-      "zmodload zsh/example\n"
-      "example -M sqrt && echo known\n"
-      "example -M no_such && echo unknown || echo missing");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "known\nmissing\n");
+  EXPECT_EQ(sh.run("zmodload zsh/example; zmodload -LF zsh/example").out,
+            "The example module has now been set up.\nzmodload -F zsh/example b:example C:ex c:len "
+            "f:length f:sum p:exarr p:exint p:exstr\n");
 }
 
 TEST(Modules, ExampleModuleCanBeUnloaded) {
@@ -1148,11 +1145,12 @@ TEST(Modules, ZsocketNotLoadedByDefault) {
   EXPECT_EQ(sh.run("echo ${+builtins[zsocket]}").out, "0\n");
 }
 
-TEST(Modules, ZsocketAliasForNetSocket) {
+TEST(Modules, ZsocketIsNotAName) {
   Shell sh;
-  auto r = sh.run("zmodload zsh/socket; echo ${modules[zsh/net/socket]}");
-  EXPECT_EQ(r.rc, 0);
-  EXPECT_EQ(r.out, "loaded\n");
+  // zsh 5.9 has no zsh/socket alias for zsh/net/socket.
+  auto r = sh.run("zmodload zsh/socket");
+  EXPECT_EQ(r.rc, 1);
+  EXPECT_NE(r.err.find("failed to load module `zsh/socket'"), str::npos);
 }
 
 TEST(Modules, ZsocketListenAcceptConnectRoundTrip) {

@@ -279,6 +279,10 @@ private:
 
 extern const OptionInfo OPTION_INFO[OPT_COUNT];
 
+// zsh's option aliases (braceexpand, dotglob, …): names find() accepts
+// that aren't in OPTION_INFO.
+vec<strv> option_alias_names();
+
 }  // namespace jfsh
 
 #endif  // JFSH_CORE_OPTIONS_H

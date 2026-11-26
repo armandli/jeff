@@ -830,6 +830,9 @@ struct Scan {
         }
         if (c == '$' or c == '`') {
           if (auto r = substitution(w, i, true); not r) return r;
+          // After a failed autoload the rest of the word is dropped (zsh's
+          // stringsubst stops at errflag).
+          if (ctx().lookup_failing()) return {};
           continue;
         }
         put(c, true);
@@ -887,6 +890,7 @@ struct Scan {
       }
       if (c == '$' or c == '`') {
         if (auto r = substitution(w, i, dq); not r) return r;
+        if (ctx().lookup_failing()) return {};   // the rest of the word goes
         continue;
       }
       if (top and not dq and i + 1 < w.size() and w[i + 1] == '('
@@ -1107,6 +1111,9 @@ struct Scan {
     if (expand and expr.find_first_of("\"\\$`") != strv::npos) {
       auto text = expand_scalar(expr, Mode::Arith);
       if (not text) return s::unexpected(text.error());
+      // A failed autoload in it: nothing is evaluated (zsh's matheval does
+      // nothing under errflag).
+      if (ctx().lookup_failing()) return MathNum::of(s::int64_t{0});
       expanded = s::move(*text);
       expr = expanded;
     }
@@ -1181,12 +1188,6 @@ struct Scan {
       if (n >= 1 and n <= c.positional.size()) scalar(c.positional[n - 1]);
       return v;
     }
-    if (name == "dirstack") {
-      v.set = true;
-      v.make_array(c.dirstack);
-      return v;
-    }
-
     auto p = c.params.lookup(name);
     if (not p or not p->get().is_set()) return v;
     const Param& param = p->get();
@@ -1463,13 +1464,19 @@ struct Scan {
   // when the handlers don't apply.
   opt<Result<Value>> element_view(strv name, strv t, s::size_t& i) {
     if (i >= t.size() or t[i] != '[') return s::nullopt;
-    auto p = ctx().params.lookup_raw(name);
+    auto failures = ctx().params.lookup_failures;
+    auto p = ctx().params.lookup_noget(name);
+    // An autoloaded parameter this lookup found undefined, subscripted:
+    // the message, and the word goes on empty (zsh's getindex clears
+    // errflag).
+    if (ctx().params.lookup_failures != failures) (void)ctx().take_lookup_error();
     if (not p or not p->get().handlers or not p->get().handlers->get_elem)
       return s::nullopt;
     s::size_t e = find_close(t, i);
     if (e == strv::npos) return s::nullopt;
     strv sub = t.substr(i + 1, e - i - 1);
-    if (sub == "@" or sub == "*") return s::nullopt;
+    // Subscript flags ((I)pat, (r)pat …) search the whole table.
+    if (sub == "@" or sub == "*" or is_subscript_flags(sub)) return s::nullopt;
     auto key = expand_scalar(sub, Mode::Scalar);
     if (not key) return Result<Value>(s::unexpected(key.error()));
     auto got = p->get().handlers->get_elem(*key);
@@ -2388,6 +2395,9 @@ struct Scan {
 
   // ${…}: `t` is the text between the braces.
   Result<void> param(strv t, bool dq) {
+    // After a failed autoload the rest of the word's substitutions give
+    // nothing (zsh's paramsubst returns at errflag).
+    if (ctx().lookup_failing()) return {};
     // At the top of the `=` operand of a result that is to be split, zsh
     // (PREFORK_SINGLE) also skips (s) and (f).
     auto r = param_value(t, dq, mode != Mode::Word or no_eq_split);
@@ -2756,6 +2766,14 @@ struct Scan {
     };
 
     bool from_operand = false;   // the value is that of ${x:-word} and the like
+    // A failed autoload of the name: no operator or modifier runs (zsh's
+    // paramsubst returns at errflag), so `${x:?msg}` adds no message.
+    if (ctx().lookup_failing()) {
+      // `${x?…}` still exits a non-interactive zsh with 1 (its exit(1) comes
+      // after the zerr that errflag silences).
+      if (op.find('?') != strv::npos) ctx().last_exit = 1;
+      op = {};
+    }
     if (not op.empty()) {
       bool colon = op[0] == ':';
       strv rest = colon ? op.substr(1) : op;
@@ -3884,6 +3902,7 @@ Result<void> tilde_at(Field& f, s::size_t p, s::size_t end, ExecContext& ctx) {
 // Tilde expansion at the start of the word and, for assignments (or
 // MAGIC_EQUAL_SUBST arguments), after `=` and each `:`.
 Result<void> tilde_expand(Field& f, bool assign_like, ExecContext& ctx) {
+  if (ctx.lookup_failing()) return {};   // none under errflag (a failed autoload)
   auto bound = [&](s::size_t p) {
     s::size_t e = p + 1;
     while (e < f.text.size() and f.text[e] != '/' and not (assign_like and f.text[e] == ':'))
@@ -3923,6 +3942,12 @@ Result<vec<str>> Expander::words(const vec<str>& words) {
     for (auto& f : fields) {
       if (f.text.empty()) {
         if (f.quoted and not f.empty_at) out.emplace_back();
+        continue;
+      }
+      // After a failed autoload the word is left as it is: zsh's prefork
+      // does no ~, = or glob expansion under errflag.
+      if (mCtx.lookup_failing()) {
+        out.push_back(s::move(f.text));
         continue;
       }
       bool magic = opts.get(OPT_MAGICEQUALSUBST)

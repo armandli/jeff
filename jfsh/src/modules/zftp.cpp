@@ -563,7 +563,6 @@ void register_zftp_module(ModuleManager& mm) {
                             "ZFTP_REPLY", "ZFTP_CODE"})
         drop_module_param(ctxp->params, p);
     };
-    out.feature_names = {"b:zftp"};
   });
 }
 

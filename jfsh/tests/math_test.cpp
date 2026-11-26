@@ -380,6 +380,7 @@ TEST(MathM5Review, UntakenBranchesAreNotEvaluated) {
 
 TEST(MathM5Review, ShellValuesAndFunctions) {
   Shell sh;
+  sh.run("zmodload zsh/mathfunc");
   EXPECT_EQ(out(sh, "set -- a b c; echo $(( ARGC )) $(( # )) $(( #+1 ))"), "3 3 4\n");
   EXPECT_EQ(out(sh, "set -- 5 6; echo $(( argv[2] + 1 ))"), "7\n");
   EXPECT_EQ(out(sh, "f() { return 3; }; f; echo $(( ? + 1 ))"), "4\n");

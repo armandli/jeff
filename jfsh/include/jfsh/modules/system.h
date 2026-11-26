@@ -1,19 +1,18 @@
 #ifndef JFSH_MODULES_SYSTEM_H
 #define JFSH_MODULES_SYSTEM_H
-// jfsh/modules/system.h — the `zsh/system` module (M10 Phase 2b).
+// jfsh/modules/system.h — the `zsh/system` module (a port of zsh's
+// Src/Modules/system.c).
 //
-// Contributes zsh's thin wrappers around the UNIX syscall surface:
-//
-//   syserror [-e var] [-p prefix] errno
-//   sysopen  -o flags -u fd file
-//   sysread  [-c count] [-i fd] [-o fd] [-s size] [-t timeout] [name]
+//   syserror [-e errvar] [-p prefix] [errno | errname]
+//   sysopen  [-arw] [-m perms] [-o opts] -u fd file
+//   sysread  [-c countvar] [-i infd] [-o outfd] [-s bufsize] [-t timeout] [param]
 //   sysseek  [-u fd] [-w start|end|current] offset
-//   syswrite [-c count] [-o fd] data
-//   zsystem  flock [-t secs] [-f fd] [-r] file
-//   zsystem  supports feature
-//   $errnos  — associative array: errno name → numeric value (EACCES → "13").
-//
-// Used by any script that needs raw fd I/O, timed reads or advisory locks.
+//   syswrite [-c countvar] [-o outfd] data
+//   zsystem  flock [-ef] [-i interval] [-r] [-t timeout] file; flock -u fd
+//   zsystem  supports subcommand
+//   systell(fd)  — math function
+//   $errnos      — array of errno names by number
+//   $sysparams   — pid, ppid, procsubstpid
 
 #include <jfsh/modules/module.h>
 

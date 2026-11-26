@@ -2666,13 +2666,336 @@ items landed together, closing M10:
   tests and documented in the header as a template for third-party
   module authors.
 
+**Review fixes** (branch jfsh-m10-review), against zsh 5.9 (848 probes, each run as
+`-c` and as a script, three ways: zsh, main and the branch; scratchpad m10/p, driver
+m10/reg.py; M7's 1,652-probe corpus and M9's and M8's pty, startup and history corpora
+run again). The framework is a port of zsh's Src/module.c: the module table (loaded
+modules, aliases, entries that only have dependencies or autoload marks), features
+(`b:` builtins, `c:`/`C:` conditions, `f:` math functions, `p:` parameters) each on or
+off, autoload marks for each kind (the first use loads the module with just that
+feature, or with -ab/-ap all of it, as zsh's FEAT_AUTOALL), dependencies loaded first,
+and `zmodload` is bin_zmodload with all its sub-commands (-A/-R, -e, -d, -a/-u with
+-b/-c/-p/-f, -F with -l/-L/-e/-m/-a/-P, -i, -s), zsh's listings (printmodulenode,
+autoloadscan, printautoparams) and messages. Before, `-F` re-loaded the module,
+`-ab`/`-ac`/`-ap`/`-af`, `-d`, `-m`, `-P`, `-s` did nothing or the wrong thing, listings
+weren't zsh's, `zmodload -A` printed `x -> y` for -L too, `$builtins` gave module names
+and `$modules` had no autoloaded ones. A shell starts as `zsh -f` does: zsh/main loaded,
+nothing else (zsh/zle too in an interactive shell), with zsh 5.9's bltinmods autoload
+marks and dependencies; jfsh had auto-loaded zsh/datetime, zsh/mathfunc, zsh/parameter,
+zsh/zutil, zsh/computil and zsh/system, so `$EPOCHSECONDS`, `sqrt()` and `syserror`
+worked without `zmodload` and `zmodload` listed six modules. zsh's modules whose
+builtins jfsh keeps with the shell are modules again (zsh/main, zsh/zle with bindkey,
+vared and zle; zsh/complete with compadd, compset and the -after/-between/-prefix/-suffix
+conditions; zsh/complist; zsh/rlimits with ulimit; zsh/sched with sched and
+`$zsh_scheduled_events`; compquote went to zsh/computil), and `$EPOCHSECONDS`,
+`$funcstack`, `$functrace` and `$dirstack` moved from install_special_params into their
+modules. A module's parameters go to the module first (`ParamTable::capture`) and into
+the table when their feature is turned on, with zsh's checkaddparam ("Can't add module
+parameter"); a PM_AUTOLOAD mark loads its module on lookup (lookup_noget is lookup
+without a getter), typeset lists it as `undefined` and by name, typeset -p and set leave
+it out, and typeset can't change its type. A module special with PM_HIDE is hidden by a
+`local`, as in zsh, and an unset module array is emptied first. `=~` runs zsh/regex's
+`C:regex-match` (zsh/pcre's under RE_MATCH_PCRE), as zsh's COND_REGEX, and a module's
+prefix condition (`[[ -len … ]]`) is found by name. `$module_path`/`$MODULE_PATH` exist
+(tied, not imported, default JFSH_MODULE_DIR); a module not compiled in is dlopen'd from
+it with zsh's messages. The zsh/socket and zsh/private aliases jfsh had added are gone.
+The core modules are ports: zsh/datetime (bin_strftime: -n -q -r -s, nanoseconds,
+zsh's checks, a local exported `$TZ`; the specials are integer, float and array,
+read-only), zsh/mathfunc (zsh's mftab: copysign fmod ilogb jn ldexp nextafter scalb yn
+added, atan2 and pow, which zsh doesn't have, gone, rand48 as a string function with its
+seed parameter), zsh/parameter (all 34 parameters: added $functions_source,
+$dis_functions_source, $funcfiletrace, $funcsourcetrace, $history, $historywords,
+$jobdirs, $jobstates and $jobtexts; $functions, $aliases,
+$galiases, $saliases, $commands, $options, $dis_functions and $dirstack are assignable
+as in zsh; values in zsh's form — function bodies as getpermtext, reswords in zsh's hash
+order, the 15 patchars, option aliases in $options; $widgets went to zsh/zleparameter,
+where zsh has it), zsh/zutil (bin_zstyle with weights and listing order, -e, -g, -t/-T
+statuses; zformat -f/-F with ternaries and -a; zparseopts including -M, -K, -A, -F and
+zsh's quirks; zregexparse, which was missing; is-at-least, a builtin jfsh had added, is
+the $fpath function again), zsh/system (execbuiltin options, sysopen's -o list and -m,
+sysread/syswrite statuses, sysseek, systell(), zsystem flock -e -i -t -u, `$errnos` an
+array, `$sysparams` added), zsh/files (zf_ names, rm -d -i -s, ln -h -n -i, mv's
+questions, zsh's messages), zsh/stat (bin_stat: -f -F -g -n -N -t -T, `stat` too; the
+`type` element jfsh had added is gone), zsh/pcre (PCRE2: -b and `$ZPCRE_OP`, `$MATCH`/
+`$match` as zsh sets them, BASH_REMATCH, case blind under RE_MATCH_PCRE without
+CASE_MATCH; `$PCRE_MATCH`/`$pcre_match` were jfsh's), zsh/regex (CASE_MATCH, KSH_ARRAYS,
+BASH_REMATCH, multibyte offsets) and zsh/example (its builtin, `[[ -len ]]`, `[[ a -ex b
+]]`, length() and sum(), the bound parameters, the GLOB_DOTS function wrapper). Every
+builtin reads its options as zsh's execbuiltin (`ZOps`, `zsh_options` in
+builtins/util.h). Older bugs fixed on the way: `${h[(I)…]}` and other subscript flags on
+a special hash went to its element getter; `$commands[x]` after `hash x=…`; `$jobtexts`
+etc. by job spec; `exec {fd}<&-` on an fd sysopen made ("used by shell"); compmatch's
+match_str read bytes before the text it matched a suffix against (zsh's does, on its
+heap), so `Matcher.WithTheOtherOptions` passed or failed with the heap's layout: the
+copies it keeps have NULs around them now.
+Counts: 848 probes, 1,696 runs: 1,612 as zsh, 1,054 fixed against main, 84 still different (listed under Still open; most are messages naming the function, PCRE2's wording, hash order, and the missing core builtins), 2 "regressions" that are one probe (`${#builtins}`: main's extra builtins had made its count equal zsh's by chance). M7's corpus: 1,652 probes, 0 regressions, 16 fixed. M9's and M8's pty, startup and history corpora (5,504 probes, and the 93 history round-trip cases): 4,959 as zsh, 16 fixed, the round-trips as before, 8 flagged that are timing (`PERIOD=1`, `MAILCHECK=1` and `TMOUT=1` probes land either side of a second; zsh itself gives either result from one run to the next).
+Performance: `$parameters[x]` 10,000 times took over 30 s on main (each lookup made every
+special's value) and 0.03 s now (zsh 0.02); `typeset`/`set` listings no longer make the
+hidden values; `$commands[x]`, `${#commands}`, `${(k)functions}`, 1,000 styles with
+10,000 zstyle lookups, `$EPOCHSECONDS`/`sqrt()`/strftime loops are within 0.01–0.02 s of
+zsh. Tests: `ModulesM10Review.StartupStateAsZshF`, `ModulesM10Review.AutoloadBringsOneFeature`,
+`ModulesM10Review.FailedAutoloads`, `ModulesM10Review.FeaturesListedAndToggled`,
+`ModulesM10Review.AliasesAndDependencies`, `ModulesM10Review.ErrorsAsBinZmodload`,
+`ModulesM10Review.ModuleParametersClash`, `ModulesM10Review.BuiltinsModulesAndLookup`,
+`ModulesM10Review.ParameterTablesAssignable`, `ModulesM10Review.ParameterViews`,
+`ModulesM10Review.ModuleSpecialsHideUnderLocal`, `ModulesM10Review.ZstyleAsBinZstyle`,
+`ModulesM10Review.ZformatAsBinZformat`, `ModulesM10Review.ZparseoptsAsBinZparseopts`,
+`ModulesM10Review.ZregexparseAsBinZregexparse`, `ModulesM10Review.StrftimeAsBinStrftime`,
+`ModulesM10Review.MathfuncAsZsh`, `ModulesM10Review.SystemAsZsh`,
+`ModulesM10Review.FilesAsZsh`, `ModulesM10Review.StatAsBinStat`,
+`ModulesM10Review.RegexAndPcreConditions`, `ModulesM10Review.ExampleAsZsh`
+(`tests/modules_m10_review_test.cpp`, each command's output, errors and status taken
+from `zsh -f -c`); updated to zsh's values (most `Modules.*` tests had relied on the
+auto-loaded modules or on jfsh's own builtins and parameters): `Modules.Zmodload*`,
+`Modules.Mathfunc*` (`MathfuncAtan2OfOneOne` is `MathfuncAtanOfOneOne`),
+`Modules.LetUsesMathfunc`, `Modules.Strftime*`, `Modules.EpochSecondsIsIntegerWithPositiveValue`,
+`Modules.ParameterBuiltinsIncludesModuleContributed`,
+`Modules.ParameterModulesIncludesAutoloaded`, `Modules.FilesAfterZmodloadBuiltinsExist`,
+`Modules.ErrnosArrayByNumber` (was `ErrnosHashHasCommonEntries`), `Modules.Syserror*`,
+`Modules.SysopenSysreadSyswriteSysseekRoundTrip`,
+`Modules.SysreadTimeoutZeroOnEmptyPipe` (was `…ReturnsTwoOnEmpty`), `Modules.Zsystem*`,
+`Modules.Example*` (`ExampleModuleFeatures` was `…DashMChecksMathFuncExists`),
+`Modules.Pcre*` (`PcreMatchSetsMatch` was `PcreMatchSetsPcreMatch`), `Modules.Stat*`
+(`StatDirectoryModeString` was `StatDirectoryTypeIsDirectory`),
+`Modules.ZsocketIsNotAName` (was `ZsocketAliasForNetSocket`),
+`Modules.IsAtLeastIsAFunctionNotABuiltin` (the three `IsAtLeast*` tests),
+`Cond.RegexSetsMatchParameters`, `MathM5Review.ShellValuesAndFunctions`,
+`Specials.EpochAndHistcmd`, `Interactive.TabCompletionAndHistoryKeys` (`ech` Tab is
+ambiguous in zsh: echotc and echoti are autoloadable builtins). Ported from zsh, with its attribution and licence:
+`src/modules/module.cpp`, `src/modules/datetime.cpp`, `src/modules/mathfunc.cpp`,
+`src/modules/parameter.cpp`, `src/modules/zutil.cpp`, `src/modules/system.cpp`,
+`src/modules/files.cpp`, `src/modules/stat.cpp`, `src/modules/pcre.cpp`,
+`src/modules/regex.cpp`, `src/modules/example.cpp`.
+
+**Review fixes, round 1.** A parameter mark whose module came without defining it is
+zsh's zerr: the message, then the command line stops with status 1 (a subshell's too);
+the math-function one returns its error through `MathFuncRegistry::find`'s Result
+instead of a static stand-in. Assigning all of `$aliases`, `$galiases` or `$saliases`
+first removes the aliases of that kind (zsh's setaliases); assigning `$commands` no
+longer fills the whole command hash (set_array doesn't make a special's value unless
+`+=` needs it). typeset on a mark: the name alone prints the name, `-r`, `+x`, `-g`
+and a `local` in a function leave the mark and its module alone, a value or `-x`
+loads it (zsh's export_param reads it); `unset 'name[sub]'` on a mark is zsh's
+scalar subscript (position 0: "assignment to invalid subscript range", status 1, no
+load). Unsetting either side of a tied special (`$module_path`/`$MODULE_PATH`,
+`$fpath`, `$path`, …) unsets both, the array keeping its type, so an assignment to
+either makes the pair again (`ParamHandlers::tied_set`; on main `unset fpath;
+fpath=(…)` failed). whence, type, which and `command -v` pass over disabled builtins
+and functions; a module loaded anew enables its builtins again, as zsh frees the
+disabled node (toggling a feature keeps the mark). Added `bye`, `where` (whence -ca),
+`unhash` (zsh's bin_unhash: -a, -s, -f, -d, -m, the command hash) and `ttyctl`
+(-f/-u accepted; jfsh's editor sets the terminal up for each line). A module builtin
+runs from a copy of its function, so one that unloads its own module (`zmodload -u`
+from a `zstyle -e` value: a heap-use-after-free under ASan, zsh segfaults) keeps its
+state until it returns. One lookup per module-builtin command (`resolve_builtin` with
+a `marked` flag; `has_builtin` for is_builtin). The licence headers of datetime.cpp,
+system.cpp, pcre.cpp and regex.cpp are now zsh's exactly (all ported files were checked
+against zsh-5.9's sources and LICENCE); `break; case` switches (F3) and the
+module.h layout (E8, E2). The M10 plan bullets that the review overturned are marked.
+Tests: `ModulesM10Review.TypesetLeavesMarks`, `ModulesM10Review.TiedSpecialsUnsetTogether`,
+`ModulesM10Review.CoreBuiltinsBecomeZsh`, and new cases in `…FailedAutoloads`,
+`…BuiltinsModulesAndLookup` and `…ParameterTablesAssignable`. Round-1 counts: the 848 probes (1,696 runs) give 1,625 as zsh (1,612 before), 1,068 fixed against main; the two `${#builtins}` runs are still flagged (100, zsh 103, main's 102 by chance), and `sysread -t abc` once (a pipe race). The reviewer's 429 probes (m10rv1 p1–p14, s1) differ now only where listed under Still open, or in dlopen's text naming its module path. M7's corpus: 1,652 probes, 0 regressions, 20 fixed. M8's and M9's pty, startup and history corpora: 5,504 probes, 4,961 as zsh, 18 fixed, the 93 history round-trips as before; the 6 flagged are again the `PERIOD=1`/`MAILCHECK=1` probes and one `exit-trap-int` that was still alive when the driver stopped waiting (6 of 6 again as zsh). Run 6 times each, zsh and the branch both land either side: `period` zsh 4 runs/2 runs, branch 3/3; `mail-default`, `mail-mailpath-scalar` and `mail-dir` 4/2 or 3/3 in both. `tmout-notrap-empty` differs as on main (M9's).
+
+**Review fixes, round 2.** The failed parameter autoload now has zsh's status in each
+place zsh has its own: `(( ))` gives 2 and `let` 1 and the line goes on (execarith and
+bin_let clear errflag), a subscripted `${name[1]}` goes on empty with 0 (getindex), an
+external command's redirection fails just that command with 1 (zsh expands it in the
+child), typeset/export of the mark return 1, and an EXIT trap that hit it makes the
+shell exit 1 unless it called `exit N` (`ExecContext::lookup_error`, set by the hook).
+(Round 2 also had `case` end with 0, `[[ ]]` fail, and any command that returned 0
+while the line ended give 1: those were wrong, and round 3 replaces them with zsh's
+rules, below.) `aliases=()` (and `galiases=()`, `saliases=()`, `set -A aliases`)
+changes nothing, as setaliases returns at once; `+=` on a special hash adds to what
+the table has (round 3: one pair at a time where the table can). Ties: `make_envp` brings a tied scalar's set flag up to date before it exports,
+so `unset FPATH; export FPATH=/q` reaches the environment and `export FPATH; unset
+fpath` leaves it out; unsetting one side of a user's tie (`typeset -T`) ends the tie
+and both names go, as zsh's; a read-only other side refuses the unset (the message,
+the line stops, status 0, as zsh); a tie's scalar reads the array past a `local -h`
+of it, and a user's tie keeps to the array of its own scope (`ParamTable::tied_array`,
+`mTies`); an unset `local -h` keeps hiding. A mark whose module doesn't load is tried
+once per typeset or assignment (one "failed to load module" line, as zsh). `unalias
+-m`/`unhash -am` that match nothing are status 1; `ttyctl` alone says whether the tty
+is frozen; `unset 'mark[1+]'` reports the math error. Style: the remaining switches
+(zstyle, zformat, zmodload) have their grouped labels and blank lines; RParseState,
+Zoptdesc and Recursive are ordered without inner padding (-Wpadded on every struct
+the branch adds shows only tail padding); the three long test lines are split. Tests:
+new cases in `ModulesM10Review.FailedAutoloads`, `…ParameterTablesAssignable`,
+`…TiedSpecialsUnsetTogether`, `…CoreBuiltinsBecomeZsh`, `…BuiltinsModulesAndLookup`
+(a zstyle -e value that unloads zsh/zutil: `v 0`, where zsh segfaults), and
+`Binary.FailedAutoloadInExitTrap`. Round-2 counts: the 848 probes as in round 1 (1,625 runs as zsh, 1,068 fixed, the same `${#builtins}` and `sysread -t abc` flags); the round-1 reviewer's 429 probes unchanged; the round-2 reviewer's 225 (m10rv2 q1–q8) differ in 11, each a function or `(eval)` naming its messages, a Still open item (named directories, `enable -p`, `typeset -p` of ties, hash order), the compiled-in modules ignoring an empty `$module_path`, or the two shells' own `$fpath`. M7: 1,652 probes, 0 regressions, 20 fixed. M8/M9: 5,504 probes, 4,959 as zsh, 17 fixed, the history round-trips as before, 5 flagged, all the `PERIOD=1`/`MAILCHECK=1` probes shown above to land either side of a second in both shells.
+
+**Review fixes, round 3.** The failed autoload now follows zsh's errflag as one model
+instead of per-site statuses. The hook raises it (`ExecContext::raise_lookup_error`:
+`aborting`, `abort_line`, `lookup_error`) and, as zsh's zerr, leaves `$?` alone; a
+sublist that starts with no error pending drops the mark, and so does
+`end_trap_abort`, so it can't outlive its error; where zsh clears errflag one helper,
+`take_lookup_error`, takes it back; each construct then gives the status zsh's code
+gives (zsh 5.9: params.c getparamnode, exec.c execcmd_exec/execsimple/addvars,
+loop.c execwhile, cond.c, math.c op/setmathvar, builtin.c bin_let, signals.c dotrap),
+each probed against zsh:
+
+| construct (after a failed autoload; `$?` before it 0 / 3) | zsh and jfsh (probed in round 4) |
+|---|---|
+| a word of a simple command (`echo $x`), `$(( x ))` | line ends; `$?` 1 / 3 (execcmd: `if (!lastval) lastval = 1`) |
+| `${x:?msg}` | line ends, 1 / 1 (paramsubst's exit(1) after the silenced zerr) |
+| assignment alone (`y=$x`, `y=$(exit 4)$x`) | line ends, 1 / 1 |
+| prefix assignment of a builtin or function (`x=$x true`) | line ends, 1 / 1 |
+| redirection of a command run in the shell (`echo hi > $x`, `command -v … > $x`, `{ … } > $x`) | line ends, 1 / 1 |
+| prefix assignment or redirection of a forked command (`x=$x /bin/echo`, `/bin/echo > $x`, `command /bin/echo`, a disabled builtin, `> $x` alone) | the child fails, 1; the line goes on (also `${x?}` there) |
+| `[[ … ]]` | the test on what the word kept (text after the failure in the same word is dropped: `[[ -z ${x}y ]]` is 0, `[[ x${x} = x ]]` 0), then the line ends |
+| `[[ … ]] && …`, `[[ … ]] \|\| …` when the next part would run | 1 / 3 (execcmd for it) |
+| `! [[ -n $x ]]` | 1 / 1 (no inversion under errflag) |
+| `while`/`until` condition | stop: `$?` from before the loop, 0 on the first pass; go on: 1 |
+| `case $x` | 0 / 0 (nothing matches under errflag) |
+| `for i in $x`, `select i in $x` | 1 / 1 |
+| `(( … ))` | 2, line goes on; no binary assignment after it, `x++` on it stores; a `$x` in its text evaluates nothing |
+| `let x` | 1, line goes on |
+| `${x[1]}`, `x[1]=v` | message, then goes on with 0 (getindex clears errflag) |
+| typeset/export/read of the mark | 1 / 1 |
+| `eval '…$x…'` | the eval ends, `$?` 1 / 3, the line goes on |
+| the EXIT trap at the end | 1 when the script ran off its end; `exit N`/`return N` give N |
+| a function's EXIT trap | the function returns 1, the caller goes on |
+
+Assignment to a mark loads its module once and then takes the normal path (`exint=3+4`
+is 7, `exint+=2` adds), the error assigning nothing; a mark whose module doesn't load
+takes a scalar itself, or is replaced by an array, with one "failed to load module"
+line. A module's parameter that isn't special (zsh/example's) becomes a plain one when
+a value of another type is assigned; a special array takes a scalar as its one element
+(`dirstack=x`); a special hash refuses a scalar ("attempt to set slice of associative
+array"); `options+=(…)` sets only the pairs given. `make_envp` reads a tie's state
+without changing flags. Tests: new rows in `ModulesM10Review.FailedAutoloads` (the
+table above), `…ExampleAsZsh`, `…ParameterTablesAssignable`, and
+`Binary.FailedAutoloadInExitTrap` (`return 4`, `false`). Round-3 counts: the 848 probes, 1,626 runs as zsh (sy one more), 1,069 fixed, the `${#builtins}` flag; the round-3 reviewer's 285 (m10rv3 r1–r16) went from 85 differing to 31: dlopen's path in the zsh/x messages, a function's or `(eval)`'s name in messages, zsh's blank line before xtrace output after `options[xtrace]=on`, `typeset -T` re-ties, `time`, `case ${x:bad}`, and the module messages a forked command's child repeats; round 1's 429 and round 2's 225 (11 differ) unchanged; M7: 1,652 probes, 0 regressions, 21 fixed; M8/M9: 5,504 probes, 4,959 as zsh, 16 fixed, the round-trips as before, 6 flagged: the `PERIOD=1`/`MAILCHECK=1` timing probes and `rand-p-s`, a three-digit `$RANDOM` the driver doesn't mask (3 of 3 reruns same).
+
+**Review fixes, round 4.** Two regressions from round 3: `command` with -v/-V (or,
+under POSIX_BUILTINS, before a builtin) runs in the shell, so `runs_forked` reads
+command's options; and a typeset that changes the type of a module's parameter that
+isn't special (`typeset -A exarr`) now drops its handlers, as zsh replaces the
+parameter. The failed autoload drops the rest of its word (`${x}y` keeps nothing after
+it, `x${x}` keeps the `x`) and `(( ))`/`$(( ))` evaluate nothing once it is raised;
+`case` gives 0; the next part of a `&&`/`||` that would run gives 1 if `$?` is 0; `!`
+doesn't invert; `select` and a builtin whose assignment failed (`read exnosuch`) give
+1; a redirection of a command run in the shell sets 1 whatever `$?` was; `${x:?msg}`
+adds no message and gives 1. The forked child exits before its xtrace line; a forked
+failure sets `$_` from the words. The table above is now the probed one: every row run
+from `$?` 0 and 3 against zsh (scratchpad m10/table.py, 41 rows × 2, all the same).
+Tests: rows in `ModulesM10Review.FailedAutoloads` and `…ExampleAsZsh`. Round-4 counts: the 848 probes as in round 3 (1,626 runs as zsh, 1,069 fixed); the round-4 reviewer's sets (m10rv4 e1, e2, t1–t3, 931 probes, each as -c and as a script) show 0 regressions against main, and their remaining behaviour differences are the pre-existing core-error items now under Still open, the forked command's expansions done in the parent, `time`/`coproc`, and `aliases+=`; m10rv1, m10rv2 (11) and m10rv3 (31) unchanged; M7: 1,652 probes, 0 regressions, 21 fixed (`times` is clock noise); M8/M9: 5,504 probes, 4,959 as zsh, 17 fixed, the round-trips as before, 8 flagged, all timing: `PERIOD=1`/`MAILCHECK=1`, a three-digit `$RANDOM`, and vi `R-mode`'s cursor (4 of 4 reruns same as zsh).
+
+**Review fixes, round 5.** A command of only redirections forks only when zsh's
+execcmd_exec would: `fork_kind` (replacing runs_forked) gives "no command" after a
+precommand modifier (`noglob`, `-`, `command`, bare `builtin`), under CSH_NULLCMD or
+with `$NULLCMD` empty, and then no redirection is expanded before "redirection with no
+command" (round 6: one parser and one decision for this, below); it runs in the shell under SH_NULLCMD or when `$NULLCMD` (`$READNULLCMD` for
+a lone `<`) is a builtin or function, and forks otherwise (a regression from round 3,
+which forked for every such command). After a failed autoload the kept part of a word
+gets no `~`, `=` or glob expansion (zsh's prefork under errflag). Rows in
+`ModulesM10Review.FailedAutoloads`. Counts: table.py 82 of 82 as zsh; m10rv5 (w1–w6,
+cmd; 166 probes, -c and script, -m) 0 regressions, the behaviour differences left being
+the Still open core-error statuses (`(exit 3); : ${x:bad}` keeps 3 in zsh) and `hash
+-d`; m10rv4 (931) 0 regressions, unchanged; m10rv1–3 unchanged; the 848 probes as
+before (1,626 runs as zsh, 1,069 fixed); M7 1,652 probes, 0 regressions, 21 fixed.
+
+**Review fixes, round 6.** Round 5's `fork_kind` read the precommand words its own way
+(after `command`, a `-`/`noglob`/`nocorrect` was one more modifier and `exec` ran in the
+shell), so where it said "no command" exec_simple ran a command with its redirections
+unexpanded (`command noglob > f$(echo X)` made `f$(echo X)`). Now one parser,
+`parse_precommands`, reads the modifiers for both; `expand_command` hands its decision
+(`ForkKind`) to exec_simple, which reports "redirection with no command" (and "no such
+builtin") from it, so a redirection is never used unexpanded; one `null_command` picks
+`$NULLCMD`/`$READNULLCMD`/`:`. Without POSIX_BUILTINS the word after `command` is an
+external name (forks); under it a builtin runs in the shell, and `noglob`/`-` after
+`command` are modifiers (`nocorrect` is a reserved word only where the parser takes
+it), and so is `builtin` (round 7). `builtin name` with no such builtin reports it before any
+redirection is expanded and goes on with 1 (`builtin /bin/echo > ${nox?}` too). Rows in
+`ModulesM10Review.FailedAutoloads`. Counts: the reviewer's m10rv6 (n1–n5, 297 probes, -c and script, -m) 0 regressions, the differences left listed under Still open; m10rv5 and m10rv4 0 regressions, unchanged; m10rv1–3 unchanged; table.py 82/82; M7 1,652 probes, 0 regressions, 21 fixed (an intermediate build that also took `nocorrect` after another modifier for one showed 26 regressions there, so it doesn't: zsh's `nocorrect` is a reserved word only); the 848 probes as before but for the `sysread -t abc` pipe race.
+
+**Review fixes, round 7.** Under POSIX_BUILTINS `command builtin echo > ${nox?}` was taken
+for an external command (the line went on); `fork_kind` now settles `builtin` first,
+after `command` too: an enabled builtin runs in the shell, else "no such builtin".
+`parse_precommands` reads a `const` vector and returns the index of the command word, so
+`fork_kind` copies nothing and exec_simple drops the modifiers itself; `fork_kind` runs
+only for a command with redirections (a 200,000-iteration loop is 2.39 s on main and on
+the branch, zsh 2.20 s). Rows in `ModulesM10Review.FailedAutoloads`. Counts: m10rv7
+(a1–a7, 331 probes, -m) 0 regressions; m10rv4–6 0 regressions, unchanged; table.py 82/82; r6.py as round 6; M7 1,652 probes, 0 regressions, 21 fixed. The remaining m10rv7 differences are the Still open items below and assignments in a forked command's redirection (`> ${x::=f}`) staying in the parent.
+
 **Still open** (moved to follow-up work; not blocking M10 "done"):
-- Module-contributed parameters flowing entirely through `ParamHandlers`
-  instead of `install_special_params` (M8 overlap) — a refactor, not a
-  feature gap.
+- Still different from zsh, on purpose or for want of the shell feature: modules are
+  compiled in, so `module_path=()` doesn't stop `zmodload zsh/x` and a dlopen'd module
+  has no features; zsh/rlimits has no `limit`/`unlimit`, zsh/compctl no `compcall`,
+  zsh/watch no `WATCH`/`watch` (so zsh's marks for them aren't made); jfsh has no
+  disabled aliases, reserved words or pattern characters, nor named directories
+  (`$dis_aliases`, `$dis_galiases`, `$dis_saliases`, `$dis_reswords`, `$dis_patchars`
+  and `$nameddirs` are empty); `$jobdirs` is `$PWD` (jobs keep no directory);
+  `$userdirs`/`$usergroups` list every user and group, as zsh built with getpwent does
+  (macOS's /bin/zsh lists none); hash-table order of `${(k)…}` (jfsh's are sorted;
+  arrays such as `$reswords` follow zsh's order); PCRE2's error messages; a zstyle
+  pattern with an unbalanced `(` isn't refused; zsh's messages from a function name
+  their function (`f: Can't add module parameter …`).
+- **M10z — `zcompile`** (zsh's core builtin; the plan lists it with zsh/zutil and it
+  has been deferred since Phase 2a): `zcompile [-U] [-z|-k] [-R|-M] file [name …]`,
+  `-c`/`-m`/`-a` from the loaded functions, `-t` listing; `.zwc` read back by
+  `autoload` and `source`.  jfsh's compiled programs would need a stable on-disk
+  form first, so this is its own milestone.
+- The other core builtins jfsh lacks: `getln`, `pushln`, `suspend`; zsh/rlimits'
+  `limit` and `unlimit` (jfsh has only `ulimit`) and zsh/compctl's `compcall`, so
+  those modules' feature lists and `$builtins` are short of them (`${#builtins}` is
+  100, zsh's 103).  jfsh's own `_command_names`, `_directories`, `_files` and
+  `compdef` builtins (compsys helpers zsh has as functions) are in `$builtins` and
+  `whence -w`, which `zsh -f` has none of.
+- `functions -M` / `+M` (user math functions calling a shell function, the value of
+  the last arithmetic it evaluates: zsh's lastmathval, which jfsh's evaluator doesn't
+  keep); zsh/watch's `log` is status 1 where zsh's is 0 (M11).
+- zsh/parameter corners: `functions[f]='echo ('` defines f in zsh (its parse error
+  comes when f runs), jfsh refuses it; `aliases+=(…)` (and `galiases+=`,
+  `saliases+=`) in zsh empties the aliases of that kind and adds nothing (its
+  augmenting assignment to a special hash), jfsh keeps them and adds the new ones;
+  `commands+=(…)` doesn't fill the whole command hash as zsh's does.
+- Found here, outside M10: `${(v)h[(I)pat]}` gives keys, not values; `typeset -x` in
+  a function shows `-local` in `$parameters`, zsh doesn't; KSH_ARRAYS doesn't make
+  `$a[0]` the scalar `$a` and a literal `[0]`; `typeset -Z`/`-L`/`-R` aren't
+  implemented (so `$parameters` has no `right_zeros`, `left`, `right_blanks`);
+  `enable -p` lists no pattern characters; zsh/zleparameter's `$widgets` lacks
+  `hide-hideval` in its type (M11); `typeset -p` of a tied pair prints plain
+  `typeset FPATH=…`/`typeset -a fpath=(…)` where zsh prints `-T`/`-aT`; `typeset -U
+  path; PATH=/a:/a` drops the repeat (zsh keeps it); `disable -f` lists names, zsh
+  the definitions; `${x?}` in a here-string of a builtin or a `{ … }` goes on (zsh
+  stops the line); `case ${x?} in …`/`case ${x:bad} …` end with 1 (zsh's case gives
+  0); jfsh's other expansion errors (`${x:bad}`, `${(Q}`, `$((1+))`, `$((1/0))`) set
+  `$?` to 1 where zsh's zerr leaves it (`typeset y=${x:bad}`, `until [[ -z ${x:bad} ]]`:
+  zsh 0), and `(( ${(Q} ))` gives 1 (zsh 2); such an error (or NOMATCH) in the
+  redirection of `{ … }` or `function { … }` goes on with 1 where zsh ends the line,
+  and NOMATCH in an external command's words (`/bin/echo /nonexist*zz`) ends the line
+  where zsh's child globs and fails with 1 (`time`/`coproc` the same); `builtin
+  command /bin/echo > ${nox?}` ends the line, zsh goes on; `exec -q`, `exec -c`/`exec -a
+  z` with no command are run (zsh: "exec requires a command to execute"); `builtin
+  builtin > f` and `builtin noglob > f` run (zsh: "redirection with no command"); `x=1
+  command > f` and `command -p noglob > f` don't create f (zsh's child opens it before
+  it fails); a here-string's error in a forked command leaves `> f` unopened; `echo foo
+  | < in` and `< in < in` don't copy the pipe/both inputs as zsh's cat does; `local -h
+  NULLCMD=` in a function is "redirection with no command" (zsh uses the global); a
+  function named `command`/`builtin`/`noglob`/`exec` doesn't shadow the modifier, and
+  `disable builtin`/`exec`/`noglob` leaves it working (zsh: command not found);
+  `builtin noglob echo *`, `exec noglob echo *` and (POSIX_BUILTINS) `command noglob
+  echo *` still glob; `setopt posixbuiltins; command f` runs function f (zsh: command
+  not found); `x=1 builtin` doesn't keep x; `exec exec echo hi` is "command not found:
+  exec"; `exec -a "" cmd` and `exec -a foo -l cmd` give the wrong argv0; `echo hi |
+  builtin cat` is 1 (zsh 0); `setopt posixbuiltins; command -p cd /` doesn't cd; a
+  `noglob` command's redirection targets aren't globbed; a builtin's autoload mark
+  brings its module in after the redirections are expanded, zsh before; `typeset -T FOO bar` on a FOO already tied is accepted (zsh: "can't tie
+  already tied scalar"), `typeset +T` doesn't untie; `time cmd` and `coproc cmd` are parse errors.
+- A forked command's own expansions are done in jfsh's parent, so what they change
+  stays (a module they load, a mark they use up) where zsh's child takes it away;
+  `XX[1]=v` on a mark whose module doesn't load tries it twice more than zsh.
+  `Computil.ComptagsAndComptry` fails when run in one process after the `Matcher.*`
+  tests (`--gtest_filter='Matcher.*:Comp*'`), on main too; ctest runs it alone.
 - A loadable `.so` example (today the module ABI runs through compiled-in
   `RegisterFn` callbacks; the `dlopen` path exists but has no in-tree
   test target).  Lands with the M11 external-module work.
+
+(The plan below is M10's as first written; where it says otherwise, the review block
+above is what landed: `atan2`/`pow` aren't zsh/mathfunc's, `is-at-least` is zsh's
+`$fpath` function, `$errnos` is an array, zsh/pcre sets `$MATCH`/`$match`, and there
+is no `zstat` alias.)
 
 **Framework**
 - Wire `ModuleManager` into `Shell`/`Executor`; own it on `ExecContext`. Expose
@@ -2699,10 +3022,10 @@ items landed together, closing M10:
 - `zsh/datetime`: `strftime [-rs] fmt [epochtime]`, `$EPOCHSECONDS`,
   `$EPOCHREALTIME`, `$epochtime` array. Wire the existing specials through
   the module's parameter table so `unset` drops them as zsh does.
-- `zsh/mathfunc`: `sqrt sin cos tan asin acos atan atan2 exp log log10 pow
-  abs int float ceil floor rint logb erf erfc gamma lgamma j0 j1 y0 y1 hypot
-  cosh sinh tanh asinh acosh atanh cbrt expm1 log1p` as math-function
-  names via a `MathEvaluator::register_function` hook. Also `rand48`.
+- `zsh/mathfunc`: zsh's mftab (`abs acos acosh asin asinh atan atanh cbrt ceil
+  copysign cos cosh erf erfc exp expm1 fabs float floor fmod gamma hypot ilogb int
+  isinf isnan j0 j1 jn ldexp lgamma log log10 log1p log2 logb nextafter rint scalb
+  signgam sin sinh sqrt tan tanh y0 y1 yn`) and `rand48`.
 - `zsh/parameter`: expose shell state as live associative-array / array
   parameters. Each of these must read through to the live table: `$parameters`,
   `$commands`, `$functions`, `$dis_functions`, `$aliases`, `$dis_aliases`,
@@ -2716,22 +3039,22 @@ items landed together, closing M10:
   `zformat -f var spec args…` and `zformat -a var sep key=val…`;
   `zregexparse [-c] [-d] [-A arr] [-M arr] subject regex`;
   `zparseopts [-D] [-K] [-M] [-E] [-F] [-A arr] [-a arr] spec…` with
-  `name+=` / `name:` / `name:-` / `name::` forms; `zcompile [-UMcma]`
-  bytecode cache (writes `.zwc`, read by `autoload`); the `is-at-least`
-  comparison builtin. Needed by compsys and every non-trivial zsh script.
+  `name+=` / `name:` / `name:-` / `name::` forms. (`zcompile` is M10z, under Still
+  open; `is-at-least` is zsh's `$fpath` function.) Needed by compsys and every
+  non-trivial zsh script.
 - `zsh/system`: `syserror [-e var] [-p prefix] errno`, `sysopen -o flags
   -u fd file`, `sysread [-c count] [-i fd] [-o fd] [-s size] [-t secs]
   [name]`, `sysseek [-u fd] [-w start|end|current] offset`, `syswrite
   [-c count] [-o fd] data`, `zsystem flock [-t secs] [-f fd] [-r] file`,
-  `zsystem supports feature`, `$errnos` associative array.
+  `zsystem supports feature`, the `$errnos` array, `$sysparams`.
 - `zsh/files`: builtin `chmod`, `chown`, `chgrp`, `ln`, `mkdir`, `mv`, `rm`,
   `rmdir`, `sync`. Register through the module so they override the externals
   only when enabled, as zsh does.
-- `zsh/stat` (alias `zstat`): `zstat [-glLnoNrstT] [+element] [-A arr | -H
+- `zsh/stat` (builtins `zstat` and `stat`): `zstat [-glLnoNrstT] [+element] [-A arr | -H
   hash] file…` with every stat field; a format string with zsh's placeholders.
 - `zsh/pcre`: `pcre_compile [-aimsx] pattern`, `pcre_study`,
-  `pcre_match [-v var] [-a arr] [-n offset] string`, `$PCRE_MATCH`,
-  `$pcre_match`; `[[ string -pcre-match pattern ]]` condition (wired into
+  `pcre_match [-b] [-v var] [-a arr] [-n offset] string`, `$MATCH`,
+  `$match`, `$ZPCRE_OP`; `[[ string -pcre-match pattern ]]` condition (wired into
   `[[ ]]` in M14). Uses PCRE2.
 
 **Tests**
@@ -4437,7 +4760,6 @@ Severity:
 |---|---|---|
 | B49 | `src/agent/agent.cpp` | The non-streaming path of `Agent::handle` prints a newline even when the request failed. |
 | B51 | `include/jfsh/core/param.h:63` | It uses `std::unique_ptr` without `#include <memory>` and only compiles through `types.h`. |
-| B53 | `src/modules/module.cpp` | `ModuleManager` is never instantiated. Its `resolve_path` maps `zsh/x` → `zsh_x.so` but has no default search path, so `zmodload` can't work even once implemented. |
 | B56 | `cmake/CompilerOptions.cmake` | Release builds use `-march=native`, so binaries only run on CPUs like the build machine's. simdjson already dispatches at runtime. `-Wno-unused-parameter` is still on "for the stub phase". |
 | B57 | `src/main.cpp` | `curl_global_init` is never called, and the HTTP code relies on `curl_easy_init`'s implicit, non-thread-safe init. |
 
@@ -4445,6 +4767,7 @@ Severity:
 
 | ID | Fixed by |
 |---|---|
+| B53 | M10: `ExecContext` owns the `ModuleManager`; a module not compiled in is looked for as `NAME.so` in `$module_path` (default `JFSH_MODULE_DIR`). |
 | B5 | M9: with APPEND_HISTORY only the entries not yet in `HISTFILE` are appended. |
 | B25 | M9: the editor moves by UTF-8 character and measures widths with `wcwidth()` (`src/core/utf8.cpp`). |
 | B26 | M9: the prompt is expanded once per line; each refresh redraws from the prompt's first row, wrapping rows itself. |

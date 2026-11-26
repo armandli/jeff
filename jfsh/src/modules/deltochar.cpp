@@ -62,7 +62,6 @@ void register_deltochar_module(ModuleManager& mm) {
       zle->module_widgets.erase("delete-to-char");
       zle->module_widgets.erase("zap-to-char");
     };
-    out.feature_names = {"z:delete-to-char", "z:zap-to-char"};
   });
 }
 

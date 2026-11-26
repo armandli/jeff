@@ -9,9 +9,6 @@
 //   zsocket    path    — connect to a UNIX-domain socket;  $REPLY = fd
 //   zsocket -a fd      — accept on fd; $REPLY = client fd
 //   zsocket -d fd      — close fd
-//
-// `zsh/socket` is registered as an alias for `zsh/net/socket` (zsh's
-// historical name) so `zmodload zsh/socket` resolves the same module.
 
 #include <jfsh/modules/module.h>
 

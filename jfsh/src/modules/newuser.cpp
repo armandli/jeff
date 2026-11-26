@@ -134,7 +134,6 @@ bool newuser_needed(ExecContext& ctx) {
 void register_newuser_module(ModuleManager& mm) {
   mm.register_builtin_module("zsh/newuser", [](ModuleFeatures& out, ExecContext&) {
     out.builtins.push_back(BuiltinDef{"zsh-newuser-install", builtin_newuser_install, BINF_NONE, 0});
-    out.feature_names = {"b:zsh-newuser-install"};
   });
 }
 

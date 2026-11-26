@@ -89,8 +89,11 @@ TEST(Cond, RegexSetsMatchParameters) {
   EXPECT_EQ(truth(sh, {"[[ foo =~ \"o+\" ]]", "[[ o+ =~ o\\+ ]]", "x=123; [[ $x =~ ^[0-9]+$ ]]",
                        "[[ a =~ [[:alpha:]] ]]"}),
             "TTTT");
-  // Offsets count characters, not bytes.
-  EXPECT_EQ(out(sh, "[[ héllo =~ l+ ]]; echo $MBEGIN $MEND $MATCH"), "3 4 ll\n");
+  // Offsets count characters, not bytes, in a UTF-8 locale.
+  if (test::Utf8Ctype u; u.ok)
+    EXPECT_EQ(out(sh, "[[ héllo =~ l+ ]]; echo $MBEGIN $MEND $MATCH"), "3 4 ll\n");
+  EXPECT_EQ(out(sh, "unsetopt multibyte; [[ héllo =~ l+ ]]; echo $MBEGIN $MEND $MATCH"),
+            "4 5 ll\n");
   auto r = sh.run("[[ foo =~ \"(\" ]]");
   EXPECT_EQ(r.rc, 1);
   EXPECT_NE(r.err.find("failed to compile regex"), str::npos);

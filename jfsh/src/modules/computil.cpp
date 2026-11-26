@@ -2960,6 +2960,7 @@ void register_computil_module(ModuleManager& mm) {
     out.builtins.push_back(BuiltinDef{"compdescribe", builtin_compdescribe, BINF_NONE});
     out.builtins.push_back(BuiltinDef{"compfiles",    builtin_compfiles,    BINF_NONE});
     out.builtins.push_back(BuiltinDef{"compgroups",   builtin_compgroups,   BINF_NONE});
+    out.builtins.push_back(BuiltinDef{"compquote",    builtin_compquote,    BINF_NONE});
     out.builtins.push_back(BuiltinDef{"comptags",     builtin_comptags,     BINF_NONE});
     out.builtins.push_back(BuiltinDef{"comptry",      builtin_comptry,      BINF_NONE});
     out.builtins.push_back(BuiltinDef{"compvalues",   builtin_compvalues,   BINF_NONE});

@@ -82,7 +82,29 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
     return builtin_error(cmd, (digit ? "not an identifier: " : "not valid in this context: ")
                                   + name);
   }
-  auto existing = attrs.global ? ctx.params.lookup(name) : ctx.params.lookup_local(name);
+  // A module's parameter not loaded yet keeps its type (zsh's
+  // typeset_single).  Its module comes in only for a value or -x (zsh's
+  // export_param reads it); other attributes leave the mark as it is.
+  // A new local in a function just hides it.
+  bool autoload_mark = false;
+  if (auto raw = ctx.params.lookup_raw(name); raw and (raw->get().flags & PM_AUTOLOAD)) {
+    autoload_mark = true;
+    if (attrs.global or ctx.params.local_scope() == 0) {
+      if (attrs.type)
+        return builtin_error(cmd, name + ": can't change type of autoloaded parameter");
+      if (not has_value and not (attrs.on & PM_EXPORTED)) return 0;
+      auto failures = ctx.params.lookup_failures;
+      (void)ctx.params.lookup_noget(name);
+      // Its module came without it: zsh's typeset_single fails.
+      if (ctx.params.lookup_failures != failures) return 1;
+      autoload_mark = false;
+    }
+  }
+  // A mark whose module didn't load is tried once (one message).
+  bool tried = not autoload_mark and ctx.params.lookup_raw(name)
+               and (ctx.params.lookup_raw(name)->get().flags & PM_AUTOLOAD);
+  auto existing = attrs.global ? (tried ? ctx.params.lookup_raw(name) : ctx.params.lookup(name))
+                               : ctx.params.lookup_local(name);
   // `typeset +r` takes the attribute away, except from a special.
   if (existing and existing->get().is_readonly()
       and (has_value or attrs.type
@@ -94,7 +116,7 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
   // A special keeps its type (zsh's typeset_single): no special becomes an
   // array, and a string one ($PS1, $histchars) no number either.
   if (attrs.type) {
-    auto sp = existing ? existing : ctx.params.lookup(name);
+    auto sp = existing ? existing : tried ? ctx.params.lookup_raw(name) : ctx.params.lookup(name);
     bool string = sp and not sp->get().is_integer() and not sp->get().is_float();
     if (sp and sp->get().scalar_special()
         and (attrs.type == 'a' or attrs.type == 'A' or string))
@@ -103,16 +125,18 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
   if (not p) {
     // A new local is not exported (unless -x), even when the parameter it
     // hides is, as in zsh: children see the local's absence.
-    auto outer = ctx.params.lookup(name);
+    optref<Param> outer = autoload_mark ? optref<Param>{}
+                          : tried ? ctx.params.lookup_raw(name) : ctx.params.lookup(name);
     if (attrs.global) {
       (void)ctx.params.set_scalar(name, "");
       p = &ctx.params.lookup(name)->get();
     } else {
       // A special parameter stays special in the function, as in zsh
-      // (unless -h): it starts empty and has its value back at the end.
+      // (unless -h, or it is a module's that hides, PM_HIDE): it starts
+      // empty and has its value back at the end.
       // A view with no setter ($commands) just stays a view.
       Param* special = outer and (outer->get().flags & PM_SPECIAL) and outer->get().handlers
-                           and not (attrs.on & PM_HIDE)
+                           and not (attrs.on & PM_HIDE) and not (outer->get().flags & PM_HIDE)
                        ? &outer->get() : nullptr;
       // zsh refuses a local $LINENO or $HISTCMD (its other read-only
       // specials, $status, $PPID, …, may be made local).
@@ -169,6 +193,13 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
   // string keep the environment value they had.
   if (has_value) ctx.params.note_assigned(name);
   bool was_integer = p->is_integer(), was_float = p->is_float();
+  // A module's parameter that isn't special (zsh/example's) is replaced by
+  // a plain one when typeset gives it another type, as zsh's.
+  if (p->handlers and not (p->flags & PM_SPECIAL)
+      and ((attrs.type == 'a' and not p->is_array()) or (attrs.type == 'A' and not p->is_hash())
+           or (attrs.type == 'i' and not p->is_integer())
+           or (attrs.type == 'F' and not p->is_float())))
+    p->handlers.reset();
   switch (attrs.type) {
     case 'a':
       // A parameter that becomes an array starts empty, as zsh makes a
@@ -233,7 +264,9 @@ int typeset_one(strv cmd, strv arg, const TypesetAttrs& attrs, ExecContext& ctx)
 // zsh's PM_RO_BY_DESIGN: a special that is always read-only can't be
 // restored, so `typeset -p` leaves it out.
 bool ro_by_design(const Param& p) {
-  return (p.flags & (PM_SPECIAL | PM_READONLY)) == (PM_SPECIAL | PM_READONLY);
+  if (p.flags & PM_RO_BY_DESIGN) return true;
+  // A module's (PM_HIDE) says so itself.
+  return (p.flags & (PM_SPECIAL | PM_READONLY | PM_HIDE)) == (PM_SPECIAL | PM_READONLY);
 }
 
 // The attributes of `p` in zsh's pmtypes order, each as `letter` (for
@@ -241,6 +274,7 @@ bool ro_by_design(const Param& p) {
 // on a local, an array or an association (printparamnode).
 template <typename Fn>
 void for_each_attr(const Param& p, Fn&& fn) {
+  if (p.flags & PM_AUTOLOAD) fn(0, "undefined", 0);
   if (p.is_integer()) fn('i', "integer", p.base);
   if (p.is_float())   fn((p.flags & PM_EFLOAT) ? 'E' : 'F', "float", 0);
   if (p.is_array())   fn('a', "array", 0);
@@ -327,7 +361,7 @@ int typeset_list(const TypesetAttrs& attrs, const vec<str>& patterns, ExecContex
     // As printparamnode: an unset parameter isn't shown, nor with -p a
     // special that is read-only by design.
     if (not p.is_set()) return false;
-    if (attrs.print and ro_by_design(p)) return false;
+    if (attrs.print and (ro_by_design(p) or (p.flags & PM_AUTOLOAD))) return false;
     if (not has_attrs(p, attrs)) return false;
     if (pats.empty()) return true;
     return s::any_of(pats.begin(), pats.end(),
@@ -337,8 +371,12 @@ int typeset_list(const TypesetAttrs& attrs, const vec<str>& patterns, ExecContex
   for (const Param* p : params) {
     if (attrs.print)
       s::printf("%s\n", typeset_line(*p, ctx.params.local_scope(), attrs.lines).c_str());
-    else if (attrs.names_only or ((p->flags & PM_HIDEVAL) and not attrs.pattern))
-      s::printf("%s%s\n", attrs.on or attrs.type ? "" : type_words(*p).c_str(),
+    else if (attrs.names_only or (p->flags & PM_AUTOLOAD)
+             or ((p->flags & PM_HIDEVAL) and not attrs.pattern))
+      s::printf("%s%s\n",
+                attrs.on or attrs.type
+                        or ((p->flags & PM_AUTOLOAD) and attrs.pattern and not attrs.names_only)
+                    ? "" : type_words(*p).c_str(),
                 shell_quote(p->name).c_str());
     else
       s::printf("%s%s=%s\n", plain ? "" : type_words(*p).c_str(), shell_quote(p->name).c_str(),
@@ -517,6 +555,10 @@ int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
   int rc = 0;
   if (attrs.print) {
     for (const auto& name : names) {
+      // A module's mark can't be restored, so isn't printed (zsh's
+      // printparamnode); nor is its module loaded for it.
+      if (auto raw = ctx.params.lookup_raw(name); raw and (raw->get().flags & PM_AUTOLOAD))
+        continue;
       auto p = ctx.params.lookup(name);
       // A prefix assignment's copy that was unset is gone, as in zsh.
       if (p and not p->get().is_set() and ctx.params.in_prefix_scope(p->get()))
@@ -545,6 +587,11 @@ int typeset_common(vec<str>& args, ExecContext& ctx, strv implied) {
   for (const auto& name : names) {
     if (show and name.find('=') == str::npos) {
       auto p = ctx.params.lookup_local(name);
+      // A module's mark shows as its name, and its module stays out.
+      if (p and (p->get().flags & PM_AUTOLOAD) and ctx.params.local_scope() == 0) {
+        s::printf("%s\n", shell_quote(name).c_str());
+        continue;
+      }
       if (p and p->get().is_set()
           and (p->get().scope == ctx.params.local_scope() or ctx.params.local_scope() == 0)) {
         s::printf("%s=%s\n", shell_quote(name).c_str(), param_value_text(p->get()).c_str());
@@ -662,6 +709,16 @@ int builtin_unset(vec<str>& args, ExecContext& ctx) {
         (void)ctx.params.unset_element(base, key);
         continue;
       }
+      // A module's mark stays unloaded (zsh's getnode2): zsh takes it for
+      // a scalar, whose subscript is a position, and position 0 is an error.
+      if (auto raw = ctx.params.lookup_raw(base); raw and (raw->get().flags & PM_AUTOLOAD)) {
+        auto v = math_eval(key, ctx.params, math_options(ctx), &ctx.modules.math_funcs());
+        if (v and v->as_int() != 0) continue;
+        str msg = v ? base + ": assignment to invalid subscript range" : v.error().message;
+        s::fprintf(stderr, "jfsh: %s\n", msg.c_str());
+        rc = 1;
+        continue;
+      }
       auto p = ctx.params.lookup(base);
       if (not p or not p->get().is_set()) continue;
       Param& prm = p->get();
@@ -699,7 +756,9 @@ int builtin_unset(vec<str>& args, ExecContext& ctx) {
     }
     if (auto r = ctx.params.unset(name); not r) {
       s::fprintf(stderr, "jfsh: %s\n", r.error().message.c_str());
-      rc = 1;
+      // A read-only other side of a tie ends the line with status 0, as
+      // zsh's error from inside the special's unset does.
+      if (r.error().kind != ErrorKind::PermissionDenied) rc = 1;
       abort.fatal = true;
     }
   }

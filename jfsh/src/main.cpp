@@ -30,39 +30,8 @@
 #include <jfsh/exec/loop.h>
 #include <jfsh/history/history.h>
 #include <jfsh/lexer/lexer.h>
-#include <jfsh/modules/attr.h>
-#include <jfsh/modules/cap.h>
-#include <jfsh/modules/clone.h>
-#include <jfsh/modules/compctl.h>
-#include <jfsh/modules/computil.h>
-#include <jfsh/modules/curses.h>
-#include <jfsh/modules/datetime.h>
-#include <jfsh/modules/db_gdbm.h>
-#include <jfsh/modules/deltochar.h>
-#include <jfsh/modules/example.h>
-#include <jfsh/modules/files.h>
-#include <jfsh/modules/langinfo.h>
-#include <jfsh/modules/mapfile.h>
-#include <jfsh/modules/mathfunc.h>
-#include <jfsh/modules/nearcolor.h>
-#include <jfsh/modules/net_socket.h>
-#include <jfsh/modules/net_tcp.h>
+#include <jfsh/modules/module.h>
 #include <jfsh/modules/newuser.h>
-#include <jfsh/modules/parameter.h>
-#include <jfsh/modules/pcre.h>
-#include <jfsh/modules/private.h>
-#include <jfsh/modules/regex.h>
-#include <jfsh/modules/stat.h>
-#include <jfsh/modules/system.h>
-#include <jfsh/modules/termcap.h>
-#include <jfsh/modules/terminfo.h>
-#include <jfsh/modules/watch.h>
-#include <jfsh/modules/zftp.h>
-#include <jfsh/modules/zleparameter.h>
-#include <jfsh/modules/zprof.h>
-#include <jfsh/modules/zpty.h>
-#include <jfsh/modules/zselect.h>
-#include <jfsh/modules/zutil.h>
 #include <jfsh/parser/parser.h>
 #include <jfsh/prompt/prompt.h>
 #include <jfsh/router/jeff.h>
@@ -231,70 +200,11 @@ int main(int argc, char* argv[]) {
   if (inv.command)            params.assign("ZSH_EXECUTION_STRING", *inv.command);
   if (inv.script) params.assign("ZSH_SCRIPT", *inv.script);
 
-  // M10: register the shipped modules.  Register makes `zmodload NAME`
-  // able to find them; the four modules jfsh ships today are auto-loaded
-  // so $EPOCHSECONDS/strftime, sqrt()/sin(), $functions/$commands/… and
-  // zstyle/zparseopts/is-at-least/zformat are available without a
-  // `zmodload` in the user's rc files, as zsh does with a typical
-  // distribution zshrc.
-  // $module_path default from the CMake cache (M10 polish).  A user can
-  // override with `module_path=(…)` in their rc, as with zsh.
-  if (sizeof JFSH_MODULE_DIR > 1) ctx.modules.add_search_path(JFSH_MODULE_DIR);
-
-  jfsh::register_datetime_module    (ctx.modules);
-  jfsh::register_mathfunc_module    (ctx.modules);
-  jfsh::register_parameter_module   (ctx.modules);
-  jfsh::register_zutil_module       (ctx.modules);
-  jfsh::register_computil_module    (ctx.modules);
-  jfsh::register_system_module      (ctx.modules);
-  jfsh::register_files_module       (ctx.modules);
-  jfsh::register_stat_module        (ctx.modules);
-  jfsh::register_pcre_module        (ctx.modules);
-  jfsh::register_regex_module       (ctx.modules);
-  jfsh::register_example_module     (ctx.modules);
-  // M11 Phase 11a modules — registered, not auto-loaded.
-  jfsh::register_langinfo_module    (ctx.modules);
-  jfsh::register_zselect_module     (ctx.modules);
-  jfsh::register_net_socket_module  (ctx.modules);
-  jfsh::register_zleparameter_module(ctx.modules);
-  // M11 Phase 11b modules — registered, not auto-loaded.
-  jfsh::register_net_tcp_module     (ctx.modules);
-  jfsh::register_zftp_module        (ctx.modules);
-  jfsh::register_termcap_module     (ctx.modules);
-  jfsh::register_terminfo_module    (ctx.modules);
-  jfsh::register_curses_module      (ctx.modules);
-  jfsh::register_nearcolor_module   (ctx.modules);
-  jfsh::register_mapfile_module     (ctx.modules);
-  jfsh::register_db_gdbm_module     (ctx.modules);
-  jfsh::register_private_module     (ctx.modules);
-  jfsh::register_zpty_module        (ctx.modules);
-  jfsh::register_zprof_module       (ctx.modules);
-  jfsh::register_attr_module        (ctx.modules);
-  jfsh::register_cap_module         (ctx.modules);
-  jfsh::register_deltochar_module   (ctx.modules);
-  jfsh::register_compctl_module     (ctx.modules);
-  jfsh::register_clone_module       (ctx.modules);
-  jfsh::register_watch_module       (ctx.modules);
-  jfsh::register_newuser_module     (ctx.modules);
-  // zsh's autoloaded builtins: the first use loads the module.
-  for (auto [mod, builtin] : {s::pair{"zsh/termcap", "echotc"}, s::pair{"zsh/terminfo", "echoti"},
-                              s::pair{"zsh/compctl", "compctl"},
-                              s::pair{"zsh/param/private", "private"}})
-    ctx.modules.mark_autoload(mod, builtin);
-  (void)ctx.modules.load("zsh/datetime",  &ctx);
-  (void)ctx.modules.load("zsh/mathfunc",  &ctx);
-  (void)ctx.modules.load("zsh/parameter", &ctx);
-  (void)ctx.modules.load("zsh/zutil",     &ctx);
-  (void)ctx.modules.load("zsh/computil",  &ctx);
-  (void)ctx.modules.load("zsh/system",    &ctx);
-  // zsh/files, zsh/stat, zsh/pcre, zsh/regex and zsh/example are
-  // registered but NOT auto-loaded:
-  //   - zsh/files replaces externals (rm, mv, …) which users often prefer
-  //     to keep as GNU coreutils.
-  //   - zsh/stat shadows the common `stat` external.
-  //   - zsh/pcre needs libpcre2 at build time; opt in with `zmodload zsh/pcre`.
-  //   - zsh/regex supplies `[[ -regex-match ]]`; opt in with `zmodload zsh/regex`.
-  //   - zsh/example is a reference for third-party module authors.
+  // The shipped modules, with zsh's autoload marks; zsh/main is loaded.  An
+  // interactive shell has zsh/compctl too, and the modules it needs (zsh/zle,
+  // zsh/complete), as zsh's line editor loads them.
+  jfsh::setup_shipped_modules(ctx);
+  if (interactive) (void)ctx.modules.require("zsh/compctl");
 
   if (interactive) executor.update_window_size();
 
@@ -310,7 +220,7 @@ int main(int argc, char* argv[]) {
   // offers to write a starter ~/.jfshrc first, so the one it writes is
   // read straight away.
   if (interactive and ctx.opts.get(jfsh::OPT_RCS) and ::isatty(STDIN_FILENO)
-      and jfsh::newuser_needed(ctx) and ctx.modules.load("zsh/newuser", &ctx))
+      and jfsh::newuser_needed(ctx) and ctx.modules.require("zsh/newuser") == 0)
     (void)executor.exec_string("zsh-newuser-install");
 
   jfsh::StartupConfig startup;
@@ -456,7 +366,7 @@ int main(int argc, char* argv[]) {
         // (The trap's output ends a line of its own, as zsh's.)
         s::fputc('\n', stderr);
         printed = true;
-        ctx.aborting = ctx.abort_line = ctx.interrupt = ctx.intr_echoed = false;
+        ctx.aborting = ctx.abort_line = ctx.interrupt = ctx.intr_echoed = ctx.lookup_error = false;
         ctx.end_trap_abort();
       }
       if (opts.monitor() and opts.get(jfsh::OPT_NOTIFY) and ctx.jobs.has_changes()) {
@@ -508,7 +418,7 @@ int main(int argc, char* argv[]) {
       ed.resume();
       if (not (ctx.aborting or returned)) return false;
       ctx.zle->trap_break = ctx.last_exit;
-      ctx.aborting = ctx.abort_line = ctx.interrupt = ctx.intr_echoed = false;
+      ctx.aborting = ctx.abort_line = ctx.interrupt = ctx.intr_echoed = ctx.lookup_error = false;
       ctx.end_trap_abort();
       return true;
     };

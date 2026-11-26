@@ -50,7 +50,6 @@ void register_zleparameter_module(ModuleManager& mm) {
 
     out.params.emplace_back("widgets");
     out.params.emplace_back("keymaps");
-    out.feature_names = {"p:widgets", "p:keymaps"};
   });
 }
 

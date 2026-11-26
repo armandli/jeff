@@ -3,6 +3,7 @@
 // jfsh/builtins/util.h — helpers shared by the builtins: option parsing,
 // quoting for listings, and printing parameters the way zsh does.
 
+#include <cstdint>
 #include <cstdio>
 
 #include <string>
@@ -56,6 +57,42 @@ struct OptParse {
 // `-2` is an argument, not options (fc's event numbers).
 bool parse_options(const vec<str>& args, strv letters, strv with_arg,
                    OptParse& out, bool plus = false, bool numbers = false);
+
+// zsh's struct options as execbuiltin fills it from a builtin's option
+// string ("nqrs:": letters, `:` after one that takes an argument): ind[c]
+// is 1 for -c, 2 for +c, with the number of c's argument above (zsh's
+// OPT_ISSET, OPT_MINUS, OPT_PLUS, OPT_HASARG, OPT_ARG).
+struct ZOps {
+  bool isset(char c)  const noexcept { return ind[idx(c)] != 0; }
+  bool minus(char c)  const noexcept { return ind[idx(c)] & 1; }
+  bool plus(char c)   const noexcept { return ind[idx(c)] & 2; }
+  bool hasarg(char c) const noexcept { return ind[idx(c)] > 3; }
+  const str& arg(char c) const noexcept { return args[(ind[idx(c)] >> 2) - 1]; }
+  // OPT_ARG_SAFE: the argument, or null.
+  const str* arg_safe(char c) const noexcept { return hasarg(c) ? &arg(c) : nullptr; }
+
+  vec<str>    args;
+  s::uint16_t ind[128]{};
+
+protected:
+  static s::size_t idx(char c) noexcept { return static_cast<unsigned char>(c) & 127u; }
+};
+
+// execbuiltin's BINF_ flags that change how options are read.
+enum ZOpsFlags : s::uint32_t {
+  ZOPS_PLUSOPTS = 1 << 0,   // +x is an option too
+  ZOPS_KEEPNUM  = 1 << 1,   // -5 is an option, not an argument
+  ZOPS_SKIPDASH = 1 << 2,   // a lone - is an argument
+  ZOPS_DASHDASH = 1 << 3,   // BINF_DASHDASHVALID
+};
+
+// execbuiltin's option scan and argument count check for `args[0]`, with
+// zsh's messages (`bad option: -x`, `argument expected: -x`, `not enough
+// arguments`, `too many arguments`).  A null `optstr` takes no options,
+// only drops a first `--`.  Returns the index of the first argument, or -1
+// after an error.
+int zsh_options(const vec<str>& args, const char* optstr, int minargs, int maxargs,
+                ZOps& ops, s::uint32_t flags = 0);
 
 // The value of `p` as typeset -p and set print it: `'a b'`, `( a b )`
 // (`(  )` when empty), `( [k]=v )`.

@@ -41,10 +41,7 @@ int builtin_private(vec<str>& args, ExecContext& ctx) {
 void register_private_module(ModuleManager& mm) {
   mm.register_builtin_module("zsh/param/private", [](ModuleFeatures& out, ExecContext&) {
     out.builtins.push_back(BuiltinDef{"private", builtin_private, BINF_TYPESET, 0});
-    out.feature_names = {"b:private"};
   });
-  // jfsh's earlier name for it.
-  mm.add_alias("zsh/private", "zsh/param/private");
 }
 
 }  // namespace jfsh

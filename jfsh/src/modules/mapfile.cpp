@@ -69,7 +69,6 @@ void register_mapfile_module(ModuleManager& mm) {
     };
     out.params.emplace_back("mapfile");
     out.on_unload = [ctxp] { drop_module_param(ctxp->params, "mapfile"); };
-    out.feature_names = {"p:mapfile"};
   });
 }
 

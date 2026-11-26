@@ -111,7 +111,6 @@ void register_terminfo_module(ModuleManager& mm) {
     };
     out.params.emplace_back("terminfo");
     out.on_unload = [ctxp] { drop_module_param(ctxp->params, "terminfo"); };
-    out.feature_names = {"b:echoti", "p:terminfo"};
   });
 }
 
@@ -131,7 +130,6 @@ int builtin_echoti(vec<str>&, ExecContext&) {
 void register_terminfo_module(ModuleManager& mm) {
   mm.register_builtin_module("zsh/terminfo", [](ModuleFeatures& out, ExecContext&) {
     out.builtins.push_back(BuiltinDef{"echoti", builtin_echoti, BINF_NONE, 1});
-    out.feature_names = {"b:echoti"};
   });
 }
 

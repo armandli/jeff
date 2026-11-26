@@ -24,39 +24,7 @@
 #include <jfsh/core/param.h>
 #include <jfsh/core/signals.h>
 #include <jfsh/exec/executor.h>
-#include <jfsh/modules/attr.h>
-#include <jfsh/modules/cap.h>
-#include <jfsh/modules/clone.h>
-#include <jfsh/modules/compctl.h>
-#include <jfsh/modules/computil.h>
-#include <jfsh/modules/curses.h>
-#include <jfsh/modules/datetime.h>
-#include <jfsh/modules/db_gdbm.h>
-#include <jfsh/modules/deltochar.h>
-#include <jfsh/modules/example.h>
-#include <jfsh/modules/files.h>
-#include <jfsh/modules/langinfo.h>
-#include <jfsh/modules/mapfile.h>
-#include <jfsh/modules/mathfunc.h>
-#include <jfsh/modules/nearcolor.h>
-#include <jfsh/modules/net_socket.h>
-#include <jfsh/modules/net_tcp.h>
-#include <jfsh/modules/newuser.h>
-#include <jfsh/modules/parameter.h>
-#include <jfsh/modules/pcre.h>
-#include <jfsh/modules/private.h>
-#include <jfsh/modules/regex.h>
-#include <jfsh/modules/stat.h>
-#include <jfsh/modules/system.h>
-#include <jfsh/modules/termcap.h>
-#include <jfsh/modules/terminfo.h>
-#include <jfsh/modules/watch.h>
-#include <jfsh/modules/zftp.h>
-#include <jfsh/modules/zleparameter.h>
-#include <jfsh/modules/zprof.h>
-#include <jfsh/modules/zpty.h>
-#include <jfsh/modules/zselect.h>
-#include <jfsh/modules/zutil.h>
+#include <jfsh/modules/module.h>
 
 namespace jfsh::test {
 
@@ -102,52 +70,9 @@ struct Shell {
     const char* path = s::getenv("PATH");
     params.assign("PATH", str(path ? path : "/usr/bin:/bin"),
                   PM_SCALAR | PM_EXPORTED);
-    // Register and auto-load the shipped modules so the in-process shell
-    // sees zsh/datetime, zsh/mathfunc, zsh/parameter and zsh/zutil the
-    // way the jfsh binary does.
-    register_datetime_module    (ctx.modules);
-    register_mathfunc_module    (ctx.modules);
-    register_parameter_module   (ctx.modules);
-    register_zutil_module       (ctx.modules);
-    register_system_module      (ctx.modules);
-    register_files_module       (ctx.modules);
-    register_stat_module        (ctx.modules);
-    register_pcre_module        (ctx.modules);
-    register_regex_module       (ctx.modules);
-    register_example_module     (ctx.modules);
-    // M11 Phase 11a modules — registered, not auto-loaded.
-    register_langinfo_module    (ctx.modules);
-    register_zselect_module     (ctx.modules);
-    register_net_socket_module  (ctx.modules);
-    register_zleparameter_module(ctx.modules);
-    // M11 Phase 11b modules — registered, not auto-loaded.
-    register_net_tcp_module     (ctx.modules);
-    register_zftp_module        (ctx.modules);
-    register_termcap_module     (ctx.modules);
-    register_terminfo_module    (ctx.modules);
-    register_curses_module      (ctx.modules);
-    register_nearcolor_module   (ctx.modules);
-    register_mapfile_module     (ctx.modules);
-    register_db_gdbm_module     (ctx.modules);
-    register_private_module     (ctx.modules);
-    register_zpty_module        (ctx.modules);
-    register_zprof_module       (ctx.modules);
-    register_attr_module        (ctx.modules);
-    register_cap_module         (ctx.modules);
-    register_deltochar_module   (ctx.modules);
-    register_compctl_module     (ctx.modules);
-    register_computil_module    (ctx.modules);
-    register_clone_module       (ctx.modules);
-    register_watch_module       (ctx.modules);
-    register_newuser_module     (ctx.modules);
-    (void)ctx.modules.load("zsh/datetime",  &ctx);
-    (void)ctx.modules.load("zsh/mathfunc",  &ctx);
-    (void)ctx.modules.load("zsh/parameter", &ctx);
-    (void)ctx.modules.load("zsh/zutil",     &ctx);
-    (void)ctx.modules.load("zsh/computil",  &ctx);
-    (void)ctx.modules.load("zsh/system",    &ctx);
-    // zsh/files, zsh/stat, zsh/pcre are registered but not auto-loaded;
-    // tests that want their builtins use `sh.run("zmodload zsh/pcre; …")`.
+    // The shipped modules as the jfsh binary has them: zsh/main loaded,
+    // the rest autoloadable as in zsh, or loaded with zmodload.
+    setup_shipped_modules(ctx);
   }
   // Traps live in the process-wide Signals: don't let one test's traps
   // reach the next.
@@ -170,6 +95,7 @@ struct Shell {
   Run call(Fn fn) {
     ctx.exiting  = false;
     ctx.aborting = false;
+    ctx.lookup_error = false;
     s::fflush(nullptr);
     s::FILE* out = s::tmpfile();
     s::FILE* err = s::tmpfile();
