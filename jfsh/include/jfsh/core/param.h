@@ -43,6 +43,14 @@ enum ParamFlags : s::uint32_t {
   // the functions that scope calls.
   PM_PRIVATE   = 0x0001'0000,
   PM_HIDEVAL   = 0x0002'0000,   // typeset -H: listings show the name only
+  // A module's parameter not loaded yet (`zmodload -ap`): its value is the
+  // module's name, and the first lookup loads the module.  PM_AUTOALL: the
+  // module comes in with all its features (zmodload -ap, not -Fa).
+  PM_AUTOLOAD  = 0x0004'0000,
+  PM_AUTOALL   = 0x0008'0000,
+  // A special always read-only (zsh's PM_RO_BY_DESIGN): typeset -p leaves
+  // it out.  A module's read-only special without it can be listed.
+  PM_RO_BY_DESIGN = 0x0010'0000,
 };
 
 using ParamValue = s::variant<
@@ -63,6 +71,9 @@ struct ParamHandlers {
   func<umap<str, str>()>          get_hash;   // M10 Phase 2: live hash views
   func<void(umap<str, str>)>      set_hash;
   func<void()>                    unset_fn;
+  // The scalar side of a tie: whether its array is set, which the scalar
+  // follows (unsetting either side unsets both, as zsh).
+  func<bool()>                    tied_set;
   // M11: per-key access to a special associative array ($mapfile,
   // $terminfo, a ztie'd database, …), so `${h[key]}`, `h[key]=v` and
   // `unset 'h[key]'` touch one element instead of the whole table.
@@ -155,8 +166,10 @@ struct ParamTable {
   optref<const Param> lookup(strv name) const noexcept;
 
   // As lookup(), without running a special parameter's getter: for a
-  // reader that wants the handlers, not the value.
+  // reader that wants the handlers, not the value.  lookup_raw also leaves
+  // a module's PM_AUTOLOAD mark as it is; lookup_noget loads its module.
   optref<Param> lookup_raw(strv name) noexcept;
+  optref<Param> lookup_noget(strv name) noexcept;
 
   // The parameter in the innermost scope only (for `local`), or in a
   // command's prefix scope above it.
@@ -260,13 +273,32 @@ struct ParamTable {
   // as they were.
   void share_string(vec<str> names, str storage);
 
+  // Module parameters (zsh's addparamdef and deleteparamdef).  While
+  // `into` is set, assign() puts what it creates there instead of in the
+  // table: a module's register callback makes its parameters that way.
+  void capture(HashTable<Param>* into) noexcept { mCapture = into; }
+  // Puts `p` in the global scope, replacing what is there.
+  void put_global(Param p);
+  // Takes the global parameter `name` out of the table.
+  opt<Param> take_global(strv name);
+  // Loads the module of a PM_AUTOLOAD parameter `name` (zsh's
+  // getparamnode), for lookup(); set by the module manager.
+  func<void(const str& name, const str& module, bool all)> autoload_hook;
+  // How many lookups brought a module in that didn't define the parameter
+  // (the hook reports each): arithmetic stops at one, as at zsh's errflag.
+  s::uint64_t lookup_failures = 0;
+
 private:
+  // The array a tie's scalar reads and sets (see tie()).
+  Param* tied_array(const str& array, bool special, int scope) noexcept;
 
   // mScopes[0] = global; mScopes.back() = innermost local
   vec<HashTable<Param>> mScopes;
   vec<int>              mPrefixScopes;   // indexes of prefix scopes, ascending
   umap<str, str>        mEnvPinned;   // environment entries kept as they were
+  HashTable<str>        mTies;        // each side of a tie → the other side
   umap<str, s::pair<vec<str>, str>> mShared;   // share_string: name → (group, storage)
+  HashTable<Param>*     mCapture = nullptr;
   s::uint64_t           mPathGen = 0;
 };
 

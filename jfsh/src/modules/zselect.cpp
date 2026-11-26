@@ -113,7 +113,6 @@ int builtin_zselect(vec<str>& args, ExecContext& ctx) {
 void register_zselect_module(ModuleManager& mm) {
   mm.register_builtin_module("zsh/zselect", [](ModuleFeatures& out, ExecContext&) {
     out.builtins.push_back(BuiltinDef{"zselect", builtin_zselect, BINF_NONE, 0});
-    out.feature_names = {"b:zselect"};
   });
 }
 

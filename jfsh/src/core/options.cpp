@@ -276,6 +276,12 @@ constexpr OptionAlias OPTION_ALIASES[] = {
 
 }  // namespace
 
+vec<strv> option_alias_names() {
+  vec<strv> out;
+  for (const auto& a : OPTION_ALIASES) out.emplace_back(a.name);
+  return out;
+}
+
 optref<const OptionInfo> OptionState::find(strv name, bool* negated) noexcept {
   // An option or an alias by its normalized name; `neg` when it means the
   // option off.

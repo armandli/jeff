@@ -109,6 +109,9 @@ int builtin_r         (vec<str>&, ExecContext&);
 // Misc
 int builtin_alias     (vec<str>&, ExecContext&);
 int builtin_unalias   (vec<str>&, ExecContext&);
+int builtin_unhash    (vec<str>&, ExecContext&);
+int builtin_where     (vec<str>&, ExecContext&);
+int builtin_ttyctl    (vec<str>&, ExecContext&);
 int builtin_builtin   (vec<str>&, ExecContext&);
 int builtin_command   (vec<str>&, ExecContext&);
 int builtin_echo      (vec<str>&, ExecContext&);

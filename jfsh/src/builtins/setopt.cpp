@@ -158,8 +158,11 @@ int builtin_unsetopt(vec<str>& args, ExecContext& ctx) { return setopt_common(ar
 int builtin_set(vec<str>& args, ExecContext& ctx) {
   strv cmd = args[0];
   if (args.size() == 1) {
-    for (const Param* p : sorted_params(ctx.params, [](const Param& p) { return p.is_set(); }))
-      s::printf("%s=%s\n", shell_quote(p->name).c_str(), param_value_text(*p).c_str());
+    for (const Param* p : sorted_params(ctx.params, [](const Param& p) { return p.is_set(); })) {
+      // As printparamnode: the name alone for a hidden value or a mark.
+      if (p->flags & (PM_HIDEVAL | PM_AUTOLOAD)) s::printf("%s\n", shell_quote(p->name).c_str());
+      else s::printf("%s=%s\n", shell_quote(p->name).c_str(), param_value_text(*p).c_str());
+    }
     return 0;
   }
   bool sort = false, reverse = false, positional_given = false, failed = false;

@@ -1,13 +1,14 @@
 #ifndef JFSH_MODULES_MATHFUNC_H
 #define JFSH_MODULES_MATHFUNC_H
-// jfsh/modules/mathfunc.h — the `zsh/mathfunc` module.
+// jfsh/modules/mathfunc.h — the `zsh/mathfunc` module (a port of zsh's
+// Src/Modules/mathfunc.c).
 //
-// Contributes zsh's C-math-library bindings as math functions resolvable
-// from the arithmetic evaluator (`$((…))`, `(( ))`, `let`):
-//   abs acos acosh asin asinh atan atan2 cbrt ceil cos cosh erf erfc exp
-//   expm1 fabs float floor gamma hypot int lgamma log log10 log1p log2
-//   logb pow rand48 rint signgam sin sinh sqrt tan tanh j0 j1 y0 y1.
-// `int` and `float` cast; the rest compute.
+// The math functions of zsh's mftab, resolvable from `$((…))`, `(( ))` and
+// `let` once the module is loaded: abs acos acosh asin asinh atan (atan(y,x)
+// is atan2) atanh cbrt ceil copysign cos cosh erf erfc exp expm1 fabs float
+// floor fmod gamma hypot ilogb int j0 j1 jn ldexp lgamma log log10 log1p
+// log2 logb nextafter rand48 (a string function: rand48(seed-param)) rint
+// scalb signgam sin sinh sqrt tan tanh y0 y1 yn.
 
 #include <jfsh/modules/module.h>
 

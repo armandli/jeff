@@ -253,7 +253,6 @@ int builtin_ztcp(vec<str>& args, ExecContext& ctx) {
 void register_net_tcp_module(ModuleManager& mm) {
   mm.register_builtin_module("zsh/net/tcp", [](ModuleFeatures& out, ExecContext&) {
     out.builtins.push_back(BuiltinDef{"ztcp", builtin_ztcp, BINF_NONE, 0});
-    out.feature_names = {"b:ztcp"};
   });
 }
 

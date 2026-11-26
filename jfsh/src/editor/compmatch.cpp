@@ -534,9 +534,15 @@ struct MatchRun::Impl {
     vec<s::size_t> positions;
   } cache;
 
+  // A copy of `v` that stays put.  zsh's match_str and pattern_match look
+  // as far as a matcher's length before the text (matching a suffix) or
+  // after it, which in zsh reads heap bytes around the string: here NULs
+  // on both sides keep those reads inside the copy, and their result
+  // the same from one run to the next.
   char* keep(strv v) {
-    str& stored = strs.emplace_back(v);
-    return stored.data();
+    constexpr s::size_t PAD = 16;
+    str& stored = strs.emplace_back(str(PAD, '\0') + str(v) + str(PAD, '\0'));
+    return stored.data() + PAD;
   }
   // The line's prefix and suffix, kept once for all the words of a
   // compadd call (match_str puts back what it changes in them).

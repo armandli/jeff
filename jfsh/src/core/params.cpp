@@ -75,10 +75,18 @@ umap<str, str> Param::hash() const noexcept {
   return {};
 }
 
+// A tie's scalar is set when its array is.
+static void sync_tie(Param& p) noexcept {
+  if (not p.handlers or not p.handlers->tied_set) return;
+  if (p.handlers->tied_set()) p.flags &= ~PM_UNSET;
+  else                        p.flags |= PM_UNSET;
+}
+
 // A special parameter's value is computed when it is read ($SECONDS,
 // $RANDOM, …): its getter refreshes the stored value, so every reader
 // (expansion, arithmetic, typeset -p, the environment) sees the same thing.
 static void refresh(Param& p) noexcept {
+  sync_tie(p);
   if (not p.handlers or not p.is_set()) return;
   // A getter that itself reads the parameter table (zsh/parameter's live
   // $parameters, $functions, …) can recurse through for_each → refresh →
@@ -122,8 +130,23 @@ optref<Param> ParamTable::lookup_raw(strv name) noexcept {
 }
 
 optref<Param> ParamTable::lookup(strv name) noexcept {
-  auto p = lookup_raw(name);
+  auto p = lookup_noget(name);
   if (p) refresh(p->get());
+  return p;
+}
+
+optref<Param> ParamTable::lookup_noget(strv name) noexcept {
+  auto p = lookup_raw(name);
+  if (p and (p->get().flags & PM_AUTOLOAD) and autoload_hook) {
+    // zsh's getparamnode: the module comes in, then the parameter it made.
+    str module = p->get().scalar();
+    autoload_hook(str(name), module, p->get().flags & PM_AUTOALL);
+    // A module that didn't load leaves the mark, which reads as its
+    // module's name; one that came and took it away is an error (the
+    // hook reports it).
+    p = lookup_raw(name);
+    if (not p) ++lookup_failures;
+  }
   return p;
 }
 
@@ -167,12 +190,12 @@ Param& ParamTable::assign(
     str name, ParamValue value, s::uint32_t flags) {
   note_assigned(name);
   if (mScopes.empty()) mScopes.emplace_back();
-  auto& scope = mScopes.back();
+  auto& scope = mCapture ? *mCapture : mScopes.back();
   auto& p = scope[name];
   p.name  = name;
   p.value = s::move(value);
   p.flags = flags ? flags : PM_SCALAR;
-  p.scope = current_scope();
+  p.scope = mCapture ? 0 : current_scope();
   return p;
 }
 
@@ -184,6 +207,21 @@ Result<void> ParamTable::set_scalar(
     if (p.is_readonly())
       return s::unexpected(ShellError{ErrorKind::ExecError,
           "read-only variable: " + str(name)});
+    // A table with handlers of its own ($aliases, $options …) takes no
+    // scalar (zsh's setstrvalue on a special hash).
+    if (p.is_hash() and p.handlers)
+      return s::unexpected(ShellError{ErrorKind::ExecError,
+          str(name) + ": attempt to set slice of associative array"});
+    if (p.handlers and not p.handlers->set_scalar) {
+      // A special array takes it as its one element ($dirstack=x).
+      if ((p.flags & PM_SPECIAL) and p.is_array() and p.handlers->set_array) {
+        p.handlers->set_array({s::move(value)});
+        return {};
+      }
+      // A module's parameter that isn't special (zsh/example's) is a plain
+      // one once a value of another type is assigned, as zsh replaces it.
+      if (not (p.flags & PM_SPECIAL)) p.handlers.reset();
+    }
     // A special's value comes through its getter even while this name is
     // unset: the names of a shared prompt string read one string.
     if (append)
@@ -302,8 +340,21 @@ Result<void> ParamTable::set_slice(
 
 Result<void> ParamTable::set_array(
     strv name, vec<str> words, bool append) {
-  // As setarrvalue: read-only first, then the type.
-  if (auto existing = lookup(name)) {
+  // A module's mark: the module comes in once.  One that came without the
+  // parameter is the error, and nothing is assigned; a mark whose module
+  // didn't load is replaced by the array, as zsh's.
+  if (auto raw = lookup_raw(name); raw and (raw->get().flags & PM_AUTOLOAD)) {
+    auto failures = lookup_failures;
+    (void)lookup_noget(name);
+    if (lookup_failures != failures) return {};
+    if (auto mark = lookup_raw(name); mark and (mark->get().flags & PM_AUTOLOAD)
+                                      and not mScopes.empty())
+      mScopes.front().erase(str(name));
+  }
+  // As setarrvalue: read-only first, then the type.  The value isn't
+  // made (a special's getter: $commands would fill the whole hash) unless
+  // `+=` needs it.
+  if (auto existing = lookup_noget(name)) {
     if (existing->get().is_readonly())
       return s::unexpected(ShellError{ErrorKind::ExecError,
           "read-only variable: " + str(name)});
@@ -312,8 +363,14 @@ Result<void> ParamTable::set_array(
           str(name) + ": attempt to assign array value to non-array"});
   }
   note_assigned(name);
-  if (auto existing = lookup(name)) {
+  if (auto existing = lookup_noget(name)) {
     Param& p = existing->get();
+    if (append) refresh(p);
+    // A module's parameter that isn't special and can't take an array is
+    // replaced by one (zsh/example's $exstr, $exint).
+    if (p.handlers and not p.handlers->set_array and not p.handlers->set_hash
+        and not (p.flags & PM_SPECIAL) and not p.is_hash())
+      p.handlers.reset();
     if (p.handlers and p.handlers->set_array) {
       if (append) {
         auto old = p.array();
@@ -327,6 +384,22 @@ Result<void> ParamTable::set_array(
       if (words.size() % 2 != 0)
         return s::unexpected(ShellError{ErrorKind::ExecError,
             "bad set of key/value pairs for associative array"});
+      // A special one (zsh/parameter's $functions …) takes the pairs itself.
+      if (p.handlers and p.handlers->set_hash) {
+        umap<str, str> map;
+        // `+=` sets just the new pairs where the table takes one at a time
+        // ($options would otherwise write back every option); else it
+        // adds to what the table has.
+        if (append and p.handlers->set_elem) {
+          for (s::size_t i = 0; i < words.size(); i += 2)
+            p.handlers->set_elem(words[i], s::move(words[i + 1]));
+          return {};
+        }
+        if (append and p.handlers->get_hash) map = p.handlers->get_hash();
+        for (s::size_t i = 0; i < words.size(); i += 2) map[words[i]] = s::move(words[i + 1]);
+        p.handlers->set_hash(s::move(map));
+        return {};
+      }
       auto map = append ? p.hash() : umap<str, str>{};
       for (s::size_t i = 0; i < words.size(); i += 2)
         map[words[i]] = s::move(words[i + 1]);
@@ -399,6 +472,33 @@ Result<void> ParamTable::unset(strv name) {
     if (it->second.is_readonly())
       return s::unexpected(ShellError{ErrorKind::ExecError,
           "read-only variable: " + str(name)});
+    // One side of a tie: a read-only other side refuses it (zsh unsets
+    // both).  A special's pair stays, unset; a user's tie (typeset -T)
+    // ends, both names gone, as zsh's.
+    if (it->second.flags & PM_TIED) {
+      auto partner = mTies.find(str(name));
+      auto other = partner != mTies.end() ? lookup_raw(partner->second) : s::nullopt;
+      if (other and (other->get().flags & PM_TIED)) {
+        // (PermissionDenied: zsh's error comes from the other side's
+        // unset, which leaves unset's status 0.)
+        if (other->get().is_readonly())
+          return s::unexpected(ShellError{ErrorKind::PermissionDenied,
+              "read-only variable: " + partner->second});
+        if (not (it->second.flags & PM_SPECIAL) and not (other->get().flags & PM_SPECIAL)) {
+          str pname = partner->second;
+          mTies.erase(pname);
+          mTies.erase(str(name));
+          note_assigned(pname);
+          for (auto& sc : mScopes)
+            if (auto o = sc.find(pname); o != sc.end() and &o->second == &other->get()) {
+              sc.erase(o);
+              break;
+            }
+          scope.erase(str(name));
+          return {};
+        }
+      }
+    }
     // A special parameter that stays set ($PREFIX in a completion
     // function) says what unsetting it means.
     if (it->second.handlers and it->second.handlers->unset_fn) {
@@ -409,38 +509,91 @@ Result<void> ParamTable::unset(strv name) {
     // unset (zsh keeps the node of a special that isn't PM_REMOVABLE).
     bool keep = (it->second.flags & PM_SPECIAL) and not it->second.handlers;
     if (i == 0 and not keep) {
+      // A module's array (zsh/parameter's $dirstack) is emptied through its
+      // setter first, as zsh's stdunsetfn does.
+      if ((it->second.flags & PM_HIDE) and it->second.handlers and it->second.handlers->set_array)
+        it->second.handlers->set_array({});
       scope.erase(it);
     } else if (i == 0) {
       // Unsetting it again changes nothing (the string it may share).
       if (not it->second.is_set()) return {};
+      // The array of a tie stays an array (its scalar follows it unset),
+      // so assigning it makes the pair again.
+      if (it->second.flags & PM_TIED) {
+        it->second.value = vec<str>{};
+        it->second.flags |= PM_UNSET;
+        return {};
+      }
       it->second.value = str{};
       it->second.flags = (it->second.flags & ~(PM_ARRAY | PM_HASH)) | PM_UNSET;
     } else {
       // A local stays local, so the outer parameter doesn't show through.
       it->second.value = str{};
-      it->second.flags = PM_SCALAR | PM_UNSET | (it->second.flags & (PM_LOCAL | PM_PRIVATE));
+      it->second.flags = PM_SCALAR | PM_UNSET
+                       | (it->second.flags & (PM_LOCAL | PM_PRIVATE | PM_HIDE));
     }
     return {};
   }
   return {};
 }
 
+void ParamTable::put_global(Param p) {
+  if (mScopes.empty()) mScopes.emplace_back();
+  note_assigned(p.name);
+  p.scope = 0;
+  str name = p.name;
+  mScopes.front()[name] = s::move(p);
+}
+
+opt<Param> ParamTable::take_global(strv name) {
+  if (mScopes.empty()) return s::nullopt;
+  auto& scope = mScopes.front();
+  auto it = scope.find(str(name));
+  if (it == scope.end()) return s::nullopt;
+  note_assigned(name);
+  Param p = s::move(it->second);
+  scope.erase(it);
+  return p;
+}
+
+Param* ParamTable::tied_array(const str& array, bool special, int scope) noexcept {
+  // A special's array is found as a name is, past a local made with -h
+  // (`local -h fpath` hides it from $FPATH); a user's tie (typeset -T) is
+  // to the array of its own scope, which a later local doesn't replace.
+  if (not special) {
+    if (scope < 0 or scope >= static_cast<int>(mScopes.size())) return nullptr;
+    auto& sc = mScopes[static_cast<s::size_t>(scope)];
+    auto it = sc.find(array);
+    return it == sc.end() ? nullptr : &it->second;
+  }
+  for (int i = static_cast<int>(mScopes.size()) - 1; i >= 0; --i) {
+    auto& sc = mScopes[static_cast<s::size_t>(i)];
+    auto it = sc.find(array);
+    if (it == sc.end() or (i > 0 and (it->second.flags & PM_HIDE))) continue;
+    if (hidden_private(it->second, i, local_scope())) continue;
+    return &it->second;
+  }
+  return nullptr;
+}
+
 void ParamTable::tie(Param& scalar, str array, char sep) {
-  auto words = [this, array] {
-    auto a = lookup(array);
-    return a and a->get().is_set() ? a->get().array() : vec<str>{};
-  };
+  bool special = scalar.flags & PM_SPECIAL;
+  int  scope   = scalar.scope;
+  auto find = [this, array, special, scope] { return tied_array(array, special, scope); };
   scalar.handlers = s::make_unique<ParamHandlers>();
-  scalar.handlers->get_scalar = [words, sep] {
+  scalar.handlers->get_scalar = [find, sep] {
     str out;
-    auto ws = words();
+    Param* a = find();
+    if (not a or not a->is_set()) return out;
+    refresh(*a);
+    auto ws = a->array();
     for (s::size_t i = 0; i < ws.size(); ++i) {
       if (i) out += sep;
       out += ws[i];
     }
     return out;
   };
-  scalar.handlers->set_scalar = [this, array, sep](str text) {
+  scalar.handlers->set_scalar = [this, find, array, sep](str text) {
     vec<str> ws;
     for (s::size_t b = 0; not text.empty();) {
       s::size_t e = text.find(sep, b);
@@ -448,13 +601,42 @@ void ParamTable::tie(Param& scalar, str array, char sep) {
       if (e == str::npos) break;
       b = e + 1;
     }
-    (void)set_array(array, s::move(ws));
+    // The array a plain name finds is set as any array (typeset -U,
+    // read-only); one a hiding local shadows is set where it is.
+    Param* a = find();
+    auto seen = lookup_raw(array);
+    if (not a or (seen and &seen->get() == a)) {
+      (void)set_array(array, s::move(ws));
+      return;
+    }
+    if (a->is_readonly()) return;
+    note_assigned(array);
+    if (a->flags & PM_UNIQUE) {
+      vec<str> kept;
+      for (auto& w : ws)
+        if (s::find(kept.begin(), kept.end(), w) == kept.end()) kept.push_back(s::move(w));
+      ws = s::move(kept);
+    }
+    a->set(s::move(ws));
   };
-  scalar.handlers->unset_fn = [this, array] { (void)set_array(array, {}); };
+  // Unsetting a special's scalar unsets its array: the next assignment to
+  // either makes the pair again.  (unset() ends a user's tie itself.)
+  scalar.handlers->unset_fn = [find] {
+    if (Param* a = find()) {
+      a->value = vec<str>{};
+      a->flags |= PM_UNSET;
+    }
+  };
+  scalar.handlers->tied_set = [find] {
+    Param* a = find();
+    return a and a->is_set();
+  };
   scalar.flags = (scalar.flags & ~(PM_UNSET | PM_ARRAY | PM_HASH | PM_INTEGER | PM_FLOAT))
                | PM_SCALAR | PM_TIED;
   scalar.value = scalar.handlers->get_scalar();
-  if (auto a = lookup_raw(array)) a->get().flags |= PM_TIED;
+  if (Param* a = find()) a->flags |= PM_TIED;
+  mTies[scalar.name] = array;
+  mTies[array]       = scalar.name;
 }
 
 // mScopes[0] is the global scope and is never popped.
@@ -511,7 +693,11 @@ vec<str> ParamTable::make_envp() const {
       env.push_back(p.name + "=" + pin->second);
     else if (p.is_scalar() or p.is_integer() or p.is_float())   // integers in their base
       env.push_back(p.name + "=" + p.scalar());
-  }, [](const Param& p) { return p.is_exported() and p.is_set(); });
+  }, [](const Param& p) {
+    // A tie's scalar follows its array (`unset fpath` unsets $FPATH).
+    if (not p.is_exported()) return false;
+    return p.handlers and p.handlers->tied_set ? p.handlers->tied_set() : p.is_set();
+  });
   return env;
 }
 

@@ -447,8 +447,12 @@ TEST(Interactive, SchedRunsBeforeThePrompt) {
 TEST(Interactive, TabCompletionAndHistoryKeys) {
   Pty sh;
   ASSERT_TRUE(sh.expect("% "));
-  sh.send("ech\t");
-  ASSERT_TRUE(sh.expect("echo ")) << sh.out;
+  // A name only one command has (`ech` is echo, echotc and echoti, as in
+  // zsh, whose autoloadable builtins count).
+  sh.line("uniquefn() { echo \"$@\"; }");
+  ASSERT_TRUE(sh.expect("% ")) << sh.out;
+  sh.send("uniquef\t");
+  ASSERT_TRUE(sh.expect("uniquefn ")) << sh.out;
   sh.line("first-word");
   EXPECT_TRUE(sh.expect("first-word\r\n")) << sh.out;
   // Ctrl-R finds it again; Enter runs it.

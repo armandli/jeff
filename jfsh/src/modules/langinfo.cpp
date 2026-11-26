@@ -60,7 +60,6 @@ void register_langinfo_module(ModuleManager& mm) {
       return h;
     };
     out.params.emplace_back("langinfo");
-    out.feature_names = {"p:langinfo"};
   });
 }
 

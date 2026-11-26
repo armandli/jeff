@@ -84,7 +84,6 @@ int builtin_echotc(vec<str>&, ExecContext&) {
 void register_termcap_module(ModuleManager& mm) {
   mm.register_builtin_module("zsh/termcap", [](ModuleFeatures& out, ExecContext& ctx) {
     out.builtins.push_back(BuiltinDef{"echotc", builtin_echotc, BINF_NONE, 1});
-    out.feature_names = {"b:echotc"};
 #ifdef JFSH_HAVE_CURSES
     ExecContext* ctxp = &ctx;
     Param& p = ctx.params.assign("termcap", umap<str, str>{},
@@ -104,7 +103,6 @@ void register_termcap_module(ModuleManager& mm) {
     };
     out.params.emplace_back("termcap");
     out.on_unload = [ctxp] { drop_module_param(ctxp->params, "termcap"); };
-    out.feature_names.emplace_back("p:termcap");
 #else
     (void)ctx;
 #endif

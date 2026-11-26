@@ -143,7 +143,6 @@ void register_attr_module(ModuleManager& mm) {
     out.builtins.push_back(BuiltinDef{"zsetattr",  builtin_zsetattr,  BINF_NONE, 3});
     out.builtins.push_back(BuiltinDef{"zdelattr",  builtin_zdelattr,  BINF_NONE, 2});
     out.builtins.push_back(BuiltinDef{"zlistattr", builtin_zlistattr, BINF_NONE, 1});
-    out.feature_names = {"b:zgetattr", "b:zsetattr", "b:zdelattr", "b:zlistattr"};
   });
 }
 

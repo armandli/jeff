@@ -199,6 +199,7 @@ TEST(Specials, PpidIsFixedAndReadonly) {
 
 TEST(Specials, EpochAndHistcmd) {
   Shell sh;
+  sh.run("zmodload zsh/datetime");
   long now = static_cast<long>(s::time(nullptr));
   long got = s::stol(out(sh, "echo $EPOCHSECONDS"));
   EXPECT_LE(s::labs(got - now), 2);
@@ -557,6 +558,28 @@ Proc jfsh(const vec<str>& args, const vec<str>& env = {}, strv input = "") {
     return str(s::istreambuf_iterator<char>(f), {});
   };
   return {WIFEXITED(st) ? WEXITSTATUS(st) : -1, slurp(out_path), slurp(err_path)};
+}
+
+// An autoloaded parameter its module doesn't define stops what reads it
+// with zsh's errflag: in the EXIT trap the shell then exits 1, unless the
+// script called `exit N` (zsh 5.9).
+TEST(Binary, FailedAutoloadInExitTrap) {
+  str pre = "zmodload -ap zsh/example exnosuch; trap 'echo trap $exnosuch' EXIT; ";
+  str msg = "The example module has now been set up.\n";
+  str err = "jfsh: module `zsh/example' has no such feature: `p:exnosuch': "
+            "autoload cancelled\n"
+            "jfsh: autoloading module zsh/example failed to define parameter: exnosuch\n";
+  auto p = jfsh({"-f", "-c", pre + "echo body"});
+  EXPECT_EQ(p.out, "body\n" + msg);
+  EXPECT_EQ(p.err, err);
+  EXPECT_EQ(p.rc, 1);
+  p = jfsh({"-f", "-c", pre + "exit 3"});
+  EXPECT_EQ(p.rc, 3);
+  // A `return N` at the top ends the script as `exit N` does.
+  p = jfsh({"-f", "-c", pre + "return 4"});
+  EXPECT_EQ(p.rc, 4);
+  p = jfsh({"-f", "-c", pre + "false"});
+  EXPECT_EQ(p.rc, 1);
 }
 
 TEST(Binary, BadOptionsFail) {

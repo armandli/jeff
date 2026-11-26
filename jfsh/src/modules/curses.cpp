@@ -320,7 +320,6 @@ int builtin_zcurses(vec<str>&, ExecContext&) {
 void register_curses_module(ModuleManager& mm) {
   mm.register_builtin_module("zsh/curses", [](ModuleFeatures& out, ExecContext& ctx) {
     out.builtins.push_back(BuiltinDef{"zcurses", builtin_zcurses, BINF_NONE, 0});
-    out.feature_names = {"b:zcurses"};
 #ifdef JFSH_HAVE_CURSES
     ExecContext* ctxp = &ctx;
     vec<str> attrs, colors;

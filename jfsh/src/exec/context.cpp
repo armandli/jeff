@@ -117,9 +117,22 @@ struct SecondsTimer {
 
 }  // namespace
 
-FuncFrame::FuncFrame(ExecContext& c, str name) : ctx(c) {
-  str caller = ctx.funcstack.empty() ? ctx.arg0 : ctx.funcstack.back().name;
-  ctx.funcstack.push_back({s::move(name), caller + ":" + s::to_string(ctx.lineno)});
+FuncFrame::FuncFrame(ExecContext& c, str name, Frame::Kind kind, str file, s::uint32_t fline)
+    : ctx(c) {
+  const Frame* prev = ctx.funcstack.empty() ? nullptr : &ctx.funcstack.back();
+  str caller = prev ? prev->name : ctx.arg0;
+  if (kind == Frame::Eval) {
+    // As zsh's bin_eval: an eval is like a function written in where it is.
+    if (not prev or prev->kind == Frame::Source) {
+      fline = ctx.lineno;
+      file  = caller;
+    } else {
+      fline = prev->fline + ctx.lineno - (prev->kind == Frame::Eval ? 1 : 0);
+      file  = prev->file;
+    }
+  }
+  ctx.funcstack.push_back({s::move(name), caller + ":" + s::to_string(ctx.lineno), s::move(file),
+                           ctx.lineno, fline, kind});
 }
 
 void install_special_params(ExecContext& ctx) {
@@ -199,36 +212,6 @@ void install_special_params(ExecContext& ctx) {
   params.assign("PPID", static_cast<s::int64_t>(::getppid()),
                 PM_INTEGER | PM_READONLY | PM_SPECIAL);
 
-  special(params, "EPOCHSECONDS", s::int64_t{0}, PM_INTEGER | PM_READONLY, {
-    .get_scalar = [] { return s::to_string(static_cast<long long>(s::time(nullptr))); },
-  });
-  special(params, "EPOCHREALTIME", str{}, PM_SCALAR | PM_READONLY, {
-    .get_scalar = [] {
-      struct timespec ts{};
-      ::clock_gettime(CLOCK_REALTIME, &ts);
-      char buf[48];
-      s::snprintf(buf, sizeof buf, "%lld.%09ld", static_cast<long long>(ts.tv_sec), ts.tv_nsec);
-      return str(buf);
-    },
-  });
-
-  special(params, "funcstack", vec<str>{}, PM_ARRAY | PM_READONLY, {
-    .get_array = [&ctx] {
-      vec<str> out;
-      for (auto it = ctx.funcstack.rbegin(); it != ctx.funcstack.rend(); ++it)
-        out.push_back(it->name);
-      return out;
-    },
-  });
-  special(params, "functrace", vec<str>{}, PM_ARRAY | PM_READONLY, {
-    .get_array = [&ctx] {
-      vec<str> out;
-      for (auto it = ctx.funcstack.rbegin(); it != ctx.funcstack.rend(); ++it)
-        out.push_back(it->caller);
-      return out;
-    },
-  });
-
   // $signals: the signal names by number from 0 (EXIT), then ZERR and
   // DEBUG.
   {
@@ -239,30 +222,12 @@ void install_special_params(ExecContext& ctx) {
     params.assign("signals", s::move(names), PM_ARRAY | PM_READONLY | PM_SPECIAL);
   }
 
-  // $dirstack is the directory stack, without $PWD; assigning it sets the
-  // stack, as zsh's.
-  special(params, "dirstack", vec<str>{}, PM_ARRAY, {
-    .get_array = [&ctx] { return ctx.dirstack; },
-    .set_array = [&ctx](vec<str> v) { ctx.dirstack = s::move(v); },
-  });
-
   // $_: the last word of the command before (not taken from the
   // environment).
   special(params, "_", str{}, PM_SCALAR, {
     .get_scalar = [&ctx] { return ctx.underscore; },
     .set_scalar = [&ctx](str v) { ctx.underscore = s::move(v); },
   }, /*import=*/false);
-
-  // $zsh_scheduled_events: the `sched` events as `time:flags:command`.
-  special(params, "zsh_scheduled_events", vec<str>{}, PM_ARRAY | PM_READONLY, {
-    .get_array = [&ctx] {
-      vec<str> out;
-      for (const auto& e : ctx.loop.sched)
-        out.push_back(s::to_string(static_cast<long long>(e.when)) + (e.trash_zle ? ":-o:" : "::")
-                      + e.cmd);
-      return out;
-    },
-  });
 
   // $argv is the positional parameters.
   special(params, "argv", vec<str>{}, PM_ARRAY, {

@@ -1,19 +1,17 @@
 #ifndef JFSH_MODULES_PARAMETER_H
 #define JFSH_MODULES_PARAMETER_H
-// jfsh/modules/parameter.h — the `zsh/parameter` module (M10 Phase 2).
+// jfsh/modules/parameter.h — the `zsh/parameter` module (a port of zsh's
+// Src/Modules/parameter.c).
 //
-// Exposes the shell's own tables as live associative-array or array
-// parameters that compsys and the shipped function library read:
-//
-//   $parameters, $commands, $functions, $aliases, $galiases, $saliases,
-//   $builtins, $reswords, $modules, $options, $widgets,
-//   $dis_functions, $dis_aliases, $dis_galiases, $dis_saliases,
-//   $dis_builtins, $dis_reswords, $dis_patchars, $patchars.
-//
-// Each is `PM_HASH | PM_SPECIAL | PM_READONLY` (or `PM_ARRAY` for the
-// reserved-word / pattern-char sets).  A ParamHandlers::get_hash /
-// get_array runs on every lookup so a function defined between prompts
-// shows up in the next `${(k)functions}` without a refresh call.
+// The shell's own tables as special parameters, made when read: $aliases
+// $builtins $commands $dirstack $dis_aliases $dis_builtins $dis_functions
+// $dis_functions_source $dis_galiases $dis_patchars $dis_reswords
+// $dis_saliases $funcfiletrace $funcsourcetrace $funcstack $functions
+// $functions_source $functrace $galiases $history $historywords $jobdirs
+// $jobstates $jobtexts $modules $nameddirs $options $parameters $patchars
+// $reswords $saliases $userdirs $usergroups.  Those zsh lets you assign
+// change the tables ($functions[f]=body defines f).  Each is marked for
+// autoload at startup, so the first use loads the module, as in zsh.
 
 #include <jfsh/modules/module.h>
 

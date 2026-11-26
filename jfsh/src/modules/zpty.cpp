@@ -270,7 +270,6 @@ void register_zpty_module(ModuleManager& mm) {
     out.on_unload = [] {
       while (not ptys().empty()) remove(ptys().back());
     };
-    out.feature_names = {"b:zpty"};
   });
 }
 

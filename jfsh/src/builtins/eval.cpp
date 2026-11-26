@@ -102,7 +102,7 @@ int builtin_eval(vec<str>& args, ExecContext& ctx) {
     text += args[i];
   }
   if (text.find_first_not_of(" \t\n") == str::npos) return 0;
-  FuncFrame frame{ctx, "(eval)"};
+  FuncFrame frame{ctx, "(eval)", FuncFrame::Frame::Eval};
   ++ctx.code_runs;
   bool hard = s::exchange(ctx.hard_error, false);
   int rc = ctx.executor->exec_string(text);

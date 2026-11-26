@@ -111,8 +111,21 @@ struct ExecContext {
   // Clears trap_failed and trap_status (below); wherever `aborting` is
   // cleared.
   void end_trap_abort() noexcept {
-    trap_failed = false;
-    trap_status = -1;
+    trap_failed  = false;
+    trap_status  = -1;
+    lookup_error = false;
+  }
+
+  // The failed autoload's zerr: the line ends (zsh's ERRFLAG_ERROR).
+  void raise_lookup_error() noexcept { aborting = abort_line = lookup_error = true; }
+  // Whether the line is ending for that error.
+  bool lookup_failing() const noexcept { return aborting and lookup_error; }
+  // Takes it back where zsh clears errflag: `(( ))`, `let`, a subscript, a
+  // forked command's own expansions.  True when there was one.
+  bool take_lookup_error() noexcept {
+    if (not lookup_failing()) return false;
+    aborting = abort_line = lookup_error = false;
+    return true;
   }
 
   ParamTable&    params;
@@ -140,6 +153,15 @@ struct ExecContext {
   // A failed expansion (`${x?}`) set `aborting`: in a widget function it
   // throws away the line being edited too.
   bool abort_line  = false;
+  // `aborting` came from zsh's zerr in getparamnode: an autoloaded
+  // parameter its module didn't define.  Unlike jfsh's other errors it
+  // leaves $? alone (zerr doesn't set lastval), so each construct gives
+  // zsh's status for it, and some take it back as zsh clears errflag
+  // there (see raise_lookup_error and take_lookup_error).
+  bool lookup_error = false;
+  // ttyctl -f / -u: the terminal's settings frozen (jfsh's editor sets the
+  // terminal up for each line itself, so only ttyctl reads it).
+  bool tty_frozen   = false;
   // Set by `${x?}`, zsh's ERRFLAG_HARD: unlike other errors it ends more
   // than an `eval` (builtin_eval clears it before running and reads it).
   bool hard_error  = false;
@@ -209,9 +231,9 @@ struct ExecContext {
   // What %N names (zsh's scriptname): the function or sourced file being
   // run, `jfsh` for a -c string; empty for $0.
   str                script_name{};
-  // Loadable and compiled-in modules (M10).  `modules.math_funcs()` feeds
-  // the arithmetic evaluator; `modules.all_builtins()` is folded into the
-  // builtin dispatch when a module registers new builtins.
+  // Loadable and compiled-in modules (M10): their builtins, conditions,
+  // math functions (`modules.math_funcs()` feeds the arithmetic evaluator)
+  // and parameters, and the autoload marks that bring them in.
   ModuleManager      modules{};
 
   // The executor running this context, set by its constructor, for the
@@ -235,8 +257,16 @@ struct ExecContext {
 
   vec<int>    pipestatus{};    // $pipestatus: each stage of the last pipeline
   // $funcstack and $functrace: the functions (and eval, sourced files)
-  // being run, outermost first, each with where it was called from.
-  struct Frame { str name, caller; };
+  // being run, outermost first, each with where it was called from
+  // (`caller`, the caller's name and line) and the file and line the code
+  // comes from ($funcsourcetrace, zsh's filename and flineno).
+  struct Frame {
+    enum Kind : s::uint8_t { Function, Eval, Source };
+    str         name, caller, file;
+    s::uint32_t line  = 0;   // the line in the caller
+    s::uint32_t fline = 0;
+    Kind        kind  = Function;
+  };
   vec<Frame>  funcstack{};
   // getopts: $OPTIND, the place in the option word being read, $OPTARG.
   // A function starts its own count unless POSIX_BUILTINS is set.
@@ -270,7 +300,11 @@ inline str autoload_stub_body(const ExecContext& ctx, const str& name, bool full
 
 // Pushes a $funcstack frame for `name` while it lives.
 struct FuncFrame {
-  FuncFrame(ExecContext& c, str name);
+  using Frame = ExecContext::Frame;
+  // A function's frame says where it was defined: `file` and `fline`; an
+  // eval's is worked out from the frame it runs in.
+  FuncFrame(ExecContext& c, str name, Frame::Kind kind = Frame::Function, str file = {},
+            s::uint32_t fline = 0);
   ~FuncFrame() { ctx.funcstack.pop_back(); }
   FuncFrame(const FuncFrame&) = delete;
   FuncFrame& operator=(const FuncFrame&) = delete;
@@ -358,6 +392,9 @@ struct Executor {
   // for scripts and sourced files, so an alias defined on one line is
   // used on the next; `first_line` numbers its first line ($LINENO).
   int exec_string(strv src, bool by_line = false, int first_line = 1);
+  // An fd the user opened through a builtin (sysopen, zsh's FDT_EXTERNAL):
+  // not one of the shell's, so `exec {fd}<&-` may close it.
+  static void note_user_fd(int fd);
   // A `return` ended the outermost string (a script's top level); cleared
   // when read.  Lets a script read from standard input a chunk at a time
   // stop there.
@@ -394,13 +431,13 @@ struct Executor {
   // The command hash table (`hash`, `rehash`), checked against $PATH.
   HashTable<str>& command_hash();
   // Fills the command hash with every executable in $PATH (`hash -r` is
-  // clear, `rehash` refills).
-  void fill_command_hash();
+  // clear, `rehash` refills); with `keep`, what is hashed already stays.
+  void fill_command_hash(bool keep = false);
   // The command hash with every command in $PATH, filled when it isn't
   // already ($commands, as zsh's HASH_LIST_ALL).
   HashTable<str>& full_command_hash() {
     auto& hash = command_hash();
-    if (not mHashFull or hash.empty()) fill_command_hash();
+    if (not mHashFull or hash.empty()) fill_command_hash(true);
     return mCmdHash;
   }
   // `typeset_args` are the `name=value` arguments of typeset and its
@@ -584,11 +621,38 @@ protected:
   // here-document or here-string failed, which fails the command alone, as
   // in zsh.  `counts`, when given, receives how many words each of `args`
   // became.
+  // Where a simple command runs, decided before its redirections are
+  // expanded (zsh forks first for an external one): see fork_kind.
+  enum class ForkKind : s::uint8_t { Shell, Forks, NoCommand, NoBuiltin };
   bool expand_command(vec<str>& args,
                       vec<Redirection>& redirs,
                       opt<int>&         subst_status,
                       bool&             fatal,
-                      vec<s::size_t>*   counts = nullptr);
+                      vec<s::size_t>*   counts   = nullptr,
+                      bool              may_fork    = false,
+                      bool              noglob      = false,
+                      bool              has_assigns = false,
+                      ForkKind*         kind        = nullptr);
+  // The precommand modifiers of a command (see parse_precommands).
+  struct Precommands {
+    enum class Only : s::uint8_t { Any, Builtin, External };
+    str  argv0;               // exec -a / -l
+    str  error;               // exec's bad option, for exec_simple to report
+    s::size_t first  = 0;     // the index of the word after the modifiers
+    Only only        = Only::Any;
+    bool prefixed    = false; // after a modifier other than exec
+    bool bare_prefix = false; // `builtin` or `command` with nothing after it
+    bool replace     = false; // exec
+    bool clear_env   = false; // exec -c
+    bool command_p   = false; // command -p
+    bool via_command = false; // run through `command`: no longer special
+  };
+  Precommands parse_precommands(const vec<str>& args, bool noglob) const;
+  // What a command of only `redirs` runs ($NULLCMD, $READNULLCMD, `:`), or
+  // nothing: "redirection with no command".
+  opt<str> null_command(const vec<Redirection>& redirs, bool prefixed) const;
+  // Where zsh runs the command `args` with `redirs` (see fork_kind).
+  ForkKind fork_kind(const vec<str>& args, const vec<Redirection>& redirs, bool noglob) const;
   // Where apply_assigns puts the assignments: the shell's parameters, or
   // (in front of a command) the current scope, which the caller pushed and
   // pops, optionally exported.
